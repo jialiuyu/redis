@@ -1,0 +1,62 @@
+
+========================================
+SuperNode + UB.mem + SVE2 Benchmark
+========================================
+SuperNodes: 150
+Workers per node: 16
+Queries: 1000000
+Threads: 8
+Batch size: 3000
+========================================
+
+Generating 1000000 test queries...
+  Generated 1000000 / 1000000 queries
+✅ Generated 1000000 queries
+
+Starting benchmark...
+
+
+========================================
+SuperNode + UB.mem + SVE2 Results
+========================================
+Total time: 0.09 seconds
+Total requests: 1000000
+Throughput: 10551929.77 QPS (10.55 M QPS)
+Total batches: 336
+Average batch size: 2976.2
+
+Latency:
+  Average: 0.09 μs
+  Min: 0.06 μs
+  Max: 0.14 μs
+========================================
+
+========================================
+Detailed Statistics
+========================================
+Batch aggregation:
+  Average wait time: 159.54 μs
+  Average batch size: 2976.2
+
+Bitmap CAS operations:
+  Total operations: 1000000
+  Average latency: 30.00 ns
+
+SVE2 operations:
+  Total operations: 1000000
+  Parallelism: 8-16x
+========================================
+
+========================================
+Full Scale Estimation
+========================================
+Total embeddings: 110 billion
+Average latency: 0.09 μs
+Total QPS: 197848683 (0.20 billion)
+Time to process all: 555.98 seconds (9.27 minutes)
+
+Hardware Cost:
+  SuperNodes: 150
+  Estimated cost: $7 million (@ $50k per node)
+========================================
+

@@ -1,0 +1,55 @@
+
+========================================
+Traditional Redis Cluster Benchmark
+========================================
+Servers: 350000
+Queries: 1000000
+Threads: 8
+========================================
+
+Generating 1000000 test queries...
+  Generated 1000000 / 1000000 queries
+✅ Generated 1000000 queries
+
+Starting benchmark...
+
+  Thread 7: 100000 / 125000 queries
+  Thread 6: 100000 / 125000 queries
+  Thread 1: 100000 / 125000 queries
+  Thread 0: 100000 / 125000 queries
+  Thread 2: 100000 / 125000 queries
+  Thread 3: 100000 / 125000 queries
+  Thread 4: 100000 / 125000 queries
+  Thread 5: 100000 / 125000 queries
+
+========================================
+Traditional Redis Results
+========================================
+Total time: 0.18 seconds
+Total requests: 1000000
+Throughput: 5565975.18 QPS (5.57 M QPS)
+
+Latency:
+  Average: 370.03 μs
+  Min: 102.05 μs
+  Max: 735.51 μs
+
+Latency Breakdown:
+  Network: 300.10 μs (81.1%)
+  Disk I/O: 29.94 μs (8.1%)
+  CPU: 39.99 μs (10.8%)
+========================================
+
+========================================
+Full Scale Estimation
+========================================
+Total embeddings: 110 billion
+Average latency: 370.03 μs
+Total QPS: 3500000000 (3.50 billion)
+Time to process all: 31.43 seconds (0.52 minutes)
+
+Hardware Cost:
+  Servers: 350000
+  Estimated cost: $1750 million (@ $5k per server)
+========================================
+

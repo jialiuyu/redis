@@ -1,0 +1,114 @@
+# Makefile Patch for UB+SVE Integration
+# 将此补丁应用到 redis/src/Makefile
+
+# 在 REDIS_SERVER_OBJ 中添加新的目标文件：
+
+# 原有的 REDIS_SERVER_OBJ 定义后添加：
+REDIS_SERVER_OBJ += proxy_aggregator.o
+REDIS_SERVER_OBJ += supernode_worker.o
+
+# 如果这些文件还没有包含，也添加：
+# REDIS_SERVER_OBJ += batch_processor.o
+# REDIS_SERVER_OBJ += ub_client.o
+# REDIS_SERVER_OBJ += sve_compute.o
+# REDIS_SERVER_OBJ += vector_engine.o
+
+# 编译选项（针对 ARM64 + SVE）
+# 在 FINAL_CFLAGS 中添加：
+
+ifeq ($(ARCH),aarch64)
+    # ARM64 + SVE 优化
+    FINAL_CFLAGS += -march=armv8.2-a+sve
+    FINAL_CFLAGS += -mtune=native
+    FINAL_CFLAGS += -DUSE_UB_SVE
+    
+    # SVE2 支持（如果可用）
+    FINAL_CFLAGS += -march=armv8.2-a+sve2
+    
+    # 大页支持
+    FINAL_CFLAGS += -DUSE_HUGE_PAGES
+    
+    # 非临时内存访问
+    FINAL_CFLAGS += -DUSE_NON_TEMPORAL_ACCESS
+endif
+
+# 链接选项
+# 在 FINAL_LIBS 中添加：
+
+FINAL_LIBS += -lpthread
+FINAL_LIBS += -lrt
+FINAL_LIBS += -ldl
+
+# UB 固件库（如果可用）
+ifneq ($(wildcard /usr/lib/libubios.so),)
+    FINAL_LIBS += -lubios
+    FINAL_CFLAGS += -DHAVE_UBIOS
+endif
+
+# SVE 库（如果可用）
+ifneq ($(wildcard /usr/lib/libsve.so),)
+    FINAL_LIBS += -lsve
+    FINAL_CFLAGS += -DHAVE_SVE_LIB
+endif
+
+# 编译规则
+
+proxy_aggregator.o: proxy_aggregator.c proxy_aggregator.h server.h
+	$(CC) -c $(FINAL_CFLAGS) $<
+
+supernode_worker.o: supernode_worker.c supernode_worker.h proxy_aggregator.h server.h
+	$(CC) -c $(FINAL_CFLAGS) $<
+
+# 依赖关系
+
+proxy_aggregator.o: proxy_aggregator.h server.h
+supernode_worker.o: supernode_worker.h proxy_aggregator.h server.h
+batch_processor.o: batch_processor.h vector_engine.h ub_client.h
+ub_client.o: ub_client.h server.h
+sve_compute.o: sve_compute.h server.h
+vector_engine.o: vector_engine.h ub_client.h sve_compute.h
+
+# 清理规则
+# 在 clean 目标中添加：
+
+clean:
+	rm -f proxy_aggregator.o supernode_worker.o
+
+# 安装规则
+# 在 install 目标中添加配置文件：
+
+install:
+	# ... 原有的安装命令 ...
+	$(INSTALL) ../redis-ub-sve.conf $(INSTALL_BIN)/redis-ub-sve.conf.example
+
+# 测试规则
+
+test-ub-sve:
+	@echo "Running UB+SVE integration tests..."
+	@cd .. && bash test_ub_sve_integration.sh
+
+.PHONY: test-ub-sve
+
+# 性能测试规则
+
+benchmark-ub-sve:
+	@echo "Running UB+SVE performance benchmarks..."
+	@./batch_embedding_test
+
+.PHONY: benchmark-ub-sve
+
+# 帮助信息
+
+help:
+	@echo "UB+SVE specific targets:"
+	@echo "  test-ub-sve       - Run UB+SVE integration tests"
+	@echo "  benchmark-ub-sve  - Run UB+SVE performance benchmarks"
+	@echo ""
+	@echo "Build options:"
+	@echo "  ARCH=aarch64      - Enable ARM64 + SVE optimizations"
+	@echo "  USE_UB_SVE=yes    - Enable UB+SVE support"
+	@echo ""
+	@echo "Example:"
+	@echo "  make ARCH=aarch64 USE_UB_SVE=yes"
+
+.PHONY: help
