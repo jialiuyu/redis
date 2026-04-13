@@ -7,6 +7,7 @@
 #include "ub_client.h"
 #include "vector_engine.h"
 #include "sve_compute.h"
+#include <sys/time.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -83,6 +84,7 @@ void batch_processor_shutdown(void) {
 // Submit batch VEMB request
 int batch_submit_vemb_request(const char *key, const char *element,
                             vector_data_t *result, long timeout_us) {
+    (void)timeout_us;
     if (!global_batch_processor || !key || !element || !result) return C_ERR;
 
     uint64_t request_id = atomic_fetch_add(&next_request_id, 1);
@@ -97,6 +99,7 @@ int batch_submit_vemb_request(const char *key, const char *element,
             // Add request to batch
             batch_request_t *req = &batch->requests[batch->num_requests++];
             req->request_id = request_id;
+            //TODO: 放到锁外面
             req->key_name = zstrdup(key);
             req->element_name = zstrdup(element);
             req->result = result;
@@ -147,6 +150,7 @@ int batch_wait_for_completion(uint64_t request_id, long timeout_us) {
             pthread_mutex_unlock(&batch->mutex);
         }
 
+        // TODO: yield
         // Small sleep to avoid busy waiting
         struct timespec sleep_time = {0, 1000}; // 1 microsecond
         nanosleep(&sleep_time, NULL);
@@ -157,6 +161,7 @@ int batch_wait_for_completion(uint64_t request_id, long timeout_us) {
 
 // Batch processor thread
 void *batch_processor_thread(void *arg) {
+    (void)arg;
     serverLog(LL_NOTICE, "Batch processor thread started");
 
     while (global_batch_processor && global_batch_processor->running) {

@@ -1,2 +1,1 @@
-zipmap.o: zipmap.c zmalloc.h ../deps/jemalloc/include/jemalloc/jemalloc.h \
- endianconv.h config.h
+zipmap.o: zipmap.c zmalloc.h endianconv.h config.h

@@ -1,0 +1,9 @@
+CompileFlags:
+  CompilationDatabase: .
+
+---
+If:
+  PathMatch: src/batch_processor\.c
+CompileFlags:
+  Remove: [-DUSE_JEMALLOC, -I../deps/jemalloc/include]
+  Add: [-march=armv8-a+sve]

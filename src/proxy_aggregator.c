@@ -410,6 +410,7 @@ batch_packet_t *serialize_batch_for_sve(batch_bucket_t *bucket) {
         packet->requests[i].request_id = req->request_id;
         packet->requests[i].key_hash = murmur3_hash(req->key, strlen(req->key));
         packet->requests[i].key_len = strlen(req->key);
+        // flatten
         strncpy(packet->requests[i].key_data, req->key, 
                 sizeof(packet->requests[i].key_data) - 1);
     }

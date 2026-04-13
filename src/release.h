@@ -1,5 +1,5 @@
-#define REDIS_GIT_SHA1 "a3706aee"
-#define REDIS_GIT_DIRTY "0"
-#define REDIS_BUILD_ID "qiuwu-moreai-8npu-server-28-server-0-1770728172"
+#define REDIS_GIT_SHA1 "6cb3d724"
+#define REDIS_GIT_DIRTY "    2953"
+#define REDIS_BUILD_ID "MAGIT00270.local-1775737635"
 #include "version.h"
 #define REDIS_BUILD_ID_RAW REDIS_VERSION REDIS_BUILD_ID REDIS_GIT_DIRTY REDIS_GIT_SHA1
