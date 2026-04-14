@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench
 
 # 所有目标
 all: $(TARGETS)
@@ -64,6 +64,11 @@ three_layer_benchmark_ub: three_layer_benchmark_ub.c ../src/three_layer_cache_ub
 # GEMM v7-vs-v8 comparison tool
 gemm_compare: gemm_compare.c
 	$(CC) -O3 -Wall -Wno-format -march=armv8.2-a+sve -pthread -std=c11 -o $@ $< -lm -lpthread
+	@echo "✅ Built: $@"
+
+# 三层缓存基准测试
+three_layer_benchmark: three_layer_benchmark.c ../src/three_layer_cache.c ../src/three_layer_cache.h
+	$(CC) $(CFLAGS) -I../src -o $@ three_layer_benchmark.c ../src/three_layer_cache.c $(LDFLAGS)
 	@echo "✅ Built: $@"
 
 # SuperNode 优化版基准测试
