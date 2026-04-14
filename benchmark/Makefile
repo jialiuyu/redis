@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark
 
 # 所有目标
 all: $(TARGETS)
@@ -42,6 +42,11 @@ supernode_real_benchmark: supernode_real_benchmark.c benchmark_common.h
 # SuperNode 服务器
 supernode_server: supernode_server.c benchmark_common.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Built: $@"
+
+# 三层缓存基准测试
+three_layer_benchmark: three_layer_benchmark.c ../src/three_layer_cache.c ../src/three_layer_cache.h
+	$(CC) $(CFLAGS) -I../src -o $@ three_layer_benchmark.c ../src/three_layer_cache.c $(LDFLAGS)
 	@echo "✅ Built: $@"
 
 # 清理
