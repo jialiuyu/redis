@@ -160,3 +160,4 @@ cython_debug/
 *wandb
 *logs
 *tensorboard
+compile_commands.json

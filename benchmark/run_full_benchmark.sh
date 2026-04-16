@@ -268,8 +268,11 @@ print_system_info() {
     fi
     
     if [ -f /proc/meminfo ]; then
-        local mem_total=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-        echo "Memory: $((mem_total / 1024 / 1024)) GB"
+        local mem_total_kb
+        mem_total_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+        local mem_total_gb
+        mem_total_gb=$(awk "BEGIN{printf \"%d\", ${mem_total_kb}/1024/1024}")
+        echo "Memory: ${mem_total_gb} GB"
     fi
     
     echo ""
