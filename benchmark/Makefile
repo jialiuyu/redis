@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 three_layer_benchmark_ub
 
 # 所有目标
 all: $(TARGETS)
@@ -42,6 +42,27 @@ supernode_real_benchmark: supernode_real_benchmark.c benchmark_common.h
 # SuperNode 服务器
 supernode_server: supernode_server.c benchmark_common.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Built: $@"
+
+# Three-Layer Cache v4 (local memory)
+three_layer_benchmark_v4: three_layer_benchmark.c ../src/three_layer_cache.c ../src/three_layer_cache.h
+	$(CC) -O3 -Wall -Wno-format -march=armv8.2-a+lse -pthread -std=c11 -o $@ three_layer_benchmark.c ../src/three_layer_cache.c -lm -lpthread
+	@echo "✅ Built: $@"
+
+# Three-Layer Cache v5 (UB memory backend, cache-only)
+three_layer_benchmark_ub: three_layer_benchmark_ub.c ../src/three_layer_cache_ub.c ../src/three_layer_cache_ub.h ../src/sve2_gemm.h
+	. /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null; \
+	$(CC) -O3 -Wall -Wno-format -march=armv8.2-a+sve -pthread -std=c11 \
+		-I/usr/local/Ascend/ascend-toolkit/latest/include \
+		-L/usr/local/Ascend/ascend-toolkit/latest/lib64 \
+		-Wl,-rpath,/usr/local/Ascend/ascend-toolkit/latest/lib64 \
+		-o $@ three_layer_benchmark_ub.c ../src/three_layer_cache_ub.c \
+		-lm -lpthread -lascendcl -lacl_cblas
+	@echo "✅ Built: $@ (v8 UB + SVE2 Optimized + NPU GEMM)"
+
+# GEMM v7-vs-v8 comparison tool
+gemm_compare: gemm_compare.c
+	$(CC) -O3 -Wall -Wno-format -march=armv8.2-a+sve -pthread -std=c11 -o $@ $< -lm -lpthread
 	@echo "✅ Built: $@"
 
 # 清理

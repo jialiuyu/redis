@@ -72,6 +72,7 @@ static void *bench_worker(void *arg) {
     }
 
     t->elapsed_ns = bench_now_ns() - start;
+    tlc_flush_tls_stats(t->cache);
     return NULL;
 }
 

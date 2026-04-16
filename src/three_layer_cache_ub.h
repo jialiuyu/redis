@@ -1,14 +1,20 @@
 /*
- * Three-Layer Cache v3 — Optimized for throughput
+ * Three-Layer Cache v6 — UB Memory + SVE2 Fused Compute
  *
- * Key insight: HOT layer stores key+index (not full value).
- * HOT entry = 16 bytes → fits 4 entries per cache line.
- * Value lives in WARM; HOT is just an index accelerator.
+ * v5 base: UB shared memory backend + consistent hashing.
+ * v6 adds: SVE2 fused gather-load + compute in one pass:
+ *   - Embedding cosine similarity (fused gather + dot-product)
+ *   - GEMM matrix multiply (fused gather + outer-product)
+ *   - Batch gather load with SVE2 streaming prefetch
  *
- * All sync: bitmap CAS. Zero mutex.
+ * Architecture:
+ *   HOT  (16B index)  → UB.mem region 0 (local)
+ *   WARM (1200B value) → UB.mem region 1 (consistent-hash)
+ *   COLD (append-only) → UB.mem region 2 (sequential)
+ *   EMB  (float[dim])  → UB.mem region 3 (embedding table for SVE2 compute)
  */
-#ifndef __THREE_LAYER_CACHE_H
-#define __THREE_LAYER_CACHE_H
+#ifndef __THREE_LAYER_CACHE_UB_H
+#define __THREE_LAYER_CACHE_UB_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -17,8 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ---- Tuning knobs (same as v4 for apples-to-apples comparison) ---- */
 #define TLC_HOT_CAPACITY      (1 << 17)   /* 128K index entries */
-#define TLC_WARM_CAPACITY     (1 << 20)   /* 1M value entries */
+#define TLC_WARM_CAPACITY     (1 << 20)   /* 1M value entries   */
 #define TLC_COLD_SEGMENT_SIZE (1 << 20)
 #define TLC_MAX_COLD_SEGMENTS 64
 #define TLC_VALUE_SIZE        1200
@@ -29,7 +36,19 @@
 #define TLC_PAXOS_QUORUM      2
 #define BMP_BITS_PER_WORD     64
 
-/* ---- Bitmap CAS lock ---- */
+/* ---- UB Memory Configuration ---- */
+#define UB_NUM_NODES          4           /* Number of UB memory nodes */
+#define UB_VNODE_PER_PHYSICAL 32          /* Virtual nodes per physical node */
+#define UB_HASH_RING_SIZE     (UB_NUM_NODES * UB_VNODE_PER_PHYSICAL * (UB_LOCAL_VNODE_WEIGHT + 1))
+#define UB_NODE_MEM_SIZE      (2ULL * 1024 * 1024 * 1024)  /* 2GB per node region */
+#define UB_LOCAL_VNODE_WEIGHT 4           /* Local node gets 4x more vnodes */
+
+/* ---- SVE2 Compute Configuration ---- */
+#define SVE2_EMB_TABLE_SIZE   (1 << 17)   /* 128K embeddings in UB memory */
+#define SVE2_EMB_DIM_DEFAULT  300         /* Default embedding dimension */
+#define SVE2_GEMM_OUT_DIM     64          /* GEMM output dimension */
+
+/* ---- Bitmap CAS lock (identical to v4) ---- */
 typedef struct {
     atomic_uint_fast64_t *words;
     size_t num_words;
@@ -54,7 +73,6 @@ static inline void bmp_lock_acquire(bitmap_lock_t *bl, uint32_t bucket) {
                     memory_order_acquire, memory_order_relaxed))
                 return;
         }
-        /* spin yield */
 #if defined(__aarch64__)
         __asm__ volatile("yield" ::: "memory");
 #elif defined(__x86_64__)
@@ -75,16 +93,16 @@ typedef enum { RB_EVENT_NONE=0, RB_EVENT_WRITE=1, RB_EVENT_PROMOTE=2,
                RB_EVENT_EVICT=3, RB_EVENT_FLUSH=4, RB_EVENT_READ_THROUGH=5,
                RB_EVENT_CONFLICT=6 } rb_event_type_t;
 
-/* ---- HOT layer: key→warm_index only (16 bytes per entry, cache-friendly) ---- */
+/* ---- HOT layer: key→warm_index (16 bytes, cache-friendly) ---- */
 typedef struct {
     uint64_t key;
-    int32_t  warm_idx;   /* index into warm.entries[] */
+    int32_t  warm_idx;
     uint32_t _pad;
-} hot_index_t;  /* exactly 16 bytes = 4 per cache line */
+} hot_index_t;  /* 16 bytes */
 
 typedef struct {
-    hot_index_t *table;       /* open-addressing hash, power-of-2 size */
-    size_t       capacity;    /* must be power of 2 */
+    hot_index_t *table;       /* Backed by UB memory */
+    size_t       capacity;
     uint32_t     mask;
     bitmap_lock_t bmp;
     atomic_uint_fast64_t hits;
@@ -102,11 +120,11 @@ typedef struct {
 } warm_entry_t;
 
 typedef struct {
-    warm_entry_t *entries;
-    int32_t      *hash_table;
+    warm_entry_t *entries;    /* Backed by UB memory */
+    int32_t      *hash_table; /* Backed by UB memory */
     atomic_size_t count;
     size_t        capacity;
-    uint32_t      mask;       /* capacity*2 - 1 */
+    uint32_t      mask;
     bitmap_lock_t bmp;
     atomic_uint_fast64_t hits;
     atomic_uint_fast64_t misses;
@@ -145,14 +163,64 @@ typedef struct {
     int my_idc, my_shard; atomic_int failed_idc;
 } ha_manager_t;
 
-/* ---- Top-level ---- */
+/* ---- UB Memory Node ---- */
+typedef struct {
+    int      node_id;
+    void    *base_addr;       /* mmap'd UB memory region */
+    size_t   total_size;
+    size_t   used;
+    int      is_local;        /* 1 if this node is local (no cross-node) */
+} ub_mem_node_t;
+
+/* ---- Consistent Hash Ring for UB node mapping ---- */
+typedef struct {
+    uint32_t hash_val;
+    int      node_id;
+} ub_hash_vnode_t;
+
+typedef struct {
+    ub_hash_vnode_t vnodes[UB_HASH_RING_SIZE];
+    int             num_vnodes;
+    int             num_physical;
+} ub_hash_ring_t;
+
+/* ---- UB Memory Manager ---- */
+typedef struct {
+    ub_mem_node_t   nodes[UB_NUM_NODES];
+    int             num_nodes;
+    ub_hash_ring_t  ring;
+    int             local_node_id;    /* This process's preferred node */
+
+    /* Pointers into UB memory for each layer */
+    void           *hot_region;       /* HOT table lives here */
+    void           *warm_entries_region;
+    void           *warm_ht_region;
+    void           *cold_region;
+    float          *emb_table;        /* Embedding table in UB memory */
+    size_t          emb_table_entries; /* Number of embeddings */
+    size_t          emb_dim;          /* Embedding dimension */
+    float          *gemm_weights;     /* GEMM weight matrix [emb_dim × gemm_out_dim] */
+    size_t          gemm_out_dim;     /* GEMM output dimension */
+
+    /* Stats */
+    atomic_uint_fast64_t local_accesses;
+    atomic_uint_fast64_t remote_accesses;
+} ub_mem_manager_t;
+
+/* ---- Top-level cache ---- */
 typedef struct {
     hot_layer_t hot; warm_layer_t warm; cold_layer_t cold;
     ring_buffer_t ring; paxos_acceptor_t paxos[TLC_NUM_SHARDS]; ha_manager_t ha;
+    ub_mem_manager_t ub_mgr;
     atomic_uint_fast64_t total_reads, total_writes, read_throughs, write_throughs, paxos_conflicts;
+    /* SVE2 compute stats */
+    atomic_uint_fast64_t sve2_similarity_ops;
+    atomic_uint_fast64_t sve2_gemm_ops;
+    atomic_uint_fast64_t sve2_gather_ops;
+    atomic_uint_fast64_t sve2_fused_ops;
 } three_layer_cache_t;
 
-/* ---- API ---- */
+/* ---- API (same signatures as v4) ---- */
 int  tlc_init(three_layer_cache_t *c, int idc, int shard);
 void tlc_destroy(three_layer_cache_t *c);
 int  tlc_get(three_layer_cache_t *c, uint64_t key, void *out);
@@ -164,4 +232,31 @@ int  tlc_paxos_propose(three_layer_cache_t *c, uint64_t key, const void *val, ui
 void tlc_print_stats(three_layer_cache_t *c);
 void tlc_flush_tls_stats(three_layer_cache_t *c);
 int  cold_append(cold_layer_t *c, uint64_t key, const void *val);
-#endif
+
+/* ---- UB-specific API ---- */
+int  ub_mgr_init(ub_mem_manager_t *mgr, int local_node_id, int num_nodes);
+void ub_mgr_destroy(ub_mem_manager_t *mgr);
+int  ub_mgr_get_node_for_key(ub_mem_manager_t *mgr, uint64_t key);
+
+/* ---- SVE2 Fused Compute API (v6) ---- */
+
+/* Initialize embedding table in UB memory and populate with random data */
+int  tlc_emb_init(three_layer_cache_t *c, size_t n_emb, size_t dim);
+
+/* Fused gather-load + cosine similarity: read embeddings from UB, compute sim vs query */
+int  tlc_sve2_similarity(three_layer_cache_t *c,
+                         const float *query, size_t dim,
+                         const uint64_t *emb_ids, size_t n_ids,
+                         float *similarities);
+
+/* Fused gather-load + GEMM: read embedding rows from UB, multiply by weight matrix */
+int  tlc_sve2_gemm(three_layer_cache_t *c,
+                   const uint64_t *row_ids, size_t n_rows,
+                   float *output, size_t out_dim);
+
+/* Batch gather load: read N embeddings from UB memory */
+int  tlc_sve2_gather(three_layer_cache_t *c,
+                     const uint64_t *emb_ids, size_t n_ids,
+                     float *output);
+
+#endif /* __THREE_LAYER_CACHE_UB_H */

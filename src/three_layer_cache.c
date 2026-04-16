@@ -1,6 +1,12 @@
 /*
- * Three-Layer Cache v3 — HOT = index-only (16B/entry), value in WARM
- * All bitmap CAS, zero mutex, no syscall on hot path.
+ * Three-Layer Cache v4 — Kunpeng ARM optimized
+ *
+ * Key optimizations over v3:
+ * 1. Lock-free HOT via 128-bit atomic (ARM LDP/STP naturally atomic on 16B aligned)
+ * 2. WARM: memcpy outside lock, only index update inside lock
+ * 3. Per-thread stats (no global atomic on hot path)
+ * 4. PRFM prefetch hints for hash probe
+ * 5. Compile with -march=armv8.2-a+lse for hardware LDADD/CASAL
  */
 #define _GNU_SOURCE
 #include "three_layer_cache.h"
@@ -21,59 +27,67 @@ static inline uint64_t now_ns_slow(void) {
 }
 static void rb_init(ring_buffer_t *rb) { memset(rb, 0, sizeof(*rb)); }
 
+/* Per-thread stats to avoid global atomic bouncing on 320 cores */
+static __thread uint64_t tls_hot_hits = 0;
+static __thread uint64_t tls_hot_misses = 0;
+static __thread uint64_t tls_warm_hits = 0;
+static __thread uint64_t tls_warm_misses = 0;
+
 /* ============================================================
- * HOT: 16-byte index entries → 128K entries = 2MB (fits L3)
- * key(8B) + warm_idx(4B) + pad(4B) = 16B → 4 per cache line
+ * HOT: FULLY LOCK-FREE via aligned 16B atomic read/write
+ * ARM guarantees LDP/STP atomicity on 16B-aligned addresses.
+ * No bitmap CAS needed — just atomic load/store of {key, warm_idx}.
  * ============================================================ */
 static int hot_init(hot_layer_t *h, size_t cap) {
     h->capacity = cap; h->mask = (uint32_t)(cap - 1);
     atomic_store(&h->hits, 0); atomic_store(&h->misses, 0);
-    if (bmp_lock_init(&h->bmp, cap) != 0) return -1;
-    h->table = (hot_index_t *)calloc(cap, sizeof(hot_index_t));
-    if (!h->table) return -1;
+    /* Allocate 16B-aligned for atomic LDP/STP */
+    if (posix_memalign((void **)&h->table, 16, cap * sizeof(hot_index_t)) != 0)
+        return -1;
+    memset(h->table, 0, cap * sizeof(hot_index_t));
     for (size_t i = 0; i < cap; i++) h->table[i].warm_idx = -1;
+    /* Still init bmp for compatibility but won't use it on hot path */
+    bmp_lock_init(&h->bmp, 1);
     return 0;
 }
 
-/* HOT get: returns warm_idx if found, -1 if miss. NO memcpy. */
+/* Lock-free HOT get: just read 16B entry (atomic on ARM if aligned) */
 static inline int32_t hot_get_idx(hot_layer_t *h, uint64_t key) {
     uint32_t slot = hash_fast(key, h->mask);
-    /* No lock needed for read — entries are written atomically (key+idx together) */
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t s = (slot + i) & h->mask;
-        hot_index_t *e = &h->table[s];
-        if (e->warm_idx >= 0 && e->key == key) {
-            atomic_fetch_add_explicit(&h->hits, 1, memory_order_relaxed);
-            return e->warm_idx;
+        /* Prefetch next probe slot */
+        if (i < 3) __builtin_prefetch(&h->table[(slot + i + 1) & h->mask], 0, 3);
+        hot_index_t e = h->table[s]; /* 16B load — atomic on ARM aligned */
+        if (e.warm_idx >= 0 && e.key == key) {
+            tls_hot_hits++;
+            return e.warm_idx;
         }
-        if (e->warm_idx < 0) break; /* empty slot = end of chain */
+        if (e.warm_idx < 0) break;
     }
-    atomic_fetch_add_explicit(&h->misses, 1, memory_order_relaxed);
+    tls_hot_misses++;
     return -1;
 }
 
-/* HOT put: insert/update index entry */
+/* Lock-free HOT put: just write 16B entry (atomic on ARM aligned) */
 static inline void hot_put_idx(hot_layer_t *h, uint64_t key, int32_t warm_idx) {
     uint32_t slot = hash_fast(key, h->mask);
-    uint32_t lock_id = slot % (uint32_t)h->bmp.num_words;
-    bmp_lock_acquire(&h->bmp, lock_id);
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t s = (slot + i) & h->mask;
-        if (h->table[s].warm_idx < 0 || h->table[s].key == key) {
-            h->table[s].key = key;
-            h->table[s].warm_idx = warm_idx;
-            bmp_lock_release(&h->bmp, lock_id);
+        hot_index_t cur = h->table[s];
+        if (cur.warm_idx < 0 || cur.key == key) {
+            hot_index_t nv = {key, warm_idx};
+            h->table[s] = nv; /* 16B store — atomic on ARM aligned */
             return;
         }
     }
-    /* All 4 slots full — evict slot 0 (pseudo-random) */
-    h->table[slot & h->mask].key = key;
-    h->table[slot & h->mask].warm_idx = warm_idx;
-    bmp_lock_release(&h->bmp, lock_id);
+    /* Evict first slot */
+    hot_index_t nv = {key, warm_idx};
+    h->table[slot & h->mask] = nv;
 }
 
 /* ============================================================
- * WARM: value storage, bitmap CAS per bucket
+ * WARM: memcpy OUTSIDE lock, only index ops inside lock
  * ============================================================ */
 static int warm_init(warm_layer_t *w, size_t cap) {
     w->capacity = cap; w->mask = (uint32_t)(cap * 2 - 1);
@@ -87,69 +101,84 @@ static int warm_init(warm_layer_t *w, size_t cap) {
     return 0;
 }
 
-/* Returns entry index if found, -1 if miss. Copies value to out. */
 static int warm_get(warm_layer_t *w, uint64_t key, void *out, int32_t *out_idx) {
     uint32_t slot = hash_fast(key, w->mask);
     uint32_t lock_id = slot % (uint32_t)w->bmp.num_words;
+
+    /* Prefetch the first hash table entry before acquiring lock */
+    __builtin_prefetch(&w->hash_table[slot & w->mask], 0, 3);
+
     bmp_lock_acquire(&w->bmp, lock_id);
+    int32_t found = -1;
     for (uint32_t i = 0; i < 6; i++) {
         int32_t idx = w->hash_table[(slot + i) & w->mask];
         if (idx < 0) break;
         if (w->entries[idx].key == key && w->entries[idx].state != ENTRY_EMPTY) {
-            if (out) memcpy(out, w->entries[idx].value, TLC_VALUE_SIZE);
-            if (out_idx) *out_idx = idx;
+            found = idx;
             w->entries[idx].access_count++;
-            atomic_fetch_add_explicit(&w->hits, 1, memory_order_relaxed);
-            bmp_lock_release(&w->bmp, lock_id);
-            return 0;
+            break;
         }
     }
-    atomic_fetch_add_explicit(&w->misses, 1, memory_order_relaxed);
     bmp_lock_release(&w->bmp, lock_id);
+
+    if (found >= 0) {
+        /* memcpy OUTSIDE lock — no contention during copy */
+        if (out) memcpy(out, w->entries[found].value, TLC_VALUE_SIZE);
+        if (out_idx) *out_idx = found;
+        tls_warm_hits++;
+        return 0;
+    }
+    tls_warm_misses++;
     return -1;
 }
 
 static int warm_put(warm_layer_t *w, uint64_t key, const void *val, int32_t *out_idx) {
     uint32_t slot = hash_fast(key, w->mask);
     uint32_t lock_id = slot % (uint32_t)w->bmp.num_words;
+
     bmp_lock_acquire(&w->bmp, lock_id);
-    /* Update existing */
+    /* Check existing */
     for (uint32_t i = 0; i < 6; i++) {
         int32_t idx = w->hash_table[(slot + i) & w->mask];
         if (idx < 0) break;
         if (idx >= 0 && (size_t)idx < w->capacity &&
             w->entries[idx].key == key && w->entries[idx].state != ENTRY_EMPTY) {
-            memcpy(w->entries[idx].value, val, TLC_VALUE_SIZE);
-            w->entries[idx].state = ENTRY_DIRTY;
-            w->entries[idx].access_count++;
-            if (out_idx) *out_idx = idx;
+            int32_t target = idx;
+            w->entries[target].state = ENTRY_DIRTY;
+            w->entries[target].access_count++;
             bmp_lock_release(&w->bmp, lock_id);
+            /* memcpy OUTSIDE lock */
+            memcpy(w->entries[target].value, val, TLC_VALUE_SIZE);
+            if (out_idx) *out_idx = target;
             return 0;
         }
     }
-    /* Insert new */
+    /* Allocate new slot (atomic, outside lock scope for index) */
     int32_t target = (int32_t)atomic_fetch_add_explicit(&w->count, 1, memory_order_relaxed);
     if ((size_t)target >= w->capacity) {
         bmp_lock_release(&w->bmp, lock_id);
         return -1;
     }
+    /* Insert into hash table (inside lock) */
+    for (uint32_t i = 0; i < 6; i++) {
+        uint32_t s = (slot + i) & w->mask;
+        if (w->hash_table[s] < 0) { w->hash_table[s] = target; break; }
+    }
+    bmp_lock_release(&w->bmp, lock_id);
+
+    /* Initialize entry OUTSIDE lock — no contention */
     w->entries[target].key = key;
     memcpy(w->entries[target].value, val, TLC_VALUE_SIZE);
     w->entries[target].state = ENTRY_DIRTY;
     w->entries[target].write_ts_ns = now_ns_slow();
     w->entries[target].ttl_ns = 60ULL * 1000000000ULL;
     w->entries[target].access_count = 1;
-    for (uint32_t i = 0; i < 6; i++) {
-        uint32_t s = (slot + i) & w->mask;
-        if (w->hash_table[s] < 0) { w->hash_table[s] = target; break; }
-    }
     if (out_idx) *out_idx = target;
-    bmp_lock_release(&w->bmp, lock_id);
     return 0;
 }
 
 /* ============================================================
- * COLD: O(1) append + O(1) offset lookup
+ * COLD: unchanged from v3 (not on hot path)
  * ============================================================ */
 static int cold_init(cold_layer_t *c) {
     memset(c, 0, sizeof(*c));
@@ -210,7 +239,7 @@ static int cold_get(cold_layer_t *c, uint64_t key, void *out) {
     return -1;
 }
 
-/* Paxos + HA (compact) */
+/* Paxos + HA (unchanged) */
 static void paxos_init(paxos_acceptor_t *p) {
     atomic_store(&p->highest_seen_id, 0); atomic_store(&p->accepted_id, 0);
     bmp_lock_init(&p->bmp, 1);
@@ -261,8 +290,7 @@ int tlc_ha_recover(three_layer_cache_t *c, int ri) {
 }
 
 /* ============================================================
- * Top-level: HOT = index accelerator, value in WARM
- * GET fast path: HOT index lookup (16B, no memcpy) → direct WARM read
+ * Top-level
  * ============================================================ */
 int tlc_init(three_layer_cache_t *c, int idc, int shard) {
     memset(c, 0, sizeof(*c));
@@ -282,66 +310,70 @@ void tlc_destroy(three_layer_cache_t *c) {
     free(c->cold.offset_index); bmp_lock_destroy(&c->cold.bmp);
 }
 
+/* GET: lock-free HOT → bitmap-CAS WARM → COLD */
 int tlc_get(three_layer_cache_t *c, uint64_t key, void *out) {
     atomic_fetch_add_explicit(&c->total_reads, 1, memory_order_relaxed);
 
-    /* 1. HOT index lookup — 16B entry, no lock, no memcpy */
+    /* 1. HOT: fully lock-free, 16B atomic read */
     int32_t widx = hot_get_idx(&c->hot, key);
     if (widx >= 0 && (size_t)widx < c->warm.capacity) {
-        /* Direct read from WARM by index — skip hash lookup entirely */
         warm_entry_t *e = &c->warm.entries[widx];
         if (e->key == key && e->state != ENTRY_EMPTY) {
             memcpy(out, e->value, TLC_VALUE_SIZE);
             e->access_count++;
             return 0;
         }
-        /* Stale HOT entry — fall through to WARM hash */
     }
 
-    /* 2. WARM hash lookup */
+    /* 2. WARM: bitmap CAS lock, memcpy outside lock */
     int32_t found_idx = -1;
-    int wr = warm_get(&c->warm, key, out, &found_idx);
-    if (wr == 0) {
-        /* Promote to HOT index (cheap: just write 16B) */
-        hot_put_idx(&c->hot, key, found_idx);
+    if (warm_get(&c->warm, key, out, &found_idx) == 0) {
+        hot_put_idx(&c->hot, key, found_idx); /* lock-free 16B write */
         return 0;
     }
 
     /* 3. COLD read-through */
     if (cold_get(&c->cold, key, out) == 0) {
-        int32_t new_idx = -1;
-        warm_put(&c->warm, key, out, &new_idx);
-        if (new_idx >= 0) hot_put_idx(&c->hot, key, new_idx);
+        int32_t ni = -1;
+        warm_put(&c->warm, key, out, &ni);
+        if (ni >= 0) hot_put_idx(&c->hot, key, ni);
         atomic_fetch_add_explicit(&c->read_throughs, 1, memory_order_relaxed);
         return 0;
     }
     return -1;
 }
 
+/* PUT: bitmap CAS WARM, lock-free HOT index update */
 int tlc_put(three_layer_cache_t *c, uint64_t key, const void *val) {
     atomic_fetch_add_explicit(&c->total_writes, 1, memory_order_relaxed);
     int32_t idx = -1;
-    int rc = warm_put(&c->warm, key, val, &idx);
-    if (rc != 0) {
+    if (warm_put(&c->warm, key, val, &idx) != 0) {
         cold_append(&c->cold, key, val);
         atomic_fetch_add_explicit(&c->write_throughs, 1, memory_order_relaxed);
         return 0;
     }
-    /* Update HOT index if this key was hot */
     if (idx >= 0) hot_put_idx(&c->hot, key, idx);
     return 0;
 }
 
+/* Flush TLS stats to global (call from benchmark after threads join) */
+void tlc_flush_tls_stats(three_layer_cache_t *c) {
+    atomic_fetch_add(&c->hot.hits, tls_hot_hits);
+    atomic_fetch_add(&c->hot.misses, tls_hot_misses);
+    atomic_fetch_add(&c->warm.hits, tls_warm_hits);
+    atomic_fetch_add(&c->warm.misses, tls_warm_misses);
+    tls_hot_hits = tls_hot_misses = tls_warm_hits = tls_warm_misses = 0;
+}
+
 void tlc_print_stats(three_layer_cache_t *c) {
     printf("\n========================================\n");
-    printf("Three-Layer Cache v3 (Index-HOT, Bitmap CAS)\n");
+    printf("Three-Layer Cache v4 (Kunpeng ARM Optimized)\n");
     printf("========================================\n");
     printf("Reads: %lu  Writes: %lu\n",
            atomic_load(&c->total_reads), atomic_load(&c->total_writes));
     printf("Read-throughs: %lu  Write-throughs: %lu\n",
            atomic_load(&c->read_throughs), atomic_load(&c->write_throughs));
-    printf("Paxos conflicts: %lu\n", atomic_load(&c->paxos_conflicts));
-    printf("HOT  hits=%lu miss=%lu (index-only, 16B/entry)\n",
+    printf("HOT  hits=%lu miss=%lu (lock-free 16B index)\n",
            atomic_load(&c->hot.hits), atomic_load(&c->hot.misses));
     printf("WARM hits=%lu miss=%lu count=%zu/%zu\n",
            atomic_load(&c->warm.hits), atomic_load(&c->warm.misses),
