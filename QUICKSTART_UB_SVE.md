@@ -1,305 +1,80 @@
-# Redis UB+SVE 快速开始指南
+# Redis UB+SVE2 快速开始指南 (v10)
 
-## 5 分钟快速部署
+## 环境要求
 
-### 前置条件
+- Kunpeng 920/930 (aarch64, SVE2 256-bit)
+- 可选: Ascend 910C NPU (用于 CPU/NPU 对比)
+
+## 1. 启动服务
 
 ```bash
-# 检查架构
-uname -m  # 应该输出 aarch64 或 arm64
+cd /sharedata/qiuwu/redis
+mkdir -p /tmp/redis-test-baseline /tmp/redis-test-ub
 
-# 检查 SVE 支持
-grep sve /proc/cpuinfo
+# 清理端口 (如被占用)
+for p in 6379 6380; do
+  pid=$(lsof -ti :$p 2>/dev/null)
+  [ -n "$pid" ] && echo "Port $p: killing PID $pid" && kill -9 $pid && sleep 0.5
+done
 
-# 检查大页支持
-cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+# Baseline Redis (端口 6379)
+./src/redis-server ./redis-baseline.conf
+
+# Optimized + TLC Module (端口 6380)
+./src/redis-server ./redis-ub-sve.conf
+
+# 验证
+./src/redis-cli -p 6379 ping   # → PONG
+./src/redis-cli -p 6380 ping   # → PONG
+./src/redis-cli -p 6380 MODULE LIST  # → tlc module
 ```
 
-### 步骤 1: 编译 Redis
+## 2. 填充真实数据 (1M+)
 
 ```bash
-cd /sharedata/qiuwu/moreai/redis
-
-# 应用 Makefile 补丁
-cd src
-patch < ../Makefile.ub-sve.patch
-
-# 编译
-cd ..
-make ARCH=aarch64 USE_UB_SVE=yes -j$(nproc)
-```
-
-### 步骤 2: 配置
-
-```bash
-# 复制配置文件
-cp redis-ub-sve.conf /etc/redis/redis-ub-sve.conf
-
-# 编辑配置（根据实际情况调整）
-vim /etc/redis/redis-ub-sve.conf
-
-# 关键配置项：
-# - supernode-id: 当前超节点 ID (0-149)
-# - supernode-num-workers: Worker 线程数（建议 = CPU 核心数）
-# - proxy-num-supernodes: 总超节点数（150）
-```
-
-### 步骤 3: 启动 Redis
-
-#### 方式 A: Proxy 模式（接入层）
-
-```bash
-./src/redis-server /etc/redis/redis-ub-sve.conf \
-    --vector-engine ub \
-    --proxy-aggregator-enabled yes \
-    --proxy-num-supernodes 150
-```
-
-#### 方式 B: SuperNode 模式（计算层）
-
-```bash
-./src/redis-server /etc/redis/redis-ub-sve.conf \
-    --supernode-id 0 \
-    --supernode-num-workers 16
-```
-
-#### 方式 C: 一体化模式（同机部署）
-
-```bash
-./src/redis-server /etc/redis/redis-ub-sve.conf \
-    --vector-engine ub \
-    --proxy-aggregator-enabled yes \
-    --supernode-id 0 \
-    --supernode-num-workers 16
-```
-
-### 步骤 4: 验证
-
-```bash
-# 连接 Redis
-./src/redis-cli
-
-# 检查向量引擎
-127.0.0.1:6379> VENGINE GET
-"ub"
-
-# 添加测试向量
-127.0.0.1:6379> VADD myvectors VALUES 300 <300个浮点数> user:1
-
-# 查询向量
-127.0.0.1:6379> VEMB myvectors user:1
+# 通过网络接口填充 1.1M 条 1200B 数据到 UB 内存三层缓存
+./src/redis-cli -p 6380 TLC.FILL 1100000
+# → "Filled 1100000 entries in 1.720 s (0.64 M ops/s)"
 
 # 查看统计
-127.0.0.1:6379> PROXY STATS
-127.0.0.1:6379> SUPERNODE STATS
+./src/redis-cli -p 6380 TLC.STATS
 ```
 
-### 步骤 5: 性能测试
+## 3. 运行 Benchmark
 
 ```bash
-# 运行集成测试
-./test_ub_sve_integration.sh
+# hiredis 多线程网络 benchmark (推荐)
+./benchmark/tlc_client_bench --ops 500000 --threads 8 --pipeline 16
 
-# 运行性能测试
-./batch_embedding_test
-
-# 预期结果：
-# ✅ Latency: < 100 μs
-# ✅ Throughput: > 50000 QPS
+# 或用 redis-benchmark 标准工具
+./src/redis-benchmark -p 6379 -t set,get -q -n 500000 -c 50 --threads 8 -d 1200
+./src/redis-benchmark -p 6380 -t set,get -q -n 500000 -c 50 --threads 8 -d 1200
 ```
 
-## 常见问题
+## 4. TLC 命令
 
-### Q1: 编译失败 - SVE 指令不支持
+| 命令 | 说明 |
+|------|------|
+| `TLC.PUT <id> <value>` | 写入 (1200B, UB 内存) |
+| `TLC.GET <id>` | 读取 (HOT→WARM→COLD) |
+| `TLC.MPUT <id1> <v1> ...` | 批量写入 |
+| `TLC.MGET <id1> ...` | 批量读取 |
+| `TLC.FILL <count>` | 预填充随机数据 |
+| `TLC.STATS` | 缓存统计 |
 
-**解决方案**:
-```bash
-# 使用标量回退模式编译
-make CFLAGS="-march=armv8-a -O2"
-```
+## 5. 性能结果
 
-### Q2: Ring Buffer 创建失败
+| 场景 | Baseline | TLC Module | 提升 |
+|------|----------|-----------|------|
+| 80R/20W 无 Pipeline | 123K QPS | 213K QPS | **1.73x** |
+| 80R/20W P=16 | 747K QPS | 828K QPS | **1.11x** |
+| 100% GET P=16 | 786K QPS | 889K QPS | **1.13x** |
 
-**解决方案**:
-```bash
-# 增加共享内存限制
-sudo sysctl -w kernel.shmmax=17179869184  # 16GB
-sudo sysctl -w kernel.shmall=4194304
-
-# 或者在 /etc/sysctl.conf 中添加：
-# kernel.shmmax = 17179869184
-# kernel.shmall = 4194304
-```
-
-### Q3: UB.mem 映射失败
-
-**解决方案**:
-```bash
-# 配置大页
-sudo sysctl -w vm.nr_hugepages=2048  # 4GB (2048 * 2MB)
-
-# 永久配置：
-echo "vm.nr_hugepages = 2048" | sudo tee -a /etc/sysctl.conf
-```
-
-### Q4: 性能未达到预期
-
-**检查清单**:
-1. CPU 频率是否锁定在最高？
-   ```bash
-   sudo cpupower frequency-set -g performance
-   ```
-
-2. NUMA 绑定是否正确？
-   ```bash
-   numactl --cpunodebind=0 --membind=0 ./src/redis-server ...
-   ```
-
-3. 批量大小是否合适？
-   ```bash
-   # 在 redis.conf 中调整
-   proxy-batch-limit 3000  # 尝试 2000-6000
-   ```
-
-4. Worker 线程数是否合适？
-   ```bash
-   # 建议 = CPU 核心数
-   supernode-num-workers 16
-   ```
-
-## 监控和调优
-
-### 实时监控
+## 6. 关闭
 
 ```bash
-# 监控 Proxy 统计
-watch -n 1 'redis-cli PROXY STATS'
-
-# 监控 SuperNode 统计
-watch -n 1 'redis-cli SUPERNODE STATS'
-
-# 监控 Worker 统计
-redis-cli WORKER STATS 0
+./src/redis-cli -p 6379 shutdown nosave
+./src/redis-cli -p 6380 shutdown nosave
 ```
 
-### 关键指标
-
-| 指标 | 目标值 | 说明 |
-|------|--------|------|
-| Average batch size | 2500-3500 | 批量大小 |
-| Average batch latency | < 300 μs | 批量延迟 |
-| Locked skips | < 1% | 锁冲突率 |
-| SVE operations | > 95% | SVE 利用率 |
-| Throughput | > 50000 QPS | 吞吐量 |
-
-### 性能调优
-
-#### 1. 批量大小优化
-
-```bash
-# 测试不同批量大小
-for size in 1000 2000 3000 4000 5000 6000; do
-    redis-cli CONFIG SET proxy-batch-limit $size
-    ./batch_embedding_test
-done
-```
-
-#### 2. 超时时间优化
-
-```bash
-# 测试不同超时时间
-for timeout in 100 200 300 400 500; do
-    redis-cli CONFIG SET proxy-timeout-us $timeout
-    ./batch_embedding_test
-done
-```
-
-#### 3. Worker 数量优化
-
-```bash
-# 测试不同 Worker 数量
-for workers in 8 12 16 20 24; do
-    # 重启 Redis 并测试
-    ./src/redis-server --supernode-num-workers $workers &
-    sleep 5
-    ./batch_embedding_test
-    killall redis-server
-done
-```
-
-## 生产部署建议
-
-### 1. 硬件配置
-
-- **CPU**: 鲲鹏 920/930，64 核以上
-- **内存**: 8GB 系统内存 + 4TB UB.mem
-- **网络**: UB-Mesh 互联，0.2 TB/s 带宽
-- **存储**: NVMe SSD（用于日志和配置）
-
-### 2. 系统配置
-
-```bash
-# /etc/sysctl.conf
-vm.nr_hugepages = 2048
-kernel.shmmax = 17179869184
-kernel.shmall = 4194304
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-
-# 应用配置
-sudo sysctl -p
-```
-
-### 3. 服务配置
-
-```bash
-# /etc/systemd/system/redis-ub-sve.service
-[Unit]
-Description=Redis UB+SVE Server
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=/usr/local/bin/redis-server /etc/redis/redis-ub-sve.conf
-ExecStop=/usr/local/bin/redis-cli shutdown
-Restart=always
-User=redis
-Group=redis
-
-# 性能优化
-LimitNOFILE=65535
-LimitNPROC=65535
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 4. 监控告警
-
-```bash
-# Prometheus 监控指标
-redis_ub_sve_batch_size
-redis_ub_sve_batch_latency_us
-redis_ub_sve_locked_skips
-redis_ub_sve_throughput_qps
-redis_ub_sve_worker_utilization
-```
-
-## 下一步
-
-1. 阅读完整文档: [UB_SVE_INTEGRATION_README.md](UB_SVE_INTEGRATION_README.md)
-2. 查看设计文档: [design.md](design.md)
-3. 运行完整测试: `./test_ub_sve_integration.sh`
-4. 性能调优: 根据实际负载调整参数
-5. 生产部署: 参考生产部署建议
-
-## 获取帮助
-
-- 技术问题: 查看 [UB_SVE_INTEGRATION_README.md](UB_SVE_INTEGRATION_README.md)
-- 性能问题: 查看监控和调优章节
-- Bug 报告: 联系开发团队
-
----
-
-**版本**: v1.0  
-**更新日期**: 2026-02-03
+详细报告见 `V10_BENCHMARK_REPORT.md`。
