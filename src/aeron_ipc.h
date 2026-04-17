@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 
 #define AERON_RING_BITS   12          /* 4096 slots */
 #define AERON_RING_SIZE   (1 << AERON_RING_BITS)
@@ -146,6 +147,71 @@ static inline int aeron_available(aeron_ring_t *ring) {
     uint64_t head = ring->head;
     uint64_t tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
     return (int)(tail - head);
+}
+
+/* ============================================================
+ * Adaptive Spin Poll (Seastar pattern)
+ *
+ * Phase 1 (0-64 iters): pure spin, atomic_load only, no yield
+ * Phase 2 (64-256 iters): spin with ARM yield
+ * Phase 3 (>256 iters): nanosleep backoff
+ *
+ * This eliminates the ~100ns yield penalty for fast responses.
+ * ============================================================ */
+#define AERON_SPIN_PHASE1  64   /* Pure spin iterations */
+#define AERON_SPIN_PHASE2  256  /* Yield iterations */
+
+static inline int aeron_poll_adaptive(aeron_ring_t *ring, void *data, uint32_t max_len) {
+    int spins = 0;
+    int got;
+
+    /* Phase 1: Pure spin — just atomic_load, no yield, no syscall */
+    while (spins < AERON_SPIN_PHASE1) {
+        got = aeron_poll(ring, data, max_len);
+        if (got > 0) return got;
+        spins++;
+        /* Compiler barrier only — no CPU yield */
+        __asm__ volatile("" ::: "memory");
+    }
+
+    /* Phase 2: Spin with yield (Seastar cpu_relax pattern) */
+    while (spins < AERON_SPIN_PHASE2) {
+        got = aeron_poll(ring, data, max_len);
+        if (got > 0) return got;
+        spins++;
+#if defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+        __asm__ volatile("pause" ::: "memory");
+#endif
+    }
+
+    /* Phase 3: Backoff nanosleep (for truly idle channels) */
+    struct timespec ts = {0, 1000}; /* 1μs */
+    while (1) {
+        got = aeron_poll(ring, data, max_len);
+        if (got > 0) return got;
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* Adaptive publish: spin-wait if ring is full */
+static inline int aeron_publish_adaptive(aeron_ring_t *ring, const void *data, uint32_t len) {
+    int spins = 0;
+    while (aeron_publish(ring, data, len) != 0) {
+        if (spins < AERON_SPIN_PHASE1) {
+            __asm__ volatile("" ::: "memory");
+        } else if (spins < AERON_SPIN_PHASE2) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        } else {
+            struct timespec ts = {0, 1000};
+            nanosleep(&ts, NULL);
+        }
+        spins++;
+    }
+    return 0;
 }
 
 #endif /* __AERON_IPC_H */
