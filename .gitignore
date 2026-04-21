@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+!deps/xxhash/build/
+!deps/xxhash/build/**
 develop-eggs/
 dist/
 downloads/
@@ -161,3 +163,5 @@ cython_debug/
 *logs
 *tensorboard
 compile_commands.json
+*_ANALYSIS.md
+*_SUMMARY.md
