@@ -147,9 +147,34 @@ endif
 # Override default settings if possible
 -include .make-settings
 
+# ============================================================
+# HPC Feature Flags (build_opts/*.mk)
+# ============================================================
+# Initialize aggregation variables
+FEATURE_MARCH_SUFFIX :=
+FEATURE_CFLAGS  :=
+FEATURE_LDFLAGS :=
+FEATURE_LIBS    :=
+FEATURE_OBJS    :=
+
+# Load all feature fragment files
+include build_opts/*.mk
+
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(REDIS_LDFLAGS) $(DEBUG)
 FINAL_LIBS=-lm -lstdc++
+
+# Apply aggregated feature flags directly to FINAL_* (not CFLAGS/REDIS_CFLAGS)
+# This prevents persist-settings from saving feature flags into CFLAGS/REDIS_CFLAGS
+# and causing duplication on subsequent builds.
+empty :=
+space := $(empty) $(empty)
+ifneq ($(strip $(FEATURE_MARCH_SUFFIX)),)
+    FINAL_CFLAGS += -march=armv8.2-a$(subst $(space),,$(strip $(FEATURE_MARCH_SUFFIX)))
+endif
+FINAL_CFLAGS  += $(FEATURE_CFLAGS)
+FINAL_LDFLAGS += $(FEATURE_LDFLAGS)
+FINAL_LIBS    += $(FEATURE_LIBS)
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -383,6 +408,7 @@ endif
 REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
 REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
 REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o vector_engine.o ub_client.o sve_compute.o batch_processor.o
+REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
 REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
 REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
@@ -423,6 +449,12 @@ persist-settings: distclean
 	echo REDIS_LDFLAGS=$(REDIS_LDFLAGS) >> .make-settings
 	echo PREV_FINAL_CFLAGS=$(FINAL_CFLAGS) >> .make-settings
 	echo PREV_FINAL_LDFLAGS=$(FINAL_LDFLAGS) >> .make-settings
+	echo USE_SVE2=$(USE_SVE2) >> .make-settings
+	echo USE_LSE=$(USE_LSE) >> .make-settings
+	echo USE_F32MM=$(USE_F32MM) >> .make-settings
+	echo USE_NPU=$(USE_NPU) >> .make-settings
+	echo USE_UB=$(USE_UB) >> .make-settings
+	echo USE_TLC=$(USE_TLC) >> .make-settings
 	-(cd ../deps && $(MAKE) $(DEPENDENCY_TARGETS))
 
 .PHONY: persist-settings
@@ -494,6 +526,7 @@ commands.c: $(COMMANDS_DEF_FILENAME).def
 clean:
 	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep *.so
 	rm -f $(DEP)
+	rm -f $(TLC_SERVERS)
 	-(cd ../tests/modules && $(MAKE) clean)
 
 .PHONY: clean
@@ -505,6 +538,84 @@ distclean: clean
 	-(rm -f .make-*)
 
 .PHONY: distclean
+
+# ============================================================
+# TLC Server build targets
+# ============================================================
+
+TLC_SERVERS = \
+    tlc_server tlc_unified_server tlc_aeron_server tlc_fc_server \
+    tlc_dpdk_server tlc_urma_server tlc_v10_server tlc_v13_server tlc_v14_server
+
+# TLC Server compilation flags (always includes SVE2 + LSE)
+TLC_CFLAGS  = -O3 -std=c11 -pthread -I. -march=armv8.2-a+sve+lse -DUSE_SVE2 -DUSE_TLC $(filter -DUSE_NPU -I%,$(REDIS_CFLAGS))
+TLC_LDFLAGS = -pthread -lm -lpthread $(filter -L% -l%,$(FINAL_LIBS))
+
+# Shared source dependency for all TLC servers
+TLC_COMMON_DEPS = three_layer_cache_ub.c
+
+# Static pattern rule for all TLC servers
+$(TLC_SERVERS): %: %.c $(TLC_COMMON_DEPS)
+	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
+	$(CC) $(TLC_CFLAGS) -o $@ $< $(TLC_COMMON_DEPS) $(TLC_LDFLAGS)
+
+# Build liburma.so from urma.c
+liburma.so: urma.c urma.h
+	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
+	$(CC) $(TLC_CFLAGS) -fPIC -shared -o $@ urma.c
+
+# tlc_urma_server links against liburma.so
+tlc_urma_server: tlc_urma_server.c liburma.so $(TLC_COMMON_DEPS)
+	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
+	$(CC) $(TLC_CFLAGS) -o $@ $< $(TLC_COMMON_DEPS) -L. -lurma -Wl,-rpath,'$$ORIGIN' $(TLC_LDFLAGS)
+
+ifdef TLC_VERSION
+tlc_single: tlc_$(TLC_VERSION)_server
+endif
+
+# Build subset: make TLC_VERSIONS="v13 v14"
+ifdef TLC_VERSIONS
+tlc_subset:
+	$(foreach v,$(TLC_VERSIONS),$(MAKE) tlc_$(v)_server &&) true
+endif
+
+# Build all TLC servers
+tlc-all: $(TLC_SERVERS)
+
+tlc-clean:
+	rm -f $(TLC_SERVERS) liburma.so
+
+.PHONY: tlc-all tlc-clean tlc_single tlc_subset
+
+# ============================================================
+# Help target
+# ============================================================
+
+help:
+	@echo "Redis HPC Build System"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make                                    Build redis-server (default, no HPC)"
+	@echo "  make USE_SVE2=yes USE_LSE=yes           Build with SVE2 + LSE atomics"
+	@echo "  make USE_SVE2=yes USE_NPU=yes           Build with SVE2 + Ascend NPU"
+	@echo "  make USE_SVE2=yes USE_UB=yes USE_TLC=yes  Full HPC build"
+	@echo ""
+	@echo "  make TLC_VERSION=v14                    Build single TLC server"
+	@echo "  make TLC_VERSIONS=\"v13 v14\"             Build specific TLC servers"
+	@echo "  make tlc-all                            Build all 9 TLC servers"
+	@echo ""
+	@echo "Feature flags:"
+	@echo "  USE_SVE2=yes    ARM SVE2 vector instructions"
+	@echo "  USE_LSE=yes     ARM LSE atomic instructions"
+	@echo "  USE_F32MM=yes   SVE F32MM matrix extension (requires SVE2)"
+	@echo "  USE_NPU=yes     Huawei Ascend NPU (requires ASCEND_HOME)"
+	@echo "  USE_UB=yes      UB bus components"
+	@echo "  USE_TLC=yes     Three-layer cache module"
+	@echo ""
+	@echo "Paths:"
+	@echo "  ASCEND_HOME     Ascend Toolkit root (default: /usr/local/Ascend/ascend-toolkit/latest)"
+
+.PHONY: help
 
 test: $(REDIS_SERVER_NAME) $(REDIS_CHECK_AOF_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) module_tests
 	@(cd ..; ./runtest)

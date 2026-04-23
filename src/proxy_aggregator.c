@@ -55,8 +55,8 @@ uint32_t murmur3_hash(const char *key, size_t len) {
     const uint8_t *tail = (const uint8_t *)(data + nblocks * 4);
     uint32_t k = 0;
     switch (len & 3) {
-        case 3: k ^= tail[2] << 16;
-        case 2: k ^= tail[1] << 8;
+        case 3: k ^= tail[2] << 16; /* fall through */
+        case 2: k ^= tail[1] << 8; /* fall through */
         case 1: k ^= tail[0];
                 k *= c1;
                 k = (k << 15) | (k >> (32 - 15));
