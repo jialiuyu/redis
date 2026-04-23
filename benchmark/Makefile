@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 three_layer_benchmark_ub
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench
 
 # 所有目标
 all: $(TARGETS)
@@ -50,6 +50,7 @@ three_layer_benchmark_v4: three_layer_benchmark.c ../src/three_layer_cache.c ../
 	@echo "✅ Built: $@"
 
 # Three-Layer Cache v5 (UB memory backend, cache-only)
+# NOTE: requires Ascend Toolkit, not in default `make all`
 three_layer_benchmark_ub: three_layer_benchmark_ub.c ../src/three_layer_cache_ub.c ../src/three_layer_cache_ub.h ../src/sve2_gemm.h
 	. /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null; \
 	$(CC) -O3 -Wall -Wno-format -march=armv8.2-a+sve -pthread -std=c11 \
@@ -65,9 +66,64 @@ gemm_compare: gemm_compare.c
 	$(CC) -O3 -Wall -Wno-format -march=armv8.2-a+sve -pthread -std=c11 -o $@ $< -lm -lpthread
 	@echo "✅ Built: $@"
 
+# SuperNode 优化版基准测试
+supernode_benchmark_optimized: supernode_benchmark_optimized.c benchmark_common.h sve_compute_standalone_optimized.c sve_compute_standalone.h
+	$(CC) $(CFLAGS) -o $@ supernode_benchmark_optimized.c sve_compute_standalone_optimized.c $(LDFLAGS)
+	@echo "✅ Built: $@"
+
+# TLC Aeron 传输基准测试
+tlc_aeron_bench: tlc_aeron_bench.c ../src/aeron_ipc.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC FC 传输基准测试
+tlc_fc_bench: tlc_fc_bench.c ../src/aeron_ipc.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC KCP 传输基准测试
+tlc_kcp_bench: tlc_kcp_bench.c ../src/kcp_lite.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC Raw TCP 传输基准测试
+tlc_raw_bench: tlc_raw_bench.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC Transport 层基准测试
+tlc_transport_bench: tlc_transport_bench.c ../src/tlc_transport.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC 全传输对比基准测试
+tlc_all_transport_bench: tlc_all_transport_bench.c ../src/aeron_ipc.h ../src/tlc_transport.h
+	$(CC) -O3 -Wall -Wextra -Wno-unused-function -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC 客户端基准测试（依赖 hiredis）
+tlc_client_bench: tlc_client_bench.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Built: $@"
+
+# TLC v10 传输基准测试
+tlc_v10_bench: tlc_v10_bench.c ../src/aeron_ipc.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC v13 传输基准测试
+tlc_v13_bench: tlc_v13_bench.c ../src/aeron_ipc.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# TLC v14 传输基准测试
+tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
 # 清理
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) gemm_compare
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "✅ Cleaned build artifacts"
@@ -128,7 +184,13 @@ help:
 	@echo "Individual benchmarks:"
 	@echo "  ./redis_traditional_benchmark [options]"
 	@echo "  ./supernode_benchmark [options]"
+	@echo "  ./supernode_benchmark_optimized [options]"
 	@echo "  ./compare_results <redis_output> <supernode_output>"
+	@echo ""
+	@echo "TLC transport benchmarks:"
+	@echo "  ./tlc_aeron_bench / tlc_fc_bench / tlc_kcp_bench / tlc_raw_bench"
+	@echo "  ./tlc_transport_bench / tlc_all_transport_bench / tlc_client_bench"
+	@echo "  ./tlc_v10_bench / tlc_v13_bench / tlc_v14_bench"
 	@echo ""
 	@echo "Options:"
 	@echo "  --queries N    Number of queries"

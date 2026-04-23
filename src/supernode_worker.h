@@ -41,9 +41,9 @@
  * 在多核系统中，如果两个原子量位于同一个 CPU 缓存行（通常 64 字节），
  * 会导致严重的性能下降。通过 64 字节对齐，每个原子量独占一个缓存行。
  */
-typedef struct alignas(64) aligned_atomic_word {
+typedef struct aligned_atomic_word {
     atomic_uint_fast64_t word;          /* 原子 64 位字 */
-} aligned_atomic_word_t;
+} __attribute__((aligned(64))) aligned_atomic_word_t;
 
 /* 状态 Bitmap - 用于并发控制
  * 使用 C11 原子操作和精确的内存序，实现高性能无锁并发控制

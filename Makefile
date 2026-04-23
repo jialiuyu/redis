@@ -10,10 +10,29 @@ endif
 
 default: all
 
+# Delegate TLC server targets to src/Makefile
+tlc-all:
+	$(MAKE) -C src tlc-all
+
+tlc-clean:
+	$(MAKE) -C src tlc-clean
+
+# When TLC_VERSION is set, delegate to tlc_single in src/
+ifdef TLC_VERSION
+all:
+	$(MAKE) -C src tlc_single
+endif
+
+# When TLC_VERSIONS is set, delegate to tlc_subset in src/
+ifdef TLC_VERSIONS
+all:
+	$(MAKE) -C src tlc_subset
+endif
+
 .DEFAULT:
 	for dir in $(SUBDIRS); do $(MAKE) -C $$dir $@; done
 
 install:
 	for dir in $(SUBDIRS); do $(MAKE) -C $$dir $@; done
 
-.PHONY: install
+.PHONY: install tlc-all tlc-clean
