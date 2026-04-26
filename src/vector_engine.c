@@ -7,6 +7,7 @@
 #include "ub_client.h"
 #include "redismodule.h"
 #include <dlfcn.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +19,27 @@ vector_engine_t *current_vector_engine = NULL;
 /* Configuration */
 static vector_engine_type_t configured_engine_type = VECTOR_ENGINE_REDIS;
 static dict *engine_config = NULL;
+
+static const char *vectorEngineObjectCString(void *arg, sds *tmp)
+{
+    robj *obj = (robj *)arg;
+
+    if (arg == NULL) {
+        return NULL;
+    }
+    if (sdsEncodedObject(obj)) {
+        return obj->ptr;
+    }
+
+    obj = getDecodedObject(obj);
+    if (obj == NULL || !sdsEncodedObject(obj)) {
+        return NULL;
+    }
+
+    *tmp = sdsdup(obj->ptr);
+    decrRefCount(obj);
+    return *tmp;
+}
 
 /* Redis Engine Implementation */
 static int redis_engine_init(void) {
@@ -101,19 +123,12 @@ static vector_engine_t redis_engine = {
 
 /* UB Engine Implementation */
 static int ub_engine_init(void) {
-    /* Initialize UB bus connection and SVE environment */
-    /* This would load UB libraries and establish connections */
     serverLog(LL_NOTICE, "Initializing UB Vector Engine");
-
-    /* Load UB firmware libraries */
-    /* Initialize SVE instruction set */
-    /* Connect to UB fabric manager */
-
-    return C_OK;
+    return ub_client_init(&server.ub);
 }
 
 static void ub_engine_cleanup(void) {
-    /* Cleanup UB connections and resources */
+    ub_client_cleanup();
     serverLog(LL_NOTICE, "Cleaning up UB Vector Engine");
 }
 
@@ -156,58 +171,71 @@ static int ub_engine_vsim(void *ctx, void *key, vector_data_t *query_vector,
 }
 
 int ub_engine_vemb(void *ctx, void *key, void *element, vector_data_t *result) {
-    /* UB VEMB - High-performance embedding retrieval */
+    ub_mem_config_t *cfg = &server.ub;
+    ub_address_space_t *addr_space = NULL;
+    const char *resource_name = NULL;
+    const char *element_name = NULL;
+    uint64_t index = 0;
+    sds resource_tmp = NULL;
+    sds element_tmp = NULL;
 
-    // Simulate microsecond-level latency for UB processing
-    struct timespec sleep_time = {0, 50000}; // 50 microseconds
-    nanosleep(&sleep_time, NULL);
+    if (!result || cfg->vector_dimension <= 0) return C_ERR;
 
-    if (!result) return C_ERR;
+    if (ctx != NULL) {
+        resource_name = vectorEngineObjectCString(key, &resource_tmp);
+        element_name = vectorEngineObjectCString(element, &element_tmp);
+    } else {
+        resource_name = (const char *)key;
+        element_name = (const char *)element;
+    }
 
-    // For demonstration, return a mock embedding vector
-    // In real implementation, this would:
-    // 1. Hash element to get UB address space offset
-    // 2. Perform SVE gather load from UB memory
-    // 3. Return dequantized vector data
+    if (!resource_name || !element_name) {
+        sdsfree(resource_tmp);
+        sdsfree(element_tmp);
+        return C_ERR;
+    }
 
-    const int EMBEDDING_DIM = 300; // Standard embedding dimension
-    result->dim = EMBEDDING_DIM;
+    if (ub_client_init(cfg) != C_OK) {
+        sdsfree(resource_tmp);
+        sdsfree(element_tmp);
+        return C_ERR;
+    }
+
+    if (ub_client_load_embedding_table(resource_name, &addr_space) != C_OK || !addr_space) {
+        sdsfree(resource_tmp);
+        sdsfree(element_tmp);
+        return C_ERR;
+    }
+    if (ub_client_resolve_element_index(element_name, &index, cfg->vector_dimension) != C_OK) {
+        sdsfree(resource_tmp);
+        sdsfree(element_tmp);
+        return C_ERR;
+    }
+
+    result->dim = (size_t)cfg->vector_dimension;
     result->is_fp32 = 1;
-
-    // Allocate result vector (caller should free)
-    result->data = zmalloc(sizeof(float) * EMBEDDING_DIM);
-    if (!result->data) return C_ERR;
-
-    // Generate mock normalized embedding vector
-    // In real UB implementation, this would be loaded from UB memory tiles
-    float norm_factor = 0.0f;
-    for (int i = 0; i < EMBEDDING_DIM; i++) {
-        // Simple hash-based pseudo-random values (deterministic per element)
-        unsigned int hash = 5381;
-        const char *str = element;
-        while (*str) {
-            hash = ((hash << 5) + hash) + *str++;
-        }
-        hash += i;
-
-        // Generate normalized float value
-        result->data[i] = (float)(hash % 2000 - 1000) / 1000.0f;
-        norm_factor += result->data[i] * result->data[i];
+    result->data = zmalloc(sizeof(float) * result->dim);
+    if (!result->data) {
+        sdsfree(resource_tmp);
+        sdsfree(element_tmp);
+        return C_ERR;
     }
 
-    // Normalize the vector (cosine normalization)
-    norm_factor = sqrtf(norm_factor);
-    if (norm_factor > 0.0f) {
-        for (int i = 0; i < EMBEDDING_DIM; i++) {
-            result->data[i] /= norm_factor;
-        }
+    if (ub_client_perform_gather_load(addr_space,
+                                      &index,
+                                      1,
+                                      result->data,
+                                      result->dim) != C_OK) {
+        zfree(result->data);
+        result->data = NULL;
+        result->dim = 0;
+        sdsfree(resource_tmp);
+        sdsfree(element_tmp);
+        return C_ERR;
     }
 
-    // Update statistics
-    if (global_ub_client) {
-        global_ub_client->total_requests++;
-    }
-
+    sdsfree(resource_tmp);
+    sdsfree(element_tmp);
     return C_OK;
 }
 
@@ -220,15 +248,15 @@ static int ub_engine_vdim(void *ctx, void *key) {
 }
 
 static int ub_engine_set_config(const char *key, const char *value) {
-    return redis_engine_set_config(key, value); /* Reuse Redis config for now */
+    return ub_client_set_config(key, value);
 }
 
 static sds ub_engine_get_config(const char *key) {
-    return redis_engine_get_config(key); /* Reuse Redis config for now */
+    return ub_client_get_config(key);
 }
 
 static sds ub_engine_get_stats(void) {
-    return sdsnew("UB Vector Engine: Active (SVE + UB Bus)");
+    return ub_client_get_stats();
 }
 
 /* UB Engine Structure */

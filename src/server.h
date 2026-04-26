@@ -49,7 +49,10 @@ typedef long long ustime_t; /* microsecond time type. */
 /* Vector Engine Types */
 #define VECTOR_ENGINE_REDIS 0    /* Traditional Redis HNSW implementation */
 #define VECTOR_ENGINE_UB 1       /* UB bus + SVE high-performance implementation */
+
 typedef int vector_engine_type_t;
+
+#include "ub_client.h"
 
 #include "ae.h"      /* Event driven programming library */
 #include "sds.h"     /* Dynamic safe strings */
@@ -1921,6 +1924,7 @@ struct redisServer {
     /* Vector Engine */
     vector_engine_type_t vector_engine_type; /* Type of vector engine to use */
     int vector_engine_enabled;   /* Whether vector engine is enabled */
+    ub_mem_config_t ub;          /* UB data-plane configuration */
     /* Networking */
     int port;                   /* TCP listening port */
     int tls_port;               /* TLS listening port */

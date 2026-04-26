@@ -1,532 +1,704 @@
 /*
- * UB Client Implementation
- * User-space zero-copy communication with SVE acceleration
+ * UB client data-plane implementation.
+ * Export/import are managed out-of-process by obmmctl; Redis only consumes
+ * an existing shmdev through configuration.
  */
 
 #include "ub_client.h"
 #include "server.h"
+
+#include <ctype.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <string.h>
-#include <dlfcn.h>
 
-/* Global UB client instance */
+typedef int (*obmm_set_ownership_func)(int fd, void *start, void *end, int prot);
+
 ub_client_t *global_ub_client = NULL;
 
-/* SVE instruction detection and availability */
-static int sve_supported = 0;
-static size_t sve_vector_length = 0;
+static void *obmm_handle = NULL;
+static obmm_set_ownership_func obmm_set_ownership_ptr = NULL;
 
-/* UB Firmware Library Handles */
-static void *ubios_handle = NULL;
-static void *sve_handle = NULL;
-
-/* Function pointers for UB APIs */
-typedef int (*ubios_call_func)(uint32_t call_id, uint32_t receiver_id,
-                              void *input, size_t input_size,
-                              void *output, size_t output_size);
-
-typedef void* (*ubios_mmap_remote_func)(uint64_t ubas_addr, size_t size,
-                                       uint32_t token_id);
-
-typedef int (*sve_init_func)(void **context);
-typedef void (*sve_cleanup_func)(void *context);
-typedef int (*sve_gather_func)(void *context, const float *base,
-                              const uint64_t *indices, size_t count,
-                              float *results);
-
-static ubios_call_func ubios_call_ptr = NULL;
-static ubios_mmap_remote_func ubios_mmap_remote_ptr = NULL;
-static sve_init_func sve_init_ptr = NULL;
-static sve_cleanup_func sve_cleanup_ptr = NULL;
-static sve_gather_func sve_gather_ptr = NULL;
-
-/* Check SVE support */
-static int check_sve_support(void) {
-    /* Check if running on ARM64 with SVE support */
-    /* This is a simplified check - in real implementation */
-    /* we'd use getauxval() or CPUID equivalents */
-
-#ifdef __aarch64__
-    /* Try to detect SVE availability */
-    /* For now, assume SVE is available on aarch64 */
-    sve_supported = 1;
-    sve_vector_length = 256; /* Assume 256-bit vectors */
-    return 1;
-#else
-    serverLog(LL_WARNING, "SVE not supported on this architecture");
-    return 0;
-#endif
-}
-
-/* Load UB libraries */
-static int load_ub_libraries(void) {
-    /* Load UB firmware library */
-    ubios_handle = dlopen("libubios.so", RTLD_LAZY);
-    if (!ubios_handle) {
-        serverLog(LL_WARNING, "Failed to load UB firmware library: %s", dlerror());
+static int same_string(const char *left, const char *right)
+{
+    if (left == right) {
+        return 1;
+    }
+    if (left == NULL || right == NULL) {
         return 0;
     }
+    return strcmp(left, right) == 0;
+}
 
-    /* Load function pointers */
-    ubios_call_ptr = dlsym(ubios_handle, "ubios_call");
-    ubios_mmap_remote_ptr = dlsym(ubios_handle, "ubios_mmap_remote");
+static char *dup_config_string(const char *value)
+{
+    size_t len;
+    char *copy;
 
-    if (!ubios_call_ptr || !ubios_mmap_remote_ptr) {
-        serverLog(LL_WARNING, "Failed to load UB firmware functions");
-        dlclose(ubios_handle);
-        ubios_handle = NULL;
+    if (value == NULL) {
+        return NULL;
+    }
+    len = strlen(value) + 1;
+    copy = zcalloc(len);
+    if (copy != NULL) {
+        memcpy(copy, value, len);
+    }
+    return copy;
+}
+
+static void free_config_strings(ub_mem_config_t *cfg)
+{
+    if (cfg == NULL) {
+        return;
+    }
+    if (cfg->table_name) {
+        zfree(cfg->table_name);
+        cfg->table_name = NULL;
+    }
+    if (cfg->shm_path) {
+        zfree(cfg->shm_path);
+        cfg->shm_path = NULL;
+    }
+}
+
+static int copy_config(ub_mem_config_t *dst, const ub_mem_config_t *src)
+{
+    memset(dst, 0, sizeof(*dst));
+    dst->vector_dimension = src->vector_dimension;
+    dst->cacheable = src->cacheable;
+    dst->use_ownership = src->use_ownership;
+    dst->element_index_mode = src->element_index_mode;
+    dst->shm_memid = src->shm_memid;
+    dst->shm_size = src->shm_size;
+    dst->table_offset = src->table_offset;
+    dst->table_size = src->table_size;
+    dst->vector_stride_bytes = src->vector_stride_bytes;
+    dst->table_name = dup_config_string(src->table_name);
+    if (src->table_name != NULL && dst->table_name == NULL) {
+        return C_ERR;
+    }
+    dst->shm_path = dup_config_string(src->shm_path);
+    if (src->shm_path != NULL && dst->shm_path == NULL) {
+        free_config_strings(dst);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+static int config_equals(const ub_mem_config_t *left, const ub_mem_config_t *right)
+{
+    return left->vector_dimension == right->vector_dimension &&
+           left->cacheable == right->cacheable &&
+           left->use_ownership == right->use_ownership &&
+           left->element_index_mode == right->element_index_mode &&
+           left->shm_memid == right->shm_memid &&
+           left->shm_size == right->shm_size &&
+           left->table_offset == right->table_offset &&
+           left->table_size == right->table_size &&
+           left->vector_stride_bytes == right->vector_stride_bytes &&
+           same_string(left->table_name, right->table_name) &&
+           same_string(left->shm_path, right->shm_path);
+}
+
+static size_t configured_vector_stride(const ub_mem_config_t *cfg, size_t vector_dim)
+{
+    if (cfg->vector_stride_bytes != 0) {
+        return cfg->vector_stride_bytes;
+    }
+    if (vector_dim == 0 || vector_dim > SIZE_MAX / sizeof(float)) {
         return 0;
     }
-
-    /* Load SVE library */
-    sve_handle = dlopen("libsve.so", RTLD_LAZY);
-    if (!sve_handle) {
-        serverLog(LL_WARNING, "Failed to load SVE library: %s", dlerror());
-        /* SVE is optional - continue without it */
-    } else {
-        sve_init_ptr = dlsym(sve_handle, "sve_init_context");
-        sve_cleanup_ptr = dlsym(sve_handle, "sve_cleanup_context");
-        sve_gather_ptr = dlsym(sve_handle, "sve_gather_load_f32");
-
-        if (!sve_init_ptr || !sve_cleanup_ptr || !sve_gather_ptr) {
-            serverLog(LL_WARNING, "Failed to load SVE functions");
-            dlclose(sve_handle);
-            sve_handle = NULL;
-        }
-    }
-
-    return 1;
+    return vector_dim * sizeof(float);
 }
 
-/* Initialize ring buffer */
-static ub_ring_buffer_t *ring_buffer_create(void) {
-    ub_ring_buffer_t *rb = zmalloc(sizeof(ub_ring_buffer_t));
-    if (!rb) return NULL;
+static int configured_table_size(const ub_mem_config_t *cfg, size_t *table_size)
+{
+    size_t size = cfg->table_size;
 
-    rb->head = 0;
-    rb->tail = 0;
-    memset(rb->buffer, 0, UB_RING_BUFFER_SIZE);
-
-    pthread_mutex_init(&rb->mutex, NULL);
-    pthread_cond_init(&rb->cond, NULL);
-
-    return rb;
-}
-
-static void ring_buffer_destroy(ub_ring_buffer_t *rb) {
-    if (rb) {
-        pthread_mutex_destroy(&rb->mutex);
-        pthread_cond_destroy(&rb->cond);
-        zfree(rb);
+    if (cfg->shm_size == 0) {
+        errno = EINVAL;
+        return C_ERR;
     }
-}
-
-/* Event handling thread */
-static void *ub_event_thread_func(void *arg) {
-    ub_client_t *client = arg;
-
-    serverLog(LL_NOTICE, "UB event thread started");
-
-    while (client->event_thread_running) {
-        /* Poll completion queue and ring buffer */
-        /* Process incoming messages and events */
-
-        /* Check for new completions */
-        ub_message_t *msg = NULL;
-        if (ub_client_receive_message(&msg, 100) == C_OK && msg) {
-            /* Process message */
-            client->total_responses++;
-
-            /* Free message */
-            zfree(msg);
-        }
-
-        usleep(1000); /* 1ms sleep to avoid busy loop */
+    if (cfg->table_offset >= cfg->shm_size) {
+        errno = EINVAL;
+        return C_ERR;
     }
-
-    serverLog(LL_NOTICE, "UB event thread stopped");
-    return NULL;
-}
-
-/* Initialize UB client */
-int ub_client_init(void) {
-    if (global_ub_client) {
-        return C_OK; /* Already initialized */
+    if (size == 0) {
+        size = cfg->shm_size - cfg->table_offset;
     }
-
-    /* Check SVE support */
-    if (!check_sve_support()) {
-        serverLog(LL_WARNING, "SVE not supported, falling back to scalar operations");
-    }
-
-    /* Load UB libraries */
-    if (!load_ub_libraries()) {
-        serverLog(LL_WARNING, "Failed to load UB libraries");
+    if (size == 0 || cfg->table_offset + size > cfg->shm_size) {
+        errno = EINVAL;
         return C_ERR;
     }
 
-    /* Allocate client structure */
-    global_ub_client = zcalloc(sizeof(ub_client_t));
+    *table_size = size;
+    return C_OK;
+}
+
+static int configured_device_path(const ub_mem_config_t *cfg, char path[UB_DEVICE_PATH_MAX])
+{
+    int written;
+
+    if (cfg->shm_path && cfg->shm_path[0] != '\0') {
+        if (strlen(cfg->shm_path) >= UB_DEVICE_PATH_MAX) {
+            errno = ENAMETOOLONG;
+            return C_ERR;
+        }
+        memcpy(path, cfg->shm_path, strlen(cfg->shm_path) + 1);
+        return C_OK;
+    }
+
+    if (cfg->shm_memid == 0) {
+        errno = ENOENT;
+        return C_ERR;
+    }
+
+    written = snprintf(path, UB_DEVICE_PATH_MAX, "/dev/obmm_shmdev%llu",
+                       cfg->shm_memid);
+    if (written < 0 || written >= UB_DEVICE_PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+static int resource_name_matches(const ub_mem_config_t *cfg, const char *resource_name)
+{
+    if (cfg->table_name == NULL || cfg->table_name[0] == '\0') {
+        return 1;
+    }
+    if (resource_name == NULL) {
+        return 0;
+    }
+    return strcmp(cfg->table_name, resource_name) == 0;
+}
+
+static int load_obmm_library(void)
+{
+    if (obmm_set_ownership_ptr) {
+        return C_OK;
+    }
+
+    obmm_handle = dlopen("libobmm.so", RTLD_LAZY);
+    if (obmm_handle == NULL) {
+        _serverLog(LL_WARNING, "Failed to load libobmm.so for ownership control: %s",
+                   dlerror());
+        return C_ERR;
+    }
+
+    obmm_set_ownership_ptr = (obmm_set_ownership_func)dlsym(obmm_handle, "obmm_set_ownership");
+    if (obmm_set_ownership_ptr == NULL) {
+        _serverLog(LL_WARNING, "Failed to resolve obmm_set_ownership: %s",
+                   dlerror());
+        dlclose(obmm_handle);
+        obmm_handle = NULL;
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+static void unload_obmm_library(void)
+{
+    obmm_set_ownership_ptr = NULL;
+    if (obmm_handle) {
+        dlclose(obmm_handle);
+        obmm_handle = NULL;
+    }
+}
+
+static int set_read_ownership(ub_address_space_t *addr_space)
+{
+    void *start = addr_space->mapping_addr;
+    void *end = (char *)addr_space->mapping_addr + addr_space->mapping_size;
+
+    if (!addr_space->cacheable || !addr_space->use_ownership) {
+        return C_OK;
+    }
+    if (load_obmm_library() != C_OK) {
+        return C_ERR;
+    }
+    if (obmm_set_ownership_ptr(addr_space->shm_fd, start, end, PROT_READ) != 0) {
+        _serverLog(LL_WARNING,
+                   "Failed to acquire OBMM read ownership for %s: %s",
+                   addr_space->device_path, strerror(errno));
+        return C_ERR;
+    }
+
+    addr_space->use_ownership = 1;
+    return C_OK;
+}
+
+static void release_ownership(ub_address_space_t *addr_space)
+{
+    void *start = addr_space->mapping_addr;
+    void *end = (char *)addr_space->mapping_addr + addr_space->mapping_size;
+
+    if (!addr_space || !addr_space->use_ownership || !obmm_set_ownership_ptr) {
+        return;
+    }
+    if (obmm_set_ownership_ptr(addr_space->shm_fd, start, end, PROT_NONE) != 0) {
+        _serverLog(LL_WARNING,
+                   "Failed to release OBMM ownership for %s: %s",
+                   addr_space->device_path, strerror(errno));
+    }
+}
+
+static void destroy_addr_space(ub_address_space_t *addr_space)
+{
+    if (!addr_space) {
+        return;
+    }
+
+    release_ownership(addr_space);
+
+    if (addr_space->mapping_addr && addr_space->mapping_addr != MAP_FAILED &&
+        addr_space->mapping_size > 0) {
+        munmap(addr_space->mapping_addr, addr_space->mapping_size);
+    }
+    if (addr_space->shm_fd >= 0) {
+        close(addr_space->shm_fd);
+    }
+
+    zfree(addr_space);
+}
+
+static int addr_space_matches_config(const ub_address_space_t *addr_space,
+                                     const ub_mem_config_t *cfg,
+                                     const char *device_path,
+                                     size_t table_size,
+                                     size_t vector_stride)
+{
+    if (!addr_space || !device_path) {
+        return 0;
+    }
+
+    return addr_space->mem_id == cfg->shm_memid &&
+           addr_space->mapping_size == cfg->shm_size &&
+           addr_space->data_offset == cfg->table_offset &&
+           addr_space->size == table_size &&
+           addr_space->vector_stride_bytes == vector_stride &&
+           addr_space->cacheable == cfg->cacheable &&
+           addr_space->use_ownership == cfg->use_ownership &&
+           strcmp(addr_space->device_path, device_path) == 0;
+}
+
+static int create_addr_space(const ub_mem_config_t *cfg, ub_address_space_t **addr_space)
+{
+    ub_address_space_t *new_addr_space = NULL;
+    char device_path[UB_DEVICE_PATH_MAX];
+    size_t table_size;
+    size_t vector_stride;
+    int open_flags;
+    int mmap_prot;
+    int fd = -1;
+    void *mapping = MAP_FAILED;
+
+    if (configured_table_size(cfg, &table_size) != C_OK) {
+        _serverLog(LL_WARNING, "Invalid UB table size/offset configuration");
+        return C_ERR;
+    }
+
+    if (configured_device_path(cfg, device_path) != C_OK) {
+        _serverLog(LL_WARNING, "Missing UB shmdev configuration");
+        return C_ERR;
+    }
+
+    vector_stride = configured_vector_stride(cfg, cfg->vector_dimension);
+    if (vector_stride == 0 || vector_stride < cfg->vector_dimension * sizeof(float)) {
+        _serverLog(LL_WARNING, "Invalid UB vector stride configuration");
+        return C_ERR;
+    }
+    if (table_size < vector_stride) {
+        _serverLog(LL_WARNING, "UB table size is smaller than one vector row");
+        return C_ERR;
+    }
+
+    open_flags = O_RDWR;
+    if (!cfg->cacheable) {
+        open_flags |= O_SYNC;
+    }
+
+    fd = open(device_path, open_flags);
+    if (fd < 0) {
+        _serverLog(LL_WARNING, "Failed to open %s: %s", device_path, strerror(errno));
+        return C_ERR;
+    }
+
+    mmap_prot = (cfg->cacheable && cfg->use_ownership) ? PROT_NONE : PROT_READ;
+    mapping = mmap(NULL, cfg->shm_size, mmap_prot, MAP_SHARED, fd, 0);
+    if (mapping == MAP_FAILED) {
+        _serverLog(LL_WARNING, "Failed to mmap %s: %s", device_path, strerror(errno));
+        close(fd);
+        return C_ERR;
+    }
+
+    new_addr_space = zcalloc(sizeof(*new_addr_space));
+    if (!new_addr_space) {
+        munmap(mapping, cfg->shm_size);
+        close(fd);
+        return C_ERR;
+    }
+
+    new_addr_space->base_addr = cfg->table_offset;
+    new_addr_space->size = table_size;
+    new_addr_space->mapped_addr = (char *)mapping + cfg->table_offset;
+    new_addr_space->mapping_addr = mapping;
+    new_addr_space->mapping_size = cfg->shm_size;
+    new_addr_space->data_offset = cfg->table_offset;
+    new_addr_space->vector_stride_bytes = vector_stride;
+    new_addr_space->mem_id = cfg->shm_memid;
+    new_addr_space->shm_fd = fd;
+    new_addr_space->cacheable = cfg->cacheable;
+    new_addr_space->use_ownership = cfg->use_ownership ? 1 : 0;
+    memcpy(new_addr_space->device_path, device_path, strlen(device_path) + 1);
+
+    if (set_read_ownership(new_addr_space) != C_OK) {
+        destroy_addr_space(new_addr_space);
+        return C_ERR;
+    }
+
+    *addr_space = new_addr_space;
+    return C_OK;
+}
+
+static uint64_t fnv1a64(const char *text)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    while (*p) {
+        hash ^= (uint64_t)*p++;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int parse_u64_strict(const char *text, uint64_t *value)
+{
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (text == NULL || *text == '\0') {
+        return C_ERR;
+    }
+
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        return C_ERR;
+    }
+
+    *value = parsed;
+    return C_OK;
+}
+
+static int parse_numeric_suffix(const char *text, uint64_t *value)
+{
+    size_t len;
+    size_t start;
+
+    if (text == NULL || *text == '\0') {
+        return C_ERR;
+    }
+
+    len = strlen(text);
+    start = len;
+    while (start > 0 && isdigit((unsigned char)text[start - 1])) {
+        start--;
+    }
+    if (start == len) {
+        return C_ERR;
+    }
+
+    return parse_u64_strict(text + start, value);
+}
+
+int ub_client_init(const ub_mem_config_t *cfg)
+{
+    ub_mem_config_t next_cfg = {0};
+
+    if (cfg == NULL) {
+        errno = EINVAL;
+        return C_ERR;
+    }
+    if (copy_config(&next_cfg, cfg) != C_OK) {
+        return C_ERR;
+    }
+
+    if (global_ub_client) {
+        if (!config_equals(&global_ub_client->config, &next_cfg)) {
+            destroy_addr_space(global_ub_client->global_ubas);
+            global_ub_client->global_ubas = NULL;
+            free_config_strings(&global_ub_client->config);
+            global_ub_client->config = next_cfg;
+            memset(&next_cfg, 0, sizeof(next_cfg));
+        }
+        free_config_strings(&next_cfg);
+        return C_OK;
+    }
+
+    global_ub_client = zcalloc(sizeof(*global_ub_client));
     if (!global_ub_client) {
         return C_ERR;
     }
 
-    /* Initialize client */
-    global_ub_client->initialized = 0;
-    global_ub_client->num_entities = 0;
-
-    /* Create communication queues */
-    global_ub_client->sq = zcalloc(sizeof(ub_submission_queue_t));
-    global_ub_client->cq = zcalloc(sizeof(ub_completion_queue_t));
-    global_ub_client->event_rb = ring_buffer_create();
-
-    if (!global_ub_client->sq || !global_ub_client->cq || !global_ub_client->event_rb) {
-        ub_client_cleanup();
-        return C_ERR;
-    }
-
-    /* Initialize SVE context if available */
-    if (sve_supported && sve_init_ptr) {
-        if (sve_init_ptr(&global_ub_client->sve_context) != C_OK) {
-            serverLog(LL_WARNING, "Failed to initialize SVE context");
-            global_ub_client->sve_context = NULL;
-        } else {
-            global_ub_client->sve_vl = sve_vector_length / 8; /* bytes per vector */
-        }
-    }
-
-    /* Connect to fabric manager */
-    if (ub_client_connect_fabric_manager() != C_OK) {
-        serverLog(LL_WARNING, "Failed to connect to UB fabric manager");
-        ub_client_cleanup();
-        return C_ERR;
-    }
-
-    /* Enumerate entities */
-    if (ub_client_enumerate_entities() != C_OK) {
-        serverLog(LL_WARNING, "Failed to enumerate UB entities");
-        ub_client_cleanup();
-        return C_ERR;
-    }
-
-    /* Start event thread */
-    global_ub_client->event_thread_running = 1;
-    if (pthread_create(&global_ub_client->event_thread, NULL,
-                       ub_event_thread_func, global_ub_client) != 0) {
-        serverLog(LL_WARNING, "Failed to create UB event thread");
-        ub_client_cleanup();
-        return C_ERR;
-    }
-
+    global_ub_client->config = next_cfg;
+    memset(&next_cfg, 0, sizeof(next_cfg));
     global_ub_client->initialized = 1;
-    serverLog(LL_NOTICE, "UB client initialized successfully");
+    _serverLog(LL_NOTICE, "UB client initialized in data-plane mode");
     return C_OK;
 }
 
-/* Cleanup UB client */
-void ub_client_cleanup(void) {
-    if (!global_ub_client) return;
-
-    /* Stop event thread */
-    if (global_ub_client->event_thread_running) {
-        global_ub_client->event_thread_running = 0;
-        pthread_join(global_ub_client->event_thread, NULL);
+void ub_client_cleanup(void)
+{
+    if (!global_ub_client) {
+        return;
     }
 
-    /* Cleanup SVE context */
-    if (global_ub_client->sve_context && sve_cleanup_ptr) {
-        sve_cleanup_ptr(global_ub_client->sve_context);
-    }
-
-    /* Free communication queues */
-    if (global_ub_client->sq) zfree(global_ub_client->sq);
-    if (global_ub_client->cq) zfree(global_ub_client->cq);
-    if (global_ub_client->event_rb) ring_buffer_destroy(global_ub_client->event_rb);
-
-    /* Unmap global address space */
-    if (global_ub_client->global_ubas && global_ub_client->global_ubas->mapped_addr) {
-        ub_unmap_memory(global_ub_client->global_ubas->mapped_addr,
-                       global_ub_client->global_ubas->size);
-        zfree(global_ub_client->global_ubas);
-    }
-
-    /* Free entities */
-    for (size_t i = 0; i < global_ub_client->num_entities; i++) {
-        if (global_ub_client->entities[i].addr_space) {
-            zfree(global_ub_client->entities[i].addr_space);
-        }
-    }
-
-    /* Close libraries */
-    if (ubios_handle) dlclose(ubios_handle);
-    if (sve_handle) dlclose(sve_handle);
+    destroy_addr_space(global_ub_client->global_ubas);
+    global_ub_client->global_ubas = NULL;
+    free_config_strings(&global_ub_client->config);
+    unload_obmm_library();
 
     zfree(global_ub_client);
     global_ub_client = NULL;
 
-    serverLog(LL_NOTICE, "UB client cleaned up");
+    _serverLog(LL_NOTICE, "UB client cleaned up");
 }
 
-/* Connect to UB fabric manager */
-int ub_client_connect_fabric_manager(void) {
-    /* This would implement the actual connection to UB fabric manager */
-    /* For now, simulate connection */
-
-    serverLog(LL_NOTICE, "Connecting to UB fabric manager...");
-
-    /* Get local EID and CNA from system registers/hardware */
-    /* In simulation, use dummy values */
-    global_ub_client->local_eid = 0x1001;
-    global_ub_client->local_cna = 0x2001;
-
-    serverLog(LL_NOTICE, "Connected to UB fabric manager (EID: %x, CNA: %x)",
-              global_ub_client->local_eid, global_ub_client->local_cna);
-
-    return C_OK;
-}
-
-/* Enumerate UB entities */
-int ub_client_enumerate_entities(void) {
-    /* Enumerate compute nodes, memory tiles, etc. */
-    /* This would query the fabric manager for available entities */
-
-    serverLog(LL_NOTICE, "Enumerating UB entities...");
-
-    /* Add fabric manager */
-    global_ub_client->entities[0].eid = 0x0001; /* UBFM EID */
-    global_ub_client->entities[0].cna = 0x0001;
-    global_ub_client->entities[0].type = UB_ENTITY_FABRIC_MANAGER;
-    global_ub_client->num_entities = 1;
-
-    /* Add memory tile */
-    global_ub_client->entities[1].eid = 0x2001;
-    global_ub_client->entities[1].cna = 0x2001;
-    global_ub_client->entities[1].type = UB_ENTITY_MEMORY_TILE;
-
-    /* Allocate address space for memory tile */
-    global_ub_client->entities[1].addr_space = zcalloc(sizeof(ub_address_space_t));
-    if (global_ub_client->entities[1].addr_space) {
-        global_ub_client->entities[1].addr_space->base_addr = 0x100000000ULL; /* 4GB */
-        global_ub_client->entities[1].addr_space->size = 600ULL * 1024 * 1024 * 1024; /* 600GB */
-        global_ub_client->entities[1].addr_space->token_id = 0x12345678;
-    }
-
-    global_ub_client->num_entities = 2;
-
-    serverLog(LL_NOTICE, "Enumerated %zu UB entities", global_ub_client->num_entities);
-    return C_OK;
-}
-
-/* Load embedding table */
 int ub_client_load_embedding_table(const char *resource_name,
-                                 ub_address_space_t **addr_space) {
-    if (!global_ub_client || !global_ub_client->initialized) {
+                                   ub_address_space_t **addr_space)
+{
+    const ub_mem_config_t *cfg;
+    char device_path[UB_DEVICE_PATH_MAX];
+    size_t table_size;
+    size_t vector_stride;
+
+    if (!addr_space || !global_ub_client || !global_ub_client->initialized) {
+        return C_ERR;
+    }
+    cfg = &global_ub_client->config;
+    if (!resource_name_matches(cfg, resource_name)) {
+        _serverLog(LL_WARNING, "UB table resource mismatch for key %s",
+                   resource_name ? resource_name : "(null)");
+        return C_ERR;
+    }
+    if (configured_table_size(cfg, &table_size) != C_OK ||
+        configured_device_path(cfg, device_path) != C_OK) {
         return C_ERR;
     }
 
-    serverLog(LL_NOTICE, "Loading embedding table: %s", resource_name);
-
-    /* Find memory tile entity */
-    ub_entity_t *mem_tile = NULL;
-    for (size_t i = 0; i < global_ub_client->num_entities; i++) {
-        if (global_ub_client->entities[i].type == UB_ENTITY_MEMORY_TILE) {
-            mem_tile = &global_ub_client->entities[i];
-            break;
-        }
-    }
-
-    if (!mem_tile || !mem_tile->addr_space) {
-        serverLog(LL_WARNING, "No memory tile available");
-        return C_ERR;
-    }
-
-    /* Send image service request */
-    ub_image_request_t request = {
-        .ubfm_eid = 0x0001, /* Fabric manager EID */
-        .client_cna = global_ub_client->local_cna,
-        .client_eid = global_ub_client->local_eid,
-    };
-    strncpy(request.resource_name, resource_name, sizeof(request.resource_name));
-
-    if (ub_client_send_message(UB_MSG_MEMORY_LOAD, &request,
-                             sizeof(request), 0x0001) != C_OK) {
-        return C_ERR;
-    }
-
-    /* Wait for response */
-    ub_message_t *response = NULL;
-    if (ub_client_receive_message(&response, 5000) != C_OK || !response) {
-        serverLog(LL_WARNING, "Timeout waiting for embedding table load response");
-        return C_ERR;
-    }
-
-    /* Process response and map memory */
-    *addr_space = mem_tile->addr_space;
-
-    /* Map the remote memory to local address space */
-    if (ub_mmap_remote_memory((*addr_space)->base_addr, (*addr_space)->size,
-                            (*addr_space)->token_id,
-                            &(*addr_space)->mapped_addr) != C_OK) {
-        serverLog(LL_WARNING, "Failed to map remote UB memory");
-        zfree(response);
-        return C_ERR;
-    }
-
-    serverLog(LL_NOTICE, "Successfully loaded embedding table: %s", resource_name);
-    zfree(response);
-    return C_OK;
-}
-
-/* Perform SVE gather load */
-int ub_client_perform_gather_load(ub_address_space_t *addr_space,
-                                uint64_t *indices, size_t num_indices,
-                                float *results, size_t vector_dim) {
-    if (!global_ub_client || !addr_space || !addr_space->mapped_addr) {
-        return C_ERR;
-    }
-
-    global_ub_client->total_requests++;
-
-    /* Check if SVE is available */
-    if (global_ub_client->sve_context && sve_gather_ptr) {
-        /* Use SVE accelerated gather */
-        return sve_gather_load_f32(global_ub_client->sve_context,
-                                 addr_space->mapped_addr,
-                                 indices, num_indices, results);
-    } else {
-        /* Fallback to scalar gather */
-        const float *base = addr_space->mapped_addr;
-
-        for (size_t i = 0; i < num_indices; i++) {
-            uint64_t idx = indices[i];
-            if (idx * vector_dim >= addr_space->size / sizeof(float)) {
-                serverLog(LL_WARNING, "Index out of bounds: %llu", (unsigned long long)idx);
-                return C_ERR;
-            }
-
-            memcpy(&results[i * vector_dim], &base[idx * vector_dim],
-                   vector_dim * sizeof(float));
-        }
-
+    vector_stride = configured_vector_stride(cfg, cfg->vector_dimension);
+    if (addr_space_matches_config(global_ub_client->global_ubas,
+                                  cfg,
+                                  device_path,
+                                  table_size,
+                                  vector_stride)) {
+        global_ub_client->cache_hits++;
+        *addr_space = global_ub_client->global_ubas;
         return C_OK;
     }
-}
 
-/* Send UB message */
-int ub_client_send_message(ub_message_type_t type, void *payload,
-                          size_t payload_size, uint32_t target_eid) {
-    if (!global_ub_client || !ubios_call_ptr) {
+    global_ub_client->cache_misses++;
+    destroy_addr_space(global_ub_client->global_ubas);
+    global_ub_client->global_ubas = NULL;
+
+    if (create_addr_space(cfg, &global_ub_client->global_ubas) != C_OK) {
         return C_ERR;
     }
 
-    /* Use UB firmware call */
-    int result = ubios_call_ptr((uint32_t)type, target_eid,
-                               payload, payload_size, NULL, 0);
-
-    return result == 0 ? C_OK : C_ERR;
+    *addr_space = global_ub_client->global_ubas;
+    return C_OK;
 }
 
-/* Receive UB message */
-int ub_client_receive_message(ub_message_t **msg, int timeout_ms) {
-    /* This would implement message reception from completion queue */
-    /* For now, return timeout */
-    *msg = NULL;
-    return C_ERR; /* Timeout */
-}
+int ub_client_resolve_element_index(const char *element_name,
+                                    uint64_t *index,
+                                    size_t vector_dim)
+{
+    const ub_mem_config_t *cfg = global_ub_client ? &global_ub_client->config : NULL;
+    ub_address_space_t *addr_space = global_ub_client ? global_ub_client->global_ubas : NULL;
+    size_t vector_stride = configured_vector_stride(cfg, vector_dim);
+    uint64_t capacity;
+    uint64_t resolved = 0;
 
-/* Memory mapping functions */
-int ub_mmap_remote_memory(uint64_t ubas_addr, size_t size,
-                         uint32_t token_id, void **local_addr) {
-    if (!ubios_mmap_remote_ptr) {
-        /* Fallback to regular mmap for simulation */
-        *local_addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        return (*local_addr != MAP_FAILED) ? C_OK : C_ERR;
+    if (!element_name || !index || !addr_space || cfg == NULL || vector_stride == 0) {
+        return C_ERR;
     }
 
-    *local_addr = ubios_mmap_remote_ptr(ubas_addr, size, token_id);
-    return (*local_addr != NULL) ? C_OK : C_ERR;
+    capacity = addr_space->size / vector_stride;
+    if (capacity == 0) {
+        return C_ERR;
+    }
+
+    switch (cfg->element_index_mode) {
+    case UB_ELEMENT_INDEX_NUMERIC:
+        if (parse_u64_strict(element_name, &resolved) != C_OK) {
+            return C_ERR;
+        }
+        break;
+    case UB_ELEMENT_INDEX_SUFFIX_NUMERIC:
+        if (parse_numeric_suffix(element_name, &resolved) != C_OK) {
+            return C_ERR;
+        }
+        break;
+    case UB_ELEMENT_INDEX_HASH:
+        resolved = fnv1a64(element_name) % capacity;
+        break;
+    default:
+        return C_ERR;
+    }
+
+    if (resolved >= capacity) {
+        _serverLog(LL_WARNING, "Resolved UB index %" PRIu64 " out of range (capacity=%" PRIu64 ")",
+                   resolved, capacity);
+        return C_ERR;
+    }
+
+    *index = resolved;
+    return C_OK;
 }
 
-void ub_unmap_memory(void *local_addr, size_t size) {
-    if (local_addr) {
-        munmap(local_addr, size);
+int ub_client_perform_gather_load(ub_address_space_t *addr_space,
+                                  uint64_t *indices,
+                                  size_t num_indices,
+                                  float *results,
+                                  size_t vector_dim)
+{
+    const char *base;
+    size_t vector_bytes;
+    size_t capacity;
+
+    if (!global_ub_client || !addr_space || !indices || !results || vector_dim == 0) {
+        return C_ERR;
     }
+
+    vector_bytes = vector_dim * sizeof(float);
+    if (addr_space->vector_stride_bytes < vector_bytes) {
+        return C_ERR;
+    }
+
+    capacity = addr_space->size / addr_space->vector_stride_bytes;
+    base = (const char *)addr_space->mapped_addr;
+
+    for (size_t i = 0; i < num_indices; i++) {
+        uint64_t idx = indices[i];
+        const char *src;
+
+        if (idx >= capacity) {
+            _serverLog(LL_WARNING, "UB index %" PRIu64 " out of bounds", idx);
+            return C_ERR;
+        }
+
+        src = base + (idx * addr_space->vector_stride_bytes);
+        __builtin_prefetch(src, 0, 1);
+        memcpy(&results[i * vector_dim], src, vector_bytes);
+    }
+
+    global_ub_client->total_requests += num_indices;
+    return C_OK;
 }
 
-/* SVE functions */
-int sve_init_context(void *context) {
-    if (sve_init_ptr) {
-        return sve_init_ptr(&context);
-    }
+int ub_client_set_config(const char *key, const char *value)
+{
+    UNUSED(key);
+    UNUSED(value);
+    _serverLog(LL_WARNING, "Use CONFIG SET for UB client parameters");
     return C_ERR;
 }
 
-void sve_cleanup_context(void *context) {
-    if (sve_cleanup_ptr) {
-        sve_cleanup_ptr(context);
+sds ub_client_get_config(const char *key)
+{
+    if (key == NULL) {
+        return NULL;
     }
-}
-
-int sve_gather_load_f32(void *sve_ctx, const float *base_addr,
-                       const uint64_t *indices, size_t num_indices,
-                       float *results) {
-    if (sve_gather_ptr) {
-        return sve_gather_ptr(sve_ctx, base_addr, indices, num_indices, results);
+    if (!global_ub_client) {
+        return NULL;
     }
 
-    /* Fallback implementation */
-    for (size_t i = 0; i < num_indices; i++) {
-        results[i] = base_addr[indices[i]];
+    if (!strcasecmp(key, "ub-table-name")) {
+        return global_ub_client->config.table_name ? sdsnew(global_ub_client->config.table_name) : NULL;
     }
-    return C_OK;
-}
-
-int sve_scatter_store_f32(void *sve_ctx, float *base_addr,
-                         const uint64_t *indices, const float *values,
-                         size_t num_indices) {
-    /* SVE scatter store implementation */
-    for (size_t i = 0; i < num_indices; i++) {
-        base_addr[indices[i]] = values[i];
+    if (!strcasecmp(key, "ub-shm-path")) {
+        return global_ub_client->config.shm_path ? sdsnew(global_ub_client->config.shm_path) : NULL;
     }
-    return C_OK;
-}
+    if (!strcasecmp(key, "ub-shm-memid")) {
+        return sdscatprintf(sdsempty(), "%llu", global_ub_client->config.shm_memid);
+    }
+    if (!strcasecmp(key, "ub-shm-size")) {
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.shm_size);
+    }
+    if (!strcasecmp(key, "ub-table-offset")) {
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.table_offset);
+    }
+    if (!strcasecmp(key, "ub-table-size")) {
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.table_size);
+    }
+    if (!strcasecmp(key, "ub-vector-stride-bytes")) {
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.vector_stride_bytes);
+    }
+    if (!strcasecmp(key, "vector-dimension")) {
+        return sdscatprintf(sdsempty(), "%d", global_ub_client->config.vector_dimension);
+    }
+    if (!strcasecmp(key, "ub-cacheable")) {
+        return sdsnew(global_ub_client->config.cacheable ? "yes" : "no");
+    }
+    if (!strcasecmp(key, "ub-use-ownership")) {
+        return sdsnew(global_ub_client->config.use_ownership ? "yes" : "no");
+    }
+    if (!strcasecmp(key, "ub-element-index-mode")) {
+        switch (global_ub_client->config.element_index_mode) {
+        case UB_ELEMENT_INDEX_NUMERIC:
+            return sdsnew("numeric");
+        case UB_ELEMENT_INDEX_SUFFIX_NUMERIC:
+            return sdsnew("suffix-numeric");
+        case UB_ELEMENT_INDEX_HASH:
+            return sdsnew("hash");
+        default:
+            return sdsnew("unknown");
+        }
+    }
 
-/* Configuration */
-int ub_client_set_config(const char *key, const char *value) {
-    /* Store configuration - implementation needed */
-    return C_OK;
-}
-
-sds ub_client_get_config(const char *key) {
-    /* Retrieve configuration - implementation needed */
     return NULL;
 }
 
-/* Statistics */
-sds ub_client_get_stats(void) {
+sds ub_client_get_stats(void)
+{
     sds stats = sdsempty();
 
     if (!global_ub_client) {
-        stats = sdscat(stats, "UB Client: Not initialized");
-        return stats;
+        return sdscat(stats, "UB Client: Not initialized");
     }
 
     stats = sdscatprintf(stats, "UB Client Stats:\n");
     stats = sdscatprintf(stats, "  Initialized: %s\n",
-                        global_ub_client->initialized ? "Yes" : "No");
-    stats = sdscatprintf(stats, "  Local EID: 0x%x\n", global_ub_client->local_eid);
-    stats = sdscatprintf(stats, "  Local CNA: 0x%x\n", global_ub_client->local_cna);
-    stats = sdscatprintf(stats, "  Entities: %zu\n", global_ub_client->num_entities);
-    stats = sdscatprintf(stats, "  SVE Supported: %s\n", sve_supported ? "Yes" : "No");
-    stats = sdscatprintf(stats, "  SVE Vector Length: %zu bits\n", sve_vector_length);
+                         global_ub_client->initialized ? "Yes" : "No");
+    stats = sdscatprintf(stats, "  Cache Hits: %llu\n",
+                         (unsigned long long)global_ub_client->cache_hits);
+    stats = sdscatprintf(stats, "  Cache Misses: %llu\n",
+                         (unsigned long long)global_ub_client->cache_misses);
     stats = sdscatprintf(stats, "  Total Requests: %llu\n",
-                        (unsigned long long)global_ub_client->total_requests);
-    stats = sdscatprintf(stats, "  Total Responses: %llu\n",
-                        (unsigned long long)global_ub_client->total_responses);
+                         (unsigned long long)global_ub_client->total_requests);
+
+    if (global_ub_client->global_ubas) {
+        ub_address_space_t *addr_space = global_ub_client->global_ubas;
+
+        stats = sdscatprintf(stats, "  Device: %s\n", addr_space->device_path);
+        stats = sdscatprintf(stats, "  MemId: %llu\n", addr_space->mem_id);
+        stats = sdscatprintf(stats, "  Mapping Size: %zu\n", addr_space->mapping_size);
+        stats = sdscatprintf(stats, "  Table Offset: %zu\n", addr_space->data_offset);
+        stats = sdscatprintf(stats, "  Table Size: %zu\n", addr_space->size);
+        stats = sdscatprintf(stats, "  Vector Stride: %zu\n", addr_space->vector_stride_bytes);
+        stats = sdscatprintf(stats, "  Cacheable: %s\n", addr_space->cacheable ? "Yes" : "No");
+        stats = sdscatprintf(stats, "  Ownership: %s\n", addr_space->use_ownership ? "Yes" : "No");
+    } else {
+        stats = sdscat(stats, "  Mapping: Not loaded\n");
+    }
 
     return stats;
 }

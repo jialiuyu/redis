@@ -1299,8 +1299,10 @@ int VEMB_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     RedisModuleString *element = argv[2];
 
     /* Check if UB engine is enabled and try UB implementation first */
-    if (vector_engine_enabled && current_engine_type == VECTOR_ENGINE_UB &&
-        current_vector_engine && current_vector_engine->vemb) {
+    if (vector_engine_enabled &&
+        current_vector_engine &&
+        current_vector_engine->type == VECTOR_ENGINE_UB &&
+        current_vector_engine->vemb) {
 
         vector_data_t result = {0};
         int ub_ret = current_vector_engine->vemb(ctx, key, element, &result);
@@ -1324,7 +1326,7 @@ int VEMB_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
             }
 
             /* Cleanup */
-            vector_data_destroy(&result);
+            zfree(result.data);
             return REDISMODULE_OK;
         }
         /* Fall through to traditional Redis implementation if UB fails */
@@ -2283,9 +2285,10 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     /* Initialize vector engine */
     if (vector_engine_init_from_config() == C_OK) {
+        current_engine_type = current_vector_engine ? current_vector_engine->type : VECTOR_ENGINE_REDIS;
         vector_engine_enabled = 1;
         RedisModule_Log(ctx, "notice", "Vector engine initialized: %s",
-                       current_vector_engine ? "UB Engine" : "Redis Engine");
+                       current_engine_type == VECTOR_ENGINE_UB ? "UB Engine" : "Redis Engine");
 
         /* Initialize batch processor for high-throughput operations */
         if (batch_processor_init() == C_OK) {
@@ -2664,10 +2667,12 @@ int VENGINE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     const char *subcmd = RedisModule_StringPtrLen(argv[1], NULL);
 
     if (!strcasecmp(subcmd, "GET")) {
+        vector_engine_type_t active_type =
+            current_vector_engine ? current_vector_engine->type : current_engine_type;
         /* Get current engine type */
         RedisModule_ReplyWithArray(ctx, 2);
         RedisModule_ReplyWithSimpleString(ctx, "engine");
-        if (current_engine_type == VECTOR_ENGINE_UB) {
+        if (active_type == VECTOR_ENGINE_UB) {
             RedisModule_ReplyWithSimpleString(ctx, "UB");
         } else {
             RedisModule_ReplyWithSimpleString(ctx, "REDIS");
@@ -2705,7 +2710,7 @@ int VENGINE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
         /* Get engine statistics */
         if (current_vector_engine && current_vector_engine->get_stats) {
             sds stats = current_vector_engine->get_stats();
-            RedisModule_ReplyWithSimpleString(ctx, stats);
+            RedisModule_ReplyWithStringBuffer(ctx, stats, sdslen(stats));
             sdsfree(stats);
         } else {
             RedisModule_ReplyWithSimpleString(ctx, "No vector engine statistics available");
