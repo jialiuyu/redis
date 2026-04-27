@@ -10,6 +10,7 @@
 /* Minimal declarations when building outside redis-server */
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp */
 #define C_OK  0
 #define C_ERR -1
 #define LL_WARNING 3
@@ -606,11 +607,6 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
             float       *dst = results + i * vector_dim;
             size_t       rem = vector_dim;
 
-            /* Prefetch next row while processing current */
-            if (i + 1 < num_indices && indices[i + 1] < capacity) {
-                __builtin_prefetch(base + indices[i + 1] * addr_space->vector_stride_bytes, 0, 1);
-            }
-
             /* Copy full SVE-width chunks */
             while (rem >= vl_f32) {
                 svbool_t pg = svptrue_b32();
@@ -641,7 +637,6 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
         }
 
         src = base + (idx * addr_space->vector_stride_bytes);
-        __builtin_prefetch(src, 0, 1);
         memcpy(&results[i * vector_dim], src, vector_bytes);
     }
 #endif
