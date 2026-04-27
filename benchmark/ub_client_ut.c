@@ -56,6 +56,7 @@ typedef struct {
     int use_ownership;
     int verify;   /* for gather mode: check values against write-fixture pattern */
     int verbose;
+    int mock_local; /* gather mode: use local malloc buffer instead of UB.MEM */
 } ub_ut_options_t;
 
 static void ut_log(const char *fmt, ...)
@@ -186,7 +187,9 @@ static void usage(const char *prog)
             "  gather mode: reads the specified row indices via ub_client_perform_gather_load\n"
             "  and prints each vector. With --verify, checks values against the write-fixture\n"
             "  pattern (row*1000+col). Use on the reader node (111 or 112) after write-fixture\n"
-            "  has been run on the writer node.\n",
+            "  has been run on the writer node.\n"
+            "  With --mock-local, skips UB.MEM and uses a local malloc buffer as data source\n"
+            "  to benchmark pure gather_load performance without UB link overhead.\n",
             prog, prog, prog, prog);
 }
 
@@ -714,6 +717,14 @@ static int run_gather(const ub_ut_options_t *opts)
 
     build_ub_config(opts, &cfg);
 
+    /* mock_local doesn't need a real shm device, but ub_client_init
+     * requires shm_size > 0. Use table_bytes as a stand-in. */
+    if (opts->mock_local && cfg.shm_size == 0) {
+        size_t stride = effective_stride(opts);
+        cfg.shm_size   = num_indices * stride;
+        cfg.table_size = cfg.shm_size;
+    }
+
     if (ub_client_init(&cfg) != 0) {
         ut_log("ub_client_init failed");
         goto out;
@@ -725,24 +736,68 @@ static int run_gather(const ub_ut_options_t *opts)
         double load_us;
         size_t total_bytes = num_indices * opts->vector_dimension * sizeof(float);
 
-        if (ub_client_load_embedding_table(opts->table_name, &addr_space) != 0 ||
-            addr_space == NULL) {
-            ut_log("ub_client_load_embedding_table failed");
-            ub_client_cleanup();
-            goto out;
-        }
+        if (opts->mock_local) {
+            /* Mock path: allocate a local table filled with fixture pattern,
+             * build a fake addr_space pointing into it. This benchmarks pure
+             * gather_load (SVE or memcpy) without any UB link overhead. */
+            size_t stride = effective_stride(opts);
+            size_t table_bytes = num_indices * stride;
+            unsigned char *mock_table = calloc(table_bytes, 1);
+            if (!mock_table) {
+                ut_log("OOM allocating mock table");
+                ub_client_cleanup();
+                goto out;
+            }
+            fill_fixture_vectors((float *)mock_table, num_indices,
+                                 opts->vector_dimension, stride);
 
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (ub_client_perform_gather_load(addr_space,
-                                          indices,
-                                          num_indices,
-                                          results,
-                                          opts->vector_dimension) != 0) {
-            ut_log("ub_client_perform_gather_load failed");
-            ub_client_cleanup();
-            goto out;
+            /* Build a stack addr_space pointing into the mock table */
+            ub_address_space_t mock_as;
+            memset(&mock_as, 0, sizeof(mock_as));
+            mock_as.mapped_addr      = mock_table;
+            mock_as.mapping_addr     = mock_table;
+            mock_as.mapping_size     = table_bytes;
+            mock_as.size             = table_bytes;
+            mock_as.data_offset      = 0;
+            mock_as.vector_stride_bytes = stride;
+            mock_as.shm_fd           = -1;
+            mock_as.cacheable        = 0;
+            mock_as.use_ownership    = 0;
+            addr_space = &mock_as;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (ub_client_perform_gather_load(addr_space,
+                                              indices,
+                                              num_indices,
+                                              results,
+                                              opts->vector_dimension) != 0) {
+                ut_log("ub_client_perform_gather_load failed (mock)");
+                free(mock_table);
+                ub_client_cleanup();
+                goto out;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            free(mock_table);
+        } else {
+            if (ub_client_load_embedding_table(opts->table_name, &addr_space) != 0 ||
+                addr_space == NULL) {
+                ut_log("ub_client_load_embedding_table failed");
+                ub_client_cleanup();
+                goto out;
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (ub_client_perform_gather_load(addr_space,
+                                              indices,
+                                              num_indices,
+                                              results,
+                                              opts->vector_dimension) != 0) {
+                ut_log("ub_client_perform_gather_load failed");
+                ub_client_cleanup();
+                goto out;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
         }
-        clock_gettime(CLOCK_MONOTONIC, &t1);
         load_us = elapsed_us(&t0, &t1);
 
         /* Print and optionally verify each row */
@@ -776,6 +831,7 @@ static int run_gather(const ub_ut_options_t *opts)
             ut_log("  method      : scalar memcpy");
             ut_log("  memcpy      : %.1f us (%.3f ms)", load_us, load_us / 1e3);
 #endif
+            ut_log("  source      : %s", opts->mock_local ? "local malloc (no UB)" : "UB.MEM");
             ut_log("  data        : %zu bytes (%.2f MB)",
                    total_bytes, (double)total_bytes / (1024.0 * 1024.0));
             if (load_us > 0) {
@@ -910,6 +966,7 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
         {"use-ownership", required_argument, NULL, 'u'},
         {"verify", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
+        {"mock-local", no_argument, NULL, 'M'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -930,7 +987,7 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
     }
 
     optind = 2;
-    while ((ch = getopt_long(argc, argv, "p:m:s:o:t:S:d:r:n:e:g:i:R:c:u:Vvh",
+    while ((ch = getopt_long(argc, argv, "p:m:s:o:t:S:d:r:n:e:g:i:R:c:u:VMvh",
                              long_opts, NULL)) != -1) {
         switch (ch) {
         case 'p':
@@ -1013,6 +1070,9 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
             break;
         case 'V':
             opts->verify = 1;
+            break;
+        case 'M':
+            opts->mock_local = 1;
             break;
         case 'v':
             opts->verbose = 1;

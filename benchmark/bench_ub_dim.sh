@@ -11,7 +11,7 @@
 #   节点 112:  ./bench_ub_dim.sh read  128 5 8G 1024
 #   单节点:    ./bench_ub_dim.sh all   128 5 8G 1024
 #
-#   多个 dim 扫描:
+#   多 dim 扫描:
 #   for dim in 16 64 128 256 512 1024; do ./bench_ub_dim.sh all $dim; done
 
 MODE=${1:-all}
@@ -63,13 +63,31 @@ do_write() {
 }
 
 # ============================================================
-# READ: gather 并测速
+# 解析 gather 输出中的关键指标
+# ============================================================
+parse_gather_output() {
+    local output="$1"
+    echo "$output" | grep -E 'source|method|gather_load|memcpy|data|throughput|per row'
+    local verify
+    verify=$(echo "$output" | grep -c 'mismatch' 2>/dev/null || echo 0)
+    if [ "$verify" -gt 0 ]; then
+        echo "  verify      : MISMATCH ($verify rows)"
+    else
+        echo "  verify      : OK"
+    fi
+}
+
+# ============================================================
+# READ: gather 并测速（UB.MEM 真实读取 + mock 本地对比）
 # ============================================================
 do_read() {
     echo "========================================================"
     echo " READ benchmark: dim=$DIM memid=$SHM_MEMID size=$SHM_SIZE rows=$FILL_ROWS"
     echo "========================================================"
 
+    # --- 真实 UB.MEM 读取 ---
+    echo ""
+    echo "[ UB.MEM read ]"
     output=$($UT gather \
         --shm-memid "$SHM_MEMID" \
         --shm-size  "$SHM_SIZE" \
@@ -80,16 +98,24 @@ do_read() {
         --cacheable false \
         --use-ownership false \
         --verify 2>&1)
+    parse_gather_output "$output"
 
-    # print raw timing lines
-    echo "$output" | grep -E 'method|gather_load|memcpy|data|throughput|per row'
+    # --- mock 本地内存对比（排除 UB 链路，测纯 gather_load 基线）---
+    echo ""
+    echo "[ local mock (baseline, no UB) ]"
+    output_mock=$($UT gather \
+        --shm-memid "$SHM_MEMID" \
+        --shm-size  "$SHM_SIZE" \
+        --vector-dimension "$DIM" \
+        --table-name ut_vectors \
+        --gather-indices all \
+        --fill-rows "$FILL_ROWS" \
+        --cacheable false \
+        --use-ownership false \
+        --mock-local \
+        --verify 2>&1)
+    parse_gather_output "$output_mock"
 
-    verify=$(echo "$output" | grep -c 'mismatch' 2>/dev/null || echo 0)
-    if [ "$verify" -gt 0 ]; then
-        echo "  verify      : MISMATCH ($verify rows)"
-    else
-        echo "  verify      : OK"
-    fi
     echo "========================================================"
 }
 
