@@ -61,6 +61,7 @@ distclean:
 	-(cd fpconv && $(MAKE) clean) > /dev/null || true
 	-(cd fast_float && $(MAKE) clean) > /dev/null || true
 	-(cd xxhash && $(MAKE) clean) > /dev/null || true
+	-(cd libobmm && $(MAKE) clean) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
@@ -149,3 +150,9 @@ jemalloc: .make-prerequisites
 	cd jemalloc && $(MAKE) lib/libjemalloc.a
 
 .PHONY: jemalloc
+
+libobmm: .make-prerequisites
+	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
+	cd libobmm && $(MAKE) CFLAGS="$(DEPS_CFLAGS)" LDFLAGS="$(DEPS_LDFLAGS)"
+
+.PHONY: libobmm

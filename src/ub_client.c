@@ -8,7 +8,6 @@
 #include "server.h"
 
 #include <ctype.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -18,12 +17,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-typedef int (*obmm_set_ownership_func)(int fd, void *start, void *end, int prot);
+#ifdef USE_CC_MODE
+#include "obmm_ownership.h"
+#endif
 
 ub_client_t *global_ub_client = NULL;
-
-static void *obmm_handle = NULL;
-static obmm_set_ownership_func obmm_set_ownership_ptr = NULL;
 
 static int same_string(const char *left, const char *right)
 {
@@ -179,39 +177,6 @@ static int resource_name_matches(const ub_mem_config_t *cfg, const char *resourc
     return strcmp(cfg->table_name, resource_name) == 0;
 }
 
-static int load_obmm_library(void)
-{
-    if (obmm_set_ownership_ptr) {
-        return C_OK;
-    }
-
-    obmm_handle = dlopen("libobmm.so", RTLD_LAZY);
-    if (obmm_handle == NULL) {
-        _serverLog(LL_WARNING, "Failed to load libobmm.so for ownership control: %s",
-                   dlerror());
-        return C_ERR;
-    }
-
-    obmm_set_ownership_ptr = (obmm_set_ownership_func)dlsym(obmm_handle, "obmm_set_ownership");
-    if (obmm_set_ownership_ptr == NULL) {
-        _serverLog(LL_WARNING, "Failed to resolve obmm_set_ownership: %s",
-                   dlerror());
-        dlclose(obmm_handle);
-        obmm_handle = NULL;
-        return C_ERR;
-    }
-    return C_OK;
-}
-
-static void unload_obmm_library(void)
-{
-    obmm_set_ownership_ptr = NULL;
-    if (obmm_handle) {
-        dlclose(obmm_handle);
-        obmm_handle = NULL;
-    }
-}
-
 static int set_read_ownership(ub_address_space_t *addr_space)
 {
     void *start = addr_space->mapping_addr;
@@ -220,33 +185,41 @@ static int set_read_ownership(ub_address_space_t *addr_space)
     if (!addr_space->cacheable || !addr_space->use_ownership) {
         return C_OK;
     }
-    if (load_obmm_library() != C_OK) {
-        return C_ERR;
-    }
-    if (obmm_set_ownership_ptr(addr_space->shm_fd, start, end, PROT_READ) != 0) {
-        _serverLog(LL_WARNING,
-                   "Failed to acquire OBMM read ownership for %s: %s",
-                   addr_space->device_path, strerror(errno));
+#ifdef USE_CC_MODE
+    if (obmm_set_ownership(addr_space->shm_fd, start, end, PROT_READ) != 0) {
+        serverLog(LL_WARNING,
+                  "Failed to acquire OBMM read ownership for %s: %s",
+                  addr_space->device_path, strerror(errno));
         return C_ERR;
     }
 
     addr_space->use_ownership = 1;
     return C_OK;
+#else
+    (void)start;
+    (void)end;
+    serverLog(LL_WARNING, "OBMM ownership requires USE_CC_MODE=yes at build time");
+    return C_ERR;
+#endif
 }
 
 static void release_ownership(ub_address_space_t *addr_space)
 {
-    void *start = addr_space->mapping_addr;
-    void *end = (char *)addr_space->mapping_addr + addr_space->mapping_size;
-
-    if (!addr_space || !addr_space->use_ownership || !obmm_set_ownership_ptr) {
+    if (!addr_space || !addr_space->use_ownership) {
         return;
     }
-    if (obmm_set_ownership_ptr(addr_space->shm_fd, start, end, PROT_NONE) != 0) {
-        _serverLog(LL_WARNING,
-                   "Failed to release OBMM ownership for %s: %s",
-                   addr_space->device_path, strerror(errno));
+#ifdef USE_CC_MODE
+    {
+        void *start = addr_space->mapping_addr;
+        void *end = (char *)addr_space->mapping_addr + addr_space->mapping_size;
+
+        if (obmm_set_ownership(addr_space->shm_fd, start, end, PROT_NONE) != 0) {
+            serverLog(LL_WARNING,
+                      "Failed to release OBMM ownership for %s: %s",
+                      addr_space->device_path, strerror(errno));
+        }
     }
+#endif
 }
 
 static void destroy_addr_space(ub_address_space_t *addr_space)
@@ -300,22 +273,22 @@ static int create_addr_space(const ub_mem_config_t *cfg, ub_address_space_t **ad
     void *mapping = MAP_FAILED;
 
     if (configured_table_size(cfg, &table_size) != C_OK) {
-        _serverLog(LL_WARNING, "Invalid UB table size/offset configuration");
+        serverLog(LL_WARNING, "Invalid UB table size/offset configuration");
         return C_ERR;
     }
 
     if (configured_device_path(cfg, device_path) != C_OK) {
-        _serverLog(LL_WARNING, "Missing UB shmdev configuration");
+        serverLog(LL_WARNING, "Missing UB shmdev configuration");
         return C_ERR;
     }
 
     vector_stride = configured_vector_stride(cfg, cfg->vector_dimension);
     if (vector_stride == 0 || vector_stride < cfg->vector_dimension * sizeof(float)) {
-        _serverLog(LL_WARNING, "Invalid UB vector stride configuration");
+        serverLog(LL_WARNING, "Invalid UB vector stride configuration");
         return C_ERR;
     }
     if (table_size < vector_stride) {
-        _serverLog(LL_WARNING, "UB table size is smaller than one vector row");
+        serverLog(LL_WARNING, "UB table size is smaller than one vector row");
         return C_ERR;
     }
 
@@ -326,14 +299,14 @@ static int create_addr_space(const ub_mem_config_t *cfg, ub_address_space_t **ad
 
     fd = open(device_path, open_flags);
     if (fd < 0) {
-        _serverLog(LL_WARNING, "Failed to open %s: %s", device_path, strerror(errno));
+        serverLog(LL_WARNING, "Failed to open %s: %s", device_path, strerror(errno));
         return C_ERR;
     }
 
     mmap_prot = (cfg->cacheable && cfg->use_ownership) ? PROT_NONE : PROT_READ;
     mapping = mmap(NULL, cfg->shm_size, mmap_prot, MAP_SHARED, fd, 0);
     if (mapping == MAP_FAILED) {
-        _serverLog(LL_WARNING, "Failed to mmap %s: %s", device_path, strerror(errno));
+        serverLog(LL_WARNING, "Failed to mmap %s: %s", device_path, strerror(errno));
         close(fd);
         return C_ERR;
     }
@@ -451,7 +424,7 @@ int ub_client_init(const ub_mem_config_t *cfg)
     global_ub_client->config = next_cfg;
     memset(&next_cfg, 0, sizeof(next_cfg));
     global_ub_client->initialized = 1;
-    _serverLog(LL_NOTICE, "UB client initialized in data-plane mode");
+    serverLog(LL_NOTICE, "UB client initialized in data-plane mode");
     return C_OK;
 }
 
@@ -464,12 +437,11 @@ void ub_client_cleanup(void)
     destroy_addr_space(global_ub_client->global_ubas);
     global_ub_client->global_ubas = NULL;
     free_config_strings(&global_ub_client->config);
-    unload_obmm_library();
 
     zfree(global_ub_client);
     global_ub_client = NULL;
 
-    _serverLog(LL_NOTICE, "UB client cleaned up");
+    serverLog(LL_NOTICE, "UB client cleaned up");
 }
 
 int ub_client_load_embedding_table(const char *resource_name,
@@ -485,8 +457,8 @@ int ub_client_load_embedding_table(const char *resource_name,
     }
     cfg = &global_ub_client->config;
     if (!resource_name_matches(cfg, resource_name)) {
-        _serverLog(LL_WARNING, "UB table resource mismatch for key %s",
-                   resource_name ? resource_name : "(null)");
+        serverLog(LL_WARNING, "UB table resource mismatch for key %s",
+                  resource_name ? resource_name : "(null)");
         return C_ERR;
     }
     if (configured_table_size(cfg, &table_size) != C_OK ||
@@ -555,8 +527,8 @@ int ub_client_resolve_element_index(const char *element_name,
     }
 
     if (resolved >= capacity) {
-        _serverLog(LL_WARNING, "Resolved UB index %" PRIu64 " out of range (capacity=%" PRIu64 ")",
-                   resolved, capacity);
+        serverLog(LL_WARNING, "Resolved UB index %" PRIu64 " out of range (capacity=%" PRIu64 ")",
+                  resolved, capacity);
         return C_ERR;
     }
 
@@ -591,7 +563,7 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
         const char *src;
 
         if (idx >= capacity) {
-            _serverLog(LL_WARNING, "UB index %" PRIu64 " out of bounds", idx);
+            serverLog(LL_WARNING, "UB index %" PRIu64 " out of bounds", idx);
             return C_ERR;
         }
 
@@ -608,7 +580,7 @@ int ub_client_set_config(const char *key, const char *value)
 {
     UNUSED(key);
     UNUSED(value);
-    _serverLog(LL_WARNING, "Use CONFIG SET for UB client parameters");
+    serverLog(LL_WARNING, "Use CONFIG SET for UB client parameters");
     return C_ERR;
 }
 

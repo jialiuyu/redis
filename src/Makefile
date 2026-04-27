@@ -456,6 +456,7 @@ persist-settings: distclean
 	echo USE_F32MM=$(USE_F32MM) >> .make-settings
 	echo USE_NPU=$(USE_NPU) >> .make-settings
 	echo USE_UB=$(USE_UB) >> .make-settings
+	echo USE_CC_MODE=$(USE_CC_MODE) >> .make-settings
 	echo USE_TLC=$(USE_TLC) >> .make-settings
 	-(cd ../deps && $(MAKE) $(DEPENDENCY_TARGETS))
 
