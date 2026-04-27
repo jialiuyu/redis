@@ -415,8 +415,6 @@ REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
 REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
 REDIS_CHECK_AOF_NAME=redis-check-aof$(PROG_SUFFIX)
-UB_CLIENT_UT_NAME=ub_client-ut$(PROG_SUFFIX)
-UB_CLIENT_UT_OBJ=ub_client_ut.o ub_client.o
 ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
 
 all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(TLS_MODULE) module_tests
@@ -504,14 +502,6 @@ $(REDIS_CLI_NAME): $(REDIS_CLI_OBJ)
 $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
-# ub_client standalone UT
-$(UB_CLIENT_UT_NAME): $(UB_CLIENT_UT_OBJ)
-	$(REDIS_LD) -o $@ $^ $(FINAL_LIBS)
-
-ub_client_ut: $(UB_CLIENT_UT_NAME)
-
-.PHONY: ub_client_ut
-
 DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_VEC_SETS_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
 -include $(DEP)
 
@@ -536,7 +526,7 @@ endif
 commands.c: $(COMMANDS_DEF_FILENAME).def
 
 clean:
-	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(UB_CLIENT_UT_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep *.so ub_client_ut.d
+	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep *.so
 	rm -f $(DEP)
 	rm -f $(TLC_SERVERS)
 	-(cd ../tests/modules && $(MAKE) clean)
@@ -611,7 +601,7 @@ help:
 	@echo "  make USE_SVE2=yes USE_LSE=yes           Build with SVE2 + LSE atomics"
 	@echo "  make USE_SVE2=yes USE_NPU=yes           Build with SVE2 + Ascend NPU"
 	@echo "  make USE_SVE2=yes USE_UB=yes USE_TLC=yes  Full HPC build"
-	@echo "  make ub_client_ut                       Build ub_client standalone UT"
+	@echo "  make ub_client_ut                       Build ub_client UT (in benchmark/)"
 	@echo ""
 	@echo "  make TLC_VERSION=v14                    Build single TLC server"
 	@echo "  make TLC_VERSIONS=\"v13 v14\"             Build specific TLC servers"

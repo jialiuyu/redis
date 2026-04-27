@@ -121,9 +121,30 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
 	@echo "✅ Built: $@"
 
+# UB client 跨节点验证工具
+# 编译: make ub_client_ut
+# 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
+UB_UT_CFLAGS = -O2 -Wall -std=c99 -I../src -I../deps/libobmm
+UB_UT_LIBS   = -lm
+UB_UT_SRCS   = ub_client_ut.c ../src/ub_client.c
+
+ifeq ($(USE_CC_MODE),yes)
+    UB_UT_CFLAGS += -DUSE_CC_MODE
+    UB_UT_LIBS   += ../deps/libobmm/libobmm_ownership.a
+endif
+ifeq ($(USE_SVE),yes)
+    UB_UT_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+ub_client_ut: $(UB_UT_SRCS)
+	$(CC) $(UB_UT_CFLAGS) -o $@ $(UB_UT_SRCS) $(UB_UT_LIBS)
+	@echo "✅ Built: $@"
+
+.PHONY: ub_client_ut
+
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare
+	rm -f $(TARGETS) gemm_compare ub_client_ut
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "✅ Cleaned build artifacts"
@@ -191,6 +212,12 @@ help:
 	@echo "  ./tlc_aeron_bench / tlc_fc_bench / tlc_kcp_bench / tlc_raw_bench"
 	@echo "  ./tlc_transport_bench / tlc_all_transport_bench / tlc_client_bench"
 	@echo "  ./tlc_v10_bench / tlc_v13_bench / tlc_v14_bench"
+	@echo ""
+	@echo "UB cross-node validation:"
+	@echo "  make ub_client_ut [USE_CC_MODE=yes] [USE_SVE=yes]"
+	@echo "  ./ub_client_ut selftest"
+	@echo "  ./ub_client_ut write-fixture --shm-memid <id> --shm-size <N> --vector-dimension 128 --fill-rows 1024"
+	@echo "  ./ub_client_ut gather --shm-memid <id> --shm-size <N> --vector-dimension 128 --table-name ut_vectors --gather-indices 0,1,42 --verify"
 	@echo ""
 	@echo "Options:"
 	@echo "  --queries N    Number of queries"
