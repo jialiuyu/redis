@@ -77,6 +77,7 @@ parse_gather_output() {
     echo "$output" | grep -E 'source|method|gather_load|memcpy|data|throughput|per row'
     local verify
     verify=$(echo "$output" | grep -c 'mismatch' 2>/dev/null || echo 0)
+    verify=$((verify + 0))  # normalize to integer
     if [ "$verify" -gt 0 ]; then
         echo "  verify      : MISMATCH ($verify rows)"
     else
