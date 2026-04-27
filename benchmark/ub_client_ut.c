@@ -776,10 +776,11 @@ static int run_gather(const ub_ut_options_t *opts)
             ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
 #ifdef USE_SVE
             ut_log("  method: SVE gather-load (sve1 contiguous ld1w/st1w)");
+            ut_log("  gather_load : %.1f us (%.3f ms)", load_us, load_us / 1e3);
 #else
             ut_log("  method: scalar memcpy");
+            ut_log("  memcpy      : %.1f us (%.3f ms)", load_us, load_us / 1e3);
 #endif
-            ut_log("  gather_load : %.1f us (%.3f ms)", load_us, load_us / 1e3);
             ut_log("  total       : %.1f us (%.3f ms)  [includes verify+print]",
                    total_us, total_us / 1e3);
             ut_log("  data        : %zu bytes (%.2f MB)",
