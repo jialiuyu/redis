@@ -124,7 +124,7 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
-UB_UT_CFLAGS = -O2 -Wall -std=gnu99 -I../src -I../deps/libobmm -DUB_CLIENT_STANDALONE
+UB_UT_CFLAGS = -O3 -Wall -march=native -std=c11 -I../src -I../deps/libobmm -DUB_CLIENT_STANDALONE
 UB_UT_LIBS   = -lm
 UB_UT_SRCS   = ub_client_ut.c ../src/ub_client.c
 
