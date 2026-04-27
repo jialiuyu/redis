@@ -1,0 +1,94 @@
+# ub_client_ut — UB 跨节点数据面验证工具
+# 位置: hpc-redis/benchmark/ub_client_ut
+#
+# ============================================================
+# 编译
+# ============================================================
+#
+# 基础编译（无 OBMM ownership，无 SVE）:
+#   make -C benchmark ub_client_ut
+#
+# 带 OBMM cacheable ownership 支持:
+#   make -C benchmark ub_client_ut USE_CC_MODE=yes
+#
+# 带 SVE gather 加速:
+#   make -C benchmark ub_client_ut USE_SVE=yes
+#
+# 完整 HPC 编译:
+#   make -C benchmark ub_client_ut USE_CC_MODE=yes USE_SVE=yes
+#
+# ============================================================
+# 本地自测（不需要真实 UB 设备）
+# ============================================================
+#
+#   ./benchmark/ub_client_ut selftest
+#
+# ============================================================
+# 跨节点验证流程（节点 111 写 → 节点 112 读）
+# ============================================================
+#
+# 步骤 1: 通过 obmmctl 完成 UB.MEM 数据面配置，获取 shm_memid
+#
+# 步骤 2: 节点 111（写端）— 向共享内存写入 fixture 数据
+#
+./benchmark/ub_client_ut write-fixture \
+  --shm-memid <obmmctl_memid> \
+  --shm-size 4M \
+  --vector-dimension 128 \
+  --fill-rows 1024 \
+  --cacheable yes \
+  --use-ownership yes
+
+#
+# 步骤 3: 节点 112（读端）— 通过 UB 链路 gather 指定行并验证
+#
+./benchmark/ub_client_ut gather \
+  --shm-memid <obmmctl_memid> \
+  --shm-size 4M \
+  --vector-dimension 128 \
+  --table-name ut_vectors \
+  --gather-indices 0,1,7,42,1023 \
+  --cacheable yes \
+  --use-ownership yes \
+  --verify \
+  --verbose
+
+# ============================================================
+# 其他模式
+# ============================================================
+#
+# read-verify: 单行读取并验证（兼容旧流程）
+#
+#   ./benchmark/ub_client_ut read-verify \
+#     --shm-memid <obmmctl_memid> \
+#     --shm-size 4M \
+#     --vector-dimension 128 \
+#     --table-name ut_vectors \
+#     --element "42" \
+#     --resolver numeric \
+#     --expected-index 42 \
+#     --cacheable yes \
+#     --use-ownership yes \
+#     --verbose
+#
+# ============================================================
+# 参数说明
+# ============================================================
+#
+#   --shm-memid <id>          obmmctl 分配的 mem_id
+#   --shm-path  <path>        或直接指定设备路径 /dev/obmm_shmdev<id>
+#   --shm-size  <bytes>       共享内存总大小，支持 K/M/G 后缀
+#   --table-offset <bytes>    embedding table 在 shm 内的偏移（默认 0）
+#   --table-size <bytes>      embedding table 大小（默认 shm-size - offset）
+#   --vector-dimension <n>    每行向量的 float 元素数
+#   --vector-stride-bytes <n> 行步长（默认 dim * 4）
+#   --fill-rows <n>           write-fixture 写入的行数
+#   --table-name <name>       逻辑表名（默认 ut_vectors）
+#   --gather-indices <i,...>  gather 模式：逗号分隔的行索引列表
+#   --element <name>          read-verify 模式：元素名
+#   --resolver numeric|suffix-numeric|hash  索引解析方式
+#   --expected-index <n>      期望的解析结果（可选，用于断言）
+#   --cacheable yes|no        是否使用 cacheable 映射（默认 no）
+#   --use-ownership yes|no    是否申请 OBMM read ownership（默认 no）
+#   --verify                  gather 模式：校验数据是否符合 write-fixture 模式
+#   --verbose                 打印向量内容和统计信息

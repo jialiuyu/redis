@@ -6,7 +6,7 @@
  * an existing shmdev path or memid and validates read-side behavior.
  */
 
-#include "ub_client.h"
+#include "../src/ub_client.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 #ifdef USE_CC_MODE
-#include "obmm_ownership.h"
+#include "../deps/libobmm/obmm_ownership.h"
 #endif
 
 typedef enum {
