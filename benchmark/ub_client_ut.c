@@ -650,8 +650,26 @@ static int run_gather(const ub_ut_options_t *opts)
         return 1;
     }
 
-    /* Count and parse comma-separated indices */
-    {
+    /* Parse --gather-indices: comma-separated list, or "all" to read every row */
+    if (strcmp(opts->gather_indices_str, "all") == 0) {
+        /* "all" mode: derive capacity from config, build 0..N-1 index array */
+        size_t stride = effective_stride(opts);
+        size_t tsize  = effective_table_size(opts);
+        num_indices = (stride > 0 && tsize > 0) ? tsize / stride : 0;
+        if (num_indices == 0) {
+            ut_log("cannot determine capacity for 'all': set --table-size or --shm-size");
+            return 1;
+        }
+        indices = calloc(num_indices, sizeof(uint64_t));
+        if (!indices) {
+            ut_log("OOM allocating indices for 'all' (%zu rows)", num_indices);
+            return 1;
+        }
+        for (i = 0; i < num_indices; i++) {
+            indices[i] = (uint64_t)i;
+        }
+    } else {
+        /* Count and parse comma-separated indices */
         const char *p = opts->gather_indices_str;
         num_indices = 1;
         while (*p) {
