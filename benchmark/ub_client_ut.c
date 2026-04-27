@@ -652,12 +652,16 @@ static int run_gather(const ub_ut_options_t *opts)
 
     /* Parse --gather-indices: comma-separated list, or "all" to read every row */
     if (strcmp(opts->gather_indices_str, "all") == 0) {
-        /* "all" mode: derive capacity from config, build 0..N-1 index array */
+        /* "all" mode: use fill_rows if set (matches write-fixture), otherwise
+         * derive from table_size. Never use raw shm_size to avoid reading
+         * unwritten rows beyond the fixture boundary. */
         size_t stride = effective_stride(opts);
-        size_t tsize  = effective_table_size(opts);
-        num_indices = (stride > 0 && tsize > 0) ? tsize / stride : 0;
-        if (num_indices == 0) {
-            ut_log("cannot determine capacity for 'all': set --table-size or --shm-size");
+        if (opts->fill_rows > 0) {
+            num_indices = opts->fill_rows;
+        } else if (opts->table_size > 0 && stride > 0) {
+            num_indices = opts->table_size / stride;
+        } else {
+            ut_log("'all' requires --fill-rows or --table-size to bound the row count");
             return 1;
         }
         indices = calloc(num_indices, sizeof(uint64_t));
