@@ -20,6 +20,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -630,10 +631,10 @@ static int run_read_verify(const ub_ut_options_t *opts)
     return 0;
 }
 
-static double elapsed_us(const struct timespec *start, const struct timespec *end)
+static double elapsed_ns(const struct timespec *start, const struct timespec *end)
 {
-    return (double)(end->tv_sec - start->tv_sec) * 1e6 +
-           (double)(end->tv_nsec - start->tv_nsec) / 1e3;
+    return (double)(end->tv_sec - start->tv_sec) * 1e9 +
+           (double)(end->tv_nsec - start->tv_nsec);
 }
 
 /*
@@ -733,7 +734,7 @@ static int run_gather(const ub_ut_options_t *opts)
     /* --- timed: only ub_client_perform_gather_load --- */
     {
         struct timespec t0, t1;
-        double load_us;
+        double load_ns;
         size_t total_bytes = num_indices * opts->vector_dimension * sizeof(float);
 
         if (opts->mock_local) {
@@ -798,7 +799,7 @@ static int run_gather(const ub_ut_options_t *opts)
             }
             clock_gettime(CLOCK_MONOTONIC, &t1);
         }
-        load_us = elapsed_us(&t0, &t1);
+        load_ns = elapsed_ns(&t0, &t1);
 
         /* Print and optionally verify each row */
         rc = 0;
@@ -826,19 +827,19 @@ static int run_gather(const ub_ut_options_t *opts)
             ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
 #ifdef USE_SVE
             ut_log("  method      : SVE gather-load (sve1 contiguous ld1w/st1w)");
-            ut_log("  gather_load : %.1f us (%.3f ms)", load_us, load_us / 1e3);
+            ut_log("  gather_load : %.0f ns (%.3f us)", load_ns, load_ns / 1e3);
 #else
             ut_log("  method      : scalar memcpy");
-            ut_log("  memcpy      : %.1f us (%.3f ms)", load_us, load_us / 1e3);
+            ut_log("  memcpy      : %.0f ns (%.3f us)", load_ns, load_ns / 1e3);
 #endif
             ut_log("  source      : %s", opts->mock_local ? "local malloc (no UB)" : "UB.MEM");
             ut_log("  data        : %zu bytes (%.2f MB)",
                    total_bytes, (double)total_bytes / (1024.0 * 1024.0));
-            if (load_us > 0) {
-                double bw_mbs = (double)total_bytes / load_us;
-                double per_row_us = load_us / (double)num_indices;
+            if (load_ns > 0) {
+                double bw_mbs = (double)total_bytes / (load_ns / 1e3); /* bytes/us = MB/s */
+                double per_row_ns = load_ns / (double)num_indices;
                 ut_log("  throughput  : %.1f MB/s", bw_mbs);
-                ut_log("  per row     : %.3f us / row  (%zu rows)", per_row_us, num_indices);
+                ut_log("  per row     : %.1f ns / row  (%zu rows)", per_row_ns, num_indices);
             }
             if (opts->verbose && stats) {
                 ut_log("%s", stats);
