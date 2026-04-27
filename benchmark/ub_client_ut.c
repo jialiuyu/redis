@@ -471,6 +471,18 @@ static int run_write_fixture(const ub_ut_options_t *opts)
     table_base = (unsigned char *)mapping + opts->table_offset;
     fill_fixture_vectors((float *)table_base, rows, opts->vector_dimension, stride);
 
+    /* Print written data when --verbose, same format as gather for easy diff */
+    if (opts->verbose) {
+        for (size_t row = 0; row < rows; row++) {
+            const float *vec = (const float *)(table_base + row * stride);
+            fprintf(stdout, "row=%zu [", row);
+            for (size_t d = 0; d < opts->vector_dimension; d++) {
+                fprintf(stdout, "%s%.1f", d ? ", " : "", vec[d]);
+            }
+            fprintf(stdout, "]\n");
+        }
+    }
+
     /* Flush written data. msync works on mmap regions; fsync may fail on
      * device files (e.g. OBMM shmdev returns EINVAL), so treat it as
      * non-fatal. */
