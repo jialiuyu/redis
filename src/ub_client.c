@@ -17,6 +17,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef USE_SVE
+#include <arm_sve.h>
+#endif
+
 #ifdef USE_CC_MODE
 #include "obmm_ownership.h"
 #endif
@@ -558,6 +562,55 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
     capacity = addr_space->size / addr_space->vector_stride_bytes;
     base = (const char *)addr_space->mapped_addr;
 
+#ifdef USE_SVE
+    /*
+     * SVE gather-load path.
+     * Each row is vector_dim floats; we copy one row per index using SVE
+     * contiguous loads (LD1W) with a predicate covering the row width.
+     * The stride between rows may be larger than vector_dim (padding), so
+     * we use a plain contiguous load per row rather than a true scatter-gather
+     * across rows — this matches the memory layout and avoids strided-gather
+     * complexity while still benefiting from SVE's wide vector registers.
+     */
+    {
+        const size_t vl_f32 = svcntw();   /* SVE vector length in float lanes */
+
+        for (size_t i = 0; i < num_indices; i++) {
+            uint64_t idx = indices[i];
+            if (idx >= capacity) {
+                serverLog(LL_WARNING, "UB index %" PRIu64 " out of bounds", idx);
+                return C_ERR;
+            }
+
+            const float *src = (const float *)(base + idx * addr_space->vector_stride_bytes);
+            float       *dst = results + i * vector_dim;
+            size_t       rem = vector_dim;
+
+            /* Prefetch next row while processing current */
+            if (i + 1 < num_indices && indices[i + 1] < capacity) {
+                __builtin_prefetch(base + indices[i + 1] * addr_space->vector_stride_bytes, 0, 1);
+            }
+
+            /* Copy full SVE-width chunks */
+            while (rem >= vl_f32) {
+                svbool_t pg = svptrue_b32();
+                svfloat32_t v = svld1_f32(pg, src);
+                svst1_f32(pg, dst, v);
+                src += vl_f32;
+                dst += vl_f32;
+                rem -= vl_f32;
+            }
+
+            /* Tail: predicated store for remaining elements */
+            if (rem > 0) {
+                svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+                svfloat32_t v = svld1_f32(pg, src);
+                svst1_f32(pg, dst, v);
+            }
+        }
+    }
+#else
+    /* Scalar fallback */
     for (size_t i = 0; i < num_indices; i++) {
         uint64_t idx = indices[i];
         const char *src;
@@ -571,6 +624,7 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
         __builtin_prefetch(src, 0, 1);
         memcpy(&results[i * vector_dim], src, vector_bytes);
     }
+#endif
 
     global_ub_client->total_requests += num_indices;
     return C_OK;

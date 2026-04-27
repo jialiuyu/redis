@@ -452,6 +452,7 @@ persist-settings: distclean
 	echo PREV_FINAL_CFLAGS=$(FINAL_CFLAGS) >> .make-settings
 	echo PREV_FINAL_LDFLAGS=$(FINAL_LDFLAGS) >> .make-settings
 	echo USE_SVE2=$(USE_SVE2) >> .make-settings
+	echo USE_SVE=$(USE_SVE) >> .make-settings
 	echo USE_LSE=$(USE_LSE) >> .make-settings
 	echo USE_F32MM=$(USE_F32MM) >> .make-settings
 	echo USE_NPU=$(USE_NPU) >> .make-settings
