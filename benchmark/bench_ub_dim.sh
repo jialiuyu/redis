@@ -3,12 +3,13 @@
 #
 # 用法:
 #   ./bench_ub_dim.sh write <dim> [shm_memid] [shm_size] [fill_rows]
-#   ./bench_ub_dim.sh read  <dim> [shm_memid] [shm_size] [fill_rows]
-#   ./bench_ub_dim.sh all   <dim> [shm_memid] [shm_size] [fill_rows]
+#   ./bench_ub_dim.sh read  <dim> [shm_memid] [shm_size] [fill_rows] [--no-mock]
+#   ./bench_ub_dim.sh all   <dim> [shm_memid] [shm_size] [fill_rows] [--no-mock]
 #
 # 示例:
 #   节点 111:  ./bench_ub_dim.sh write 128 5 8G 1024
-#   节点 112:  ./bench_ub_dim.sh read  128 5 8G 1024
+#   节点 112:  ./bench_ub_dim.sh read  128 5 8G 1024           # UB.MEM + mock 对比
+#   节点 112:  ./bench_ub_dim.sh read  128 5 8G 1024 --no-mock # 只显示 UB.MEM
 #   单节点:    ./bench_ub_dim.sh all   128 5 8G 1024
 #
 #   多 dim 扫描:
@@ -19,7 +20,13 @@ DIM=${2:-128}
 SHM_MEMID=${3:-5}
 SHM_SIZE=${4:-8G}
 FILL_ROWS=${5:-1024}
+SHOW_MOCK=yes   # set to 'no' via --no-mock to skip local baseline
 UT=./ub_client_ut
+
+# parse optional --no-mock flag anywhere in args
+for arg in "$@"; do
+    [ "$arg" = "--no-mock" ] && SHOW_MOCK=no
+done
 
 if [ ! -x "$UT" ]; then
     echo "ERROR: $UT not found, run: make ub_client_ut [USE_SVE=yes]"
@@ -101,20 +108,22 @@ do_read() {
     parse_gather_output "$output"
 
     # --- mock 本地内存对比（排除 UB 链路，测纯 gather_load 基线）---
-    echo ""
-    echo "[ local mock (baseline, no UB) ]"
-    output_mock=$($UT gather \
-        --shm-memid "$SHM_MEMID" \
-        --shm-size  "$SHM_SIZE" \
-        --vector-dimension "$DIM" \
-        --table-name ut_vectors \
-        --gather-indices all \
-        --fill-rows "$FILL_ROWS" \
-        --cacheable false \
-        --use-ownership false \
-        --mock-local \
-        --verify 2>&1)
-    parse_gather_output "$output_mock"
+    if [ "$SHOW_MOCK" = "yes" ]; then
+        echo ""
+        echo "[ local mock (baseline, no UB) ]"
+        output_mock=$($UT gather \
+            --shm-memid "$SHM_MEMID" \
+            --shm-size  "$SHM_SIZE" \
+            --vector-dimension "$DIM" \
+            --table-name ut_vectors \
+            --gather-indices all \
+            --fill-rows "$FILL_ROWS" \
+            --cacheable false \
+            --use-ownership false \
+            --mock-local \
+            --verify 2>&1)
+        parse_gather_output "$output_mock"
+    fi
 
     echo "========================================================"
 }
