@@ -470,14 +470,12 @@ static int run_write_fixture(const ub_ut_options_t *opts)
 
     table_base = (unsigned char *)mapping + opts->table_offset;
     fill_fixture_vectors((float *)table_base, rows, opts->vector_dimension, stride);
-    if (fsync(fd) != 0) {
-        ut_log("fsync failed: %s", strerror(errno));
-        if (opts->cacheable && opts->use_ownership) {
-            (void)maybe_set_ownership(opts, fd, mapping, mapping_size, PROT_NONE);
-        }
-        munmap(mapping, mapping_size);
-        close(fd);
-        return 1;
+
+    /* Flush written data. msync works on mmap regions; fsync may fail on
+     * device files (e.g. OBMM shmdev returns EINVAL), so treat it as
+     * non-fatal. */
+    if (msync(mapping, mapping_size, MS_SYNC) != 0) {
+        ut_log("warning: msync failed: %s (non-fatal)", strerror(errno));
     }
 
     if (opts->cacheable && opts->use_ownership) {
