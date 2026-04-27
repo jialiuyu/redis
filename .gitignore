@@ -197,3 +197,5 @@ compile_commands.json
 OBMM_QUICK_VALIDATION.md
 FABRIC_UB_MEM_DESIGN_GAPS.md
 benchmark/ARCHITECTURE_DEEP_DIVE.md
+benchmark/read_output.txt
+benchmark/write_output.txt

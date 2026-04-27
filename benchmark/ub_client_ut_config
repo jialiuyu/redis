@@ -35,27 +35,29 @@
 #
 # 步骤 2: 节点 111（写端）— 向共享内存写入 fixture 数据
 #
-./benchmark/ub_client_ut write-fixture \
-  --shm-memid <obmmctl_memid> \
-  --shm-size 4M \
+./ub_client_ut write-fixture \
+  --shm-memid 5 \
+  --shm-size 8G \
   --vector-dimension 128 \
-  --fill-rows 1024 \
-  --cacheable yes \
-  --use-ownership yes
+  --fill-rows 1024       \
+  --cacheable false      \
+  --use-ownership false
 
 #
 # 步骤 3: 节点 112（读端）— 通过 UB 链路 gather 指定行并验证
 #
-./benchmark/ub_client_ut gather \
-  --shm-memid <obmmctl_memid> \
-  --shm-size 4M \
+./ub_client_ut gather \
+  --shm-memid 1 \
+  --shm-size 8G \
   --vector-dimension 128 \
   --table-name ut_vectors \
-  --gather-indices 0,1,7,42,1023 \
-  --cacheable yes \
-  --use-ownership yes \
+  --gather-indices all \
+  --fill-rows 1024 \
+  --cacheable false \
+  --use-ownership false \
   --verify \
-  --verbose
+  --verbose > read_output.txt 2>&1
+
 
 # ============================================================
 # 其他模式
