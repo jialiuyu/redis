@@ -43,6 +43,10 @@
   --cacheable false      \
   --use-ownership false
 
+
+  ./bench_ub_dim.sh write 5 8G 1024 
+  ./bench_ub_dim.sh read  1 8G 1024
+
 #
 # 步骤 3: 节点 112（读端）— 通过 UB 链路 gather 指定行并验证
 #

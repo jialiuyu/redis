@@ -719,13 +719,11 @@ static int run_gather(const ub_ut_options_t *opts)
         goto out;
     }
 
-    /* --- timed section: UB.MEM read (mmap setup + gather load) --- */
+    /* --- timed: only ub_client_perform_gather_load --- */
     {
-        struct timespec t_ub0, t0, t1, t2;
-        double ub_mem_us, load_us, total_us;
+        struct timespec t0, t1;
+        double load_us;
         size_t total_bytes = num_indices * opts->vector_dimension * sizeof(float);
-
-        clock_gettime(CLOCK_MONOTONIC, &t_ub0);
 
         if (ub_client_load_embedding_table(opts->table_name, &addr_space) != 0 ||
             addr_space == NULL) {
@@ -735,7 +733,6 @@ static int run_gather(const ub_ut_options_t *opts)
         }
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
-
         if (ub_client_perform_gather_load(addr_space,
                                           indices,
                                           num_indices,
@@ -745,7 +742,6 @@ static int run_gather(const ub_ut_options_t *opts)
             ub_client_cleanup();
             goto out;
         }
-
         clock_gettime(CLOCK_MONOTONIC, &t1);
         load_us = elapsed_us(&t0, &t1);
 
@@ -770,10 +766,6 @@ static int run_gather(const ub_ut_options_t *opts)
             }
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &t2);
-        ub_mem_us = elapsed_us(&t_ub0, &t1);
-        total_us = elapsed_us(&t_ub0, &t2);
-
         if (rc == 0) {
             sds stats = ub_client_get_stats();
             ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
@@ -784,15 +776,13 @@ static int run_gather(const ub_ut_options_t *opts)
             ut_log("  method      : scalar memcpy");
             ut_log("  memcpy      : %.1f us (%.3f ms)", load_us, load_us / 1e3);
 #endif
-            ut_log("  UB.MEM read : %.1f us (%.3f ms)  [mmap setup + gather_load]",
-                   ub_mem_us, ub_mem_us / 1e3);
-            ut_log("  total       : %.1f us (%.3f ms)  [UB.MEM + verify + print]",
-                   total_us, total_us / 1e3);
             ut_log("  data        : %zu bytes (%.2f MB)",
                    total_bytes, (double)total_bytes / (1024.0 * 1024.0));
             if (load_us > 0) {
-                double bw_mbs = (double)total_bytes / load_us; /* bytes/us = MB/s */
+                double bw_mbs = (double)total_bytes / load_us;
+                double per_row_us = load_us / (double)num_indices;
                 ut_log("  throughput  : %.1f MB/s", bw_mbs);
+                ut_log("  per row     : %.3f us / row  (%zu rows)", per_row_us, num_indices);
             }
             if (opts->verbose && stats) {
                 ut_log("%s", stats);
