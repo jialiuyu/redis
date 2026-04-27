@@ -5,6 +5,10 @@
 # 编译
 # ============================================================
 #
+# 注意: ub_client_ut 以 standalone 模式编译 ub_client.c（-DUB_CLIENT_STANDALONE），
+# 不依赖 server.h / lua / hiredis 等 redis-server 内部头文件。
+# ut 自身提供 serverLog、zcalloc、zfree、sds 等函数的 stub 实现。
+#
 # 基础编译（无 OBMM ownership，无 SVE）:
 #   make -C benchmark ub_client_ut
 #

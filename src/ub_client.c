@@ -5,7 +5,27 @@
  */
 
 #include "ub_client.h"
+
+#ifdef UB_CLIENT_STANDALONE
+/* Minimal declarations when building outside redis-server */
+#include <stdlib.h>
+#include <string.h>
+#define C_OK  0
+#define C_ERR -1
+#define LL_WARNING 3
+#define LL_NOTICE  2
+#define UNUSED(V) ((void)(V))
+typedef char *sds;
+extern void serverLog(int level, const char *fmt, ...);
+extern void *zcalloc(size_t size);
+extern void  zfree(void *ptr);
+extern sds   sdsempty(void);
+extern sds   sdsnew(const char *init);
+extern sds   sdscat(sds s, const char *t);
+extern sds   sdscatprintf(sds s, const char *fmt, ...);
+#else
 #include "server.h"
+#endif
 
 #include <ctype.h>
 #include <errno.h>
