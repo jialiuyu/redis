@@ -20,6 +20,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef USE_CC_MODE
@@ -626,6 +627,12 @@ static int run_read_verify(const ub_ut_options_t *opts)
     return 0;
 }
 
+static double elapsed_us(const struct timespec *start, const struct timespec *end)
+{
+    return (double)(end->tv_sec - start->tv_sec) * 1e6 +
+           (double)(end->tv_nsec - start->tv_nsec) / 1e3;
+}
+
 /*
  * gather mode: parse a comma-separated list of row indices, call
  * ub_client_perform_gather_load for all of them in one shot, then
@@ -719,44 +726,73 @@ static int run_gather(const ub_ut_options_t *opts)
         goto out;
     }
 
-    if (ub_client_perform_gather_load(addr_space,
-                                      indices,
-                                      num_indices,
-                                      results,
-                                      opts->vector_dimension) != 0) {
-        ut_log("ub_client_perform_gather_load failed");
-        ub_client_cleanup();
-        goto out;
-    }
+    /* --- timed section: gather load --- */
+    {
+        struct timespec t0, t1, t2;
+        double load_us, total_us;
+        size_t total_bytes = num_indices * opts->vector_dimension * sizeof(float);
 
-    /* Print and optionally verify each row */
-    rc = 0;
-    for (i = 0; i < num_indices; i++) {
-        uint64_t row = indices[i];
-        const float *vec = results + i * opts->vector_dimension;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        if (opts->verbose) {
-            fprintf(stdout, "row=%" PRIu64 " [", row);
-            for (size_t d = 0; d < opts->vector_dimension; d++) {
-                fprintf(stdout, "%s%.1f", d ? ", " : "", vec[d]);
+        if (ub_client_perform_gather_load(addr_space,
+                                          indices,
+                                          num_indices,
+                                          results,
+                                          opts->vector_dimension) != 0) {
+            ut_log("ub_client_perform_gather_load failed");
+            ub_client_cleanup();
+            goto out;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        load_us = elapsed_us(&t0, &t1);
+
+        /* Print and optionally verify each row */
+        rc = 0;
+        for (i = 0; i < num_indices; i++) {
+            uint64_t row = indices[i];
+            const float *vec = results + i * opts->vector_dimension;
+
+            if (opts->verbose) {
+                fprintf(stdout, "row=%" PRIu64 " [", row);
+                for (size_t d = 0; d < opts->vector_dimension; d++) {
+                    fprintf(stdout, "%s%.1f", d ? ", " : "", vec[d]);
+                }
+                fprintf(stdout, "]\n");
             }
-            fprintf(stdout, "]\n");
-        }
 
-        if (opts->verify) {
-            if (verify_vector_row(row, vec, opts->vector_dimension) != 0) {
-                rc = 1;
+            if (opts->verify) {
+                if (verify_vector_row(row, vec, opts->vector_dimension) != 0) {
+                    rc = 1;
+                }
             }
         }
-    }
 
-    if (rc == 0) {
-        sds stats = ub_client_get_stats();
-        ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
-        if (opts->verbose && stats) {
-            ut_log("%s", stats);
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        total_us = elapsed_us(&t0, &t2);
+
+        if (rc == 0) {
+            sds stats = ub_client_get_stats();
+            ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
+#ifdef USE_SVE
+            ut_log("  method: SVE gather-load (sve1 contiguous ld1w/st1w)");
+#else
+            ut_log("  method: scalar memcpy");
+#endif
+            ut_log("  gather_load : %.1f us (%.3f ms)", load_us, load_us / 1e3);
+            ut_log("  total       : %.1f us (%.3f ms)  [includes verify+print]",
+                   total_us, total_us / 1e3);
+            ut_log("  data        : %zu bytes (%.2f MB)",
+                   total_bytes, (double)total_bytes / (1024.0 * 1024.0));
+            if (load_us > 0) {
+                double bw_mbs = (double)total_bytes / load_us; /* bytes/us = MB/s */
+                ut_log("  throughput  : %.1f MB/s", bw_mbs);
+            }
+            if (opts->verbose && stats) {
+                ut_log("%s", stats);
+            }
+            free(stats);
         }
-        free(stats);
     }
 
     ub_client_cleanup();
