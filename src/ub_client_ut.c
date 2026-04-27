@@ -9,7 +9,6 @@
 #include "ub_client.h"
 
 #include <errno.h>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -23,13 +22,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef int (*obmm_set_ownership_func)(int fd, void *start, void *end, int prot);
+#ifdef USE_CC_MODE
+#include "obmm_ownership.h"
+#endif
 
 typedef enum {
     UB_UT_MODE_NONE = 0,
     UB_UT_MODE_SELFTEST,
     UB_UT_MODE_WRITE_FIXTURE,
     UB_UT_MODE_READ_VERIFY,
+    UB_UT_MODE_GATHER,
 } ub_ut_mode_t;
 
 typedef struct {
@@ -44,11 +46,14 @@ typedef struct {
     size_t fill_rows;
     const char *table_name;
     const char *element;
+    /* comma-separated list of indices for gather mode */
+    const char *gather_indices_str;
     ub_element_index_mode_t resolver_mode;
     uint64_t expected_index;
     int has_expected_index;
     int cacheable;
     int use_ownership;
+    int verify;   /* for gather mode: check values against write-fixture pattern */
     int verbose;
 } ub_ut_options_t;
 
@@ -62,7 +67,7 @@ static void ut_log(const char *fmt, ...)
     va_end(ap);
 }
 
-void _serverLog(int level, const char *fmt, ...)
+void serverLog(int level, const char *fmt, ...)
 {
     va_list ap;
 
@@ -162,16 +167,26 @@ static void usage(const char *prog)
     fprintf(stderr,
             "Usage:\n"
             "  %s selftest\n"
-            "  %s write-fixture --shm-path <path>|--shm-memid <id> --vector-dimension <n> "
-            "[--fill-rows <n>] [--shm-size <bytes>] [--table-offset <bytes>] "
-            "[--table-size <bytes>] [--vector-stride-bytes <bytes>] "
-            "[--cacheable yes|no] [--use-ownership yes|no]\n"
-            "  %s read-verify --table-name <name> --element <name> "
-            "--shm-path <path>|--shm-memid <id> --vector-dimension <n> "
-            "[--expected-index <n>] [--resolver numeric|suffix-numeric|hash] "
-            "[--shm-size <bytes>] [--table-offset <bytes>] [--table-size <bytes>] "
-            "[--vector-stride-bytes <bytes>] [--cacheable yes|no] [--use-ownership yes|no]\n",
-            prog, prog, prog);
+            "  %s write-fixture --shm-path <path>|--shm-memid <id> --vector-dimension <n>\n"
+            "      [--fill-rows <n>] [--shm-size <bytes>] [--table-offset <bytes>]\n"
+            "      [--table-size <bytes>] [--vector-stride-bytes <bytes>]\n"
+            "      [--cacheable yes|no] [--use-ownership yes|no]\n"
+            "  %s read-verify --table-name <name> --element <name>\n"
+            "      --shm-path <path>|--shm-memid <id> --vector-dimension <n>\n"
+            "      [--expected-index <n>] [--resolver numeric|suffix-numeric|hash]\n"
+            "      [--shm-size <bytes>] [--table-offset <bytes>] [--table-size <bytes>]\n"
+            "      [--vector-stride-bytes <bytes>] [--cacheable yes|no] [--use-ownership yes|no]\n"
+            "  %s gather --table-name <name> --gather-indices <i0,i1,...>\n"
+            "      --shm-path <path>|--shm-memid <id> --vector-dimension <n>\n"
+            "      [--shm-size <bytes>] [--table-offset <bytes>] [--table-size <bytes>]\n"
+            "      [--vector-stride-bytes <bytes>] [--cacheable yes|no] [--use-ownership yes|no]\n"
+            "      [--verify] [--verbose]\n"
+            "\n"
+            "  gather mode: reads the specified row indices via ub_client_perform_gather_load\n"
+            "  and prints each vector. With --verify, checks values against the write-fixture\n"
+            "  pattern (row*1000+col). Use on the reader node (111 or 112) after write-fixture\n"
+            "  has been run on the writer node.\n",
+            prog, prog, prog, prog);
 }
 
 static int parse_yesno(const char *text, int *value)
@@ -340,24 +355,6 @@ static void fill_fixture_vectors(float *table,
     }
 }
 
-static int load_obmm_ownership(obmm_set_ownership_func *func)
-{
-    void *handle;
-
-    *func = NULL;
-    handle = dlopen("libobmm.so", RTLD_LAZY);
-    if (handle == NULL) {
-        return -1;
-    }
-
-    *func = (obmm_set_ownership_func)dlsym(handle, "obmm_set_ownership");
-    if (*func == NULL) {
-        dlclose(handle);
-        return -1;
-    }
-    return 0;
-}
-
 static int map_existing_region(const ub_ut_options_t *opts,
                                int write_access,
                                int *fd_out,
@@ -410,20 +407,20 @@ static int maybe_set_ownership(const ub_ut_options_t *opts,
                                size_t mapping_size,
                                int prot)
 {
-    obmm_set_ownership_func func = NULL;
-
     if (!opts->cacheable || !opts->use_ownership) {
         return 0;
     }
-    if (load_obmm_ownership(&func) != 0 || func == NULL) {
-        ut_log("libobmm.so / obmm_set_ownership unavailable");
-        return -1;
-    }
-    if (func(fd, mapping, (char *)mapping + mapping_size, prot) != 0) {
+#ifdef USE_CC_MODE
+    if (obmm_set_ownership(fd, mapping, (char *)mapping + mapping_size, prot) != 0) {
         ut_log("obmm_set_ownership failed: %s", strerror(errno));
         return -1;
     }
     return 0;
+#else
+    (void)fd; (void)mapping; (void)mapping_size; (void)prot;
+    ut_log("ownership control requires USE_CC_MODE=yes at build time");
+    return -1;
+#endif
 }
 
 static void build_ub_config(const ub_ut_options_t *opts, ub_mem_config_t *cfg)
@@ -619,6 +616,124 @@ static int run_read_verify(const ub_ut_options_t *opts)
     return 0;
 }
 
+/*
+ * gather mode: parse a comma-separated list of row indices, call
+ * ub_client_perform_gather_load for all of them in one shot, then
+ * print (and optionally verify) each result vector.
+ *
+ * Node 111 (writer): run write-fixture to stamp the shared memory.
+ * Node 112 (reader): run gather to pull rows via the UB link.
+ */
+static int run_gather(const ub_ut_options_t *opts)
+{
+    ub_mem_config_t cfg;
+    ub_address_space_t *addr_space = NULL;
+    uint64_t *indices = NULL;
+    float *results = NULL;
+    size_t num_indices = 0;
+    size_t i;
+    int rc = 1;
+
+    if (opts->table_name == NULL || opts->gather_indices_str == NULL ||
+        opts->vector_dimension == 0) {
+        ut_log("gather requires --table-name, --gather-indices, --vector-dimension");
+        return 1;
+    }
+
+    /* Count and parse comma-separated indices */
+    {
+        const char *p = opts->gather_indices_str;
+        num_indices = 1;
+        while (*p) {
+            if (*p++ == ',') num_indices++;
+        }
+        indices = calloc(num_indices, sizeof(uint64_t));
+        if (!indices) {
+            ut_log("OOM allocating indices");
+            return 1;
+        }
+        p = opts->gather_indices_str;
+        for (i = 0; i < num_indices; i++) {
+            char *end;
+            errno = 0;
+            indices[i] = strtoull(p, &end, 10);
+            if (errno != 0 || end == p) {
+                ut_log("invalid index at position %zu in '%s'", i, opts->gather_indices_str);
+                free(indices);
+                return 1;
+            }
+            p = (*end == ',') ? end + 1 : end;
+        }
+    }
+
+    results = calloc(num_indices * opts->vector_dimension, sizeof(float));
+    if (!results) {
+        ut_log("OOM allocating results");
+        free(indices);
+        return 1;
+    }
+
+    build_ub_config(opts, &cfg);
+
+    if (ub_client_init(&cfg) != 0) {
+        ut_log("ub_client_init failed");
+        goto out;
+    }
+
+    if (ub_client_load_embedding_table(opts->table_name, &addr_space) != 0 ||
+        addr_space == NULL) {
+        ut_log("ub_client_load_embedding_table failed");
+        ub_client_cleanup();
+        goto out;
+    }
+
+    if (ub_client_perform_gather_load(addr_space,
+                                      indices,
+                                      num_indices,
+                                      results,
+                                      opts->vector_dimension) != 0) {
+        ut_log("ub_client_perform_gather_load failed");
+        ub_client_cleanup();
+        goto out;
+    }
+
+    /* Print and optionally verify each row */
+    rc = 0;
+    for (i = 0; i < num_indices; i++) {
+        uint64_t row = indices[i];
+        const float *vec = results + i * opts->vector_dimension;
+
+        if (opts->verbose) {
+            fprintf(stdout, "row=%" PRIu64 " [", row);
+            for (size_t d = 0; d < opts->vector_dimension; d++) {
+                fprintf(stdout, "%s%.1f", d ? ", " : "", vec[d]);
+            }
+            fprintf(stdout, "]\n");
+        }
+
+        if (opts->verify) {
+            if (verify_vector_row(row, vec, opts->vector_dimension) != 0) {
+                rc = 1;
+            }
+        }
+    }
+
+    if (rc == 0) {
+        sds stats = ub_client_get_stats();
+        ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
+        if (opts->verbose && stats) {
+            ut_log("%s", stats);
+        }
+        free(stats);
+    }
+
+    ub_client_cleanup();
+out:
+    free(results);
+    free(indices);
+    return rc;
+}
+
 static int run_selftest(void)
 {
     ub_ut_options_t opts;
@@ -704,6 +819,10 @@ static int parse_mode(const char *text, ub_ut_mode_t *mode)
         *mode = UB_UT_MODE_READ_VERIFY;
         return 0;
     }
+    if (!strcmp(text, "gather")) {
+        *mode = UB_UT_MODE_GATHER;
+        return 0;
+    }
     return -1;
 }
 
@@ -720,10 +839,12 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
         {"fill-rows", required_argument, NULL, 'r'},
         {"table-name", required_argument, NULL, 'n'},
         {"element", required_argument, NULL, 'e'},
+        {"gather-indices", required_argument, NULL, 'g'},
         {"expected-index", required_argument, NULL, 'i'},
         {"resolver", required_argument, NULL, 'R'},
         {"cacheable", required_argument, NULL, 'c'},
         {"use-ownership", required_argument, NULL, 'u'},
+        {"verify", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
@@ -745,7 +866,7 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
     }
 
     optind = 2;
-    while ((ch = getopt_long(argc, argv, "p:m:s:o:t:S:d:r:n:e:i:R:c:u:vh",
+    while ((ch = getopt_long(argc, argv, "p:m:s:o:t:S:d:r:n:e:g:i:R:c:u:Vvh",
                              long_opts, NULL)) != -1) {
         switch (ch) {
         case 'p':
@@ -799,6 +920,9 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
         case 'e':
             opts->element = optarg;
             break;
+        case 'g':
+            opts->gather_indices_str = optarg;
+            break;
         case 'i':
             if (parse_u64_arg(optarg, &tmp_u64) != 0) {
                 return -1;
@@ -822,6 +946,9 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
                 return -1;
             }
             opts->use_ownership = tmp_bool;
+            break;
+        case 'V':
+            opts->verify = 1;
             break;
         case 'v':
             opts->verbose = 1;
@@ -856,6 +983,13 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
         if (opts->table_size == 0 && opts->shm_size > opts->table_offset) {
             opts->table_size = opts->shm_size - opts->table_offset;
         }
+    } else if (opts->mode == UB_UT_MODE_GATHER) {
+        if (opts->gather_indices_str == NULL) {
+            return -1;
+        }
+        if (opts->table_size == 0 && opts->shm_size > opts->table_offset) {
+            opts->table_size = opts->shm_size - opts->table_offset;
+        }
     }
 
     return 0;
@@ -878,6 +1012,8 @@ int main(int argc, char **argv)
         return run_write_fixture(&opts);
     case UB_UT_MODE_READ_VERIFY:
         return run_read_verify(&opts);
+    case UB_UT_MODE_GATHER:
+        return run_gather(&opts);
     default:
         usage(argv[0]);
         return 1;
