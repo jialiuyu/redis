@@ -1,3 +1,26 @@
+# Build output directory
+output/
+
+# Build metadata
+.make-*
+.nfs*
+
+# Dependency build artifacts (built in-place, copied to output/deps/)
+deps/**/*.o
+deps/**/*.a
+deps/**/*.so
+deps/**/*.d
+deps/xxhash/cachedObjs/
+
+# Source build artifacts (should all go to output/src/, but just in case)
+src/*.o
+src/*.d
+src/*.so
+
+# Test module build artifacts
+tests/modules/*.xo
+tests/modules/*.so
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -199,3 +222,5 @@ FABRIC_UB_MEM_DESIGN_GAPS.md
 benchmark/ARCHITECTURE_DEEP_DIVE.md
 benchmark/read_output.txt
 benchmark/write_output.txt
+AGENTS.md
+.agents/

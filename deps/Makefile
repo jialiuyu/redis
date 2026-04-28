@@ -16,6 +16,9 @@ DEPS_CFLAGS := $(CFLAGS)
 DEPS_LDFLAGS := $(LDFLAGS)
 CLANG := $(findstring clang,$(shell sh -c '$(CC) --version | head -1'))
 
+# Output directory for dependency artifacts
+OUT_DIR := ../output/deps
+
 # MSan looks for errors related to uninitialized memory.
 # Make sure to build the dependencies with MSan as it needs all the code to be instrumented.
 # A library could be used to initialize memory but if it's not build with --fsanitize=memory then
@@ -63,6 +66,7 @@ distclean:
 	-(cd xxhash && $(MAKE) clean) > /dev/null || true
 	-(cd libobmm && $(MAKE) clean) > /dev/null || true
 	-(rm -f .make-*)
+	rm -rf $(OUT_DIR)
 
 .PHONY: distclean
 
@@ -70,35 +74,47 @@ ifneq (,$(filter $(BUILD_TLS),yes module))
     HIREDIS_MAKE_FLAGS = USE_SSL=1
 endif
 
+# Helper: copy built artifacts to output directory
+define COPY_DEP_ARTIFACT
+	@mkdir -p $(OUT_DIR)/$(1)
+	@cp -f $(2) $(OUT_DIR)/$(1)/
+endef
+
 # Special care is needed to pass additional CFLAGS/LDFLAGS to hiredis as it
 # modifies these variables in its Makefile.
 hiredis: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd hiredis && $(MAKE) static $(HIREDIS_MAKE_FLAGS) HIREDIS_CFLAGS="$(DEPS_CFLAGS)" HIREDIS_LDFLAGS="$(DEPS_LDFLAGS)"
+	$(call COPY_DEP_ARTIFACT,hiredis,hiredis/libhiredis.a)
+	$(if $(filter yes,$(BUILD_TLS)),$(call COPY_DEP_ARTIFACT,hiredis,hiredis/libhiredis_ssl.a))
 
 .PHONY: hiredis
 
 linenoise: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd linenoise && $(MAKE) CFLAGS="$(DEPS_CFLAGS)" LDFLAGS="$(DEPS_LDFLAGS)"
+	$(call COPY_DEP_ARTIFACT,linenoise,linenoise/linenoise.o)
 
 .PHONY: linenoise
 
 hdr_histogram: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd hdr_histogram && $(MAKE) CFLAGS="$(DEPS_CFLAGS)" LDFLAGS="$(DEPS_LDFLAGS)"
+	$(call COPY_DEP_ARTIFACT,hdr_histogram,hdr_histogram/libhdrhistogram.a)
 
 .PHONY: hdr_histogram
 
 fpconv: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd fpconv && $(MAKE) CFLAGS="$(DEPS_CFLAGS)" LDFLAGS="$(DEPS_LDFLAGS)"
+	$(call COPY_DEP_ARTIFACT,fpconv,fpconv/libfpconv.a)
 
 .PHONY: fpconv
 
 fast_float: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd fast_float && $(MAKE) libfast_float CFLAGS="$(DEPS_CFLAGS)" LDFLAGS="$(DEPS_LDFLAGS)"
+	$(call COPY_DEP_ARTIFACT,fast_float,fast_float/libfast_float.a)
 
 .PHONY: fast_float
 
@@ -106,6 +122,7 @@ XXHASH_CFLAGS = -fPIC $(DEPS_CFLAGS)
 xxhash: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd xxhash && $(MAKE) lib CFLAGS="$(XXHASH_CFLAGS)" LDFLAGS="$(DEPS_LDFLAGS)"
+	$(call COPY_DEP_ARTIFACT,xxhash,xxhash/libxxhash.a)
 .PHONY: xxhash
 
 ifeq ($(uname_S),SunOS)
@@ -118,7 +135,7 @@ LUA_LDFLAGS+= $(DEPS_LDFLAGS)
 ifeq ($(LUA_DEBUG),yes)
 	LUA_CFLAGS+= -O0 -g -DLUA_USE_APICHECK
 else
-	LUA_CFLAGS+= -O2 
+	LUA_CFLAGS+= -O2
 endif
 ifeq ($(LUA_COVERAGE),yes)
 	LUA_CFLAGS += -fprofile-arcs -ftest-coverage
@@ -126,14 +143,15 @@ ifeq ($(LUA_COVERAGE),yes)
 endif
 
 # lua's Makefile defines AR="ar rcu", which is unusual, and makes it more
-# challenging to cross-compile lua (and redis).  These defines make it easier
-# to fit redis into cross-compilation environments, which typically set AR.
+# challenging to cross-compile lua (and redis).  These defines make it easier to
+# fit redis into cross-compilation environments, which typically set AR.
 AR=ar
 ARFLAGS=rc
 
 lua: .make-prerequisites
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd lua/src && $(MAKE) all CFLAGS="$(LUA_CFLAGS)" MYLDFLAGS="$(LUA_LDFLAGS)" AR="$(AR) $(ARFLAGS)"
+	$(call COPY_DEP_ARTIFACT,lua,lua/src/liblua.a)
 
 .PHONY: lua
 

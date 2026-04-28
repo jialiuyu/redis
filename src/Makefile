@@ -21,6 +21,9 @@ uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 uname_M := $(shell sh -c 'uname -m 2>/dev/null || echo not')
 CLANG := $(findstring clang,$(shell sh -c '$(CC) --version | head -1'))
 
+# Build output directory
+OUT_DIR := ../output/src
+
 # Optimization flags. To override, the OPTIMIZATION variable can be passed, but
 # some automatic defaults are added to it. To specify optimization flags
 # explicitly without any defaults added, pass the OPT variable instead.
@@ -284,6 +287,21 @@ endif
 # Include paths to dependencies
 FINAL_CFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash
 
+	# Dependency library paths (redirected to output/deps/)
+	DEPS_OUT_DIR := ../output/deps
+	DEP_LIB_HIREDIS := $(DEPS_OUT_DIR)/hiredis/libhiredis.a
+	DEP_LIB_LUA := $(DEPS_OUT_DIR)/lua/liblua.a
+	DEP_LIB_HDR := $(DEPS_OUT_DIR)/hdr_histogram/libhdrhistogram.a
+	DEP_LIB_FPCONV := $(DEPS_OUT_DIR)/fpconv/libfpconv.a
+	DEP_LIB_FAST_FLOAT := $(DEPS_OUT_DIR)/fast_float/libfast_float.a
+	DEP_LIB_XXHASH := $(DEPS_OUT_DIR)/xxhash/libxxhash.a
+	DEP_OBJ_LINENOISE := $(DEPS_OUT_DIR)/linenoise/linenoise.o
+	ifeq ($(MALLOC),jemalloc)
+		DEP_LIB_JEMALLOC := ../deps/jemalloc/lib/libjemalloc.a
+	else
+		DEP_LIB_JEMALLOC :=
+	endif
+
 # Determine systemd support and/or build preference (defaulting to auto-detection)
 BUILD_WITH_SYSTEMD=no
 LIBSYSTEMD_LIBS=-lsystemd
@@ -324,7 +342,7 @@ endif
 ifeq ($(MALLOC),jemalloc)
 	DEPENDENCY_TARGETS+= jemalloc
 	FINAL_CFLAGS+= -DUSE_JEMALLOC -I../deps/jemalloc/include
-	FINAL_LIBS := ../deps/jemalloc/lib/libjemalloc.a $(FINAL_LIBS)
+	FINAL_LIBS := $(DEP_LIB_JEMALLOC) $(FINAL_LIBS)
 endif
 
 # LIBSSL & LIBCRYPTO
@@ -349,7 +367,7 @@ BUILD_MODULE:=2
 ifeq ($(BUILD_TLS),yes)
 	FINAL_CFLAGS+=-DUSE_OPENSSL=$(BUILD_YES) $(OPENSSL_CFLAGS) -DBUILD_TLS_MODULE=$(BUILD_NO)
 	FINAL_LDFLAGS+=$(OPENSSL_LDFLAGS)
-	FINAL_LIBS += ../deps/hiredis/libhiredis_ssl.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)
+	FINAL_LIBS += $(DEPS_OUT_DIR)/hiredis/libhiredis_ssl.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)
 endif
 
 TLS_MODULE=
@@ -357,7 +375,7 @@ TLS_MODULE_NAME:=redis-tls$(PROG_SUFFIX).so
 TLS_MODULE_CFLAGS:=$(FINAL_CFLAGS)
 ifeq ($(BUILD_TLS),module)
 	FINAL_CFLAGS+=-DUSE_OPENSSL=$(BUILD_MODULE) $(OPENSSL_CFLAGS)
-	TLS_CLIENT_LIBS = ../deps/hiredis/libhiredis_ssl.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)
+	TLS_CLIENT_LIBS = $(DEPS_OUT_DIR)/hiredis/libhiredis_ssl.a $(LIBSSL_LIBS) $(LIBCRYPTO_LIBS)
 	TLS_MODULE=$(TLS_MODULE_NAME)
 	TLS_MODULE_CFLAGS+=-DUSE_OPENSSL=$(BUILD_MODULE) $(OPENSSL_CFLAGS) -DBUILD_TLS_MODULE=$(BUILD_MODULE)
 endif
@@ -405,17 +423,23 @@ else
 	GEN_COMMANDS_FLAGS=
 endif
 
-REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
-REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
+REDIS_SERVER_NAME=$(OUT_DIR)/redis-server$(PROG_SUFFIX)
+REDIS_SENTINEL_NAME=$(OUT_DIR)/redis-sentinel$(PROG_SUFFIX)
 REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o vector_engine.o ub_client.o sve_compute.o batch_processor.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
-REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
+REDIS_CLI_NAME=$(OUT_DIR)/redis-cli$(PROG_SUFFIX)
 REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
-REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
+REDIS_BENCHMARK_NAME=$(OUT_DIR)/redis-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
-REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
-REDIS_CHECK_AOF_NAME=redis-check-aof$(PROG_SUFFIX)
+REDIS_CHECK_RDB_NAME=$(OUT_DIR)/redis-check-rdb$(PROG_SUFFIX)
+REDIS_CHECK_AOF_NAME=$(OUT_DIR)/redis-check-aof$(PROG_SUFFIX)
 ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
+
+# Output-prefixed object lists for linking
+REDIS_SERVER_OBJ_OUT=$(addprefix $(OUT_DIR)/,$(REDIS_SERVER_OBJ))
+REDIS_VEC_SETS_OBJ_OUT=$(addprefix $(OUT_DIR)/,$(REDIS_VEC_SETS_OBJ))
+REDIS_CLI_OBJ_OUT=$(addprefix $(OUT_DIR)/,$(REDIS_CLI_OBJ))
+REDIS_BENCHMARK_OBJ_OUT=$(addprefix $(OUT_DIR)/,$(REDIS_BENCHMARK_OBJ))
 
 all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(TLS_MODULE) module_tests
 	@echo ""
@@ -475,8 +499,9 @@ ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 endif
 
 # redis-server
-$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/fast_float/libfast_float.a ../deps/xxhash/libxxhash.a $(FINAL_LIBS)
+$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ_OUT) $(REDIS_VEC_SETS_OBJ_OUT)
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_LD) -o $@ $^ $(DEP_LIB_HIREDIS) $(DEP_LIB_LUA) $(DEP_LIB_HDR) $(DEP_LIB_FPCONV) $(DEP_LIB_FAST_FLOAT) $(DEP_LIB_XXHASH) $(FINAL_LIBS)
 
 # redis-sentinel
 $(REDIS_SENTINEL_NAME): $(REDIS_SERVER_NAME)
@@ -492,24 +517,28 @@ $(REDIS_CHECK_AOF_NAME): $(REDIS_SERVER_NAME)
 
 # redis-tls.so
 $(TLS_MODULE_NAME): $(REDIS_SERVER_NAME)
-	$(QUIET_CC)$(CC) -o $@ tls.c -shared -fPIC $(TLS_MODULE_CFLAGS) $(TLS_CLIENT_LIBS)
+	@mkdir -p $(OUT_DIR)
+	$(QUIET_CC)$(CC) -o $(OUT_DIR)/$@ tls.c -shared -fPIC $(TLS_MODULE_CFLAGS) $(TLS_CLIENT_LIBS)
 
 # redis-cli
-$(REDIS_CLI_NAME): $(REDIS_CLI_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/linenoise/linenoise.o ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
+$(REDIS_CLI_NAME): $(REDIS_CLI_OBJ_OUT)
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_LD) -o $@ $^ $(DEP_LIB_HIREDIS) $(DEP_OBJ_LINENOISE) $(DEP_LIB_HDR) $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
 # redis-benchmark
-$(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
+$(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ_OUT)
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_LD) -o $@ $^ $(DEP_LIB_HIREDIS) $(DEP_LIB_HDR) $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
-DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_VEC_SETS_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
+DEP = $(addprefix $(OUT_DIR)/,$(REDIS_SERVER_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR)/,$(REDIS_VEC_SETS_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR)/,$(REDIS_CLI_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR)/,$(REDIS_BENCHMARK_OBJ:%.o=%.d))
 -include $(DEP)
 
 # Because the jemalloc.h header is generated as a part of the jemalloc build,
 # building it should complete before building any other object. Instead of
 # depending on a single artifact, build all dependencies first.
-%.o: %.c .make-prerequisites
-	$(REDIS_CC) -MMD -o $@ -c $<
+$(OUT_DIR)/%.o: %.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) -MMD -MF $(OUT_DIR)/$*.d -o $@ -c $<
 
 # The following files are checked in and don't normally need to be rebuilt. They
 # are built only if python is available and their prereqs are modified.
@@ -526,9 +555,9 @@ endif
 commands.c: $(COMMANDS_DEF_FILENAME).def
 
 clean:
-	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep *.so
-	rm -f $(DEP)
-	rm -f $(TLC_SERVERS)
+	rm -rf $(OUT_DIR)
+	rm -f Makefile.dep
+	rm -f $(TLC_SERVERS_OUT)
 	-(cd ../tests/modules && $(MAKE) clean)
 
 .PHONY: clean
@@ -547,7 +576,10 @@ distclean: clean
 
 TLC_SERVERS = \
     tlc_server tlc_unified_server tlc_aeron_server tlc_fc_server \
-    tlc_dpdk_server tlc_urma_server tlc_v10_server tlc_v13_server tlc_v14_server
+    tlc_dpdk_server tlc_v10_server tlc_v13_server tlc_v14_server \
+    tlc_v16_server
+TLC_SERVERS_OUT = $(addprefix $(OUT_DIR)/,$(TLC_SERVERS)) $(OUT_DIR)/tlc_urma_server
+TLC_SERVERS_PATTERN = $(addprefix $(OUT_DIR)/,$(TLC_SERVERS))
 
 # TLC Server compilation flags (always includes SVE2 + LSE)
 TLC_CFLAGS  = -O3 -std=c11 -pthread -I. -march=armv8.2-a+sve+lse -DUSE_SVE2 -DUSE_TLC $(filter -DUSE_NPU -I%,$(REDIS_CFLAGS))
@@ -557,35 +589,37 @@ TLC_LDFLAGS = -pthread -lm -lpthread $(filter -L% -l%,$(FINAL_LIBS))
 TLC_COMMON_DEPS = three_layer_cache_ub.c
 
 # Static pattern rule for all TLC servers
-$(TLC_SERVERS): %: %.c $(TLC_COMMON_DEPS)
+$(TLC_SERVERS_PATTERN): $(OUT_DIR)/%: %.c $(TLC_COMMON_DEPS)
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
+	@mkdir -p $(OUT_DIR)
 	$(CC) $(TLC_CFLAGS) -o $@ $< $(TLC_COMMON_DEPS) $(TLC_LDFLAGS)
 
 # Build liburma.so from urma.c
-liburma.so: urma.c urma.h
+$(OUT_DIR)/liburma.so: urma.c urma.h
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
+	@mkdir -p $(OUT_DIR)
 	$(CC) $(TLC_CFLAGS) -fPIC -shared -o $@ urma.c
 
 # tlc_urma_server links against liburma.so
-tlc_urma_server: tlc_urma_server.c liburma.so $(TLC_COMMON_DEPS)
+$(OUT_DIR)/tlc_urma_server: tlc_urma_server.c $(OUT_DIR)/liburma.so $(TLC_COMMON_DEPS)
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
-	$(CC) $(TLC_CFLAGS) -o $@ $< $(TLC_COMMON_DEPS) -L. -lurma -Wl,-rpath,'$$ORIGIN' $(TLC_LDFLAGS)
+	$(CC) $(TLC_CFLAGS) -o $@ $< $(TLC_COMMON_DEPS) -L$(OUT_DIR) -lurma -Wl,-rpath,'$$ORIGIN' $(TLC_LDFLAGS)
 
 ifdef TLC_VERSION
-tlc_single: tlc_$(TLC_VERSION)_server
+tlc_single: $(OUT_DIR)/tlc_$(TLC_VERSION)_server
 endif
 
 # Build subset: make TLC_VERSIONS="v13 v14"
 ifdef TLC_VERSIONS
 tlc_subset:
-	$(foreach v,$(TLC_VERSIONS),$(MAKE) tlc_$(v)_server &&) true
+	$(foreach v,$(TLC_VERSIONS),$(MAKE) $(OUT_DIR)/tlc_$(v)_server &&) true
 endif
 
 # Build all TLC servers
-tlc-all: $(TLC_SERVERS)
+tlc-all: $(TLC_SERVERS_OUT)
 
 tlc-clean:
-	rm -f $(TLC_SERVERS) liburma.so
+	rm -f $(TLC_SERVERS_OUT) $(OUT_DIR)/liburma.so
 
 .PHONY: tlc-all tlc-clean tlc_single tlc_subset
 
@@ -675,3 +709,50 @@ install: all
 
 uninstall:
 	rm -f $(INSTALL_BIN)/{$(REDIS_SERVER_NAME),$(REDIS_BENCHMARK_NAME),$(REDIS_CLI_NAME),$(REDIS_CHECK_RDB_NAME),$(REDIS_CHECK_AOF_NAME),$(REDIS_SENTINEL_NAME)}
+
+# ============================================================
+# Hash Bench Server — pluggable hash strategy testing
+# ============================================================
+HBENCH_CFLAGS = -O3 -std=c11 -pthread -I. -DUSE_TLC $(if $(filter aarch64 armv%,$(shell uname -m)),-march=armv8.2-a+sve+lse -DUSE_SVE2,)
+HBENCH_LDFLAGS = -pthread -lm -lpthread
+
+# FC (Flat Combining) version — v16-based architecture
+# Hash strategy: v1=1, v2=2, v2fixed=3, v2full64=4
+# Eviction strategy: blind=0, clock=1
+FC_BENCH_SRCS = tlc_hash_fc_server.c tlc_hash_fc_cache.c
+
+define FC_BENCH_RULE
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)_stats: $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DENABLE_COLLISION_STATS -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+endef
+
+$(eval $(call FC_BENCH_RULE,v1,blind,1,0))
+$(eval $(call FC_BENCH_RULE,v1,clock,1,1))
+$(eval $(call FC_BENCH_RULE,v1,rr,1,2))
+$(eval $(call FC_BENCH_RULE,v2,blind,2,0))
+$(eval $(call FC_BENCH_RULE,v2,clock,2,1))
+$(eval $(call FC_BENCH_RULE,v2,rr,2,2))
+$(eval $(call FC_BENCH_RULE,v2fixed,blind,3,0))
+$(eval $(call FC_BENCH_RULE,v2fixed,clock,3,1))
+$(eval $(call FC_BENCH_RULE,v2fixed,rr,3,2))
+$(eval $(call FC_BENCH_RULE,v2full64,blind,4,0))
+$(eval $(call FC_BENCH_RULE,v2full64,clock,4,1))
+$(eval $(call FC_BENCH_RULE,v2full64,rr,4,2))
+$(eval $(call FC_BENCH_RULE,v3oddeven,blind,5,0))
+$(eval $(call FC_BENCH_RULE,v3oddeven,clock,5,1))
+$(eval $(call FC_BENCH_RULE,v3oddeven,rr,5,2))
+
+FC_BENCH_ALL = $(foreach h,v1 v2 v2fixed v2full64 v3oddeven,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind blind_stats clock clock_stats rr rr_stats))
+
+hash-bench-server: $(FC_BENCH_ALL)
+	@echo "Built 30 targets: 5 hash × 3 eviction × 2 (perf/stats)"
+
+hash-bench-clean:
+	rm -f $(OUT_DIR)/tlc_hash_fc_server_*
+
+.PHONY: hash-bench-server hash-bench-clean

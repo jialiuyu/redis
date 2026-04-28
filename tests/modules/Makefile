@@ -2,6 +2,9 @@
 # find the OS
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 
+# Output directory
+OUT_DIR := ../../output/test
+
 warning_cflags = -W -Wall -Wno-missing-field-initializers
 ifeq ($(uname_S),Darwin)
 	SHOBJ_CFLAGS ?= $(warning_cflags) -dynamic -fno-common -g -ggdb -std=gnu11 -O2
@@ -87,20 +90,25 @@ TEST_MODULES = \
     test_keymeta.so \
     atomicslotmigration.so
 
+TEST_MODULES_OUT = $(addprefix $(OUT_DIR)/,$(TEST_MODULES))
+
 .PHONY: all
 
-all: $(TEST_MODULES)
+all: $(TEST_MODULES_OUT)
 
 32bit:
 	$(MAKE) CFLAGS="-m32" LDFLAGS="-m32"
 
-%.xo: %.c ../../src/redismodule.h
+$(OUT_DIR)/%.xo: %.c ../../src/redismodule.h | $(OUT_DIR)
 	$(CC) -I../../src $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
 
-%.so: %.xo
+$(OUT_DIR)/%.so: $(OUT_DIR)/%.xo
 	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LDFLAGS) $(LIBS)
+
+$(OUT_DIR):
+	mkdir -p $(OUT_DIR)
 
 .PHONY: clean
 
 clean:
-	rm -f $(TEST_MODULES) $(TEST_MODULES:.so=.xo)
+	rm -rf $(OUT_DIR)
