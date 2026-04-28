@@ -5,12 +5,12 @@
  * backed by UB shared memory with consistent hashing.
  *
  * Commands:
- *   TLC.PUT <key_id> <value_bytes>     — write 1200B value
- *   TLC.GET <key_id>                   — read 1200B value
- *   TLC.MPUT <key1> <val1> [key2 val2 ...]  — batch write
- *   TLC.MGET <key1> [key2 ...]         — batch read
- *   TLC.STATS                           — print cache stats
- *   TLC.FILL <count>                    — pre-fill with random data
+ *   TLC.PUT <key_id> <value_bytes>                           — write 1200B value
+ *   TLC.GET <key_id>                                         — read 1200B value
+ *   TLC.MPUT <key1> <val1> [key2 val2 ...]                   — batch write
+ *   TLC.MGET <key1> [key2 ...]                               — batch read
+ *   TLC.STATS                                                — print cache stats
+ *   TLC.FILL <count>                                         — pre-fill with random data
  *   TLC.SIM <dim> <query_floats...> <n_ids> <id1> [id2 ...]  — SVE2 similarity
  *
  * Build:
