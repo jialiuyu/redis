@@ -7,14 +7,16 @@
 #ifndef __VECTOR_ENGINE_H
 #define __VECTOR_ENGINE_H
 
-#include "server.h"
-#ifdef VECTOR_ENGINE_MODULE
-#include "redismodule.h"
-#endif
+#include "vector_engine_types.h"
+#include "sds.h"
+#include <stddef.h>  /* size_t */
 
-/* Vector Engine Types */
-#define VECTOR_ENGINE_REDIS 0    /* Traditional Redis HNSW implementation */
-#define VECTOR_ENGINE_UB 1       /* UB bus + SVE high-performance implementation */
+
+/* Vector Engine Configuration */
+typedef struct vector_engine_config {
+    vector_engine_type_t engine_type;    /* Engine type to use */
+    int vector_dimension;                 /* Vector dimension */
+} vector_engine_config_t;
 
 /* Vector Query Result */
 typedef struct {
@@ -31,7 +33,7 @@ typedef struct {
 } vector_data_t;
 
 /* Vector Engine Interface */
-typedef struct vector_engine {
+typedef struct {
     vector_engine_type_t type;
     int (*init)(void);
     void (*cleanup)(void);
@@ -47,25 +49,26 @@ typedef struct vector_engine {
     sds (*get_stats)(void);
 } vector_engine_t;
 
-/* Global vector engine instance */
-extern vector_engine_t *current_vector_engine;
+/* Get the active engine instance (NULL if not initialized) */
+vector_engine_t *vector_engine_get(void);
 
-/* Engine Management Functions */
+/* Engine Registration - called by each impl to register itself */
+void vector_engine_register(vector_engine_type_t type, vector_engine_t *engine);
+
+/* Initialization - called once at startup, engine type fixed for lifetime */
+int vector_engine_init_from_config(vector_engine_config_t *config);
+void vector_engine_cleanup(void);
+vector_engine_type_t vector_engine_get_default_type(void);
+vector_engine_type_t vector_engine_get_current_type(void);
+
+/* Engine lifecycle */
 vector_engine_t *vector_engine_create(vector_engine_type_t type);
 void vector_engine_destroy(vector_engine_t *engine);
-int vector_engine_switch(vector_engine_type_t type);
-
-/* UB Engine Functions */
-int ub_engine_vemb(void *ctx, void *key, void *element, vector_data_t *result);
 
 /* Utility Functions */
 vector_data_t *vector_data_create(float *data, size_t dim, int is_fp32);
 void vector_data_destroy(vector_data_t *vd);
 vector_query_result_t *vector_query_result_create(size_t count);
 void vector_query_result_destroy(vector_query_result_t *results, size_t count);
-
-/* Configuration */
-int vector_engine_init_from_config(void);
-vector_engine_type_t vector_engine_get_default_type(void);
 
 #endif /* __VECTOR_ENGINE_H */

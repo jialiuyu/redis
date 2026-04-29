@@ -5,28 +5,8 @@
  */
 
 #include "ub_client.h"
-
-#ifdef UB_CLIENT_STANDALONE
-/* Minimal declarations when building outside redis-server */
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>   /* strcasecmp */
-#define C_OK  0
-#define C_ERR -1
-#define LL_WARNING 3
-#define LL_NOTICE  2
-#define UNUSED(V) ((void)(V))
-typedef char *sds;
-extern void serverLog(int level, const char *fmt, ...);
-extern void *zcalloc(size_t size);
-extern void  zfree(void *ptr);
-extern sds   sdsempty(void);
-extern sds   sdsnew(const char *init);
-extern sds   sdscat(sds s, const char *t);
-extern sds   sdscatprintf(sds s, const char *fmt, ...);
-#else
 #include "server.h"
-#endif
+#include "sve_config.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -38,9 +18,6 @@ extern sds   sdscatprintf(sds s, const char *fmt, ...);
 #include <sys/mman.h>
 #include <unistd.h>
 
-#ifdef USE_SVE
-#include <arm_sve.h>
-#endif
 
 #ifdef USE_CC_MODE
 #include "obmm_ownership.h"
@@ -228,7 +205,30 @@ static int set_read_ownership(ub_address_space_t *addr_space)
 #endif
 }
 
-static void release_ownership(ub_address_space_t *addr_space)
+static int maybe_set_write_ownership(ub_address_space_t *addr_space)
+{
+    void *start = addr_space->mapping_addr;
+    void *end = (char *)addr_space->mapping_addr + addr_space->mapping_size;
+
+    if (!addr_space->cacheable || !addr_space->use_ownership) {
+        return C_OK;
+    }
+#ifdef USE_CC_MODE
+    if (obmm_set_ownership(addr_space->shm_fd, start, end, PROT_WRITE) != 0) {
+        serverLog(LL_WARNING,
+                  "Failed to acquire OBMM write ownership for %s: %s",
+                  addr_space->device_path, strerror(errno));
+        return C_ERR;
+    }
+#else
+    UNUSED(start);
+    UNUSED(end);
+#endif
+
+    return C_OK;
+}
+
+static void maybe_release_ownership(ub_address_space_t *addr_space)
 {
     if (!addr_space || !addr_space->use_ownership) {
         return;
@@ -253,7 +253,7 @@ static void destroy_addr_space(ub_address_space_t *addr_space)
         return;
     }
 
-    release_ownership(addr_space);
+    maybe_release_ownership(addr_space);
 
     if (addr_space->mapping_addr && addr_space->mapping_addr != MAP_FAILED &&
         addr_space->mapping_size > 0) {
@@ -328,7 +328,7 @@ static int create_addr_space(const ub_mem_config_t *cfg, ub_address_space_t **ad
         return C_ERR;
     }
 
-    mmap_prot = (cfg->cacheable && cfg->use_ownership) ? PROT_NONE : PROT_READ;
+    mmap_prot = (cfg->cacheable && cfg->use_ownership) ? PROT_NONE : (PROT_READ | PROT_WRITE);
     mapping = mmap(NULL, cfg->shm_size, mmap_prot, MAP_SHARED, fd, 0);
     if (mapping == MAP_FAILED) {
         serverLog(LL_WARNING, "Failed to mmap %s: %s", device_path, strerror(errno));
@@ -583,7 +583,7 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
     capacity = addr_space->size / addr_space->vector_stride_bytes;
     base = (const char *)addr_space->mapped_addr;
 
-#ifdef USE_SVE
+#ifdef USE_ARM_SVE
     /*
      * SVE gather-load path.
      * Each row is vector_dim floats; we copy one row per index using SVE
@@ -640,6 +640,158 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
         memcpy(&results[i * vector_dim], src, vector_bytes);
     }
 #endif
+
+    global_ub_client->total_requests += num_indices;
+    return C_OK;
+}
+
+int ub_client_perform_contiguous_load(ub_address_space_t *addr_space,
+                                      size_t start_index,
+                                      size_t num_rows,
+                                      float *results,
+                                      size_t vector_dim)
+{
+    size_t vector_bytes;
+    size_t capacity;
+
+    if (!global_ub_client || !addr_space || !results || vector_dim == 0 || num_rows == 0) {
+        return C_ERR;
+    }
+
+    vector_bytes = vector_dim * sizeof(float);
+    if (addr_space->vector_stride_bytes < vector_bytes) {
+        return C_ERR;
+    }
+
+    capacity = addr_space->size / addr_space->vector_stride_bytes;
+    if (start_index + num_rows > capacity) {
+        serverLog(LL_WARNING,
+                  "UB contiguous load: range [%zu, %zu) exceeds capacity %zu",
+                  start_index, start_index + num_rows, capacity);
+        return C_ERR;
+    }
+
+    const char *base = (const char *)addr_space->mapped_addr;
+
+    if (addr_space->vector_stride_bytes == vector_bytes) {
+        /* No padding — single memcpy for the entire block */
+        const char *src = base + start_index * vector_bytes;
+        memcpy(results, src, num_rows * vector_bytes);
+    } else {
+        /* Stride > vector_bytes (padding between rows) — copy row by row */
+#ifdef USE_ARM_SVE
+        const size_t vl_f32 = svcntw();
+
+        for (size_t i = 0; i < num_rows; i++) {
+            const float *src = (const float *)(base + (start_index + i) * addr_space->vector_stride_bytes);
+            float       *dst = results + i * vector_dim;
+            size_t       rem = vector_dim;
+
+            while (rem >= vl_f32) {
+                svbool_t pg = svptrue_b32();
+                svst1_f32(pg, dst, svld1_f32(pg, src));
+                src += vl_f32;
+                dst += vl_f32;
+                rem -= vl_f32;
+            }
+            if (rem > 0) {
+                svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+                svst1_f32(pg, dst, svld1_f32(pg, src));
+            }
+        }
+#else
+        for (size_t i = 0; i < num_rows; i++) {
+            const char *src = base + (start_index + i) * addr_space->vector_stride_bytes;
+            memcpy(&results[i * vector_dim], src, vector_bytes);
+        }
+#endif
+    }
+
+    global_ub_client->total_requests += num_rows;
+    return C_OK;
+}
+
+int ub_client_perform_scatter_store(ub_address_space_t *addr_space,
+                                    uint64_t *indices,
+                                    size_t num_indices,
+                                    float *data,
+                                    size_t vector_dim)
+{
+    char *base;
+    size_t vector_bytes;
+    size_t capacity;
+
+    if (!global_ub_client || !addr_space || !indices || !data || vector_dim == 0) {
+        return C_ERR;
+    }
+
+    vector_bytes = vector_dim * sizeof(float);
+    if (addr_space->vector_stride_bytes < vector_bytes) {
+        return C_ERR;
+    }
+
+    capacity = addr_space->size / addr_space->vector_stride_bytes;
+
+    /* Validate all indices before any write */
+    for (size_t i = 0; i < num_indices; i++) {
+        if (indices[i] >= capacity) {
+            serverLog(LL_WARNING, "UB scatter index %" PRIu64 " out of bounds", indices[i]);
+            return C_ERR;
+        }
+    }
+
+    /* Acquire write ownership if in ownership mode */
+    if (maybe_set_write_ownership(addr_space) != C_OK) {
+        serverLog(LL_WARNING, "UB scatter-store: failed to acquire write ownership");
+        return C_ERR;
+    }
+
+    base = (char *)addr_space->mapped_addr;
+
+#ifdef USE_ARM_SVE
+    /*
+     * SVE scatter-store path.
+     * Each row is vector_dim floats; we copy one row per index using SVE
+     * contiguous stores (ST1W) with a predicate covering the row width.
+     */
+    {
+        const size_t vl_f32 = svcntw();   /* SVE vector length in float lanes */
+
+        for (size_t i = 0; i < num_indices; i++) {
+            uint64_t idx = indices[i];
+            const float *src = data + i * vector_dim;
+            float       *dst = (float *)(base + idx * addr_space->vector_stride_bytes);
+            size_t       rem = vector_dim;
+
+            /* Copy full SVE-width chunks */
+            while (rem >= vl_f32) {
+                svbool_t pg = svptrue_b32();
+                svfloat32_t v = svld1_f32(pg, src);
+                svst1_f32(pg, dst, v);
+                src += vl_f32;
+                dst += vl_f32;
+                rem -= vl_f32;
+            }
+
+            /* Tail: predicated store for remaining elements */
+            if (rem > 0) {
+                svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+                svfloat32_t v = svld1_f32(pg, src);
+                svst1_f32(pg, dst, v);
+            }
+        }
+    }
+#else
+    /* Scalar fallback */
+    for (size_t i = 0; i < num_indices; i++) {
+        uint64_t idx = indices[i];
+        char *dst = base + (idx * addr_space->vector_stride_bytes);
+        memcpy(dst, &data[i * vector_dim], vector_bytes);
+    }
+#endif
+
+    /* Release ownership if in ownership mode */
+    maybe_release_ownership(addr_space);
 
     global_ub_client->total_requests += num_indices;
     return C_OK;

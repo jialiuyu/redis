@@ -75,6 +75,32 @@ int ub_client_perform_gather_load(ub_address_space_t *addr_space,
                                   size_t num_indices,
                                   float *results,
                                   size_t vector_dim);
+int ub_client_perform_scatter_store(ub_address_space_t *addr_space,
+                                    uint64_t *indices,
+                                    size_t num_indices,
+                                    float *data,
+                                    size_t vector_dim);
+
+/* Contiguous bulk load — optimised path when indices are {0, 1, …, n-1}.
+ * Falls back to gather_load when stride != dim*sizeof(float) (padding). */
+int ub_client_perform_contiguous_load(ub_address_space_t *addr_space,
+                                      size_t start_index,
+                                      size_t num_rows,
+                                      float *results,
+                                      size_t vector_dim);
+
+/* Single-row convenience wrappers */
+static inline int ub_client_store_single(ub_address_space_t *addr_space,
+                                         uint64_t index,
+                                         float *data, size_t vector_dim) {
+    return ub_client_perform_scatter_store(addr_space, &index, 1, data, vector_dim);
+}
+
+static inline int ub_client_load_single(ub_address_space_t *addr_space,
+                                        uint64_t index,
+                                        float *result, size_t vector_dim) {
+    return ub_client_perform_gather_load(addr_space, &index, 1, result, vector_dim);
+}
 
 int ub_client_set_config(const char *key, const char *value);
 sds ub_client_get_config(const char *key);
