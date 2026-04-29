@@ -1,6 +1,30 @@
 /*
  * Vector Engine - UB Implementation
  * High-performance UB bus-based vector operations with SVE acceleration
+ *
+ * Key differences from native Redis vector-set behaviour:
+ *
+ * 1. Single-table addressing model
+ *    Redis uses per-key HNSW graphs where elements are user-defined names
+ *    (e.g. "doc:123"). UB uses a flat shared-memory table where vectors are
+ *    addressed by row index. The `key` parameter is therefore unused in all
+ *    UB engine callbacks (UNUSED(key)).
+ *
+ * 2. Element identity
+ *    In VSIM results, `element` is the stringified row index ("0", "1", …)
+ *    rather than a user-supplied name. Callers must maintain their own
+ *    index-to-object mapping externally.
+ *
+ * 3. Attributes not supported
+ *    Redis HNSW nodes can carry JSON attributes (set via VADD … SETATTR)
+ *    used for hybrid FILTER queries. UB stores raw vectors only, so
+ *    `attributes` is always NULL in query results. VSIM … WITHATTRIBS will
+ *    return nil for every element; VSIM … FILTER is not available.
+ *
+ * 4. Similarity search strategy
+ *    Redis VSIM walks an HNSW graph (approximate, O(log N)).
+ *    UB VSIM performs a brute-force full-table scan (exact, O(N·dim)).
+ *    UB is faster for small tables; Redis HNSW wins on large datasets.
  */
 
 #include "macro.h"
@@ -232,6 +256,7 @@ cleanup:
     return rc;
 }
 
+// TODO: brute-force full-table scan for now, needs optimization
 static int ub_engine_vsim(void *ctx, void *key, vector_data_t *query_vector,
                           size_t count, vector_query_result_t **results,
                           size_t *num_results) {
