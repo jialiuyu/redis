@@ -170,7 +170,12 @@ compile_commands.json
 *.o
 *.d
 *.a
+Makefile.dep
+.make-prerequisites
 **.kiro
+
+# NFS temporary files
+.nfs*
 
 /batch_embedding_test
 /simple_ub_test
