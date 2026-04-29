@@ -43,6 +43,28 @@
 #define UB_NODE_MEM_SIZE      (2ULL * 1024 * 1024 * 1024)  /* 2GB per node region */
 #define UB_LOCAL_VNODE_WEIGHT 4           /* Local node gets 4x more vnodes */
 
+/* ---- Real UB device parameters (only when USE_UB_MEM is defined) ---- */
+#ifdef USE_UB_MEM
+#ifndef UB_MEMID_BASE
+#define UB_MEMID_BASE    5               /* Base memid; node i → /dev/obmm_shmdev(UB_MEMID_BASE+i) */
+#endif
+#ifndef UB_SHM_SIZE
+#define UB_SHM_SIZE      (2ULL * 1024 * 1024 * 1024)  /* Per-node mapping size */
+#endif
+#ifndef UB_CACHEABLE
+#define UB_CACHEABLE     0               /* 0 = O_SYNC, 1 = cacheable */
+#endif
+#ifndef UB_HOT_CACHEABLE
+#define UB_HOT_CACHEABLE 1               /* Dedicated HOT slice uses cacheable UB mapping */
+#endif
+#ifndef UB_HOT_MEMID
+#define UB_HOT_MEMID     3               /* Dedicated HOT device; override if your platform provisions a different mmap-capable memid */
+#endif
+#ifndef UB_HOT_SLICE_SIZE
+#define UB_HOT_SLICE_SIZE (64ULL * 1024 * 1024)  /* Reserve 64 MiB for HOT on the local UB node */
+#endif
+#endif
+
 /* ---- SVE2 Compute Configuration ---- */
 #define SVE2_EMB_TABLE_SIZE   (1 << 17)   /* 128K embeddings in UB memory */
 #define SVE2_EMB_DIM_DEFAULT  300         /* Default embedding dimension */
@@ -166,10 +188,16 @@ typedef struct {
 /* ---- UB Memory Node ---- */
 typedef struct {
     int      node_id;
+    void    *mapping_addr;    /* mmap base for teardown */
+    size_t   mapping_size;    /* mmap length for teardown */
     void    *base_addr;       /* mmap'd UB memory region */
     size_t   total_size;
     size_t   used;
     int      is_local;        /* 1 if this node is local (no cross-node) */
+    int      shm_fd;          /* UB device fd, -1 for anonymous mmap */
+    char     device_path[64]; /* /dev/obmm_shmdevN, empty for anon */
+    size_t   map_offset;      /* File offset backing base_addr */
+    int      cacheable;       /* Whether this mapping is cacheable */
 } ub_mem_node_t;
 
 /* ---- Consistent Hash Ring for UB node mapping ---- */
@@ -196,6 +224,7 @@ typedef struct {
     void           *warm_entries_region;
     void           *warm_ht_region;
     void           *cold_region;
+    ub_mem_node_t   hot_node;         /* Optional dedicated cacheable HOT mapping */
     float          *emb_table;        /* Embedding table in UB memory */
     size_t          emb_table_entries; /* Number of embeddings */
     size_t          emb_dim;          /* Embedding dimension */

@@ -138,10 +138,19 @@ static void *worker(void *arg) {
     resp_ring = mmap(NULL, sizeof(aeron_ring_t), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
 
-    /* NUMA-aware: pin client to odd cores (same as v16 bench, server uses even). */
+    /* NUMA-aware: keep bench threads off the server's node0 cores.
+     * HW01 topology is node0=CPU 0-95, node1=CPU 96-191 with SMT pairs
+     * laid out as (96,97), (98,99), ... Prefer one sibling per core on
+     * node1 first, then spill to the other sibling if threads > 48. */
     {
-        int core = 3 + (ch_id * 2);
-        if (core >= 40) core = (core % 38) + 3;
+        int core;
+        if (ch_id < 48) {
+            core = 97 + (ch_id * 2);
+        } else if (ch_id < 96) {
+            core = 96 + ((ch_id - 48) * 2);
+        } else {
+            core = 96 + (ch_id % 96);
+        }
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(core, &cpuset);

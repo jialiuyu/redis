@@ -231,7 +231,7 @@ static int32_t fc_get(int slot_id, uint64_t key) {
             }
         }
 
-        /* SVE2 batch gather with prefetch — same as v16 */
+        // TODO SVE2 batch gather with prefetch — same as v16
         if (pending_count > 0) {
             uint32_t hot_mask = g_cache.hot.mask;
             for (int p = 0; p < pending_count && p < 8; p++)

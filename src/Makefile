@@ -713,13 +713,39 @@ uninstall:
 # ============================================================
 # Hash Bench Server — pluggable hash strategy testing
 # ============================================================
+USE_UB_MEM ?= 1
+HOT_ON_UB ?= 1
 HBENCH_CFLAGS = -O3 -std=c11 -pthread -I. -DUSE_TLC $(if $(filter aarch64 armv%,$(shell uname -m)),-march=armv8.2-a+sve+lse -DUSE_SVE2,)
+ifeq ($(USE_UB_MEM),1)
+HBENCH_CFLAGS += -DUSE_UB_MEM -DUB_CLIENT_STANDALONE -DHOT_ON_UB=$(HOT_ON_UB)
+ifdef UB_MEMID_BASE
+HBENCH_CFLAGS += -DUB_MEMID_BASE=$(UB_MEMID_BASE)
+endif
+ifdef UB_CACHEABLE
+HBENCH_CFLAGS += -DUB_CACHEABLE=$(UB_CACHEABLE)
+endif
+ifdef UB_SHM_SIZE
+HBENCH_CFLAGS += -DUB_SHM_SIZE=$(UB_SHM_SIZE)
+endif
+ifdef UB_HOT_MEMID
+HBENCH_CFLAGS += -DUB_HOT_MEMID=$(UB_HOT_MEMID)
+endif
+ifdef UB_HOT_CACHEABLE
+HBENCH_CFLAGS += -DUB_HOT_CACHEABLE=$(UB_HOT_CACHEABLE)
+endif
+ifdef UB_HOT_SLICE_SIZE
+HBENCH_CFLAGS += -DUB_HOT_SLICE_SIZE=$(UB_HOT_SLICE_SIZE)
+endif
+endif
 HBENCH_LDFLAGS = -pthread -lm -lpthread
 
 # FC (Flat Combining) version — v16-based architecture
 # Hash strategy: v1=1, v2=2, v2fixed=3, v2full64=4
 # Eviction strategy: blind=0, clock=1
 FC_BENCH_SRCS = tlc_hash_fc_server.c tlc_hash_fc_cache.c
+ifeq ($(USE_UB_MEM),1)
+FC_BENCH_SRCS += ub_client.c
+endif
 
 define FC_BENCH_RULE
 $(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h
