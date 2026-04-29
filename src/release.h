@@ -1,5 +1,5 @@
-#define REDIS_GIT_SHA1 "c44daf5a"
-#define REDIS_GIT_DIRTY "278"
-#define REDIS_BUILD_ID "qs-server-117-server-0-1776323698"
+#define REDIS_GIT_SHA1 "992d4018"
+#define REDIS_GIT_DIRTY "     863"
+#define REDIS_BUILD_ID "fibonaccii.local-1777456497"
 #include "version.h"
 #define REDIS_BUILD_ID_RAW REDIS_VERSION REDIS_BUILD_ID REDIS_GIT_DIRTY REDIS_GIT_SHA1

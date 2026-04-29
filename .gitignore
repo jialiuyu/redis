@@ -170,6 +170,7 @@ compile_commands.json
 *.o
 *.d
 *.a
+**.kiro
 
 /batch_embedding_test
 /simple_ub_test
@@ -199,3 +200,4 @@ FABRIC_UB_MEM_DESIGN_GAPS.md
 benchmark/ARCHITECTURE_DEEP_DIVE.md
 benchmark/read_output.txt
 benchmark/write_output.txt
+benchmark/UB_GATHER_BENCH_REPORT.md
