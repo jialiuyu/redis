@@ -47,10 +47,7 @@ typedef long long mstime_t; /* millisecond time type. */
 typedef long long ustime_t; /* microsecond time type. */
 
 /* Vector Engine Types */
-#define VECTOR_ENGINE_REDIS 0    /* Traditional Redis HNSW implementation */
-#define VECTOR_ENGINE_UB 1       /* UB bus + SVE high-performance implementation */
-
-typedef int vector_engine_type_t;
+#include "vector_engine_types.h"
 
 #include "ub_client.h"
 

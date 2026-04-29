@@ -339,7 +339,7 @@ int sve2_gather_with_bitmap_check(sve_worker_context_t *ctx,
          * - 因此这里的 memcpy/SVE load 是安全的
          */
         
-#ifdef __ARM_FEATURE_SVE
+#ifdef USE_ARM_SVE
         /* SVE2 实现 */
         svbool_t pg = svptrue_b32();
         
@@ -397,7 +397,7 @@ int sve2_batch_gather_load(sve_worker_context_t *ctx,
 
 /* 非临时内存访问（Streaming Load）*/
 void sve_streaming_load(const void *src, void *dst, size_t size) {
-#ifdef __ARM_FEATURE_SVE
+#ifdef USE_ARM_SVE
     /* 使用 SVE 非临时加载指令 */
     const uint8_t *s = (const uint8_t *)src;
     uint8_t *d = (uint8_t *)dst;

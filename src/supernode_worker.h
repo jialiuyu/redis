@@ -14,10 +14,10 @@
 
 #include "server.h"
 #include "proxy_aggregator.h"
+#include "sve_config.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <arm_sve.h>
 
 /* 超节点配置 */
 #define SUPERNODE_MAX_WORKERS 16        /* 最大 Worker 线程数 */

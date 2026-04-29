@@ -7,6 +7,7 @@
  */
 
 #include "../src/ub_client.h"
+#include "../src/sve_config.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -825,7 +826,7 @@ static int run_gather(const ub_ut_options_t *opts)
         if (rc == 0) {
             sds stats = ub_client_get_stats();
             ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
-#ifdef USE_SVE
+#ifdef USE_ARM_SVE
             ut_log("  method      : SVE gather-load (sve1 contiguous ld1w/st1w)");
             ut_log("  gather_load : %.0f ns (%.3f us)", load_ns, load_ns / 1e3);
 #else
