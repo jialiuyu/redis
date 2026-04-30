@@ -206,3 +206,4 @@ benchmark/ARCHITECTURE_DEEP_DIVE.md
 benchmark/read_output.txt
 benchmark/write_output.txt
 benchmark/UB_GATHER_BENCH_REPORT.md
+SVE_OPERATION_DESIGN.md

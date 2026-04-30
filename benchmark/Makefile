@@ -121,6 +121,23 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
 	@echo "✅ Built: $@"
 
+# Scatter/Gather vs Baseline benchmark
+# 独立模块，不依赖 server.h
+# 编译: make scatter_gather_bench
+# 可选: make scatter_gather_bench USE_SVE=yes (鲲鹏 920)
+SVE_BENCH_CFLAGS = -O3 -Wall -march=native -pthread -std=gnu11 -I../src
+SVE_BENCH_SRCS   = scatter_gather_bench.c ../src/sve_operation.c
+
+ifeq ($(USE_SVE),yes)
+    SVE_BENCH_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+scatter_gather_bench: $(SVE_BENCH_SRCS) ../src/sve_operation.h ../src/sve_config.h
+	$(CC) $(SVE_BENCH_CFLAGS) -o $@ $(SVE_BENCH_SRCS) -lm -lpthread
+	@echo "✅ Built: $@"
+
+.PHONY: scatter_gather_bench
+
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
@@ -144,7 +161,7 @@ ub_client_ut: $(UB_UT_SRCS)
 
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare ub_client_ut
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "✅ Cleaned build artifacts"
@@ -215,6 +232,10 @@ help:
 	@echo ""
 	@echo "UB cross-node validation:"
 	@echo "  make ub_client_ut [USE_CC_MODE=yes] [USE_SVE=yes]"
+	@echo ""
+	@echo "Scatter/Gather benchmark:"
+	@echo "  make scatter_gather_bench [USE_SVE=yes]"
+	@echo "  ./scatter_gather_bench [--embeddings N] [--iters N] [--warmup N]"
 	@echo "  ./ub_client_ut selftest"
 	@echo "  ./ub_client_ut write-fixture --shm-memid <id> --shm-size <N> --vector-dimension 128 --fill-rows 1024"
 	@echo "  ./ub_client_ut gather --shm-memid <id> --shm-size <N> --vector-dimension 128 --table-name ut_vectors --gather-indices 0,1,42 --verify"
