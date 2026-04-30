@@ -29,7 +29,7 @@
       "threads_mngr.o",
       "threads_mngr.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/threads_mngr.c",
     "output": "src/threads_mngr.o"
   },
@@ -63,7 +63,7 @@
       "memory_prefetch.o",
       "memory_prefetch.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/memory_prefetch.c",
     "output": "src/memory_prefetch.o"
   },
@@ -97,7 +97,7 @@
       "dict.o",
       "dict.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/dict.c",
     "output": "src/dict.o"
   },
@@ -131,7 +131,7 @@
       "ae.o",
       "ae.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/ae.c",
     "output": "src/ae.o"
   },
@@ -165,7 +165,7 @@
       "adlist.o",
       "adlist.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/adlist.c",
     "output": "src/adlist.o"
   },
@@ -199,7 +199,7 @@
       "ebuckets.o",
       "ebuckets.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/ebuckets.c",
     "output": "src/ebuckets.o"
   },
@@ -233,7 +233,7 @@
       "anet.o",
       "anet.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/anet.c",
     "output": "src/anet.o"
   },
@@ -267,7 +267,7 @@
       "quicklist.o",
       "quicklist.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/quicklist.c",
     "output": "src/quicklist.o"
   },
@@ -301,7 +301,7 @@
       "eventnotifier.o",
       "eventnotifier.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/eventnotifier.c",
     "output": "src/eventnotifier.o"
   },
@@ -335,7 +335,7 @@
       "iothread.o",
       "iothread.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/iothread.c",
     "output": "src/iothread.o"
   },
@@ -369,7 +369,7 @@
       "mstr.o",
       "mstr.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/mstr.c",
     "output": "src/mstr.o"
   },
@@ -403,7 +403,7 @@
       "entry.o",
       "entry.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/entry.c",
     "output": "src/entry.o"
   },
@@ -437,7 +437,7 @@
       "kvstore.o",
       "kvstore.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/kvstore.c",
     "output": "src/kvstore.o"
   },
@@ -471,7 +471,7 @@
       "fwtree.o",
       "fwtree.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/fwtree.c",
     "output": "src/fwtree.o"
   },
@@ -505,7 +505,7 @@
       "estore.o",
       "estore.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/estore.c",
     "output": "src/estore.o"
   },
@@ -539,7 +539,7 @@
       "server.o",
       "server.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/server.c",
     "output": "src/server.o"
   },
@@ -573,7 +573,7 @@
       "sds.o",
       "sds.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sds.c",
     "output": "src/sds.o"
   },
@@ -607,7 +607,7 @@
       "zmalloc.o",
       "zmalloc.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/zmalloc.c",
     "output": "src/zmalloc.o"
   },
@@ -641,7 +641,7 @@
       "lzf_d.o",
       "lzf_d.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lzf_d.c",
     "output": "src/lzf_d.o"
   },
@@ -675,7 +675,7 @@
       "pqsort.o",
       "pqsort.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/pqsort.c",
     "output": "src/pqsort.o"
   },
@@ -709,7 +709,7 @@
       "lzf_c.o",
       "lzf_c.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lzf_c.c",
     "output": "src/lzf_c.o"
   },
@@ -743,7 +743,7 @@
       "zipmap.o",
       "zipmap.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/zipmap.c",
     "output": "src/zipmap.o"
   },
@@ -777,7 +777,7 @@
       "sha1.o",
       "sha1.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sha1.c",
     "output": "src/sha1.o"
   },
@@ -811,7 +811,7 @@
       "ziplist.o",
       "ziplist.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/ziplist.c",
     "output": "src/ziplist.o"
   },
@@ -845,7 +845,7 @@
       "networking.o",
       "networking.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/networking.c",
     "output": "src/networking.o"
   },
@@ -879,7 +879,7 @@
       "release.o",
       "release.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/release.c",
     "output": "src/release.o"
   },
@@ -913,7 +913,7 @@
       "util.o",
       "util.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/util.c",
     "output": "src/util.o"
   },
@@ -947,7 +947,7 @@
       "object.o",
       "object.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/object.c",
     "output": "src/object.o"
   },
@@ -981,7 +981,7 @@
       "replication.o",
       "replication.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/replication.c",
     "output": "src/replication.o"
   },
@@ -1015,7 +1015,7 @@
       "db.o",
       "db.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/db.c",
     "output": "src/db.o"
   },
@@ -1049,7 +1049,7 @@
       "rdb.o",
       "rdb.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/rdb.c",
     "output": "src/rdb.o"
   },
@@ -1083,7 +1083,7 @@
       "t_string.o",
       "t_string.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/t_string.c",
     "output": "src/t_string.o"
   },
@@ -1117,7 +1117,7 @@
       "t_list.o",
       "t_list.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/t_list.c",
     "output": "src/t_list.o"
   },
@@ -1151,7 +1151,7 @@
       "t_set.o",
       "t_set.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/t_set.c",
     "output": "src/t_set.o"
   },
@@ -1185,7 +1185,7 @@
       "t_zset.o",
       "t_zset.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/t_zset.c",
     "output": "src/t_zset.o"
   },
@@ -1219,7 +1219,7 @@
       "t_hash.o",
       "t_hash.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/t_hash.c",
     "output": "src/t_hash.o"
   },
@@ -1253,7 +1253,7 @@
       "config.o",
       "config.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/config.c",
     "output": "src/config.o"
   },
@@ -1287,7 +1287,7 @@
       "aof.o",
       "aof.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/aof.c",
     "output": "src/aof.o"
   },
@@ -1321,7 +1321,7 @@
       "pubsub.o",
       "pubsub.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/pubsub.c",
     "output": "src/pubsub.o"
   },
@@ -1355,7 +1355,7 @@
       "multi.o",
       "multi.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/multi.c",
     "output": "src/multi.o"
   },
@@ -1389,7 +1389,7 @@
       "debug.o",
       "debug.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/debug.c",
     "output": "src/debug.o"
   },
@@ -1423,7 +1423,7 @@
       "sort.o",
       "sort.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sort.c",
     "output": "src/sort.o"
   },
@@ -1457,7 +1457,7 @@
       "intset.o",
       "intset.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/intset.c",
     "output": "src/intset.o"
   },
@@ -1491,7 +1491,7 @@
       "syncio.o",
       "syncio.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/syncio.c",
     "output": "src/syncio.o"
   },
@@ -1525,7 +1525,7 @@
       "cluster.o",
       "cluster.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/cluster.c",
     "output": "src/cluster.o"
   },
@@ -1559,7 +1559,7 @@
       "cluster_asm.o",
       "cluster_asm.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/cluster_asm.c",
     "output": "src/cluster_asm.o"
   },
@@ -1593,7 +1593,7 @@
       "cluster_legacy.o",
       "cluster_legacy.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/cluster_legacy.c",
     "output": "src/cluster_legacy.o"
   },
@@ -1627,7 +1627,7 @@
       "cluster_slot_stats.o",
       "cluster_slot_stats.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/cluster_slot_stats.c",
     "output": "src/cluster_slot_stats.o"
   },
@@ -1661,7 +1661,7 @@
       "crc16.o",
       "crc16.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/crc16.c",
     "output": "src/crc16.o"
   },
@@ -1695,7 +1695,7 @@
       "endianconv.o",
       "endianconv.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/endianconv.c",
     "output": "src/endianconv.o"
   },
@@ -1729,7 +1729,7 @@
       "slowlog.o",
       "slowlog.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/slowlog.c",
     "output": "src/slowlog.o"
   },
@@ -1763,7 +1763,7 @@
       "eval.o",
       "eval.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/eval.c",
     "output": "src/eval.o"
   },
@@ -1797,7 +1797,7 @@
       "bio.o",
       "bio.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/bio.c",
     "output": "src/bio.o"
   },
@@ -1831,7 +1831,7 @@
       "rio.o",
       "rio.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/rio.c",
     "output": "src/rio.o"
   },
@@ -1865,7 +1865,7 @@
       "rand.o",
       "rand.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/rand.c",
     "output": "src/rand.o"
   },
@@ -1899,7 +1899,7 @@
       "memtest.o",
       "memtest.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/memtest.c",
     "output": "src/memtest.o"
   },
@@ -1933,7 +1933,7 @@
       "syscheck.o",
       "syscheck.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/syscheck.c",
     "output": "src/syscheck.o"
   },
@@ -1967,7 +1967,7 @@
       "crccombine.o",
       "crccombine.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/crccombine.c",
     "output": "src/crccombine.o"
   },
@@ -2001,7 +2001,7 @@
       "crcspeed.o",
       "crcspeed.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/crcspeed.c",
     "output": "src/crcspeed.o"
   },
@@ -2035,7 +2035,7 @@
       "crc64.o",
       "crc64.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/crc64.c",
     "output": "src/crc64.o"
   },
@@ -2069,7 +2069,7 @@
       "bitops.o",
       "bitops.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/bitops.c",
     "output": "src/bitops.o"
   },
@@ -2103,7 +2103,7 @@
       "sentinel.o",
       "sentinel.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sentinel.c",
     "output": "src/sentinel.o"
   },
@@ -2137,7 +2137,7 @@
       "notify.o",
       "notify.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/notify.c",
     "output": "src/notify.o"
   },
@@ -2171,7 +2171,7 @@
       "setproctitle.o",
       "setproctitle.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/setproctitle.c",
     "output": "src/setproctitle.o"
   },
@@ -2205,7 +2205,7 @@
       "blocked.o",
       "blocked.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/blocked.c",
     "output": "src/blocked.o"
   },
@@ -2239,7 +2239,7 @@
       "hyperloglog.o",
       "hyperloglog.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/hyperloglog.c",
     "output": "src/hyperloglog.o"
   },
@@ -2273,7 +2273,7 @@
       "latency.o",
       "latency.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/latency.c",
     "output": "src/latency.o"
   },
@@ -2307,7 +2307,7 @@
       "sparkline.o",
       "sparkline.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sparkline.c",
     "output": "src/sparkline.o"
   },
@@ -2341,7 +2341,7 @@
       "redis-check-aof.o",
       "redis-check-aof.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/redis-check-aof.c",
     "output": "src/redis-check-aof.o"
   },
@@ -2375,7 +2375,7 @@
       "redis-check-rdb.o",
       "redis-check-rdb.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/redis-check-rdb.c",
     "output": "src/redis-check-rdb.o"
   },
@@ -2409,7 +2409,7 @@
       "geo.o",
       "geo.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/geo.c",
     "output": "src/geo.o"
   },
@@ -2443,7 +2443,7 @@
       "lazyfree.o",
       "lazyfree.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lazyfree.c",
     "output": "src/lazyfree.o"
   },
@@ -2477,7 +2477,7 @@
       "module.o",
       "module.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/module.c",
     "output": "src/module.o"
   },
@@ -2511,7 +2511,7 @@
       "evict.o",
       "evict.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/evict.c",
     "output": "src/evict.o"
   },
@@ -2545,7 +2545,7 @@
       "expire.o",
       "expire.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/expire.c",
     "output": "src/expire.o"
   },
@@ -2579,7 +2579,7 @@
       "geohash.o",
       "geohash.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/geohash.c",
     "output": "src/geohash.o"
   },
@@ -2613,7 +2613,7 @@
       "geohash_helper.o",
       "geohash_helper.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/geohash_helper.c",
     "output": "src/geohash_helper.o"
   },
@@ -2647,7 +2647,7 @@
       "childinfo.o",
       "childinfo.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/childinfo.c",
     "output": "src/childinfo.o"
   },
@@ -2681,7 +2681,7 @@
       "defrag.o",
       "defrag.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/defrag.c",
     "output": "src/defrag.o"
   },
@@ -2715,7 +2715,7 @@
       "siphash.o",
       "siphash.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/siphash.c",
     "output": "src/siphash.o"
   },
@@ -2749,7 +2749,7 @@
       "rax.o",
       "rax.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/rax.c",
     "output": "src/rax.o"
   },
@@ -2783,7 +2783,7 @@
       "t_stream.o",
       "t_stream.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/t_stream.c",
     "output": "src/t_stream.o"
   },
@@ -2817,7 +2817,7 @@
       "listpack.o",
       "listpack.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/listpack.c",
     "output": "src/listpack.o"
   },
@@ -2851,7 +2851,7 @@
       "localtime.o",
       "localtime.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/localtime.c",
     "output": "src/localtime.o"
   },
@@ -2885,7 +2885,7 @@
       "lolwut.o",
       "lolwut.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lolwut.c",
     "output": "src/lolwut.o"
   },
@@ -2919,7 +2919,7 @@
       "lolwut5.o",
       "lolwut5.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lolwut5.c",
     "output": "src/lolwut5.o"
   },
@@ -2953,7 +2953,7 @@
       "lolwut6.o",
       "lolwut6.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lolwut6.c",
     "output": "src/lolwut6.o"
   },
@@ -2987,7 +2987,7 @@
       "lolwut8.o",
       "lolwut8.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/lolwut8.c",
     "output": "src/lolwut8.o"
   },
@@ -3021,7 +3021,7 @@
       "acl.o",
       "acl.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/acl.c",
     "output": "src/acl.o"
   },
@@ -3055,7 +3055,7 @@
       "tracking.o",
       "tracking.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/tracking.c",
     "output": "src/tracking.o"
   },
@@ -3089,7 +3089,7 @@
       "socket.o",
       "socket.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/socket.c",
     "output": "src/socket.o"
   },
@@ -3123,7 +3123,7 @@
       "tls.o",
       "tls.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/tls.c",
     "output": "src/tls.o"
   },
@@ -3157,7 +3157,7 @@
       "sha256.o",
       "sha256.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sha256.c",
     "output": "src/sha256.o"
   },
@@ -3191,7 +3191,7 @@
       "timeout.o",
       "timeout.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/timeout.c",
     "output": "src/timeout.o"
   },
@@ -3225,7 +3225,7 @@
       "setcpuaffinity.o",
       "setcpuaffinity.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/setcpuaffinity.c",
     "output": "src/setcpuaffinity.o"
   },
@@ -3259,7 +3259,7 @@
       "monotonic.o",
       "monotonic.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/monotonic.c",
     "output": "src/monotonic.o"
   },
@@ -3293,7 +3293,7 @@
       "mt19937-64.o",
       "mt19937-64.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/mt19937-64.c",
     "output": "src/mt19937-64.o"
   },
@@ -3327,7 +3327,7 @@
       "resp_parser.o",
       "resp_parser.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/resp_parser.c",
     "output": "src/resp_parser.o"
   },
@@ -3361,7 +3361,7 @@
       "call_reply.o",
       "call_reply.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/call_reply.c",
     "output": "src/call_reply.o"
   },
@@ -3395,7 +3395,7 @@
       "script_lua.o",
       "script_lua.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/script_lua.c",
     "output": "src/script_lua.o"
   },
@@ -3429,7 +3429,7 @@
       "script.o",
       "script.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/script.c",
     "output": "src/script.o"
   },
@@ -3463,7 +3463,7 @@
       "functions.o",
       "functions.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/functions.c",
     "output": "src/functions.o"
   },
@@ -3497,7 +3497,7 @@
       "function_lua.o",
       "function_lua.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/function_lua.c",
     "output": "src/function_lua.o"
   },
@@ -3531,7 +3531,7 @@
       "connection.o",
       "connection.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/connection.c",
     "output": "src/connection.o"
   },
@@ -3565,7 +3565,7 @@
       "strl.o",
       "strl.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/strl.c",
     "output": "src/strl.o"
   },
@@ -3599,7 +3599,7 @@
       "commands.o",
       "commands.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/commands.c",
     "output": "src/commands.o"
   },
@@ -3633,7 +3633,7 @@
       "unix.o",
       "unix.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/unix.c",
     "output": "src/unix.o"
   },
@@ -3667,7 +3667,7 @@
       "logreqres.o",
       "logreqres.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/logreqres.c",
     "output": "src/logreqres.o"
   },
@@ -3701,7 +3701,7 @@
       "keymeta.o",
       "keymeta.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/keymeta.c",
     "output": "src/keymeta.o"
   },
@@ -3735,7 +3735,7 @@
       "chk.o",
       "chk.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/chk.c",
     "output": "src/chk.o"
   },
@@ -3769,7 +3769,7 @@
       "vector_engine.o",
       "vector_engine.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/vector_engine.c",
     "output": "src/vector_engine.o"
   },
@@ -3803,7 +3803,7 @@
       "hotkeys.o",
       "hotkeys.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/hotkeys.c",
     "output": "src/hotkeys.o"
   },
@@ -3837,7 +3837,7 @@
       "vector_engine_redis_impl.o",
       "vector_engine_redis_impl.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/vector_engine_redis_impl.c",
     "output": "src/vector_engine_redis_impl.o"
   },
@@ -3871,7 +3871,7 @@
       "vector_engine_ub_impl.o",
       "vector_engine_ub_impl.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/vector_engine_ub_impl.c",
     "output": "src/vector_engine_ub_impl.o"
   },
@@ -3905,7 +3905,7 @@
       "ub_client.o",
       "ub_client.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/ub_client.c",
     "output": "src/ub_client.o"
   },
@@ -3939,7 +3939,7 @@
       "batch_processor.o",
       "batch_processor.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/batch_processor.c",
     "output": "src/batch_processor.o"
   },
@@ -3973,7 +3973,7 @@
       "sve_compute.o",
       "sve_compute.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/sve_compute.c",
     "output": "src/sve_compute.o"
   },
@@ -4007,7 +4007,7 @@
       "vset.o",
       "../modules/vector-sets/vset.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "modules/vector-sets/vset.c",
     "output": "src/vset.o"
   },
@@ -4041,7 +4041,7 @@
       "hnsw.o",
       "../modules/vector-sets/hnsw.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "modules/vector-sets/hnsw.c",
     "output": "src/hnsw.o"
   },
@@ -4075,7 +4075,7 @@
       "vset_config.o",
       "../modules/vector-sets/vset_config.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "modules/vector-sets/vset_config.c",
     "output": "src/vset_config.o"
   },
@@ -4109,7 +4109,7 @@
       "redis-cli.o",
       "redis-cli.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/redis-cli.c",
     "output": "src/redis-cli.o"
   },
@@ -4143,7 +4143,7 @@
       "redisassert.o",
       "redisassert.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/redisassert.c",
     "output": "src/redisassert.o"
   },
@@ -4177,7 +4177,7 @@
       "cli_common.o",
       "cli_common.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/cli_common.c",
     "output": "src/cli_common.o"
   },
@@ -4211,7 +4211,7 @@
       "cli_commands.o",
       "cli_commands.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/cli_commands.c",
     "output": "src/cli_commands.o"
   },
@@ -4245,7 +4245,7 @@
       "redis-benchmark.o",
       "redis-benchmark.c"
     ],
-    "directory": "src",
+    "directory": "/Users/shuzhuangzhuang/codespace/github/hpc-redis/src",
     "file": "src/redis-benchmark.c",
     "output": "src/redis-benchmark.o"
   },
