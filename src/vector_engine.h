@@ -65,6 +65,12 @@ vector_engine_type_t vector_engine_get_current_type(void);
 vector_engine_t *vector_engine_create(vector_engine_type_t type);
 void vector_engine_destroy(vector_engine_t *engine);
 
+/* Runtime engine switching */
+int vector_engine_switch(vector_engine_type_t type);
+
+/* UB engine operations (defined in vector_engine_ub_impl.c) */
+int ub_engine_vemb(void *ctx, void *key, void *element, vector_data_t *result);
+
 /* Utility Functions */
 vector_data_t *vector_data_create(float *data, size_t dim, int is_fp32);
 void vector_data_destroy(vector_data_t *vd);

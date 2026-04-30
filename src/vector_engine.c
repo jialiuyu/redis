@@ -112,6 +112,40 @@ vector_engine_t *vector_engine_get(void) {
     return current_engine;
 }
 
+int vector_engine_switch(vector_engine_type_t type) {
+    if (type < 0 || type >= VECTOR_ENGINE_MAX) {
+        serverLog(LL_WARNING, "Invalid vector engine type %d", type);
+        return C_ERR;
+    }
+
+    vector_engine_t *engine = engine_registry[type];
+    if (!engine) {
+        serverLog(LL_WARNING, "Vector engine type %d not registered", type);
+        return C_ERR;
+    }
+
+    /* If switching to the same engine, nothing to do */
+    if (current_engine == engine) {
+        return C_OK;
+    }
+
+    /* Cleanup old engine */
+    if (current_engine) {
+        current_engine->cleanup();
+    }
+
+    /* Init and activate new engine */
+    if (engine->init() != C_OK) {
+        serverLog(LL_WARNING, "Vector engine type %d init failed during switch", type);
+        return C_ERR;
+    }
+
+    current_engine = engine;
+    serverLog(LL_NOTICE, "Vector engine switched to: %s",
+              type == VECTOR_ENGINE_UB ? "UB" : "Redis");
+    return C_OK;
+}
+
 /* ============================================================
  * Utility Functions
  * ============================================================ */

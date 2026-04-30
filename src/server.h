@@ -1919,7 +1919,7 @@ struct redisServer {
     int child_type;             /* Type of current child */
     redisAtomic int module_gil_acquring; /* Indicates whether the GIL is being acquiring by the main thread. */
     /* Vector Engine */
-    vector_engine_type_t vector_engine_type; /* Type of vector engine to use */
+    int vector_engine_type; /* Type of vector engine to use */
     int vector_engine_enabled;   /* Whether vector engine is enabled */
     ub_mem_config_t ub;          /* UB data-plane configuration */
     /* Networking */

@@ -5,9 +5,13 @@
 
 #include "sve_compute.h"
 #include "server.h"
+#ifdef __linux__
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
+#endif
+#ifdef __ARM_FEATURE_SVE
 #include <arm_sve.h>
+#endif
 
 /* Global SVE context */
 sve_context_t *global_sve_context = NULL;

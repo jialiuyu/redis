@@ -2,901 +2,6 @@
   {
     "arguments": [
       "/usr/bin/cc",
-      "-std=gnu11",
-      "-c",
-      "-o",
-      "foo.o",
-      "foo.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/foo.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/foo.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lapi.o",
-      "lapi.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lapi.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lapi.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-Wall",
-      "-Os",
-      "-g",
-      "-DHDR_MALLOC_INCLUDE=\"hdr_redis_malloc.h\"",
-      "-c",
-      "hdr_histogram.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hdr_histogram",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hdr_histogram/hdr_histogram.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-Os",
-      "-g",
-      "-c",
-      "linenoise.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/linenoise",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/linenoise/linenoise.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "alloc.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/alloc.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "net.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/net.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lcode.o",
-      "lcode.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lcode.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lcode.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "hiredis.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/hiredis.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ldebug.o",
-      "ldebug.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldebug.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldebug.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-Os",
-      "-g",
-      "-c",
-      "fpconv_dtoa.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/fpconv",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/fpconv/fpconv_dtoa.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "sds.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/sds.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ldo.o",
-      "ldo.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldo.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldo.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/c++",
-      "-Wall",
-      "-O3",
-      "-std=c++11",
-      "-DFASTFLOAT_ALLOWS_LEADING_PLUS",
-      "-c",
-      "fast_float_strtod.cpp"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/fast_float",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/fast_float/fast_float_strtod.cpp"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "async.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/async.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ldump.o",
-      "ldump.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldump.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldump.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lfunc.o",
-      "lfunc.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lfunc.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lfunc.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "read.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/read.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lgc.o",
-      "lgc.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lgc.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lgc.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-std=c99",
-      "-c",
-      "-O3",
-      "-fPIC",
-      "-Wall",
-      "-Wextra",
-      "-Werror",
-      "-Wstrict-prototypes",
-      "-Wwrite-strings",
-      "-Wno-missing-field-initializers",
-      "-g",
-      "-ggdb",
-      "-pedantic",
-      "sockcompat.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/hiredis",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/hiredis/sockcompat.c"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "llex.o",
-      "llex.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/llex.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/llex.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lmem.o",
-      "lmem.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lmem.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lmem.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lobject.o",
-      "lobject.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lobject.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lobject.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lopcodes.o",
-      "lopcodes.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lopcodes.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lopcodes.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lparser.o",
-      "lparser.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lparser.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lparser.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lstate.o",
-      "lstate.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lstate.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lstate.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lstring.o",
-      "lstring.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lstring.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lstring.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ltable.o",
-      "ltable.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ltable.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ltable.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ltm.o",
-      "ltm.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ltm.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ltm.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lundump.o",
-      "lundump.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lundump.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lundump.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lvm.o",
-      "lvm.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lvm.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lvm.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lzio.o",
-      "lzio.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lzio.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lzio.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "strbuf.o",
-      "strbuf.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/strbuf.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/strbuf.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "fpconv.o",
-      "fpconv.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/fpconv.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/fpconv.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lauxlib.o",
-      "lauxlib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lauxlib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lauxlib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lbaselib.o",
-      "lbaselib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lbaselib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lbaselib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ldblib.o",
-      "ldblib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldblib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ldblib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "liolib.o",
-      "liolib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/liolib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/liolib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lmathlib.o",
-      "lmathlib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lmathlib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lmathlib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "loslib.o",
-      "loslib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/loslib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/loslib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "ltablib.o",
-      "ltablib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ltablib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/ltablib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lstrlib.o",
-      "lstrlib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lstrlib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lstrlib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "loadlib.o",
-      "loadlib.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/loadlib.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/loadlib.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "linit.o",
-      "linit.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/linit.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/linit.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lua_cjson.o",
-      "lua_cjson.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_cjson.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_cjson.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lua_struct.o",
-      "lua_struct.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_struct.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_struct.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lua_cmsgpack.o",
-      "lua_cmsgpack.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_cmsgpack.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_cmsgpack.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lua_bit.o",
-      "lua_bit.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_bit.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua_bit.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "lua.o",
-      "lua.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/lua.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "luac.o",
-      "luac.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/luac.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/luac.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-Wall",
-      "-DLUA_ANSI",
-      "-DENABLE_CJSON_GLOBAL",
-      "-DREDIS_STATIC=",
-      "-DLUA_USE_MKSTEMP",
-      "-O2",
-      "-c",
-      "-o",
-      "print.o",
-      "print.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/deps/lua/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/print.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/deps/lua/src/print.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
       "-pedantic",
       "-DREDIS_STATIC=",
       "-std=gnu11",
@@ -924,77 +29,9 @@
       "threads_mngr.o",
       "threads_mngr.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/threads_mngr.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/threads_mngr.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "quicklist.o",
-      "quicklist.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/quicklist.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/quicklist.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "adlist.o",
-      "adlist.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/adlist.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/adlist.o"
+    "directory": "src",
+    "file": "src/threads_mngr.c",
+    "output": "src/threads_mngr.o"
   },
   {
     "arguments": [
@@ -1026,77 +63,9 @@
       "memory_prefetch.o",
       "memory_prefetch.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/memory_prefetch.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/memory_prefetch.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "ae.o",
-      "ae.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/ae.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/ae.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "anet.o",
-      "anet.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/anet.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/anet.o"
+    "directory": "src",
+    "file": "src/memory_prefetch.c",
+    "output": "src/memory_prefetch.o"
   },
   {
     "arguments": [
@@ -1128,9 +97,77 @@
       "dict.o",
       "dict.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/dict.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/dict.o"
+    "directory": "src",
+    "file": "src/dict.c",
+    "output": "src/dict.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "ae.o",
+      "ae.c"
+    ],
+    "directory": "src",
+    "file": "src/ae.c",
+    "output": "src/ae.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "adlist.o",
+      "adlist.c"
+    ],
+    "directory": "src",
+    "file": "src/adlist.c",
+    "output": "src/adlist.o"
   },
   {
     "arguments": [
@@ -1162,9 +199,77 @@
       "ebuckets.o",
       "ebuckets.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/ebuckets.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/ebuckets.o"
+    "directory": "src",
+    "file": "src/ebuckets.c",
+    "output": "src/ebuckets.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "anet.o",
+      "anet.c"
+    ],
+    "directory": "src",
+    "file": "src/anet.c",
+    "output": "src/anet.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "quicklist.o",
+      "quicklist.c"
+    ],
+    "directory": "src",
+    "file": "src/quicklist.c",
+    "output": "src/quicklist.o"
   },
   {
     "arguments": [
@@ -1196,9 +301,9 @@
       "eventnotifier.o",
       "eventnotifier.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/eventnotifier.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/eventnotifier.o"
+    "directory": "src",
+    "file": "src/eventnotifier.c",
+    "output": "src/eventnotifier.o"
   },
   {
     "arguments": [
@@ -1230,9 +335,9 @@
       "iothread.o",
       "iothread.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/iothread.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/iothread.o"
+    "directory": "src",
+    "file": "src/iothread.c",
+    "output": "src/iothread.o"
   },
   {
     "arguments": [
@@ -1264,9 +369,9 @@
       "mstr.o",
       "mstr.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/mstr.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/mstr.o"
+    "directory": "src",
+    "file": "src/mstr.c",
+    "output": "src/mstr.o"
   },
   {
     "arguments": [
@@ -1298,9 +403,9 @@
       "entry.o",
       "entry.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/entry.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/entry.o"
+    "directory": "src",
+    "file": "src/entry.c",
+    "output": "src/entry.o"
   },
   {
     "arguments": [
@@ -1332,9 +437,9 @@
       "kvstore.o",
       "kvstore.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/kvstore.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/kvstore.o"
+    "directory": "src",
+    "file": "src/kvstore.c",
+    "output": "src/kvstore.o"
   },
   {
     "arguments": [
@@ -1366,9 +471,9 @@
       "fwtree.o",
       "fwtree.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/fwtree.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/fwtree.o"
+    "directory": "src",
+    "file": "src/fwtree.c",
+    "output": "src/fwtree.o"
   },
   {
     "arguments": [
@@ -1400,9 +505,9 @@
       "estore.o",
       "estore.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/estore.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/estore.o"
+    "directory": "src",
+    "file": "src/estore.c",
+    "output": "src/estore.o"
   },
   {
     "arguments": [
@@ -1434,9 +539,9 @@
       "server.o",
       "server.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/server.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/server.o"
+    "directory": "src",
+    "file": "src/server.c",
+    "output": "src/server.o"
   },
   {
     "arguments": [
@@ -1468,9 +573,9 @@
       "sds.o",
       "sds.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/sds.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/sds.o"
+    "directory": "src",
+    "file": "src/sds.c",
+    "output": "src/sds.o"
   },
   {
     "arguments": [
@@ -1502,43 +607,9 @@
       "zmalloc.o",
       "zmalloc.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/zmalloc.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/zmalloc.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "lzf_c.o",
-      "lzf_c.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lzf_c.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lzf_c.o"
+    "directory": "src",
+    "file": "src/zmalloc.c",
+    "output": "src/zmalloc.o"
   },
   {
     "arguments": [
@@ -1570,9 +641,9 @@
       "lzf_d.o",
       "lzf_d.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lzf_d.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lzf_d.o"
+    "directory": "src",
+    "file": "src/lzf_d.c",
+    "output": "src/lzf_d.o"
   },
   {
     "arguments": [
@@ -1604,9 +675,43 @@
       "pqsort.o",
       "pqsort.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/pqsort.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/pqsort.o"
+    "directory": "src",
+    "file": "src/pqsort.c",
+    "output": "src/pqsort.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "lzf_c.o",
+      "lzf_c.c"
+    ],
+    "directory": "src",
+    "file": "src/lzf_c.c",
+    "output": "src/lzf_c.o"
   },
   {
     "arguments": [
@@ -1638,9 +743,9 @@
       "zipmap.o",
       "zipmap.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/zipmap.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/zipmap.o"
+    "directory": "src",
+    "file": "src/zipmap.c",
+    "output": "src/zipmap.o"
   },
   {
     "arguments": [
@@ -1672,9 +777,9 @@
       "sha1.o",
       "sha1.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/sha1.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/sha1.o"
+    "directory": "src",
+    "file": "src/sha1.c",
+    "output": "src/sha1.o"
   },
   {
     "arguments": [
@@ -1706,43 +811,9 @@
       "ziplist.o",
       "ziplist.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/ziplist.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/ziplist.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "release.o",
-      "release.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/release.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/release.o"
+    "directory": "src",
+    "file": "src/ziplist.c",
+    "output": "src/ziplist.o"
   },
   {
     "arguments": [
@@ -1774,9 +845,43 @@
       "networking.o",
       "networking.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/networking.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/networking.o"
+    "directory": "src",
+    "file": "src/networking.c",
+    "output": "src/networking.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "release.o",
+      "release.c"
+    ],
+    "directory": "src",
+    "file": "src/release.c",
+    "output": "src/release.o"
   },
   {
     "arguments": [
@@ -1808,9 +913,9 @@
       "util.o",
       "util.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/util.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/util.o"
+    "directory": "src",
+    "file": "src/util.c",
+    "output": "src/util.o"
   },
   {
     "arguments": [
@@ -1842,43 +947,9 @@
       "object.o",
       "object.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/object.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/object.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "db.o",
-      "db.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/db.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/db.o"
+    "directory": "src",
+    "file": "src/object.c",
+    "output": "src/object.o"
   },
   {
     "arguments": [
@@ -1910,9 +981,43 @@
       "replication.o",
       "replication.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/replication.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/replication.o"
+    "directory": "src",
+    "file": "src/replication.c",
+    "output": "src/replication.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "db.o",
+      "db.c"
+    ],
+    "directory": "src",
+    "file": "src/db.c",
+    "output": "src/db.o"
   },
   {
     "arguments": [
@@ -1944,9 +1049,9 @@
       "rdb.o",
       "rdb.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/rdb.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/rdb.o"
+    "directory": "src",
+    "file": "src/rdb.c",
+    "output": "src/rdb.o"
   },
   {
     "arguments": [
@@ -1978,9 +1083,9 @@
       "t_string.o",
       "t_string.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/t_string.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/t_string.o"
+    "directory": "src",
+    "file": "src/t_string.c",
+    "output": "src/t_string.o"
   },
   {
     "arguments": [
@@ -2012,9 +1117,9 @@
       "t_list.o",
       "t_list.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/t_list.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/t_list.o"
+    "directory": "src",
+    "file": "src/t_list.c",
+    "output": "src/t_list.o"
   },
   {
     "arguments": [
@@ -2046,9 +1151,9 @@
       "t_set.o",
       "t_set.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/t_set.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/t_set.o"
+    "directory": "src",
+    "file": "src/t_set.c",
+    "output": "src/t_set.o"
   },
   {
     "arguments": [
@@ -2080,9 +1185,9 @@
       "t_zset.o",
       "t_zset.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/t_zset.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/t_zset.o"
+    "directory": "src",
+    "file": "src/t_zset.c",
+    "output": "src/t_zset.o"
   },
   {
     "arguments": [
@@ -2114,9 +1219,9 @@
       "t_hash.o",
       "t_hash.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/t_hash.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/t_hash.o"
+    "directory": "src",
+    "file": "src/t_hash.c",
+    "output": "src/t_hash.o"
   },
   {
     "arguments": [
@@ -2148,9 +1253,9 @@
       "config.o",
       "config.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/config.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/config.o"
+    "directory": "src",
+    "file": "src/config.c",
+    "output": "src/config.o"
   },
   {
     "arguments": [
@@ -2182,9 +1287,9 @@
       "aof.o",
       "aof.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/aof.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/aof.o"
+    "directory": "src",
+    "file": "src/aof.c",
+    "output": "src/aof.o"
   },
   {
     "arguments": [
@@ -2216,9 +1321,9 @@
       "pubsub.o",
       "pubsub.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/pubsub.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/pubsub.o"
+    "directory": "src",
+    "file": "src/pubsub.c",
+    "output": "src/pubsub.o"
   },
   {
     "arguments": [
@@ -2250,9 +1355,9 @@
       "multi.o",
       "multi.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/multi.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/multi.o"
+    "directory": "src",
+    "file": "src/multi.c",
+    "output": "src/multi.o"
   },
   {
     "arguments": [
@@ -2284,9 +1389,9 @@
       "debug.o",
       "debug.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/debug.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/debug.o"
+    "directory": "src",
+    "file": "src/debug.c",
+    "output": "src/debug.o"
   },
   {
     "arguments": [
@@ -2318,9 +1423,9 @@
       "sort.o",
       "sort.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/sort.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/sort.o"
+    "directory": "src",
+    "file": "src/sort.c",
+    "output": "src/sort.o"
   },
   {
     "arguments": [
@@ -2352,9 +1457,9 @@
       "intset.o",
       "intset.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/intset.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/intset.o"
+    "directory": "src",
+    "file": "src/intset.c",
+    "output": "src/intset.o"
   },
   {
     "arguments": [
@@ -2386,9 +1491,9 @@
       "syncio.o",
       "syncio.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/syncio.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/syncio.o"
+    "directory": "src",
+    "file": "src/syncio.c",
+    "output": "src/syncio.o"
   },
   {
     "arguments": [
@@ -2420,9 +1525,9 @@
       "cluster.o",
       "cluster.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/cluster.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/cluster.o"
+    "directory": "src",
+    "file": "src/cluster.c",
+    "output": "src/cluster.o"
   },
   {
     "arguments": [
@@ -2454,9 +1559,9 @@
       "cluster_asm.o",
       "cluster_asm.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/cluster_asm.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/cluster_asm.o"
+    "directory": "src",
+    "file": "src/cluster_asm.c",
+    "output": "src/cluster_asm.o"
   },
   {
     "arguments": [
@@ -2488,9 +1593,9 @@
       "cluster_legacy.o",
       "cluster_legacy.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/cluster_legacy.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/cluster_legacy.o"
+    "directory": "src",
+    "file": "src/cluster_legacy.c",
+    "output": "src/cluster_legacy.o"
   },
   {
     "arguments": [
@@ -2522,9 +1627,9 @@
       "cluster_slot_stats.o",
       "cluster_slot_stats.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/cluster_slot_stats.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/cluster_slot_stats.o"
+    "directory": "src",
+    "file": "src/cluster_slot_stats.c",
+    "output": "src/cluster_slot_stats.o"
   },
   {
     "arguments": [
@@ -2556,9 +1661,9 @@
       "crc16.o",
       "crc16.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/crc16.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/crc16.o"
+    "directory": "src",
+    "file": "src/crc16.c",
+    "output": "src/crc16.o"
   },
   {
     "arguments": [
@@ -2590,9 +1695,9 @@
       "endianconv.o",
       "endianconv.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/endianconv.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/endianconv.o"
+    "directory": "src",
+    "file": "src/endianconv.c",
+    "output": "src/endianconv.o"
   },
   {
     "arguments": [
@@ -2624,9 +1729,9 @@
       "slowlog.o",
       "slowlog.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/slowlog.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/slowlog.o"
+    "directory": "src",
+    "file": "src/slowlog.c",
+    "output": "src/slowlog.o"
   },
   {
     "arguments": [
@@ -2658,9 +1763,9 @@
       "eval.o",
       "eval.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/eval.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/eval.o"
+    "directory": "src",
+    "file": "src/eval.c",
+    "output": "src/eval.o"
   },
   {
     "arguments": [
@@ -2692,9 +1797,9 @@
       "bio.o",
       "bio.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/bio.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/bio.o"
+    "directory": "src",
+    "file": "src/bio.c",
+    "output": "src/bio.o"
   },
   {
     "arguments": [
@@ -2726,43 +1831,9 @@
       "rio.o",
       "rio.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/rio.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/rio.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "memtest.o",
-      "memtest.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/memtest.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/memtest.o"
+    "directory": "src",
+    "file": "src/rio.c",
+    "output": "src/rio.o"
   },
   {
     "arguments": [
@@ -2794,9 +1865,43 @@
       "rand.o",
       "rand.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/rand.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/rand.o"
+    "directory": "src",
+    "file": "src/rand.c",
+    "output": "src/rand.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "memtest.o",
+      "memtest.c"
+    ],
+    "directory": "src",
+    "file": "src/memtest.c",
+    "output": "src/memtest.o"
   },
   {
     "arguments": [
@@ -2828,43 +1933,9 @@
       "syscheck.o",
       "syscheck.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/syscheck.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/syscheck.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "crcspeed.o",
-      "crcspeed.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/crcspeed.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/crcspeed.o"
+    "directory": "src",
+    "file": "src/syscheck.c",
+    "output": "src/syscheck.o"
   },
   {
     "arguments": [
@@ -2896,9 +1967,43 @@
       "crccombine.o",
       "crccombine.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/crccombine.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/crccombine.o"
+    "directory": "src",
+    "file": "src/crccombine.c",
+    "output": "src/crccombine.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "crcspeed.o",
+      "crcspeed.c"
+    ],
+    "directory": "src",
+    "file": "src/crcspeed.c",
+    "output": "src/crcspeed.o"
   },
   {
     "arguments": [
@@ -2930,9 +2035,9 @@
       "crc64.o",
       "crc64.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/crc64.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/crc64.o"
+    "directory": "src",
+    "file": "src/crc64.c",
+    "output": "src/crc64.o"
   },
   {
     "arguments": [
@@ -2964,43 +2069,9 @@
       "bitops.o",
       "bitops.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/bitops.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/bitops.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "notify.o",
-      "notify.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/notify.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/notify.o"
+    "directory": "src",
+    "file": "src/bitops.c",
+    "output": "src/bitops.o"
   },
   {
     "arguments": [
@@ -3032,9 +2103,43 @@
       "sentinel.o",
       "sentinel.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/sentinel.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/sentinel.o"
+    "directory": "src",
+    "file": "src/sentinel.c",
+    "output": "src/sentinel.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "notify.o",
+      "notify.c"
+    ],
+    "directory": "src",
+    "file": "src/notify.c",
+    "output": "src/notify.o"
   },
   {
     "arguments": [
@@ -3066,9 +2171,9 @@
       "setproctitle.o",
       "setproctitle.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/setproctitle.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/setproctitle.o"
+    "directory": "src",
+    "file": "src/setproctitle.c",
+    "output": "src/setproctitle.o"
   },
   {
     "arguments": [
@@ -3100,9 +2205,9 @@
       "blocked.o",
       "blocked.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/blocked.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/blocked.o"
+    "directory": "src",
+    "file": "src/blocked.c",
+    "output": "src/blocked.o"
   },
   {
     "arguments": [
@@ -3134,9 +2239,9 @@
       "hyperloglog.o",
       "hyperloglog.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/hyperloglog.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/hyperloglog.o"
+    "directory": "src",
+    "file": "src/hyperloglog.c",
+    "output": "src/hyperloglog.o"
   },
   {
     "arguments": [
@@ -3168,9 +2273,9 @@
       "latency.o",
       "latency.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/latency.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/latency.o"
+    "directory": "src",
+    "file": "src/latency.c",
+    "output": "src/latency.o"
   },
   {
     "arguments": [
@@ -3202,43 +2307,9 @@
       "sparkline.o",
       "sparkline.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/sparkline.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/sparkline.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "redis-check-rdb.o",
-      "redis-check-rdb.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/redis-check-rdb.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/redis-check-rdb.o"
+    "directory": "src",
+    "file": "src/sparkline.c",
+    "output": "src/sparkline.o"
   },
   {
     "arguments": [
@@ -3270,9 +2341,43 @@
       "redis-check-aof.o",
       "redis-check-aof.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/redis-check-aof.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/redis-check-aof.o"
+    "directory": "src",
+    "file": "src/redis-check-aof.c",
+    "output": "src/redis-check-aof.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "redis-check-rdb.o",
+      "redis-check-rdb.c"
+    ],
+    "directory": "src",
+    "file": "src/redis-check-rdb.c",
+    "output": "src/redis-check-rdb.o"
   },
   {
     "arguments": [
@@ -3304,9 +2409,9 @@
       "geo.o",
       "geo.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/geo.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/geo.o"
+    "directory": "src",
+    "file": "src/geo.c",
+    "output": "src/geo.o"
   },
   {
     "arguments": [
@@ -3338,9 +2443,9 @@
       "lazyfree.o",
       "lazyfree.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lazyfree.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lazyfree.o"
+    "directory": "src",
+    "file": "src/lazyfree.c",
+    "output": "src/lazyfree.o"
   },
   {
     "arguments": [
@@ -3372,9 +2477,9 @@
       "module.o",
       "module.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/module.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/module.o"
+    "directory": "src",
+    "file": "src/module.c",
+    "output": "src/module.o"
   },
   {
     "arguments": [
@@ -3406,9 +2511,9 @@
       "evict.o",
       "evict.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/evict.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/evict.o"
+    "directory": "src",
+    "file": "src/evict.c",
+    "output": "src/evict.o"
   },
   {
     "arguments": [
@@ -3440,9 +2545,9 @@
       "expire.o",
       "expire.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/expire.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/expire.o"
+    "directory": "src",
+    "file": "src/expire.c",
+    "output": "src/expire.o"
   },
   {
     "arguments": [
@@ -3474,9 +2579,9 @@
       "geohash.o",
       "geohash.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/geohash.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/geohash.o"
+    "directory": "src",
+    "file": "src/geohash.c",
+    "output": "src/geohash.o"
   },
   {
     "arguments": [
@@ -3508,9 +2613,9 @@
       "geohash_helper.o",
       "geohash_helper.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/geohash_helper.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/geohash_helper.o"
+    "directory": "src",
+    "file": "src/geohash_helper.c",
+    "output": "src/geohash_helper.o"
   },
   {
     "arguments": [
@@ -3542,9 +2647,9 @@
       "childinfo.o",
       "childinfo.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/childinfo.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/childinfo.o"
+    "directory": "src",
+    "file": "src/childinfo.c",
+    "output": "src/childinfo.o"
   },
   {
     "arguments": [
@@ -3576,9 +2681,9 @@
       "defrag.o",
       "defrag.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/defrag.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/defrag.o"
+    "directory": "src",
+    "file": "src/defrag.c",
+    "output": "src/defrag.o"
   },
   {
     "arguments": [
@@ -3610,9 +2715,9 @@
       "siphash.o",
       "siphash.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/siphash.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/siphash.o"
+    "directory": "src",
+    "file": "src/siphash.c",
+    "output": "src/siphash.o"
   },
   {
     "arguments": [
@@ -3644,9 +2749,9 @@
       "rax.o",
       "rax.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/rax.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/rax.o"
+    "directory": "src",
+    "file": "src/rax.c",
+    "output": "src/rax.o"
   },
   {
     "arguments": [
@@ -3678,9 +2783,9 @@
       "t_stream.o",
       "t_stream.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/t_stream.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/t_stream.o"
+    "directory": "src",
+    "file": "src/t_stream.c",
+    "output": "src/t_stream.o"
   },
   {
     "arguments": [
@@ -3712,9 +2817,9 @@
       "listpack.o",
       "listpack.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/listpack.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/listpack.o"
+    "directory": "src",
+    "file": "src/listpack.c",
+    "output": "src/listpack.o"
   },
   {
     "arguments": [
@@ -3746,9 +2851,9 @@
       "localtime.o",
       "localtime.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/localtime.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/localtime.o"
+    "directory": "src",
+    "file": "src/localtime.c",
+    "output": "src/localtime.o"
   },
   {
     "arguments": [
@@ -3780,9 +2885,9 @@
       "lolwut.o",
       "lolwut.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lolwut.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lolwut.o"
+    "directory": "src",
+    "file": "src/lolwut.c",
+    "output": "src/lolwut.o"
   },
   {
     "arguments": [
@@ -3814,9 +2919,9 @@
       "lolwut5.o",
       "lolwut5.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lolwut5.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lolwut5.o"
+    "directory": "src",
+    "file": "src/lolwut5.c",
+    "output": "src/lolwut5.o"
   },
   {
     "arguments": [
@@ -3848,9 +2953,9 @@
       "lolwut6.o",
       "lolwut6.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lolwut6.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lolwut6.o"
+    "directory": "src",
+    "file": "src/lolwut6.c",
+    "output": "src/lolwut6.o"
   },
   {
     "arguments": [
@@ -3882,9 +2987,9 @@
       "lolwut8.o",
       "lolwut8.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/lolwut8.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/lolwut8.o"
+    "directory": "src",
+    "file": "src/lolwut8.c",
+    "output": "src/lolwut8.o"
   },
   {
     "arguments": [
@@ -3916,43 +3021,9 @@
       "acl.o",
       "acl.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/acl.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/acl.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "socket.o",
-      "socket.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/socket.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/socket.o"
+    "directory": "src",
+    "file": "src/acl.c",
+    "output": "src/acl.o"
   },
   {
     "arguments": [
@@ -3984,9 +3055,43 @@
       "tracking.o",
       "tracking.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/tracking.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/tracking.o"
+    "directory": "src",
+    "file": "src/tracking.c",
+    "output": "src/tracking.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "socket.o",
+      "socket.c"
+    ],
+    "directory": "src",
+    "file": "src/socket.c",
+    "output": "src/socket.o"
   },
   {
     "arguments": [
@@ -4018,9 +3123,9 @@
       "tls.o",
       "tls.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/tls.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/tls.o"
+    "directory": "src",
+    "file": "src/tls.c",
+    "output": "src/tls.o"
   },
   {
     "arguments": [
@@ -4052,9 +3157,9 @@
       "sha256.o",
       "sha256.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/sha256.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/sha256.o"
+    "directory": "src",
+    "file": "src/sha256.c",
+    "output": "src/sha256.o"
   },
   {
     "arguments": [
@@ -4086,43 +3191,9 @@
       "timeout.o",
       "timeout.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/timeout.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/timeout.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "monotonic.o",
-      "monotonic.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/monotonic.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/monotonic.o"
+    "directory": "src",
+    "file": "src/timeout.c",
+    "output": "src/timeout.o"
   },
   {
     "arguments": [
@@ -4154,9 +3225,43 @@
       "setcpuaffinity.o",
       "setcpuaffinity.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/setcpuaffinity.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/setcpuaffinity.o"
+    "directory": "src",
+    "file": "src/setcpuaffinity.c",
+    "output": "src/setcpuaffinity.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "monotonic.o",
+      "monotonic.c"
+    ],
+    "directory": "src",
+    "file": "src/monotonic.c",
+    "output": "src/monotonic.o"
   },
   {
     "arguments": [
@@ -4188,9 +3293,9 @@
       "mt19937-64.o",
       "mt19937-64.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/mt19937-64.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/mt19937-64.o"
+    "directory": "src",
+    "file": "src/mt19937-64.c",
+    "output": "src/mt19937-64.o"
   },
   {
     "arguments": [
@@ -4222,9 +3327,9 @@
       "resp_parser.o",
       "resp_parser.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/resp_parser.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/resp_parser.o"
+    "directory": "src",
+    "file": "src/resp_parser.c",
+    "output": "src/resp_parser.o"
   },
   {
     "arguments": [
@@ -4256,9 +3361,9 @@
       "call_reply.o",
       "call_reply.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/call_reply.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/call_reply.o"
+    "directory": "src",
+    "file": "src/call_reply.c",
+    "output": "src/call_reply.o"
   },
   {
     "arguments": [
@@ -4290,9 +3395,9 @@
       "script_lua.o",
       "script_lua.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/script_lua.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/script_lua.o"
+    "directory": "src",
+    "file": "src/script_lua.c",
+    "output": "src/script_lua.o"
   },
   {
     "arguments": [
@@ -4324,9 +3429,9 @@
       "script.o",
       "script.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/script.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/script.o"
+    "directory": "src",
+    "file": "src/script.c",
+    "output": "src/script.o"
   },
   {
     "arguments": [
@@ -4358,9 +3463,9 @@
       "functions.o",
       "functions.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/functions.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/functions.o"
+    "directory": "src",
+    "file": "src/functions.c",
+    "output": "src/functions.o"
   },
   {
     "arguments": [
@@ -4392,77 +3497,9 @@
       "function_lua.o",
       "function_lua.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/function_lua.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/function_lua.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "strl.o",
-      "strl.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/strl.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/strl.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "commands.o",
-      "commands.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/commands.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/commands.o"
+    "directory": "src",
+    "file": "src/function_lua.c",
+    "output": "src/function_lua.o"
   },
   {
     "arguments": [
@@ -4494,9 +3531,77 @@
       "connection.o",
       "connection.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/connection.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/connection.o"
+    "directory": "src",
+    "file": "src/connection.c",
+    "output": "src/connection.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "strl.o",
+      "strl.c"
+    ],
+    "directory": "src",
+    "file": "src/strl.c",
+    "output": "src/strl.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "commands.o",
+      "commands.c"
+    ],
+    "directory": "src",
+    "file": "src/commands.c",
+    "output": "src/commands.o"
   },
   {
     "arguments": [
@@ -4528,9 +3633,9 @@
       "unix.o",
       "unix.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/unix.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/unix.o"
+    "directory": "src",
+    "file": "src/unix.c",
+    "output": "src/unix.o"
   },
   {
     "arguments": [
@@ -4562,9 +3667,9 @@
       "logreqres.o",
       "logreqres.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/logreqres.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/logreqres.o"
+    "directory": "src",
+    "file": "src/logreqres.c",
+    "output": "src/logreqres.o"
   },
   {
     "arguments": [
@@ -4596,9 +3701,9 @@
       "keymeta.o",
       "keymeta.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/keymeta.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/keymeta.o"
+    "directory": "src",
+    "file": "src/keymeta.c",
+    "output": "src/keymeta.o"
   },
   {
     "arguments": [
@@ -4630,43 +3735,9 @@
       "chk.o",
       "chk.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/chk.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/chk.o"
-  },
-  {
-    "arguments": [
-      "/usr/bin/cc",
-      "-pedantic",
-      "-DREDIS_STATIC=",
-      "-std=gnu11",
-      "-Wall",
-      "-W",
-      "-Wno-missing-field-initializers",
-      "-Werror=deprecated-declarations",
-      "-Wstrict-prototypes",
-      "-O3",
-      "-flto=auto",
-      "-fno-omit-frame-pointer",
-      "-g",
-      "-ggdb",
-      "-funwind-tables",
-      "-I../deps/hiredis",
-      "-I../deps/linenoise",
-      "-I../deps/lua/src",
-      "-I../deps/hdr_histogram",
-      "-I../deps/fpconv",
-      "-I../deps/fast_float",
-      "-I../deps/xxhash",
-      "-DINCLUDE_VEC_SETS=1",
-      "-c",
-      "-o",
-      "hotkeys.o",
-      "hotkeys.c"
-    ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/hotkeys.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/hotkeys.o"
+    "directory": "src",
+    "file": "src/chk.c",
+    "output": "src/chk.o"
   },
   {
     "arguments": [
@@ -4698,9 +3769,111 @@
       "vector_engine.o",
       "vector_engine.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/vector_engine.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/vector_engine.o"
+    "directory": "src",
+    "file": "src/vector_engine.c",
+    "output": "src/vector_engine.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "hotkeys.o",
+      "hotkeys.c"
+    ],
+    "directory": "src",
+    "file": "src/hotkeys.c",
+    "output": "src/hotkeys.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "vector_engine_redis_impl.o",
+      "vector_engine_redis_impl.c"
+    ],
+    "directory": "src",
+    "file": "src/vector_engine_redis_impl.c",
+    "output": "src/vector_engine_redis_impl.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "vector_engine_ub_impl.o",
+      "vector_engine_ub_impl.c"
+    ],
+    "directory": "src",
+    "file": "src/vector_engine_ub_impl.c",
+    "output": "src/vector_engine_ub_impl.o"
   },
   {
     "arguments": [
@@ -4732,8 +3905,1360 @@
       "ub_client.o",
       "ub_client.c"
     ],
-    "directory": "/Users/szza/codespace/work/hpc-redis/src",
-    "file": "/Users/szza/codespace/work/hpc-redis/src/ub_client.c",
-    "output": "/Users/szza/codespace/work/hpc-redis/src/ub_client.o"
+    "directory": "src",
+    "file": "src/ub_client.c",
+    "output": "src/ub_client.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "batch_processor.o",
+      "batch_processor.c"
+    ],
+    "directory": "src",
+    "file": "src/batch_processor.c",
+    "output": "src/batch_processor.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "sve_compute.o",
+      "sve_compute.c"
+    ],
+    "directory": "src",
+    "file": "src/sve_compute.c",
+    "output": "src/sve_compute.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "vset.o",
+      "../modules/vector-sets/vset.c"
+    ],
+    "directory": "src",
+    "file": "modules/vector-sets/vset.c",
+    "output": "src/vset.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "hnsw.o",
+      "../modules/vector-sets/hnsw.c"
+    ],
+    "directory": "src",
+    "file": "modules/vector-sets/hnsw.c",
+    "output": "src/hnsw.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "vset_config.o",
+      "../modules/vector-sets/vset_config.c"
+    ],
+    "directory": "src",
+    "file": "modules/vector-sets/vset_config.c",
+    "output": "src/vset_config.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "redis-cli.o",
+      "redis-cli.c"
+    ],
+    "directory": "src",
+    "file": "src/redis-cli.c",
+    "output": "src/redis-cli.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "redisassert.o",
+      "redisassert.c"
+    ],
+    "directory": "src",
+    "file": "src/redisassert.c",
+    "output": "src/redisassert.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "cli_common.o",
+      "cli_common.c"
+    ],
+    "directory": "src",
+    "file": "src/cli_common.c",
+    "output": "src/cli_common.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "cli_commands.o",
+      "cli_commands.c"
+    ],
+    "directory": "src",
+    "file": "src/cli_commands.c",
+    "output": "src/cli_commands.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-pedantic",
+      "-DREDIS_STATIC=",
+      "-std=gnu11",
+      "-Wall",
+      "-W",
+      "-Wno-missing-field-initializers",
+      "-Werror=deprecated-declarations",
+      "-Wstrict-prototypes",
+      "-O3",
+      "-flto=auto",
+      "-fno-omit-frame-pointer",
+      "-g",
+      "-ggdb",
+      "-funwind-tables",
+      "-I../deps/hiredis",
+      "-I../deps/linenoise",
+      "-I../deps/lua/src",
+      "-I../deps/hdr_histogram",
+      "-I../deps/fpconv",
+      "-I../deps/fast_float",
+      "-I../deps/xxhash",
+      "-DINCLUDE_VEC_SETS=1",
+      "-c",
+      "-o",
+      "redis-benchmark.o",
+      "redis-benchmark.c"
+    ],
+    "directory": "src",
+    "file": "src/redis-benchmark.c",
+    "output": "src/redis-benchmark.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "testrdb.xo",
+      "testrdb.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/testrdb.c",
+    "output": "tests/modules/testrdb.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "infotest.xo",
+      "infotest.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/infotest.c",
+    "output": "tests/modules/infotest.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "propagate.xo",
+      "propagate.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/propagate.c",
+    "output": "tests/modules/propagate.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "fork.xo",
+      "fork.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/fork.c",
+    "output": "tests/modules/fork.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "misc.xo",
+      "misc.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/misc.c",
+    "output": "tests/modules/misc.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "commandfilter.xo",
+      "commandfilter.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/commandfilter.c",
+    "output": "tests/modules/commandfilter.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "basics.xo",
+      "basics.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/basics.c",
+    "output": "tests/modules/basics.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "hooks.xo",
+      "hooks.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/hooks.c",
+    "output": "tests/modules/hooks.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "blockonbackground.xo",
+      "blockonbackground.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/blockonbackground.c",
+    "output": "tests/modules/blockonbackground.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "blockonkeys.xo",
+      "blockonkeys.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/blockonkeys.c",
+    "output": "tests/modules/blockonkeys.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "scan.xo",
+      "scan.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/scan.c",
+    "output": "tests/modules/scan.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "auth.xo",
+      "auth.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/auth.c",
+    "output": "tests/modules/auth.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "datatype.xo",
+      "datatype.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/datatype.c",
+    "output": "tests/modules/datatype.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "datatype2.xo",
+      "datatype2.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/datatype2.c",
+    "output": "tests/modules/datatype2.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "blockedclient.xo",
+      "blockedclient.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/blockedclient.c",
+    "output": "tests/modules/blockedclient.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "keyspace_events.xo",
+      "keyspace_events.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/keyspace_events.c",
+    "output": "tests/modules/keyspace_events.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "test_lazyfree.xo",
+      "test_lazyfree.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/test_lazyfree.c",
+    "output": "tests/modules/test_lazyfree.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "getchannels.xo",
+      "getchannels.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/getchannels.c",
+    "output": "tests/modules/getchannels.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "timer.xo",
+      "timer.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/timer.c",
+    "output": "tests/modules/timer.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "getkeys.xo",
+      "getkeys.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/getkeys.c",
+    "output": "tests/modules/getkeys.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "hash.xo",
+      "hash.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/hash.c",
+    "output": "tests/modules/hash.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "keyspecs.xo",
+      "keyspecs.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/keyspecs.c",
+    "output": "tests/modules/keyspecs.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "defragtest.xo",
+      "defragtest.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/defragtest.c",
+    "output": "tests/modules/defragtest.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "zset.xo",
+      "zset.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/zset.c",
+    "output": "tests/modules/zset.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "stream.xo",
+      "stream.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/stream.c",
+    "output": "tests/modules/stream.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "mallocsize.xo",
+      "mallocsize.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/mallocsize.c",
+    "output": "tests/modules/mallocsize.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "list.xo",
+      "list.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/list.c",
+    "output": "tests/modules/list.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "aclcheck.xo",
+      "aclcheck.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/aclcheck.c",
+    "output": "tests/modules/aclcheck.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "reply.xo",
+      "reply.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/reply.c",
+    "output": "tests/modules/reply.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "subcommands.xo",
+      "subcommands.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/subcommands.c",
+    "output": "tests/modules/subcommands.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "eventloop.xo",
+      "eventloop.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/eventloop.c",
+    "output": "tests/modules/eventloop.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "cmdintrospection.xo",
+      "cmdintrospection.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/cmdintrospection.c",
+    "output": "tests/modules/cmdintrospection.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "moduleconfigs.xo",
+      "moduleconfigs.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/moduleconfigs.c",
+    "output": "tests/modules/moduleconfigs.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "moduleconfigstwo.xo",
+      "moduleconfigstwo.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/moduleconfigstwo.c",
+    "output": "tests/modules/moduleconfigstwo.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "publish.xo",
+      "publish.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/publish.c",
+    "output": "tests/modules/publish.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "postnotifications.xo",
+      "postnotifications.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/postnotifications.c",
+    "output": "tests/modules/postnotifications.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "moduleauthtwo.xo",
+      "moduleauthtwo.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/moduleauthtwo.c",
+    "output": "tests/modules/moduleauthtwo.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "usercall.xo",
+      "usercall.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/usercall.c",
+    "output": "tests/modules/usercall.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "rdbloadsave.xo",
+      "rdbloadsave.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/rdbloadsave.c",
+    "output": "tests/modules/rdbloadsave.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "crash.xo",
+      "crash.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/crash.c",
+    "output": "tests/modules/crash.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "internalsecret.xo",
+      "internalsecret.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/internalsecret.c",
+    "output": "tests/modules/internalsecret.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "configaccess.xo",
+      "configaccess.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/configaccess.c",
+    "output": "tests/modules/configaccess.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "test_keymeta.xo",
+      "test_keymeta.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/test_keymeta.c",
+    "output": "tests/modules/test_keymeta.xo"
+  },
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-I../../src",
+      "-W",
+      "-Wall",
+      "-Wno-missing-field-initializers",
+      "-dynamic",
+      "-fno-common",
+      "-g",
+      "-ggdb",
+      "-std=gnu11",
+      "-O2",
+      "-fPIC",
+      "-c",
+      "-o",
+      "atomicslotmigration.xo",
+      "atomicslotmigration.c"
+    ],
+    "directory": "tests/modules",
+    "file": "tests/modules/atomicslotmigration.c",
+    "output": "tests/modules/atomicslotmigration.xo"
   }
 ]

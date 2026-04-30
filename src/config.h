@@ -262,6 +262,23 @@ void setproctitle(const char *fmt, ...);
 #endif
 #endif
 
+/* On macOS/Darwin, BYTE_ORDER may be defined via <machine/endian.h> */
+#if defined(__APPLE__)
+#include <machine/endian.h>
+/* If still not defined, use compiler-provided byte order */
+#if !defined(BYTE_ORDER)
+#if defined(__LITTLE_ENDIAN__) || defined(__ARMEL__) || defined(__AARCH64EL__)
+#define LITTLE_ENDIAN 1234
+#define BIG_ENDIAN 4321
+#define BYTE_ORDER LITTLE_ENDIAN
+#elif defined(__BIG_ENDIAN__) || defined(__ARMEB__) || defined(__AARCH64EB__)
+#define LITTLE_ENDIAN 1234
+#define BIG_ENDIAN 4321
+#define BYTE_ORDER BIG_ENDIAN
+#endif
+#endif
+#endif
+
 #if !defined(BYTE_ORDER) || \
     (BYTE_ORDER != BIG_ENDIAN && BYTE_ORDER != LITTLE_ENDIAN)
 	/* you must determine what the correct bit order is for
