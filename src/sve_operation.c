@@ -474,10 +474,10 @@ int sve_fused_gemm(sve_ub_mem_t *mem,
 }
 
 /* ============================================================
- * 逐 embedding 串行 Gather Load（旧 baseline 实现）
+ * 逐 embedding 串行连续加载（旧 baseline 实现）
  * ============================================================ */
 
-int sve_serial_gather_read(sve_ub_mem_t *mem,
+int sve_serial_contiguous_read(sve_ub_mem_t *mem,
                           state_bitmap_t *bmp,
                           sve_counters_t *stats,
                           uint64_t *emb_ids,

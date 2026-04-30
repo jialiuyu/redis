@@ -117,8 +117,8 @@ void sve_counters_init(sve_counters_t *c);
 
 /* ---- 旧接口的独立版本（逐 embedding 串行读取）---- */
 
-/* 逐 embedding 串行 gather load（baseline 对照）*/
-int sve_serial_gather_read(sve_ub_mem_t *mem,
+/* 逐 embedding 串行连续加载（baseline 对照）*/
+int sve_serial_contiguous_read(sve_ub_mem_t *mem,
                           state_bitmap_t *bmp,
                           sve_counters_t *stats,
                           uint64_t *emb_ids,

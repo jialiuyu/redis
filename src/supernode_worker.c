@@ -91,23 +91,18 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
     if (!results) { zfree(emb_ids); return C_ERR; }
 
     uint8_t *valid_mask = zmalloc(packet->num_requests);
-    int ret;
+    if (!valid_mask) { zfree(results); zfree(emb_ids); return C_ERR; }
 
-    /* 直接调用 sve_gather_read，不经过任何包装 */
-    if (valid_mask) {
-        ret = sve_gather_read(ctx->ub_mem, ctx->bitmap,
-                             (sve_counters_t *)&ctx->gather_ops,
-                             emb_ids, packet->num_requests, results, valid_mask);
-        zfree(valid_mask);
-    } else {
-        /* 回退到串行读取 */
-        uint8_t *fallback_mask = zmalloc(packet->num_requests);
-        ret = sve_serial_gather_read(ctx->ub_mem, ctx->bitmap,
-                                    (sve_counters_t *)&ctx->gather_ops,
-                                    emb_ids, packet->num_requests, results, fallback_mask);
-        zfree(fallback_mask);
-    }
+    /*
+     * Use contiguous load: each embedding is a contiguous row in memory,
+     * so per-embedding sequential load is optimal. SVE gather load would
+     * only help if we needed partial dimensions or column-oriented access.
+     */
+    int ret = sve_serial_contiguous_read(ctx->ub_mem, ctx->bitmap,
+                         (sve_counters_t *)&ctx->gather_ops,
+                         emb_ids, packet->num_requests, results, valid_mask);
 
+    zfree(valid_mask);
     zfree(results);
     zfree(emb_ids);
 
