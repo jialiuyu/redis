@@ -66,7 +66,6 @@ typedef struct ub_memory_space {
 
 /* Embedding 数据结构 */
 typedef struct embedding_entry {
-    uint64_t id;                        /* Embedding ID */
     float data[SUPERNODE_EMBEDDING_DIM]; /* 向量数据 */
 } __attribute__((aligned(64))) embedding_entry_t;
 
