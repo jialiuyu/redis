@@ -93,6 +93,12 @@ typedef struct sve_worker_context {
     atomic_uint_fast64_t locked_skips;  /* 因锁跳过的请求数 */
     atomic_uint_fast64_t sve_operations;
     atomic_uint_fast64_t total_latency_us;
+
+    /* Scatter/Gather 性能计数器 */
+    atomic_uint_fast64_t gather_ops;        /* svld1_gather 指令执行次数 */
+    atomic_uint_fast64_t scatter_ops;       /* svst1_scatter 指令执行次数 */
+    atomic_uint_fast64_t gather_elements;   /* gather 活跃 lane 总数 */
+    atomic_uint_fast64_t scatter_elements;  /* scatter 活跃 lane 总数 */
     
 } sve_worker_context_t;
 
@@ -174,5 +180,62 @@ void sve_streaming_store(const void *src, void *dst, size_t size);
 /* 统计信息 */
 sds supernode_get_stats(void);
 sds sve_worker_get_stats(sve_worker_context_t *ctx);
+
+/* ========== Scatter/Gather 操作上下文 ========== */
+
+/* 单个 SVE_VL 块的 gather/scatter 操作上下文
+ * 用于在 bitmap 获取和 gather/scatter 指令之间传递状态 */
+typedef struct sg_block_context {
+    uint64_t emb_ids[SVE_ELEMENTS_PER_VECTOR];  /* 本块的 embedding IDs */
+    uint8_t  acquired[SVE_ELEMENTS_PER_VECTOR];  /* bitmap 获取结果 */
+    size_t   num_active;                          /* 活跃 lane 数量 */
+    size_t   block_size;                          /* 本块实际大小 (≤ SVE_VL) */
+} sg_block_context_t;
+
+/* ========== SVE Scatter/Gather 批量操作 ========== */
+
+/* 偏移向量计算：从 embedding ID 数组计算 gather/scatter 字节偏移
+ * SVE 版本使用向量整数运算，标量版本使用循环 */
+void compute_gather_offsets(ub_memory_space_t *ub_mem,
+                            const uint64_t *emb_ids,
+                            size_t num_ids,
+                            size_t dim_index,
+                            uint64_t *out_offsets,
+                            uint8_t *out_valid);
+
+/* 基于 Gather 的批量 embedding 读取（替代 sve2_gather_with_bitmap_check）
+ * 跨 embedding 并行加载，每条 gather 指令处理 SVE_VL 个 embedding 的同一维度 */
+int sve2_scatter_gather_read(sve_worker_context_t *ctx,
+                             uint64_t *emb_ids,
+                             size_t num_ids,
+                             float *results,
+                             uint8_t *valid_mask);
+
+/* 基于 Scatter 的批量 embedding 写入
+ * 跨 embedding 并行写回，每条 scatter 指令处理 SVE_VL 个 embedding 的同一维度 */
+int sve2_scatter_gather_write(sve_worker_context_t *ctx,
+                              uint64_t *emb_ids,
+                              size_t num_ids,
+                              const float *src_data,
+                              uint8_t *valid_mask);
+
+/* 融合 Gather + 余弦相似度计算
+ * gather 数据直接进入 FMA 流水线，无中间缓冲区 */
+int sve2_fused_gather_cosine(sve_worker_context_t *ctx,
+                             const float *query,
+                             size_t dim,
+                             const uint64_t *emb_ids,
+                             size_t num_ids,
+                             float *similarities);
+
+/* 融合 Gather + GEMM 直接计算（无临时缓冲区）
+ * 适用于 embedding 行数 ≤ SVE_VL 的小批量场景
+ * 行数超过 SVE_VL 时回退到现有 sve2_fused_gather_gemm */
+int sve2_fused_gather_gemm_direct(sve_worker_context_t *ctx,
+                                  const uint64_t *emb_ids,
+                                  size_t num_rows,
+                                  const float *W,
+                                  size_t out_dim,
+                                  float *output);
 
 #endif /* __SUPERNODE_WORKER_H */

@@ -4,6 +4,7 @@
  */
 
 #include "supernode_worker.h"
+#include "macro.h"
 #include "server.h"
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -11,6 +12,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <math.h>
 #include <sched.h>
 
 /* 全局超节点实例 */
@@ -420,6 +423,549 @@ void sve_streaming_store(const void *src, void *dst, size_t size) {
     sve_streaming_load(src, dst, size); /* 实现相同 */
 }
 
+/* ========== SVE Scatter/Gather 新实现 ========== */
+
+/* 偏移向量计算：从 embedding ID 数组计算 gather/scatter 字节偏移
+ *
+ * 公式: offset[i] = emb_ids[i] * sizeof(embedding_entry_t)
+ *                  + offsetof(embedding_entry_t, data)
+ *                  + dim_index * sizeof(float)
+ *
+ * out_valid[i] = 1 如果偏移在 UB Memory 范围内，否则 0
+ */
+void compute_gather_offsets(ub_memory_space_t *ub_mem,
+                            const uint64_t *emb_ids,
+                            size_t num_ids,
+                            size_t dim_index,
+                            uint64_t *out_offsets,
+                            uint8_t *out_valid)
+{
+    const size_t entry_size = sizeof(embedding_entry_t);
+    const size_t data_field_offset = offsetof(embedding_entry_t, data);
+    const size_t dim_byte_offset = data_field_offset + dim_index * sizeof(float);
+    size_t mem_size = ub_mem ? ub_mem->size : 0;
+
+    if (!ub_mem || !emb_ids || !out_offsets || !out_valid || num_ids == 0) {
+        for (size_t i = 0; i < num_ids; i++) {
+            out_offsets[i] = 0;
+            out_valid[i] = 0;
+        }
+        return;
+    }
+
+#ifdef USE_ARM_SVE
+    {
+        /* SVE 向量化偏移计算 */
+        svbool_t pg = svwhilelt_b64_u64(0UL, (uint64_t)num_ids);
+        svuint64_t ids = svld1_u64(pg, emb_ids);
+        svuint64_t stride_vec = svdup_u64(entry_size);
+        svuint64_t base_off = svmul_u64_m(pg, ids, stride_vec);
+        svuint64_t dim_off_vec = svdup_u64(dim_byte_offset);
+        svuint64_t offsets = svadd_u64_m(pg, base_off, dim_off_vec);
+
+        /* 存储偏移 */
+        svst1_u64(pg, out_offsets, offsets);
+
+        /* 边界检查：offset + sizeof(float) <= mem_size */
+        svuint64_t max_off = svdup_u64(mem_size - sizeof(float));
+        svbool_t in_bounds = svcmple_u64(pg, offsets, max_off);
+
+        /* 将 predicate 转换为 uint8_t valid 数组 */
+        for (size_t i = 0; i < num_ids; i++) {
+            /* 逐 lane 提取 predicate 状态 */
+            out_valid[i] = (out_offsets[i] + sizeof(float) <= mem_size) ? 1 : 0;
+        }
+    }
+#else
+    /* 标量回退 */
+    for (size_t i = 0; i < num_ids; i++) {
+        uint64_t offset = emb_ids[i] * entry_size + dim_byte_offset;
+        out_offsets[i] = offset;
+        out_valid[i] = (offset + sizeof(float) <= mem_size) ? 1 : 0;
+    }
+#endif
+}
+
+/* 基于 SVE Gather 的批量 embedding 读取
+ *
+ * 核心思路：将处理维度从"逐 embedding"翻转为"跨 embedding"
+ * 每条 gather 指令同时从 SVE_VL(=8) 个不同 embedding 加载同一维度的 float
+ *
+ * 外层循环：每 SVE_VL 个 embedding 为一组
+ *   1. 批量 bitmap_try_acquire → 构建 predicate mask
+ *   2. 内层循环 d=0..299：gather load 维度 d → 转置存储到结果缓冲区
+ *   3. 批量 bitmap_release
+ */
+int sve2_scatter_gather_read(sve_worker_context_t *ctx,
+                             uint64_t *emb_ids,
+                             size_t num_ids,
+                             float *results,
+                             uint8_t *valid_mask)
+{
+    if (!ctx || !emb_ids || !results || !valid_mask || num_ids == 0) return C_ERR;
+
+    state_bitmap_t *bitmap = ctx->bitmap;
+    ub_memory_space_t *ub_mem = ctx->ub_mem;
+    const size_t dim = SUPERNODE_EMBEDDING_DIM;
+
+    if (!ub_mem || !ub_mem->base_addr) return C_ERR;
+
+    /* 初始化 valid_mask 为 0 */
+    memset(valid_mask, 0, num_ids);
+
+    /* 分块处理，每块 SVE_VL 个 embedding */
+    for (size_t blk = 0; blk < num_ids; blk += SVE_ELEMENTS_PER_VECTOR) {
+        size_t blk_size = num_ids - blk;
+        if (blk_size > SVE_ELEMENTS_PER_VECTOR) blk_size = SVE_ELEMENTS_PER_VECTOR;
+
+        /* 步骤 1: 批量 bitmap_try_acquire */
+        sg_block_context_t bctx;
+        bctx.block_size = blk_size;
+        bctx.num_active = 0;
+
+        for (size_t i = 0; i < blk_size; i++) {
+            bctx.emb_ids[i] = emb_ids[blk + i];
+            if (bitmap_try_acquire(bitmap, bctx.emb_ids[i]) == C_OK) {
+                bctx.acquired[i] = 1;
+                bctx.num_active++;
+            } else {
+                bctx.acquired[i] = 0;
+                /* 填充默认值（全零）*/
+                memset(&results[(blk + i) * dim], 0, dim * sizeof(float));
+                atomic_fetch_add(&ctx->locked_skips, 1);
+            }
+        }
+
+        /* 如果全部失败，跳过此块 */
+        if (bctx.num_active == 0) continue;
+
+        /* 预取下一块的 embedding 基地址 */
+        if (blk + SVE_ELEMENTS_PER_VECTOR < num_ids) {
+            size_t next_blk = blk + SVE_ELEMENTS_PER_VECTOR;
+            size_t prefetch_count = num_ids - next_blk;
+            if (prefetch_count > SVE_ELEMENTS_PER_VECTOR) prefetch_count = SVE_ELEMENTS_PER_VECTOR;
+            for (size_t i = 0; i < prefetch_count && i < 4; i++) {
+                void *addr = ub_mem_get_embedding_addr(ub_mem, emb_ids[next_blk + i]);
+                if (addr) __builtin_prefetch(addr, 0, 1);
+            }
+        }
+
+#ifdef USE_ARM_SVE
+        /* 步骤 2: SVE gather 路径 — 逐维度跨 embedding 加载 */
+        {
+            /* 构建 predicate mask: 仅活跃且在范围内的 lane */
+            svbool_t pg_base = svwhilelt_b32_u64(0UL, (uint64_t)blk_size);
+
+            /* 预计算各 embedding 的基偏移（不含维度偏移）*/
+            uint64_t base_offsets[SVE_ELEMENTS_PER_VECTOR];
+            uint8_t lane_valid[SVE_ELEMENTS_PER_VECTOR];
+            const size_t entry_size = sizeof(embedding_entry_t);
+            const size_t data_field_off = offsetof(embedding_entry_t, data);
+
+            for (size_t i = 0; i < blk_size; i++) {
+                if (bctx.acquired[i]) {
+                    base_offsets[i] = bctx.emb_ids[i] * entry_size + data_field_off;
+                    lane_valid[i] = (base_offsets[i] + dim * sizeof(float) <= ub_mem->size) ? 1 : 0;
+                } else {
+                    base_offsets[i] = 0;
+                    lane_valid[i] = 0;
+                }
+            }
+            for (size_t i = blk_size; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                base_offsets[i] = 0;
+                lane_valid[i] = 0;
+            }
+
+            /* 逐维度 gather load */
+            const float *ub_base = (const float *)ub_mem->base_addr;
+
+            for (size_t d = 0; d < dim; d++) {
+                /* 计算本维度的字节偏移向量 */
+                uint64_t offsets_d[SVE_ELEMENTS_PER_VECTOR];
+                for (size_t i = 0; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                    offsets_d[i] = base_offsets[i] + d * sizeof(float);
+                }
+
+                svbool_t pg = svwhilelt_b64_u64(0UL, (uint64_t)blk_size);
+                svuint64_t off_vec = svld1_u64(pg, offsets_d);
+
+                /* gather load: 从 8 个不连续地址各加载一个 float */
+                svfloat32_t gathered = svld1_gather_u64offset_f32(
+                    pg_base, (const float *)ub_mem->base_addr, off_vec);
+
+                /* 转置存储：将各 lane 的值写入对应 embedding 的结果位置 */
+                float tmp[SVE_ELEMENTS_PER_VECTOR];
+                svst1_f32(pg_base, tmp, gathered);
+                for (size_t i = 0; i < blk_size; i++) {
+                    if (lane_valid[i]) {
+                        results[(blk + i) * dim + d] = tmp[i];
+                    }
+                }
+
+                atomic_fetch_add(&ctx->gather_ops, 1);
+                atomic_fetch_add(&ctx->gather_elements, bctx.num_active);
+            }
+        }
+#else
+        /* 标量回退：逐 embedding memcpy */
+        for (size_t i = 0; i < blk_size; i++) {
+            if (!bctx.acquired[i]) continue;
+            embedding_entry_t *emb = ub_mem_get_embedding_addr(ub_mem, bctx.emb_ids[i]);
+            if (emb) {
+                memcpy(&results[(blk + i) * dim], emb->data, dim * sizeof(float));
+            }
+        }
+#endif
+
+        /* 步骤 3: 设置 valid_mask 并释放 bitmap */
+        for (size_t i = 0; i < blk_size; i++) {
+            if (bctx.acquired[i]) {
+                valid_mask[blk + i] = 1;
+                bitmap_release(bitmap, bctx.emb_ids[i]);
+            }
+        }
+    }
+
+    return C_OK;
+}
+
+/* 基于 SVE Scatter 的批量 embedding 写入
+ *
+ * 与 scatter_gather_read 对称：逐维度跨 embedding 并行写入
+ */
+int sve2_scatter_gather_write(sve_worker_context_t *ctx,
+                              uint64_t *emb_ids,
+                              size_t num_ids,
+                              const float *src_data,
+                              uint8_t *valid_mask)
+{
+    if (!ctx || !emb_ids || !src_data || !valid_mask || num_ids == 0) return C_ERR;
+
+    state_bitmap_t *bitmap = ctx->bitmap;
+    ub_memory_space_t *ub_mem = ctx->ub_mem;
+    const size_t dim = SUPERNODE_EMBEDDING_DIM;
+
+    if (!ub_mem || !ub_mem->base_addr) return C_ERR;
+
+    memset(valid_mask, 0, num_ids);
+
+    for (size_t blk = 0; blk < num_ids; blk += SVE_ELEMENTS_PER_VECTOR) {
+        size_t blk_size = num_ids - blk;
+        if (blk_size > SVE_ELEMENTS_PER_VECTOR) blk_size = SVE_ELEMENTS_PER_VECTOR;
+
+        /* 批量 bitmap_try_acquire */
+        sg_block_context_t bctx;
+        bctx.block_size = blk_size;
+        bctx.num_active = 0;
+
+        for (size_t i = 0; i < blk_size; i++) {
+            bctx.emb_ids[i] = emb_ids[blk + i];
+            if (bitmap_try_acquire(bitmap, bctx.emb_ids[i]) == C_OK) {
+                bctx.acquired[i] = 1;
+                bctx.num_active++;
+            } else {
+                bctx.acquired[i] = 0;
+                atomic_fetch_add(&ctx->locked_skips, 1);
+            }
+        }
+
+        if (bctx.num_active == 0) continue;
+
+#ifdef USE_ARM_SVE
+        {
+            svbool_t pg_base = svwhilelt_b32_u64(0UL, (uint64_t)blk_size);
+            const size_t entry_size = sizeof(embedding_entry_t);
+            const size_t data_field_off = offsetof(embedding_entry_t, data);
+
+            uint64_t base_offsets[SVE_ELEMENTS_PER_VECTOR];
+            uint8_t lane_valid[SVE_ELEMENTS_PER_VECTOR];
+
+            for (size_t i = 0; i < blk_size; i++) {
+                if (bctx.acquired[i]) {
+                    base_offsets[i] = bctx.emb_ids[i] * entry_size + data_field_off;
+                    lane_valid[i] = (base_offsets[i] + dim * sizeof(float) <= ub_mem->size) ? 1 : 0;
+                } else {
+                    base_offsets[i] = 0;
+                    lane_valid[i] = 0;
+                }
+            }
+            for (size_t i = blk_size; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                base_offsets[i] = 0;
+                lane_valid[i] = 0;
+            }
+
+            /* 逐维度 scatter store */
+            for (size_t d = 0; d < dim; d++) {
+                /* 从源缓冲区收集各 embedding 的维度 d 值 */
+                float src_vals[SVE_ELEMENTS_PER_VECTOR];
+                for (size_t i = 0; i < blk_size; i++) {
+                    src_vals[i] = lane_valid[i] ? src_data[(blk + i) * dim + d] : 0.0f;
+                }
+                for (size_t i = blk_size; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                    src_vals[i] = 0.0f;
+                }
+
+                svfloat32_t data_vec = svld1_f32(pg_base, src_vals);
+
+                uint64_t offsets_d[SVE_ELEMENTS_PER_VECTOR];
+                for (size_t i = 0; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                    offsets_d[i] = base_offsets[i] + d * sizeof(float);
+                }
+
+                svbool_t pg = svwhilelt_b64_u64(0UL, (uint64_t)blk_size);
+                svuint64_t off_vec = svld1_u64(pg, offsets_d);
+
+                /* scatter store: 向 8 个不连续地址各写入一个 float */
+                svst1_scatter_u64offset_f32(pg_base, (float *)ub_mem->base_addr, off_vec, data_vec);
+
+                atomic_fetch_add(&ctx->scatter_ops, 1);
+                atomic_fetch_add(&ctx->scatter_elements, bctx.num_active);
+            }
+        }
+#else
+        /* 标量回退 */
+        for (size_t i = 0; i < blk_size; i++) {
+            if (!bctx.acquired[i]) continue;
+            embedding_entry_t *emb = ub_mem_get_embedding_addr(ub_mem, bctx.emb_ids[i]);
+            if (emb) {
+                memcpy(emb->data, &src_data[(blk + i) * dim], dim * sizeof(float));
+            }
+        }
+#endif
+
+        /* 设置 valid_mask 并释放 bitmap */
+        for (size_t i = 0; i < blk_size; i++) {
+            if (bctx.acquired[i]) {
+                valid_mask[blk + i] = 1;
+                bitmap_release(bitmap, bctx.emb_ids[i]);
+            }
+        }
+    }
+
+    return C_OK;
+}
+
+/* 融合 Gather + 余弦相似度计算
+ *
+ * 每组 SVE_VL 个 embedding，维护 dot/norm 累加器
+ * 逐维度 gather → FMA 累加，300 维完成后计算 similarity
+ */
+int sve2_fused_gather_cosine(sve_worker_context_t *ctx,
+                             const float *query,
+                             size_t dim,
+                             const uint64_t *emb_ids,
+                             size_t num_ids,
+                             float *similarities)
+{
+    RETURN_IF(!ctx || !query || !emb_ids || !similarities || num_ids == 0,C_ERR);
+    RETURN_IF(dim != SUPERNODE_EMBEDDING_DIM,C_ERR);
+    RETURN_IF(!ctx->ub_mem || !ctx->ub_mem->base_addr,C_ERR);
+    ub_memory_space_t *ub_mem = ctx->ub_mem;
+
+    /* 预计算 query 范数 */
+    float q_norm_sq = 0.0f;
+    for (size_t d = 0; d < dim; d++) q_norm_sq += query[d] * query[d];
+    float q_norm = sqrtf(q_norm_sq);
+
+    const size_t entry_size = sizeof(embedding_entry_t);
+    const size_t data_field_off = offsetof(embedding_entry_t, data);
+
+    for (size_t blk = 0; blk < num_ids; blk += SVE_ELEMENTS_PER_VECTOR) {
+        size_t blk_size = num_ids - blk;
+        if (blk_size > SVE_ELEMENTS_PER_VECTOR) blk_size = SVE_ELEMENTS_PER_VECTOR;
+
+        /* 预计算基偏移 */
+        uint64_t base_offsets[SVE_ELEMENTS_PER_VECTOR];
+        uint8_t lane_valid[SVE_ELEMENTS_PER_VECTOR];
+        for (size_t i = 0; i < blk_size; i++) {
+            base_offsets[i] = emb_ids[blk + i] * entry_size + data_field_off;
+            lane_valid[i] = (base_offsets[i] + dim * sizeof(float) <= ub_mem->size) ? 1 : 0;
+        }
+        for (size_t i = blk_size; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+            base_offsets[i] = 0;
+            lane_valid[i] = 0;
+        }
+
+#ifdef USE_ARM_SVE
+        {
+            svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)blk_size);
+            svfloat32_t dot_acc = svdup_f32(0.0f);
+            svfloat32_t norm_acc = svdup_f32(0.0f);
+
+            for (size_t d = 0; d < dim; d++) {
+                uint64_t offsets_d[SVE_ELEMENTS_PER_VECTOR];
+                for (size_t i = 0; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                    offsets_d[i] = base_offsets[i] + d * sizeof(float);
+                }
+
+                svbool_t pg64 = svwhilelt_b64_u64(0UL, (uint64_t)blk_size);
+                svuint64_t off_vec = svld1_u64(pg64, offsets_d);
+
+                svfloat32_t emb_val = svld1_gather_u64offset_f32(
+                    pg, (const float *)ub_mem->base_addr, off_vec);
+
+                svfloat32_t q_val = svdup_f32(query[d]);
+
+                /* dot += emb * query */
+                dot_acc = svmla_f32_m(pg, dot_acc, emb_val, q_val);
+                /* norm += emb * emb */
+                norm_acc = svmla_f32_m(pg, norm_acc, emb_val, emb_val);
+
+                atomic_fetch_add(&ctx->gather_ops, 1);
+                atomic_fetch_add(&ctx->gather_elements, blk_size);
+            }
+
+            /* 提取结果 */
+            float dot_arr[SVE_ELEMENTS_PER_VECTOR];
+            float norm_arr[SVE_ELEMENTS_PER_VECTOR];
+            svst1_f32(pg, dot_arr, dot_acc);
+            svst1_f32(pg, norm_arr, norm_acc);
+
+            for (size_t i = 0; i < blk_size; i++) {
+                if (lane_valid[i]) {
+                    float denom = q_norm * sqrtf(norm_arr[i]);
+                    similarities[blk + i] = (denom > 1e-12f) ? dot_arr[i] / denom : 0.0f;
+                } else {
+                    similarities[blk + i] = 0.0f;
+                }
+            }
+        }
+#else
+        /* 标量回退 */
+        for (size_t i = 0; i < blk_size; i++) {
+            if (!lane_valid[i]) {
+                similarities[blk + i] = 0.0f;
+                continue;
+            }
+            embedding_entry_t *emb = ub_mem_get_embedding_addr(ub_mem, emb_ids[blk + i]);
+            if (!emb) { similarities[blk + i] = 0.0f; continue; }
+
+            float dot = 0.0f, enorm = 0.0f;
+            for (size_t d = 0; d < dim; d++) {
+                dot += emb->data[d] * query[d];
+                enorm += emb->data[d] * emb->data[d];
+            }
+            float denom = q_norm * sqrtf(enorm);
+            similarities[blk + i] = (denom > 1e-12f) ? dot / denom : 0.0f;
+        }
+#endif
+    }
+
+    return C_OK;
+}
+
+/* 融合 Gather + GEMM 直接计算
+ *
+ * num_rows ≤ SVE_VL: 跨行 gather 维度 d，广播乘以权重列元素，累加到输出
+ * num_rows > SVE_VL: 回退到现有实现
+ */
+int sve2_fused_gather_gemm_direct(sve_worker_context_t *ctx,
+                                  const uint64_t *emb_ids,
+                                  size_t num_rows,
+                                  const float *W,
+                                  size_t out_dim,
+                                  float *output)
+{
+    if (!ctx || !emb_ids || !W || !output || num_rows == 0 || out_dim == 0) return C_ERR;
+
+    ub_memory_space_t *ub_mem = ctx->ub_mem;
+    if (!ub_mem || !ub_mem->base_addr) return C_ERR;
+
+    const size_t emb_dim = SUPERNODE_EMBEDDING_DIM;
+    const size_t entry_size = sizeof(embedding_entry_t);
+    const size_t data_field_off = offsetof(embedding_entry_t, data);
+
+    /* 超过 SVE_VL 行时回退到现有实现 */
+    if (num_rows > SVE_ELEMENTS_PER_VECTOR) {
+        /* 回退：逐行读取到临时缓冲区，然后标量 GEMM */
+        float *gathered = zmalloc(num_rows * emb_dim * sizeof(float));
+        if (!gathered) return C_ERR;
+
+        for (size_t i = 0; i < num_rows; i++) {
+            embedding_entry_t *emb = ub_mem_get_embedding_addr(ub_mem, emb_ids[i]);
+            if (emb) {
+                memcpy(gathered + i * emb_dim, emb->data, emb_dim * sizeof(float));
+            } else {
+                memset(gathered + i * emb_dim, 0, emb_dim * sizeof(float));
+            }
+        }
+
+        /* 标量 GEMM: output[i][j] = sum_d(gathered[i][d] * W[d][j]) */
+        memset(output, 0, num_rows * out_dim * sizeof(float));
+        for (size_t i = 0; i < num_rows; i++) {
+            for (size_t d = 0; d < emb_dim; d++) {
+                float a = gathered[i * emb_dim + d];
+                for (size_t j = 0; j < out_dim; j++) {
+                    output[i * out_dim + j] += a * W[d * out_dim + j];
+                }
+            }
+        }
+
+        zfree(gathered);
+        return C_OK;
+    }
+
+    /* num_rows ≤ SVE_VL: 融合 gather + GEMM */
+    memset(output, 0, num_rows * out_dim * sizeof(float));
+
+    /* 预计算基偏移 */
+    uint64_t base_offsets[SVE_ELEMENTS_PER_VECTOR];
+    for (size_t i = 0; i < num_rows; i++) {
+        base_offsets[i] = emb_ids[i] * entry_size + data_field_off;
+    }
+    for (size_t i = num_rows; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+        base_offsets[i] = 0;
+    }
+
+#ifdef USE_ARM_SVE
+    {
+        svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)num_rows);
+
+        for (size_t d = 0; d < emb_dim; d++) {
+            /* Gather 维度 d 跨所有行 */
+            uint64_t offsets_d[SVE_ELEMENTS_PER_VECTOR];
+            for (size_t i = 0; i < SVE_ELEMENTS_PER_VECTOR; i++) {
+                offsets_d[i] = base_offsets[i] + d * sizeof(float);
+            }
+
+            svbool_t pg64 = svwhilelt_b64_u64(0UL, (uint64_t)num_rows);
+            svuint64_t off_vec = svld1_u64(pg64, offsets_d);
+
+            svfloat32_t emb_d = svld1_gather_u64offset_f32(
+                pg, (const float *)ub_mem->base_addr, off_vec);
+
+            atomic_fetch_add(&ctx->gather_ops, 1);
+            atomic_fetch_add(&ctx->gather_elements, num_rows);
+
+            /* 提取到临时数组，然后对每个输出维度累加 */
+            float emb_d_arr[SVE_ELEMENTS_PER_VECTOR];
+            svst1_f32(pg, emb_d_arr, emb_d);
+
+            for (size_t j = 0; j < out_dim; j++) {
+                float w_dj = W[d * out_dim + j];
+                for (size_t i = 0; i < num_rows; i++) {
+                    output[i * out_dim + j] += emb_d_arr[i] * w_dj;
+                }
+            }
+        }
+    }
+#else
+    /* 标量回退 */
+    for (size_t i = 0; i < num_rows; i++) {
+        embedding_entry_t *emb = ub_mem_get_embedding_addr(ub_mem, emb_ids[i]);
+        if (!emb) continue;
+        for (size_t d = 0; d < emb_dim; d++) {
+            float a = emb->data[d];
+            for (size_t j = 0; j < out_dim; j++) {
+                output[i * out_dim + j] += a * W[d * out_dim + j];
+            }
+        }
+    }
+#endif
+
+    return C_OK;
+}
+
 /* ========== SVE Worker 线程 ========== */
 
 /* 处理批量请求 */
@@ -454,8 +1000,16 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
         return C_ERR;
     }
     
-    /* SVE2 批量 Gather Load */
-    int ret = sve2_batch_gather_load(ctx, emb_ids, packet->num_requests, results);
+    /* SVE Scatter/Gather 批量读取（替代旧的 sve2_batch_gather_load）*/
+    uint8_t *valid_mask = zmalloc(packet->num_requests);
+    int ret;
+    if (valid_mask) {
+        ret = sve2_scatter_gather_read(ctx, emb_ids, packet->num_requests, results, valid_mask);
+        zfree(valid_mask);
+    } else {
+        /* 回退到旧实现 */
+        ret = sve2_batch_gather_load(ctx, emb_ids, packet->num_requests, results);
+    }
     
     /* 清理 */
     zfree(results);
@@ -566,6 +1120,10 @@ int supernode_init(int node_id, int num_workers) {
         atomic_init(&ctx->locked_skips, 0);
         atomic_init(&ctx->sve_operations, 0);
         atomic_init(&ctx->total_latency_us, 0);
+        atomic_init(&ctx->gather_ops, 0);
+        atomic_init(&ctx->scatter_ops, 0);
+        atomic_init(&ctx->gather_elements, 0);
+        atomic_init(&ctx->scatter_elements, 0);
         
         /* 启动 Worker 线程 */
         if (pthread_create(&ctx->thread, NULL, sve_worker_thread, ctx) != 0) {
@@ -642,6 +1200,10 @@ sds supernode_get_stats(void) {
     uint64_t total_locked_skips = 0;
     uint64_t total_sve_ops = 0;
     uint64_t total_latency = 0;
+    uint64_t total_gather_ops = 0;
+    uint64_t total_scatter_ops = 0;
+    uint64_t total_gather_elems = 0;
+    uint64_t total_scatter_elems = 0;
     
     for (int i = 0; i < global_supernode->num_workers; i++) {
         sve_worker_context_t *ctx = &global_supernode->workers[i];
@@ -650,6 +1212,10 @@ sds supernode_get_stats(void) {
         total_locked_skips += atomic_load(&ctx->locked_skips);
         total_sve_ops += atomic_load(&ctx->sve_operations);
         total_latency += atomic_load(&ctx->total_latency_us);
+        total_gather_ops += atomic_load(&ctx->gather_ops);
+        total_scatter_ops += atomic_load(&ctx->scatter_ops);
+        total_gather_elems += atomic_load(&ctx->gather_elements);
+        total_scatter_elems += atomic_load(&ctx->scatter_elements);
     }
     
     stats = sdscatprintf(stats, "  Total batches: %llu\n", (unsigned long long)total_batches);
@@ -662,6 +1228,21 @@ sds supernode_get_stats(void) {
         double avg_batch_size = (double)total_requests / total_batches;
         stats = sdscatprintf(stats, "  Average batch latency: %.1f μs\n", avg_latency);
         stats = sdscatprintf(stats, "  Average batch size: %.1f\n", avg_batch_size);
+    }
+    
+    /* Scatter/Gather 统计 */
+    stats = sdscat(stats, "  Scatter/Gather Stats:\n");
+    stats = sdscatprintf(stats, "    Gather ops: %llu\n", (unsigned long long)total_gather_ops);
+    stats = sdscatprintf(stats, "    Scatter ops: %llu\n", (unsigned long long)total_scatter_ops);
+    stats = sdscatprintf(stats, "    Gather elements: %llu\n", (unsigned long long)total_gather_elems);
+    stats = sdscatprintf(stats, "    Scatter elements: %llu\n", (unsigned long long)total_scatter_elems);
+    if (total_gather_ops > 0) {
+        double g_util = (double)total_gather_elems / ((double)total_gather_ops * SVE_ELEMENTS_PER_VECTOR);
+        stats = sdscatprintf(stats, "    Gather lane utilization: %.1f%%\n", g_util * 100.0);
+    }
+    if (total_scatter_ops > 0) {
+        double s_util = (double)total_scatter_elems / ((double)total_scatter_ops * SVE_ELEMENTS_PER_VECTOR);
+        stats = sdscatprintf(stats, "    Scatter lane utilization: %.1f%%\n", s_util * 100.0);
     }
     
     return stats;
@@ -692,6 +1273,16 @@ sds sve_worker_get_stats(sve_worker_context_t *ctx) {
         double avg_latency = (double)latency / batches;
         stats = sdscatprintf(stats, "  Average latency: %.1f μs\n", avg_latency);
     }
+    
+    /* Scatter/Gather 统计 */
+    uint64_t g_ops = atomic_load(&ctx->gather_ops);
+    uint64_t s_ops = atomic_load(&ctx->scatter_ops);
+    uint64_t g_elems = atomic_load(&ctx->gather_elements);
+    uint64_t s_elems = atomic_load(&ctx->scatter_elements);
+    stats = sdscatprintf(stats, "  Gather ops: %llu\n", (unsigned long long)g_ops);
+    stats = sdscatprintf(stats, "  Scatter ops: %llu\n", (unsigned long long)s_ops);
+    stats = sdscatprintf(stats, "  Gather elements: %llu\n", (unsigned long long)g_elems);
+    stats = sdscatprintf(stats, "  Scatter elements: %llu\n", (unsigned long long)s_elems);
     
     return stats;
 }
