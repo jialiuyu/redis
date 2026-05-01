@@ -22,7 +22,9 @@
 #define SVE_EMBEDDING_DIM 300
 #endif
 
+#ifndef SVE_OP_VECTOR_BITS
 #define SVE_OP_VECTOR_BITS 256
+#endif
 #define SVE_OP_VL (SVE_OP_VECTOR_BITS / 32)  /* 8 floats per vector */
 #define BITMAP_BITS_PER_WORD 64
 
