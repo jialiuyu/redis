@@ -13,7 +13,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef __linux__
 #include <sched.h>
+#endif
 
 /* SuperNode 主结构 */
 typedef struct supernode {
@@ -90,19 +92,15 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
     float *results = zmalloc(packet->num_requests * SUPERNODE_EMBEDDING_DIM * sizeof(float));
     if (!results) { zfree(emb_ids); return C_ERR; }
 
-    uint8_t *valid_mask = zmalloc(packet->num_requests);
-    if (!valid_mask) { zfree(results); zfree(emb_ids); return C_ERR; }
-
     /*
      * Use contiguous load: each embedding is a contiguous row in memory,
      * so per-embedding sequential load is optimal. SVE gather load would
      * only help if we needed partial dimensions or column-oriented access.
      */
-    int ret = sve_serial_contiguous_read(ctx->ub_mem, ctx->bitmap,
-                         (sve_counters_t *)&ctx->gather_ops,
-                         emb_ids, packet->num_requests, results, valid_mask);
+    int ret = sve_serial_contiguous_read(ctx->ub_mem, ctx->bitmap, emb_ids,
+                                         packet->num_requests, results,
+                                         &ctx->op_stats);
 
-    zfree(valid_mask);
     zfree(results);
     zfree(emb_ids);
 
@@ -121,10 +119,12 @@ void *sve_worker_thread(void *arg) {
 
     serverLog(LL_NOTICE, "SVE Worker %d started", ctx->worker_id);
 
+#ifdef __linux__
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(ctx->worker_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
 
     while (ctx->running) {
         uint8_t buffer[RING_BUFFER_BATCH_SIZE];
@@ -190,13 +190,10 @@ int supernode_init(int node_id, int num_workers) {
 
         atomic_init(&ctx->total_batches, 0);
         atomic_init(&ctx->total_requests, 0);
-        atomic_init(&ctx->locked_skips, 0);
         atomic_init(&ctx->sve_operations, 0);
         atomic_init(&ctx->total_latency_us, 0);
-        atomic_init(&ctx->gather_ops, 0);
-        atomic_init(&ctx->scatter_ops, 0);
-        atomic_init(&ctx->gather_elements, 0);
-        atomic_init(&ctx->scatter_elements, 0);
+        atomic_init(&ctx->op_stats.lock_success, 0);
+        atomic_init(&ctx->op_stats.lock_failure, 0);
 
         if (pthread_create(&ctx->thread, NULL, sve_worker_thread, ctx) != 0) {
             serverLog(LL_WARNING, "Failed to create SVE worker %d", i);
@@ -257,25 +254,24 @@ sds supernode_get_stats(void) {
     stats = sdscatprintf(stats, "  UB.mem size: %zu GB\n",
                          global_supernode->ub_mem->size / (1024 * 1024 * 1024));
 
-    uint64_t tb = 0, tr = 0, tl = 0, ts = 0, tt = 0;
+    uint64_t tb = 0, tr = 0, ts = 0, tt = 0;
+    uint64_t bls = 0, blf = 0;
     uint64_t go = 0, so = 0, ge = 0, se = 0;
 
     for (int i = 0; i < global_supernode->num_workers; i++) {
         sve_worker_context_t *c = &global_supernode->workers[i];
         tb += atomic_load(&c->total_batches);
         tr += atomic_load(&c->total_requests);
-        tl += atomic_load(&c->locked_skips);
         ts += atomic_load(&c->sve_operations);
         tt += atomic_load(&c->total_latency_us);
-        go += atomic_load(&c->gather_ops);
-        so += atomic_load(&c->scatter_ops);
-        ge += atomic_load(&c->gather_elements);
-        se += atomic_load(&c->scatter_elements);
+        bls += atomic_load(&c->op_stats.lock_success);
+        blf += atomic_load(&c->op_stats.lock_failure);
     }
 
     stats = sdscatprintf(stats, "  Total batches: %llu\n", (unsigned long long)tb);
     stats = sdscatprintf(stats, "  Total requests: %llu\n", (unsigned long long)tr);
-    stats = sdscatprintf(stats, "  Locked skips: %llu\n", (unsigned long long)tl);
+    stats = sdscatprintf(stats, "  Bitmap lock success: %llu\n", (unsigned long long)bls);
+    stats = sdscatprintf(stats, "  Bitmap lock failure: %llu\n", (unsigned long long)blf);
     stats = sdscatprintf(stats, "  SVE operations: %llu\n", (unsigned long long)ts);
 
     if (tb > 0) {
@@ -306,10 +302,9 @@ sds sve_worker_get_stats(sve_worker_context_t *ctx) {
     stats = sdscatprintf(stats, "  Batches: %llu  Requests: %llu\n",
                          (unsigned long long)atomic_load(&ctx->total_batches),
                          (unsigned long long)atomic_load(&ctx->total_requests));
-    stats = sdscatprintf(stats, "  Locked skips: %llu\n",
-                         (unsigned long long)atomic_load(&ctx->locked_skips));
-    stats = sdscatprintf(stats, "  Gather ops: %llu  Scatter ops: %llu\n",
-                         (unsigned long long)atomic_load(&ctx->gather_ops),
-                         (unsigned long long)atomic_load(&ctx->scatter_ops));
+    stats = sdscatprintf(stats, "  Bitmap lock success: %llu\n",
+                         (unsigned long long)atomic_load(&ctx->op_stats.lock_success));
+    stats = sdscatprintf(stats, "  Bitmap lock failure: %llu\n",
+                         (unsigned long long)atomic_load(&ctx->op_stats.lock_failure));
     return stats;
 }

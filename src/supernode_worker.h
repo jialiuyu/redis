@@ -52,16 +52,9 @@ typedef struct sve_worker_context {
     /* 统计信息 */
     atomic_uint_fast64_t total_batches;
     atomic_uint_fast64_t total_requests;
-    atomic_uint_fast64_t locked_skips;
     atomic_uint_fast64_t sve_operations;
     atomic_uint_fast64_t total_latency_us;
-
-    /* Scatter/Gather 性能计数器（布局与 sve_counters_t 一致）*/
-    atomic_uint_fast64_t gather_ops;
-    atomic_uint_fast64_t scatter_ops;
-    atomic_uint_fast64_t gather_elements;
-    atomic_uint_fast64_t scatter_elements;
-
+    sve_operation_stats_t op_stats;
 } sve_worker_context_t;
 
 /* ========== API ========== */

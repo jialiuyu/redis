@@ -37,8 +37,8 @@ typedef struct sve_ub_mem {
 
 /* 64 字节对齐的原子字（防伪共享）*/
 typedef struct {
-    atomic_uint_fast64_t word;
-} __attribute__((aligned(64))) bitmap_atomic_word_t;
+    _Alignas(64) atomic_uint_fast64_t word;
+} bitmap_atomic_word_t;
 
 /* Bitmap 并发控制 */
 typedef struct {
@@ -46,85 +46,29 @@ typedef struct {
     size_t num_words;
 } state_bitmap_t;
 
-/* 性能计数器 */
 typedef struct {
-    atomic_uint_fast64_t gather_ops;
-    atomic_uint_fast64_t scatter_ops;
-    atomic_uint_fast64_t gather_elements;
-    atomic_uint_fast64_t scatter_elements;
-    atomic_uint_fast64_t locked_skips;
-} sve_counters_t;
+    atomic_uint_fast64_t lock_success;
+    atomic_uint_fast64_t lock_failure;
+} sve_operation_stats_t;
 
  /* Embedding 数据结构 */
 typedef struct {
-    float data[SVE_EMBEDDING_DIM];
-} __attribute__((aligned(64))) embedding_entry_t;
+    _Alignas(64) float data[SVE_EMBEDDING_DIM];
+} embedding_entry_t;
 
 /* ---- Bitmap 操作 ---- */
-
 int  bitmap_init(state_bitmap_t *bmp, size_t num_bits);
 void bitmap_destroy(state_bitmap_t *bmp);
-int  state_bitmap_try_acquire(state_bitmap_t *bmp, uint64_t bit_index);
+int  bitmap_try_acquire(state_bitmap_t *bmp, uint64_t bit_index);
 void bitmap_release(state_bitmap_t *bmp, uint64_t bit_index);
-
-/* ---- 核心 API ---- */
-
-/* 偏移向量计算 */
-void sve_compute_offsets(sve_ub_mem_t *mem,
-                        const uint64_t *emb_ids,
-                        size_t num_ids,
-                        size_t dim_index,
-                        uint64_t *out_offsets,
-                        uint8_t *out_valid);
-
-/* 跨 embedding gather 读取 */
-int sve_gather_read(sve_ub_mem_t *mem,
-                   state_bitmap_t *bmp,
-                   sve_counters_t *stats,
-                   uint64_t *emb_ids,
-                   size_t num_ids,
-                   float *results,
-                   uint8_t *valid_mask);
-
-/* 跨 embedding scatter 写入 */
-int sve_scatter_write(sve_ub_mem_t *mem,
-                     state_bitmap_t *bmp,
-                     sve_counters_t *stats,
-                     uint64_t *emb_ids,
-                     size_t num_ids,
-                     const float *src_data,
-                     uint8_t *valid_mask);
-
-/* 融合 gather + 余弦相似度 */
-int sve_fused_cosine(sve_ub_mem_t *mem,
-                    const float *query,
-                    size_t dim,
-                    const uint64_t *emb_ids,
-                    size_t num_ids,
-                    float *similarities);
-
-/* 融合 gather + GEMM */
-int sve_fused_gemm(sve_ub_mem_t *mem,
-                  const uint64_t *emb_ids,
-                  size_t num_rows,
-                  const float *W,
-                  size_t emb_dim,
-                  size_t out_dim,
-                  float *output);
-
-/* 统计报告 */
-void sve_counters_init(sve_counters_t *c);
-
-/* ---- 旧接口的独立版本（逐 embedding 串行读取）---- */
 
 /* 逐 embedding 串行连续加载（baseline 对照）*/
 int sve_serial_contiguous_read(sve_ub_mem_t *mem,
                           state_bitmap_t *bmp,
-                          sve_counters_t *stats,
                           uint64_t *emb_ids,
                           size_t num_ids,
                           float *results,
-                          uint8_t *valid_mask);
+                          sve_operation_stats_t *stats);
 
 /* 非临时内存拷贝（SVE streaming load / 标量 memcpy）*/
 void sve_streaming_load(const void *src, void *dst, size_t size);
