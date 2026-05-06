@@ -10,6 +10,7 @@
 #ifndef __SVE_OPERATION_H
 #define __SVE_OPERATION_H
 
+#include "ub_client.h"
 #include "sve_config.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -32,17 +33,6 @@
 
 _Static_assert(BITMAP_BITS_PER_WORD == 64,
                "bitmap bit math assumes 64-bit words");
-
-typedef struct ub_address_space ub_address_space_t; // Forward declaration
-
-/* UB 内存空间 */
-typedef struct sve_ub_mem {
-    void    *base_addr;                 /* 基地址（映射后的虚拟地址）*/
-    uint64_t physical_base;             /* 物理基地址 */
-    size_t   size;                      /* 大小 */
-    uint32_t token_id;                  /* 访问令牌 */
-    int      numa_node;                 /* NUMA 节点 */
-} sve_ub_mem_t;
 
 /* 64 字节对齐的原子字（防伪共享）*/
 typedef struct {
@@ -69,11 +59,6 @@ typedef struct {
     sve_operation_stats_t *stats;
 } sve_gather_ctx_t;
 
- /* Embedding 数据结构 */
-typedef struct {
-    _Alignas(64) float data[SVE_EMBEDDING_DIM];
-} embedding_entry_t;
-
 /* ---- Bitmap 操作 ---- */
 int  bitmap_init(state_bitmap_t *bmp, size_t num_bits);
 void bitmap_destroy(state_bitmap_t *bmp);
@@ -88,13 +73,11 @@ void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
                          uint64_t table_row_capacity,
                          sve_operation_stats_t *stats);
 
-/* 逐 embedding 串行连续加载（baseline 对照）*/
-int sve_serial_contiguous_read(sve_ub_mem_t *mem,
-                          state_bitmap_t *bmp,
+/* 逐 embedding 串行读取（真实 UB 地址空间）*/
+int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
                           uint64_t *emb_ids,
                           size_t num_ids,
-                          float *results,
-                          sve_operation_stats_t *stats);
+                          float *results);
 
 /* 非临时内存拷贝（SVE streaming load / 标量 memcpy）*/
 void sve_streaming_load(const void *src, void *dst, size_t size);

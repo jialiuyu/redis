@@ -1,7 +1,7 @@
 /*
  * SuperNode Worker Implementation
  *
- * 只负责：UB.mem mmap 管理、Worker 线程调度、SuperNode 生命周期。
+ * 只负责：真实 UB 地址空间接入、Worker 线程调度、SuperNode 生命周期。
  * SVE 计算和 bitmap 操作全部直接调用 sve_operation 模块的 sve_* 函数。
  */
 
@@ -11,9 +11,7 @@
 #include "ub_client.h"
 
 #include <stddef.h>
-#include <sys/mman.h>
 #include <sys/time.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
@@ -36,41 +34,6 @@ typedef struct supernode {
 } supernode_t;
 
 supernode_t *global_supernode = NULL;
-
-/* ========== UB.mem 管理 ========== */
-
-sve_ub_mem_t *ub_mem_init(uint64_t physical_base, size_t size) {
-    sve_ub_mem_t *ub = zmalloc(sizeof(sve_ub_mem_t));
-    RETURN_IF(!ub, NULL);
-
-    ub->physical_base = physical_base;
-    ub->size = size;
-    ub->token_id = 0x12345678;
-    ub->numa_node = 0;
-
-    ub->base_addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    if (ub->base_addr == MAP_FAILED) {
-        serverLog(LL_WARNING, "Failed to mmap UB.mem (hugetlb): %s", strerror(errno));
-        ub->base_addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (ub->base_addr == MAP_FAILED) {
-            zfree(ub);
-            return NULL;
-        }
-    }
-
-    serverLog(LL_NOTICE, "UB.mem initialized: base=0x%llx, size=%zu GB",
-              (unsigned long long)physical_base, size / (1024 * 1024 * 1024));
-    return ub;
-}
-
-void ub_mem_cleanup(sve_ub_mem_t *ub) {
-    RETURN_IF(!ub);
-    if (ub->base_addr && ub->base_addr != MAP_FAILED)
-        munmap(ub->base_addr, ub->size);
-    zfree(ub);
-}
 
 /* ========== Worker 线程 ========== */
 
@@ -102,10 +65,8 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
      * so per-embedding sequential load is optimal. SVE gather load would
      * only help if we needed partial dimensions or column-oriented access.
      */
-    int ret = sve_serial_contiguous_read((sve_ub_mem_t *)ctx->gather_ctx.ubas,
-                                         ctx->gather_ctx.bitmap, emb_ids,
-                                         packet->num_requests, results,
-                                         ctx->gather_ctx.stats);
+    int ret = sve_serial_contiguous_read(&ctx->gather_ctx, emb_ids,
+                                         packet->num_requests, results);
 
     zfree(results);
     zfree(emb_ids);

@@ -21,11 +21,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-/* UB.mem 配置 */
-#define UB_MEM_BASE_ADDR 0x100000000ULL
-#define UB_MEM_SIZE (4ULL * 1024 * 1024 * 1024 * 1024)
-#define UB_MEM_PAGE_SIZE (4 * 1024 * 1024)
-
 /* SVE Worker 上下文 */
 typedef struct sve_worker_context {
     int worker_id;
@@ -52,10 +47,6 @@ typedef struct sve_worker_context {
 /* ========== API ========== */
 int  supernode_init(int node_id, int num_workers);
 void supernode_shutdown(void);
-
-/* UB.mem 管理（mmap 分配/释放，SuperNode 特有）*/
-sve_ub_mem_t *ub_mem_init(uint64_t physical_base, size_t size);
-void ub_mem_cleanup(sve_ub_mem_t *ub_mem);
 
 /* Worker 线程 */
 void *sve_worker_thread(void *arg);
