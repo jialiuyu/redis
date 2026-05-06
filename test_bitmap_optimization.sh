@@ -73,13 +73,12 @@ if [ $TEST_RESULT -eq 0 ]; then
     echo "Performance Summary:"
     echo "  - Alignment: 64 bytes (cache line)"
     echo "  - Memory order: acquire/release/relaxed"
-    echo "  - CAS variant: compare_exchange_weak"
-    echo "  - CPU pause: enabled"
+    echo "  - Compared implementations: compare_exchange_weak vs fetch_or"
+    echo "  - Includes both partitioned and high-contention hotspot modes"
+    echo "  - CPU pause/yield: enabled in CAS path"
     echo ""
-    echo "Expected improvements:"
-    echo "  - 2-10x reduction in false sharing"
-    echo "  - 2-3x faster lock release"
-    echo "  - 3-5x overall throughput improvement"
+    echo "Review the throughput, latency, and retry counts above"
+    echo "to compare the current fetch_or path against the optimized CAS path."
 else
     echo -e "${RED}❌ Tests failed${NC}"
     exit 1
