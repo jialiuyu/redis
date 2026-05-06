@@ -6,7 +6,11 @@
  */
 
 #include "supernode_worker.h"
+#include "macro.h"
 #include "server.h"
+#include "ub_client.h"
+
+#include <stddef.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <fcntl.h>
@@ -23,9 +27,10 @@ typedef struct supernode {
     int num_workers;
     sve_worker_context_t *workers;
 
-    sve_ub_mem_t *ub_mem;
+    ub_address_space_t *ubas;
     state_bitmap_t *global_bitmap;
     ring_buffer_t *input_rb;
+    int ub_client_owned;
 
     int running;
 } supernode_t;
@@ -36,7 +41,7 @@ supernode_t *global_supernode = NULL;
 
 sve_ub_mem_t *ub_mem_init(uint64_t physical_base, size_t size) {
     sve_ub_mem_t *ub = zmalloc(sizeof(sve_ub_mem_t));
-    if (!ub) return NULL;
+    RETURN_IF(!ub, NULL);
 
     ub->physical_base = physical_base;
     ub->size = size;
@@ -61,7 +66,7 @@ sve_ub_mem_t *ub_mem_init(uint64_t physical_base, size_t size) {
 }
 
 void ub_mem_cleanup(sve_ub_mem_t *ub) {
-    if (!ub) return;
+    RETURN_IF(!ub);
     if (ub->base_addr && ub->base_addr != MAP_FAILED)
         munmap(ub->base_addr, ub->size);
     zfree(ub);
@@ -70,7 +75,7 @@ void ub_mem_cleanup(sve_ub_mem_t *ub) {
 /* ========== Worker 线程 ========== */
 
 int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) {
-    if (!ctx || !packet) return C_ERR;
+    RETURN_IF(!ctx || !packet, C_ERR);
 
     uint64_t start_time = get_time_us();
 
@@ -84,12 +89,12 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
               (unsigned long long)packet->batch_id);
 
     uint64_t *emb_ids = zmalloc(packet->num_requests * sizeof(uint64_t));
-    if (!emb_ids) return C_ERR;
+    RETURN_IF(!emb_ids, C_ERR);
 
     for (uint32_t i = 0; i < packet->num_requests; i++)
-        emb_ids[i] = packet->requests[i].key_hash % SUPERNODE_MAX_EMBEDDINGS;
+        emb_ids[i] = packet->requests[i].key_hash % ctx->gather_ctx.table_row_capacity;
 
-    float *results = zmalloc(packet->num_requests * SUPERNODE_EMBEDDING_DIM * sizeof(float));
+    float *results = zmalloc(packet->num_requests * ctx->gather_ctx.vector_dim * sizeof(float));
     if (!results) { zfree(emb_ids); return C_ERR; }
 
     /*
@@ -97,9 +102,10 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
      * so per-embedding sequential load is optimal. SVE gather load would
      * only help if we needed partial dimensions or column-oriented access.
      */
-    int ret = sve_serial_contiguous_read(ctx->ub_mem, ctx->bitmap, emb_ids,
+    int ret = sve_serial_contiguous_read((sve_ub_mem_t *)ctx->gather_ctx.ubas,
+                                         ctx->gather_ctx.bitmap, emb_ids,
                                          packet->num_requests, results,
-                                         &ctx->op_stats);
+                                         ctx->gather_ctx.stats);
 
     zfree(results);
     zfree(emb_ids);
@@ -145,47 +151,74 @@ void *sve_worker_thread(void *arg) {
 /* ========== SuperNode 生命周期 ========== */
 
 int supernode_init(int node_id, int num_workers) {
-    if (global_supernode) return C_OK;
-
-    if (num_workers <= 0 || num_workers > SUPERNODE_MAX_WORKERS) {
-        serverLog(LL_WARNING, "Invalid number of workers: %d", num_workers);
-        return C_ERR;
+    RETURN_IF(global_supernode, C_OK);
+    num_workers = server.supernode_workers;
+    if (num_workers <= 0) {
+        int detected_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        num_workers = max(detected_cpus, 1);
     }
 
     global_supernode = zcalloc(sizeof(supernode_t));
-    if (!global_supernode) return C_ERR;
+    if (!global_supernode) goto failed;
 
     global_supernode->node_id = node_id;
     global_supernode->num_workers = num_workers;
+    global_supernode->ub_client_owned = 0;
 
-    /* UB.mem */
-    global_supernode->ub_mem = ub_mem_init(UB_MEM_BASE_ADDR, UB_MEM_SIZE);
-    if (!global_supernode->ub_mem) { supernode_shutdown(); return C_ERR; }
+    if (server.ub.vector_dimension <= 0) {
+        serverLog(LL_WARNING, "Invalid UB vector dimension: %d", server.ub.vector_dimension);
+        goto failed;
+    }
+
+    if (ub_client_init(&server.ub) != C_OK) {
+        serverLog(LL_WARNING, "Failed to initialize UB client for SuperNode");
+        goto failed;
+    }
+
+    if (ub_client_load_embedding_table(server.ub.table_name, &global_supernode->ubas) != C_OK ||
+        !global_supernode->ubas) {
+        serverLog(LL_WARNING, "Failed to attach UB table for SuperNode");
+        goto failed;
+    }
+
+    size_t vector_dim = (size_t)server.ub.vector_dimension;
+    size_t vector_stride_bytes = global_supernode->ubas->vector_stride_bytes;
+    if (vector_stride_bytes < vector_dim * sizeof(float)) {
+        serverLog(LL_WARNING,
+                  "Invalid UB vector stride: %zu for vector dimension %zu",
+                  vector_stride_bytes, vector_dim);
+        goto failed;
+    }
+
+    size_t table_row_capacity = vector_stride_bytes == 0 ? 0 :
+        (uint64_t)(global_supernode->ubas->size / vector_stride_bytes);
+    if (table_row_capacity == 0) {
+        serverLog(LL_WARNING, "UB table capacity is zero");
+        goto failed;
+    }
 
     /* Bitmap — 直接调用 bitmap_init */
     global_supernode->global_bitmap = zmalloc(sizeof(state_bitmap_t));
     if (!global_supernode->global_bitmap ||
-        bitmap_init(global_supernode->global_bitmap, SUPERNODE_MAX_EMBEDDINGS) != 0) {
-        supernode_shutdown();
-        return C_ERR;
+        bitmap_init(global_supernode->global_bitmap, table_row_capacity) != 0) {
+        goto failed;
     }
 
     /* Ring Buffer */
     char rb_name[64];
     snprintf(rb_name, sizeof(rb_name), "supernode_%d_input", node_id);
     global_supernode->input_rb = ring_buffer_create(RING_BUFFER_SIZE, rb_name);
-    if (!global_supernode->input_rb) { supernode_shutdown(); return C_ERR; }
+    if (!global_supernode->input_rb) goto failed;
 
     /* Workers */
     global_supernode->workers = zcalloc(sizeof(sve_worker_context_t) * num_workers);
+    if (!global_supernode->workers) goto failed;
 
     for (int i = 0; i < num_workers; i++) {
         sve_worker_context_t *ctx = &global_supernode->workers[i];
         ctx->worker_id = i;
         ctx->running = 1;
         ctx->input_rb = global_supernode->input_rb;
-        ctx->ub_mem = global_supernode->ub_mem;
-        ctx->bitmap = global_supernode->global_bitmap;
         ctx->sve_vl = SVE_OP_VECTOR_BITS / 8;
 
         atomic_init(&ctx->total_batches, 0);
@@ -194,21 +227,31 @@ int supernode_init(int node_id, int num_workers) {
         atomic_init(&ctx->total_latency_us, 0);
         atomic_init(&ctx->op_stats.lock_success, 0);
         atomic_init(&ctx->op_stats.lock_failure, 0);
+        sve_gather_ctx_init(&ctx->gather_ctx,
+                            global_supernode->ubas,
+                            global_supernode->global_bitmap,
+                            vector_dim,
+                            vector_stride_bytes,
+                            table_row_capacity,
+                            &ctx->op_stats);
 
         if (pthread_create(&ctx->thread, NULL, sve_worker_thread, ctx) != 0) {
             serverLog(LL_WARNING, "Failed to create SVE worker %d", i);
-            supernode_shutdown();
-            return C_ERR;
+            goto failed;
         }
     }
 
     global_supernode->running = 1;
     serverLog(LL_NOTICE, "SuperNode %d initialized with %d workers", node_id, num_workers);
     return C_OK;
+
+failed:
+    supernode_shutdown();
+    return C_ERR;
 }
 
 void supernode_shutdown(void) {
-    if (!global_supernode) return;
+    RETURN_IF(!global_supernode);
 
     global_supernode->running = 0;
 
@@ -231,8 +274,8 @@ void supernode_shutdown(void) {
         zfree(global_supernode->global_bitmap);
     }
 
-    if (global_supernode->ub_mem)
-        ub_mem_cleanup(global_supernode->ub_mem);
+    if (global_supernode->ub_client_owned)
+        ub_client_cleanup();
 
     zfree(global_supernode);
     global_supernode = NULL;
@@ -251,8 +294,8 @@ sds supernode_get_stats(void) {
 
     stats = sdscatprintf(stats, "SuperNode Stats (Node %d):\n", global_supernode->node_id);
     stats = sdscatprintf(stats, "  Workers: %d\n", global_supernode->num_workers);
-    stats = sdscatprintf(stats, "  UB.mem size: %zu GB\n",
-                         global_supernode->ub_mem->size / (1024 * 1024 * 1024));
+    stats = sdscatprintf(stats, "  UB table size: %zu GB\n",
+                         global_supernode->ubas->size / (1024 * 1024 * 1024));
 
     uint64_t tb = 0, tr = 0, ts = 0, tt = 0;
     uint64_t bls = 0, blf = 0;

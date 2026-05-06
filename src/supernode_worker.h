@@ -21,11 +21,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-/* 超节点配置 */
-#define SUPERNODE_MAX_WORKERS 16
-#define SUPERNODE_EMBEDDING_DIM SVE_EMBEDDING_DIM  /* 复用 sve_operation 的定义 */
-#define SUPERNODE_MAX_EMBEDDINGS (1024 * 1024 * 1024)
-
 /* UB.mem 配置 */
 #define UB_MEM_BASE_ADDR 0x100000000ULL
 #define UB_MEM_SIZE (4ULL * 1024 * 1024 * 1024 * 1024)
@@ -40,11 +35,8 @@ typedef struct sve_worker_context {
     /* Ring Buffer（从 Proxy 接收）*/
     ring_buffer_t *input_rb;
 
-    /* UB.mem 访问（直接使用 sve_ub_mem_t）*/
-    sve_ub_mem_t *ub_mem;
-
-    /* 状态 Bitmap（直接使用 state_bitmap_t）*/
-    state_bitmap_t *bitmap;
+    /* 读取路径上下文 */
+    sve_gather_ctx_t gather_ctx;
 
     /* SVE 上下文 */
     size_t sve_vl;

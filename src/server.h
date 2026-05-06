@@ -1921,6 +1921,7 @@ struct redisServer {
     /* Vector Engine */
     int vector_engine_type; /* Type of vector engine to use */
     int vector_engine_enabled;   /* Whether vector engine is enabled */
+    int supernode_workers;       /* SuperNode worker count, 0 means auto-detect */
     ub_mem_config_t ub;          /* UB data-plane configuration */
     /* Networking */
     int port;                   /* TCP listening port */

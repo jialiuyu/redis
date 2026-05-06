@@ -1,5 +1,6 @@
 #include "sve_operation.h"
 #include "macro.h"
+#include "zmalloc.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -11,7 +12,7 @@
 int bitmap_init(state_bitmap_t *bmp, size_t num_bits) {
     bmp->num_words = (num_bits + BITMAP_BITS_PER_WORD - 1) / BITMAP_BITS_PER_WORD;
     if (bmp->num_words < 1) bmp->num_words = 1;
-    bmp->bits = (bitmap_atomic_word_t *)calloc(bmp->num_words, sizeof(bitmap_atomic_word_t));
+    bmp->bits = (bitmap_atomic_word_t *) zcalloc(bmp->num_words * sizeof(bitmap_atomic_word_t));
     if (!bmp->bits) return -1;
     for (size_t i = 0; i < bmp->num_words; i++)
         atomic_init(&bmp->bits[i].word, 0);
@@ -19,13 +20,13 @@ int bitmap_init(state_bitmap_t *bmp, size_t num_bits) {
 }
 
 void bitmap_destroy(state_bitmap_t *bmp) {
-    if (bmp && bmp->bits) { free(bmp->bits); bmp->bits = NULL; }
+    if (bmp && bmp->bits) { zfree(bmp->bits); bmp->bits = NULL; }
 }
 
 int bitmap_try_acquire(state_bitmap_t *bmp, uint64_t bit_index) {
-    if (!bmp || !bmp->bits) return -1;
-    uint64_t wi = bit_index / BITMAP_BITS_PER_WORD;
-    uint64_t bo = bit_index % BITMAP_BITS_PER_WORD;
+    RETURN_IF(!bmp || !bmp->bits, -1);
+    uint64_t wi = bit_index >> BITMAP_WORD_SHIFT;
+    uint64_t bo = bit_index & BITMAP_WORD_MASK;
     if (wi >= bmp->num_words) return -1;
     const uint64_t mask = 1ULL << bo;
 
@@ -40,18 +41,35 @@ int bitmap_try_acquire(state_bitmap_t *bmp, uint64_t bit_index) {
 }
 
 void bitmap_release(state_bitmap_t *bmp, uint64_t bit_index) {
-    if (!bmp || !bmp->bits) return;
-    uint64_t wi = bit_index / BITMAP_BITS_PER_WORD;
-    uint64_t bo = bit_index % BITMAP_BITS_PER_WORD;
-    if (wi >= bmp->num_words) return;
+    RETURN_IF(!bmp || !bmp->bits);
+    uint64_t wi = bit_index >> BITMAP_WORD_SHIFT;
+    uint64_t bo = bit_index & BITMAP_WORD_MASK;
+    RETURN_IF(wi >= bmp->num_words);
     atomic_fetch_and_explicit(&bmp->bits[wi].word,
                               ~(1ULL << bo), memory_order_release);
 }
 
+void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
+                         ub_address_space_t *ubas,
+                         state_bitmap_t *bitmap,
+                         size_t vector_dim,
+                         size_t vector_stride_bytes,
+                         uint64_t table_row_capacity,
+                         sve_operation_stats_t *stats) {
+    RETURN_IF(!ctx);
+
+    ctx->ubas = ubas;
+    ctx->bitmap = bitmap;
+    ctx->vector_dim = vector_dim;
+    ctx->vector_stride_bytes = vector_stride_bytes;
+    ctx->table_row_capacity = table_row_capacity;
+    ctx->stats = stats;
+}
+
 static inline void *get_embedding_addr(sve_ub_mem_t *mem, uint64_t emb_id) {
-    if (!mem || !mem->base_addr) return NULL;
+    RETURN_IF(!mem || !mem->base_addr, NULL);
     size_t off = emb_id * sizeof(embedding_entry_t);
-    if (off + sizeof(embedding_entry_t) > mem->size) return NULL;
+    RETURN_IF(off + sizeof(embedding_entry_t) > mem->size, NULL);
     return (uint8_t *)mem->base_addr + off;
 }
 

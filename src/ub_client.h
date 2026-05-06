@@ -34,7 +34,7 @@ typedef struct {
     char *shm_path;                    /* Existing OBMM shmdev path */
 } ub_mem_config_t;
 
-typedef struct {
+typedef struct ub_address_space {
     uint64_t base_addr;          /* Table base offset inside the shmdev mapping */
     size_t size;                 /* Accessible embedding table size */
     uint32_t token_id;           /* Reserved for future use */

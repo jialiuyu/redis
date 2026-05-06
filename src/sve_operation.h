@@ -27,6 +27,13 @@
 #endif
 #define SVE_OP_VL (SVE_OP_VECTOR_BITS / 32)  /* 8 floats per vector */
 #define BITMAP_BITS_PER_WORD 64
+#define BITMAP_WORD_SHIFT 6
+#define BITMAP_WORD_MASK ((1ULL << BITMAP_WORD_SHIFT) - 1)
+
+_Static_assert(BITMAP_BITS_PER_WORD == 64,
+               "bitmap bit math assumes 64-bit words");
+
+typedef struct ub_address_space ub_address_space_t; // Forward declaration
 
 /* UB 内存空间 */
 typedef struct sve_ub_mem {
@@ -53,6 +60,15 @@ typedef struct {
     atomic_uint_fast64_t lock_failure;
 } sve_operation_stats_t;
 
+typedef struct {
+    ub_address_space_t *ubas;
+    state_bitmap_t *bitmap;
+    size_t vector_dim;
+    size_t vector_stride_bytes;
+    uint64_t table_row_capacity;
+    sve_operation_stats_t *stats;
+} sve_gather_ctx_t;
+
  /* Embedding 数据结构 */
 typedef struct {
     _Alignas(64) float data[SVE_EMBEDDING_DIM];
@@ -63,6 +79,14 @@ int  bitmap_init(state_bitmap_t *bmp, size_t num_bits);
 void bitmap_destroy(state_bitmap_t *bmp);
 int  bitmap_try_acquire(state_bitmap_t *bmp, uint64_t bit_index);
 void bitmap_release(state_bitmap_t *bmp, uint64_t bit_index);
+
+void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
+                         ub_address_space_t *ubas,
+                         state_bitmap_t *bitmap,
+                         size_t vector_dim,
+                         size_t vector_stride_bytes,
+                         uint64_t table_row_capacity,
+                         sve_operation_stats_t *stats);
 
 /* 逐 embedding 串行连续加载（baseline 对照）*/
 int sve_serial_contiguous_read(sve_ub_mem_t *mem,

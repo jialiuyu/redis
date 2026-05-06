@@ -2330,6 +2330,7 @@ void initServerConfig(void) {
     server.migrate_cached_sockets = dictCreate(&migrateCacheDictType);
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.page_size = sysconf(_SC_PAGESIZE);
+    server.supernode_workers = 0;
     server.pause_cron = 0;
     server.dict_resizing = 1;
 
