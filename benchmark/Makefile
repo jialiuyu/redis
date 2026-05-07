@@ -138,6 +138,25 @@ scatter_gather_bench: $(SVE_BENCH_SRCS) ../src/sve_operation.h ../src/sve_config
 
 .PHONY: scatter_gather_bench
 
+# SVE row copy comparison benchmark
+# 编译: make sve_row_copy_compare USE_SVE=yes
+SVE_ROW_COPY_CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=gnu11
+
+ifeq ($(USE_SVE),yes)
+    SVE_ROW_COPY_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+sve_row_copy_compare: sve_row_copy_compare.c
+ifeq ($(USE_SVE),yes)
+	$(CC) $(SVE_ROW_COPY_CFLAGS) -o $@ $< -lm -lpthread
+	@echo "✅ Built: $@"
+else
+	@echo "❌ sve_row_copy_compare requires USE_SVE=yes"
+	@exit 1
+endif
+
+.PHONY: sve_row_copy_compare
+
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
@@ -161,7 +180,7 @@ ub_client_ut: $(UB_UT_SRCS)
 
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "✅ Cleaned build artifacts"
@@ -236,6 +255,10 @@ help:
 	@echo "Scatter/Gather benchmark:"
 	@echo "  make scatter_gather_bench [USE_SVE=yes]"
 	@echo "  ./scatter_gather_bench [--embeddings N] [--iters N] [--warmup N]"
+	@echo ""
+	@echo "SVE row-copy compare:"
+	@echo "  make sve_row_copy_compare USE_SVE=yes"
+	@echo "  ./sve_row_copy_compare"
 	@echo "  ./ub_client_ut selftest"
 	@echo "  ./ub_client_ut write-fixture --shm-memid <id> --shm-size <N> --vector-dimension 128 --fill-rows 1024"
 	@echo "  ./ub_client_ut gather --shm-memid <id> --shm-size <N> --vector-dimension 128 --table-name ut_vectors --gather-indices 0,1,42 --verify"
