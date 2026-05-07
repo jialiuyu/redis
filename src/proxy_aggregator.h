@@ -30,7 +30,9 @@
 /* 请求结构 */
 typedef struct proxy_request {
     uint64_t request_id;
-    char *key;                          /* embedding key */
+    uint32_t key_hash;                  /* 预计算 hash，避免重复计算 */
+    int target_supernode_id;            /* 目标超节点 */
+    int target_worker_id;               /* 目标 worker */
     uint64_t submit_time_us;
     void *client_context;               /* 客户端上下文 */
     int completed;
@@ -45,6 +47,7 @@ typedef struct batch_bucket {
     size_t count;                       /* 当前请求数 */
     size_t capacity;                    /* 容量 */
     int target_supernode_id;            /* 目标超节点 ID */
+    int target_worker_id;               /* 目标 Worker ID */
     uint64_t last_flush_time_us;       /* 上次刷新时间 */
     pthread_mutex_t mutex;
 } batch_bucket_t;
@@ -55,6 +58,7 @@ typedef struct batch_packet {
     uint32_t packet_size;               /* 包大小 */
     uint32_t num_requests;              /* 请求数量 */
     uint32_t supernode_id;              /* 目标超节点 ID */
+    uint32_t worker_id;                 /* 目标 Worker ID */
     uint64_t timestamp_us;              /* 时间戳 */
     uint64_t batch_id;                  /* 批次 ID */
     
@@ -62,19 +66,22 @@ typedef struct batch_packet {
     struct {
         uint64_t request_id;
         uint64_t key_hash;              /* Key 的哈希值 */
-        uint32_t key_len;
-        char key_data[256];             /* Key 数据 */
     } requests[];
 } __attribute__((packed)) batch_packet_t;
 
 /* Ring Buffer 结构 */
 typedef struct ring_buffer {
-    volatile uint64_t head;             /* 读指针（原子操作）*/
-    volatile uint64_t tail;             /* 写指针（原子操作）*/
+    _Alignas(64) atomic_uint_fast64_t head; /* 仅 consumer 更新 */
+    char head_pad[64 - sizeof(atomic_uint_fast64_t)];
+    _Alignas(64) atomic_uint_fast64_t tail; /* 仅 producer 更新 */
+    char tail_pad[64 - sizeof(atomic_uint_fast64_t)];
+    atomic_uint_fast32_t refcount;      /* 进程内共享引用计数 */
     uint8_t *buffer;                    /* 缓冲区 */
     size_t size;                        /* 缓冲区大小 */
     int fd;                             /* 共享内存 fd */
-    pthread_mutex_t write_mutex;        /* 写锁 */
+    uint64_t reserved_commit_tail;      /* producer 待发布 tail */
+    size_t reserved_payload_len;        /* 本次预留的 payload 长度 */
+    int reservation_active;             /* producer 是否持有预留 */
 } ring_buffer_t;
 
 /* 一致性哈希节点 */
@@ -93,14 +100,16 @@ typedef struct consistent_hash_ring {
 
 /* Proxy 聚合器主结构 */
 typedef struct proxy_aggregator {
-    /* 批量桶 - 每个超节点一个 */
+    /* 批量桶 - 每个 (supernode, worker) 一个 */
     batch_bucket_t *buckets;
     size_t num_buckets;
+    size_t num_supernodes;
+    size_t workers_per_supernode;
     
     /* 一致性哈希环 */
     consistent_hash_ring_t *hash_ring;
     
-    /* Ring Buffer - 每个超节点一个 */
+    /* Ring Buffer - 每个 (supernode, worker) 一个 */
     ring_buffer_t **ring_buffers;
     size_t num_ring_buffers;
     
@@ -140,17 +149,27 @@ int consistent_hash_remove_node(consistent_hash_ring_t *ring, int supernode_id);
 /* Ring Buffer 操作 */
 ring_buffer_t *ring_buffer_create(size_t size, const char *name);
 void ring_buffer_destroy(ring_buffer_t *rb);
+void ring_buffer_retain(ring_buffer_t *rb);
 int ring_buffer_push(ring_buffer_t *rb, const void *data, size_t len);
 int ring_buffer_pop(ring_buffer_t *rb, void *data, size_t max_len, size_t *actual_len);
+int ring_buffer_reserve(ring_buffer_t *rb, size_t payload_len, void **payload);
+int ring_buffer_commit_write(ring_buffer_t *rb, size_t payload_len);
+int ring_buffer_peek(ring_buffer_t *rb, void **payload, size_t *payload_len);
+int ring_buffer_commit_read(ring_buffer_t *rb, size_t payload_len);
 size_t ring_buffer_available_space(ring_buffer_t *rb);
 size_t ring_buffer_available_data(ring_buffer_t *rb);
+
+/* 查询接口 */
+ring_buffer_t *proxy_aggregator_get_ring_buffer(int supernode_id, int worker_id);
+int proxy_aggregator_get_workers_per_supernode(void);
 
 /* 批量处理 */
 int flush_batch(batch_bucket_t *bucket, ring_buffer_t *rb);
 void *flush_thread_func(void *arg);
 
 /* 序列化 */
-batch_packet_t *serialize_batch_for_sve(batch_bucket_t *bucket);
+size_t batch_packet_wire_size(batch_bucket_t *bucket);
+int fill_batch_packet(batch_bucket_t *bucket, batch_packet_t *packet, size_t packet_size);
 
 /* 工具函数 */
 uint32_t murmur3_hash(const char *key, size_t len);

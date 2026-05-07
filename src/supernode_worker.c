@@ -27,7 +27,7 @@ typedef struct supernode {
 
     ub_address_space_t *ubas;
     state_bitmap_t *global_bitmap;
-    ring_buffer_t *input_rb;
+    ring_buffer_t **input_rbs;
     int ub_client_owned;
 
     int running;
@@ -94,12 +94,14 @@ void *sve_worker_thread(void *arg) {
 #endif
 
     while (ctx->running) {
-        uint8_t buffer[RING_BUFFER_BATCH_SIZE];
-        size_t actual_len = 0;
+        void *payload = NULL;
+        size_t payload_len = 0;
 
-        int ret = ring_buffer_pop(ctx->input_rb, buffer, sizeof(buffer), &actual_len);
-        if (ret == C_OK && actual_len > 0) {
-            sve_worker_process_batch(ctx, (batch_packet_t *)buffer);
+        int ret = ring_buffer_peek(ctx->input_rb, &payload, &payload_len);
+        if (ret == C_OK && payload_len > 0) {
+            if (sve_worker_process_batch(ctx, (batch_packet_t *)payload) == C_OK) {
+                ring_buffer_commit_read(ctx->input_rb, payload_len);
+            }
         } else {
             usleep(10);
         }
@@ -165,21 +167,30 @@ int supernode_init(int node_id, int num_workers) {
         goto failed;
     }
 
-    /* Ring Buffer */
-    char rb_name[64];
-    snprintf(rb_name, sizeof(rb_name), "supernode_%d_input", node_id);
-    global_supernode->input_rb = ring_buffer_create(RING_BUFFER_SIZE, rb_name);
-    if (!global_supernode->input_rb) goto failed;
-
     /* Workers */
     global_supernode->workers = zcalloc(sizeof(sve_worker_context_t) * num_workers);
     if (!global_supernode->workers) goto failed;
+    global_supernode->input_rbs = zcalloc(sizeof(ring_buffer_t *) * num_workers);
+    if (!global_supernode->input_rbs) goto failed;
+
+    for (int i = 0; i < num_workers; i++) {
+        ring_buffer_t *rb = proxy_aggregator_get_ring_buffer(node_id, i);
+        if (!rb) {
+            char rb_name[64];
+            snprintf(rb_name, sizeof(rb_name), "supernode_%d_worker_%d", node_id, i);
+            rb = ring_buffer_create(RING_BUFFER_SIZE, rb_name);
+            if (!rb) goto failed;
+        } else {
+            ring_buffer_retain(rb);
+        }
+        global_supernode->input_rbs[i] = rb;
+    }
 
     for (int i = 0; i < num_workers; i++) {
         sve_worker_context_t *ctx = &global_supernode->workers[i];
         ctx->worker_id = i;
         ctx->running = 1;
-        ctx->input_rb = global_supernode->input_rb;
+        ctx->input_rb = global_supernode->input_rbs[i];
         ctx->sve_vl = SVE_OP_VECTOR_BITS / 8;
 
         atomic_init(&ctx->total_batches, 0);
@@ -227,8 +238,13 @@ void supernode_shutdown(void) {
         zfree(global_supernode->workers);
     }
 
-    if (global_supernode->input_rb)
-        ring_buffer_destroy(global_supernode->input_rb);
+    if (global_supernode->input_rbs) {
+        for (int i = 0; i < global_supernode->num_workers; i++) {
+            if (global_supernode->input_rbs[i])
+                ring_buffer_destroy(global_supernode->input_rbs[i]);
+        }
+        zfree(global_supernode->input_rbs);
+    }
 
     if (global_supernode->global_bitmap) {
         bitmap_destroy(global_supernode->global_bitmap);

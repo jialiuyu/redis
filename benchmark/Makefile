@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench ring_buffer_ut ring_buffer_batch_bench
 
 # 所有目标
 all: $(TARGETS)
@@ -119,6 +119,15 @@ tlc_v13_bench: tlc_v13_bench.c ../src/aeron_ipc.h
 # TLC v14 传输基准测试
 tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+# Ring buffer unit test
+ring_buffer_ut: ring_buffer_ut.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
+ring_buffer_batch_bench: ring_buffer_batch_bench.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -o $@ $< -pthread -lm
 	@echo "✅ Built: $@"
 
 # Scatter/Gather vs Baseline benchmark

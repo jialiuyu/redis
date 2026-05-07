@@ -15,9 +15,23 @@
 /* 全局实例 */
 proxy_aggregator_t *global_proxy_aggregator = NULL;
 
+typedef struct ring_buffer_registry_entry {
+    char *name;
+    ring_buffer_t *rb;
+    struct ring_buffer_registry_entry *next;
+} ring_buffer_registry_entry_t;
+
 /* 原子请求 ID 生成器 */
 static atomic_uint_fast64_t next_request_id = 1;
 static atomic_uint_fast64_t next_batch_id = 1;
+static ring_buffer_registry_entry_t *g_ring_buffer_registry = NULL;
+static pthread_mutex_t g_ring_buffer_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline size_t worker_queue_index(size_t workers_per_supernode,
+                                        int supernode_id,
+                                        int worker_id) {
+    return (size_t)supernode_id * workers_per_supernode + (size_t)worker_id;
+}
 
 /* ========== 工具函数 ========== */
 
@@ -213,6 +227,17 @@ ring_buffer_t *ring_buffer_create(size_t size, const char *name) {
     /* 使用共享内存（用于跨进程通信）*/
     char shm_name[256];
     snprintf(shm_name, sizeof(shm_name), "/redis_ub_rb_%s", name);
+
+    pthread_mutex_lock(&g_ring_buffer_registry_lock);
+    for (ring_buffer_registry_entry_t *entry = g_ring_buffer_registry; entry; entry = entry->next) {
+        if (strcmp(entry->name, shm_name) == 0) {
+            ring_buffer_retain(entry->rb);
+            pthread_mutex_unlock(&g_ring_buffer_registry_lock);
+            zfree(rb);
+            return entry->rb;
+        }
+    }
+    pthread_mutex_unlock(&g_ring_buffer_registry_lock);
     
     rb->fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
     if (rb->fd < 0) {
@@ -242,9 +267,34 @@ ring_buffer_t *ring_buffer_create(size_t size, const char *name) {
     }
     
     rb->size = size;
-    rb->head = 0;
-    rb->tail = 0;
-    pthread_mutex_init(&rb->write_mutex, NULL);
+    atomic_init(&rb->head, 0);
+    atomic_init(&rb->tail, 0);
+    atomic_init(&rb->refcount, 1);
+    rb->reserved_commit_tail = 0;
+    rb->reserved_payload_len = 0;
+    rb->reservation_active = 0;
+
+    ring_buffer_registry_entry_t *entry = zmalloc(sizeof(*entry));
+    if (!entry) {
+        munmap(rb->buffer, rb->size);
+        close(rb->fd);
+        zfree(rb);
+        return NULL;
+    }
+    entry->name = zstrdup(shm_name);
+    if (!entry->name) {
+        zfree(entry);
+        munmap(rb->buffer, rb->size);
+        close(rb->fd);
+        zfree(rb);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_ring_buffer_registry_lock);
+    entry->rb = rb;
+    entry->next = g_ring_buffer_registry;
+    g_ring_buffer_registry = entry;
+    pthread_mutex_unlock(&g_ring_buffer_registry_lock);
     
     serverLog(LL_NOTICE, "Ring buffer created: %s, size: %zu bytes", name, size);
     return rb;
@@ -253,6 +303,25 @@ ring_buffer_t *ring_buffer_create(size_t size, const char *name) {
 /* 销毁 Ring Buffer */
 void ring_buffer_destroy(ring_buffer_t *rb) {
     if (!rb) return;
+
+    if (atomic_fetch_sub_explicit(&rb->refcount, 1, memory_order_acq_rel) != 1) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ring_buffer_registry_lock);
+    ring_buffer_registry_entry_t **prev = &g_ring_buffer_registry;
+    ring_buffer_registry_entry_t *entry = g_ring_buffer_registry;
+    while (entry) {
+        if (entry->rb == rb) {
+            *prev = entry->next;
+            zfree(entry->name);
+            zfree(entry);
+            break;
+        }
+        prev = &entry->next;
+        entry = entry->next;
+    }
+    pthread_mutex_unlock(&g_ring_buffer_registry_lock);
     
     if (rb->buffer && rb->buffer != MAP_FAILED) {
         munmap(rb->buffer, rb->size);
@@ -262,14 +331,18 @@ void ring_buffer_destroy(ring_buffer_t *rb) {
         close(rb->fd);
     }
     
-    pthread_mutex_destroy(&rb->write_mutex);
     zfree(rb);
+}
+
+void ring_buffer_retain(ring_buffer_t *rb) {
+    if (!rb) return;
+    atomic_fetch_add_explicit(&rb->refcount, 1, memory_order_relaxed);
 }
 
 /* 获取可用空间 */
 size_t ring_buffer_available_space(ring_buffer_t *rb) {
-    uint64_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
-    uint64_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
+    uint64_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
     
     if (tail >= head) {
         return rb->size - (tail - head) - 1;
@@ -280,8 +353,8 @@ size_t ring_buffer_available_space(ring_buffer_t *rb) {
 
 /* 获取可用数据 */
 size_t ring_buffer_available_data(ring_buffer_t *rb) {
-    uint64_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
-    uint64_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
+    uint64_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
     
     if (tail >= head) {
         return tail - head;
@@ -293,114 +366,149 @@ size_t ring_buffer_available_data(ring_buffer_t *rb) {
 /* 写入数据到 Ring Buffer（零拷贝）*/
 int ring_buffer_push(ring_buffer_t *rb, const void *data, size_t len) {
     if (!rb || !data || len == 0) return C_ERR;
-    
-    pthread_mutex_lock(&rb->write_mutex);
-    
-    /* 检查空间 */
-    if (ring_buffer_available_space(rb) < len + sizeof(uint32_t)) {
-        pthread_mutex_unlock(&rb->write_mutex);
-        return C_ERR; /* 空间不足 */
+    void *payload = NULL;
+    if (ring_buffer_reserve(rb, len, &payload) != C_OK) return C_ERR;
+    memcpy(payload, data, len);
+    return ring_buffer_commit_write(rb, len);
+}
+
+int ring_buffer_reserve(ring_buffer_t *rb, size_t payload_len, void **payload) {
+    if (!rb || !payload || payload_len == 0) return C_ERR;
+    if (rb->reservation_active) return C_ERR;
+
+    uint64_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+    uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
+    size_t used = (tail >= head) ? (size_t)(tail - head) : (rb->size - (size_t)(head - tail));
+    size_t total_len = sizeof(uint32_t) + payload_len;
+    if (rb->size - used - 1 < total_len) {
+        return C_ERR;
     }
-    
-    uint64_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
+
     size_t pos = tail % rb->size;
-    
-    /* 写入长度头 */
-    uint32_t packet_len = (uint32_t)len;
-    size_t remaining = rb->size - pos;
-    
-    if (remaining >= sizeof(uint32_t)) {
-        memcpy(rb->buffer + pos, &packet_len, sizeof(uint32_t));
-        pos = (pos + sizeof(uint32_t)) % rb->size;
-    } else {
-        /* 跨越边界 */
-        memcpy(rb->buffer + pos, &packet_len, remaining);
-        memcpy(rb->buffer, ((uint8_t *)&packet_len) + remaining, 
-               sizeof(uint32_t) - remaining);
-        pos = sizeof(uint32_t) - remaining;
+    size_t contiguous = rb->size - pos;
+    if (contiguous < total_len) {
+        if (contiguous < sizeof(uint32_t)) {
+            return C_ERR; /* 头部都写不下，暂不支持这种跨边界 */
+        }
+
+        uint32_t padding_len = 0;
+        memcpy(rb->buffer + pos, &padding_len, sizeof(uint32_t));
+        tail += contiguous;
+        pos = 0;
+        contiguous = rb->size;
+
+        head = atomic_load_explicit(&rb->head, memory_order_acquire);
+        used = (tail >= head) ? (size_t)(tail - head) : (rb->size - (size_t)(head - tail));
+        if (rb->size - used - 1 < total_len || contiguous < total_len) {
+            return C_ERR;
+        }
     }
-    
-    /* 写入数据 */
-    remaining = rb->size - pos;
-    if (remaining >= len) {
-        memcpy(rb->buffer + pos, data, len);
-        pos = (pos + len) % rb->size;
-    } else {
-        memcpy(rb->buffer + pos, data, remaining);
-        memcpy(rb->buffer, ((uint8_t *)data) + remaining, len - remaining);
-        pos = len - remaining;
-    }
-    
-    /* 更新 tail 指针 */
-    __atomic_store_n(&rb->tail, tail + sizeof(uint32_t) + len, __ATOMIC_RELEASE);
-    
-    pthread_mutex_unlock(&rb->write_mutex);
+
+    uint32_t packet_len = (uint32_t)payload_len;
+    memcpy(rb->buffer + pos, &packet_len, sizeof(uint32_t));
+    *payload = rb->buffer + pos + sizeof(uint32_t);
+    rb->reserved_commit_tail = tail + total_len;
+    rb->reserved_payload_len = payload_len;
+    rb->reservation_active = 1;
+    return C_OK;
+}
+
+int ring_buffer_commit_write(ring_buffer_t *rb, size_t payload_len) {
+    if (!rb || payload_len == 0) return C_ERR;
+    if (!rb->reservation_active || rb->reserved_payload_len != payload_len) return C_ERR;
+
+    atomic_store_explicit(&rb->tail, rb->reserved_commit_tail, memory_order_release);
+    rb->reservation_active = 0;
+    rb->reserved_payload_len = 0;
+    rb->reserved_commit_tail = 0;
     return C_OK;
 }
 
 /* 从 Ring Buffer 读取数据 */
 int ring_buffer_pop(ring_buffer_t *rb, void *data, size_t max_len, size_t *actual_len) {
     if (!rb || !data) return C_ERR;
-    
-    /* 检查是否有数据 */
-    if (ring_buffer_available_data(rb) < sizeof(uint32_t)) {
-        return C_ERR; /* 没有数据 */
+    void *payload = NULL;
+    size_t payload_len = 0;
+    if (ring_buffer_peek(rb, &payload, &payload_len) != C_OK) {
+        return C_ERR;
     }
-    
-    uint64_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
-    size_t pos = head % rb->size;
-    
-    /* 读取长度头 */
-    uint32_t packet_len;
-    size_t remaining = rb->size - pos;
-    
-    if (remaining >= sizeof(uint32_t)) {
-        memcpy(&packet_len, rb->buffer + pos, sizeof(uint32_t));
-        pos = (pos + sizeof(uint32_t)) % rb->size;
-    } else {
-        memcpy(&packet_len, rb->buffer + pos, remaining);
-        memcpy(((uint8_t *)&packet_len) + remaining, rb->buffer, 
-               sizeof(uint32_t) - remaining);
-        pos = sizeof(uint32_t) - remaining;
+    if (payload_len > max_len) {
+        return C_ERR;
     }
-    
-    if (packet_len > max_len) {
-        return C_ERR; /* 缓冲区太小 */
+    memcpy(data, payload, payload_len);
+    if (ring_buffer_commit_read(rb, payload_len) != C_OK) {
+        return C_ERR;
     }
-    
-    /* 读取数据 */
-    remaining = rb->size - pos;
-    if (remaining >= packet_len) {
-        memcpy(data, rb->buffer + pos, packet_len);
-    } else {
-        memcpy(data, rb->buffer + pos, remaining);
-        memcpy(((uint8_t *)data) + remaining, rb->buffer, packet_len - remaining);
+    if (actual_len) *actual_len = payload_len;
+    return C_OK;
+}
+
+int ring_buffer_peek(ring_buffer_t *rb, void **payload, size_t *payload_len) {
+    if (!rb || !payload || !payload_len) return C_ERR;
+
+    while (1) {
+        uint64_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+        uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+        size_t available = (tail >= head) ? (size_t)(tail - head) : (rb->size - (size_t)(head - tail));
+        if (available < sizeof(uint32_t)) {
+            return C_ERR;
+        }
+
+        size_t pos = head % rb->size;
+        uint32_t packet_len;
+        size_t remaining = rb->size - pos;
+        if (remaining >= sizeof(uint32_t)) {
+            memcpy(&packet_len, rb->buffer + pos, sizeof(uint32_t));
+            pos += sizeof(uint32_t);
+        } else {
+            memcpy(&packet_len, rb->buffer + pos, remaining);
+            memcpy(((uint8_t *)&packet_len) + remaining, rb->buffer,
+                   sizeof(uint32_t) - remaining);
+            pos = sizeof(uint32_t) - remaining;
+        }
+
+        if (packet_len == 0) {
+            atomic_store_explicit(&rb->head, head + remaining, memory_order_release);
+            continue;
+        }
+
+        if (available < sizeof(uint32_t) + packet_len) {
+            return C_ERR;
+        }
+
+        if (rb->size - pos < packet_len) {
+            return C_ERR;
+        }
+
+        *payload = rb->buffer + pos;
+        *payload_len = packet_len;
+        return C_OK;
     }
-    
-    /* 更新 head 指针 */
-    __atomic_store_n(&rb->head, head + sizeof(uint32_t) + packet_len, __ATOMIC_RELEASE);
-    
-    if (actual_len) *actual_len = packet_len;
+}
+
+int ring_buffer_commit_read(ring_buffer_t *rb, size_t payload_len) {
+    if (!rb || payload_len == 0) return C_ERR;
+
+    uint64_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
+    atomic_store_explicit(&rb->head, head + sizeof(uint32_t) + payload_len, memory_order_release);
     return C_OK;
 }
 
 /* ========== 批量处理实现 ========== */
 
-/* 序列化批量请求为 SVE 友好格式 */
-batch_packet_t *serialize_batch_for_sve(batch_bucket_t *bucket) {
-    if (!bucket || bucket->count == 0) return NULL;
-    
-    /* 计算数据包大小 */
-    size_t packet_size = sizeof(batch_packet_t) + 
-                        bucket->count * sizeof(batch_packet_t);
-    
-    batch_packet_t *packet = zmalloc(packet_size);
-    if (!packet) return NULL;
-    
+size_t batch_packet_wire_size(batch_bucket_t *bucket) {
+    if (!bucket || bucket->count == 0) return 0;
+    return sizeof(batch_packet_t) + bucket->count * sizeof(((batch_packet_t *)0)->requests[0]);
+}
+
+int fill_batch_packet(batch_bucket_t *bucket, batch_packet_t *packet, size_t packet_size) {
+    if (!bucket || !packet || packet_size < batch_packet_wire_size(bucket)) return C_ERR;
+
     packet->magic = 0xCAC0BEEF;
     packet->packet_size = packet_size;
     packet->num_requests = bucket->count;
     packet->supernode_id = bucket->target_supernode_id;
+    packet->worker_id = bucket->target_worker_id;
     packet->timestamp_us = get_time_us();
     packet->batch_id = atomic_fetch_add(&next_batch_id, 1);
     
@@ -408,29 +516,28 @@ batch_packet_t *serialize_batch_for_sve(batch_bucket_t *bucket) {
     for (size_t i = 0; i < bucket->count; i++) {
         proxy_request_t *req = bucket->requests[i];
         packet->requests[i].request_id = req->request_id;
-        packet->requests[i].key_hash = murmur3_hash(req->key, strlen(req->key));
-        packet->requests[i].key_len = strlen(req->key);
-        // flatten
-        strncpy(packet->requests[i].key_data, req->key, 
-                sizeof(packet->requests[i].key_data) - 1);
+        packet->requests[i].key_hash = req->key_hash;
     }
-    
-    return packet;
+
+    return C_OK;
 }
 
 /* 刷新批量到 Ring Buffer */
 int flush_batch(batch_bucket_t *bucket, ring_buffer_t *rb) {
     if (!bucket || !rb || bucket->count == 0) return C_ERR;
-    
-    /* 序列化批量 */
-    batch_packet_t *packet = serialize_batch_for_sve(bucket);
-    if (!packet) return C_ERR;
-    
-    /* 写入 Ring Buffer */
-    int ret = ring_buffer_push(rb, packet, packet->packet_size);
-    
-    zfree(packet);
-    
+
+    size_t packet_size = batch_packet_wire_size(bucket);
+    if (packet_size == 0) return C_ERR;
+
+    batch_packet_t *packet = NULL;
+    if (ring_buffer_reserve(rb, packet_size, (void **)&packet) != C_OK) {
+        return C_ERR;
+    }
+    if (fill_batch_packet(bucket, packet, packet_size) != C_OK) {
+        return C_ERR;
+    }
+    int ret = ring_buffer_commit_write(rb, packet_size);
+
     if (ret == C_OK) {
         serverLog(LL_DEBUG, "Flushed batch: %zu requests to supernode %d",
                   bucket->count, bucket->target_supernode_id);
@@ -459,7 +566,7 @@ void *flush_thread_func(void *arg) {
                 
                 /* 批量满或超时 */
                 if (bucket->count >= PROXY_BATCH_LIMIT || age >= PROXY_TIME_LIMIT_US) {
-                    ring_buffer_t *rb = agg->ring_buffers[bucket->target_supernode_id];
+                    ring_buffer_t *rb = agg->ring_buffers[i];
                     
                     if (flush_batch(bucket, rb) == C_OK) {
                         atomic_fetch_add(&agg->total_flushes, 1);
@@ -472,7 +579,6 @@ void *flush_thread_func(void *arg) {
                         
                         /* 清空桶 */
                         for (size_t j = 0; j < bucket->count; j++) {
-                            zfree(bucket->requests[j]->key);
                             zfree(bucket->requests[j]);
                         }
                         bucket->count = 0;
@@ -505,19 +611,30 @@ int proxy_aggregator_init(int num_supernodes) {
     
     global_proxy_aggregator = zcalloc(sizeof(proxy_aggregator_t));
     if (!global_proxy_aggregator) return C_ERR;
+
+    global_proxy_aggregator->num_supernodes = (size_t)num_supernodes;
+    global_proxy_aggregator->workers_per_supernode =
+        server.supernode_workers > 0 ? (size_t)server.supernode_workers :
+        (size_t)max((int)sysconf(_SC_NPROCESSORS_ONLN), 1);
     
     /* 初始化批量桶 */
-    global_proxy_aggregator->num_buckets = num_supernodes;
-    global_proxy_aggregator->buckets = zcalloc(sizeof(batch_bucket_t) * num_supernodes);
+    global_proxy_aggregator->num_buckets =
+        (size_t)num_supernodes * global_proxy_aggregator->workers_per_supernode;
+    global_proxy_aggregator->buckets =
+        zcalloc(sizeof(batch_bucket_t) * global_proxy_aggregator->num_buckets);
     
-    for (int i = 0; i < num_supernodes; i++) {
-        batch_bucket_t *bucket = &global_proxy_aggregator->buckets[i];
-        bucket->capacity = PROXY_BATCH_LIMIT;
-        bucket->requests = zcalloc(sizeof(proxy_request_t *) * bucket->capacity);
-        bucket->count = 0;
-        bucket->target_supernode_id = i;
-        bucket->last_flush_time_us = get_time_us();
-        pthread_mutex_init(&bucket->mutex, NULL);
+    for (int sn = 0; sn < num_supernodes; sn++) {
+        for (size_t worker = 0; worker < global_proxy_aggregator->workers_per_supernode; worker++) {
+            size_t idx = worker_queue_index(global_proxy_aggregator->workers_per_supernode, sn, (int)worker);
+            batch_bucket_t *bucket = &global_proxy_aggregator->buckets[idx];
+            bucket->capacity = PROXY_BATCH_LIMIT;
+            bucket->requests = zcalloc(sizeof(proxy_request_t *) * bucket->capacity);
+            bucket->count = 0;
+            bucket->target_supernode_id = sn;
+            bucket->target_worker_id = (int)worker;
+            bucket->last_flush_time_us = get_time_us();
+            pthread_mutex_init(&bucket->mutex, NULL);
+        }
     }
     
     /* 初始化一致性哈希环 */
@@ -527,18 +644,24 @@ int proxy_aggregator_init(int num_supernodes) {
     }
     
     /* 创建 Ring Buffers */
-    global_proxy_aggregator->num_ring_buffers = num_supernodes;
-    global_proxy_aggregator->ring_buffers = zcalloc(sizeof(ring_buffer_t *) * num_supernodes);
+    global_proxy_aggregator->num_ring_buffers = global_proxy_aggregator->num_buckets;
+    global_proxy_aggregator->ring_buffers =
+        zcalloc(sizeof(ring_buffer_t *) * global_proxy_aggregator->num_ring_buffers);
     
-    for (int i = 0; i < num_supernodes; i++) {
-        char rb_name[64];
-        snprintf(rb_name, sizeof(rb_name), "supernode_%d", i);
-        global_proxy_aggregator->ring_buffers[i] = ring_buffer_create(RING_BUFFER_SIZE, rb_name);
-        
-        if (!global_proxy_aggregator->ring_buffers[i]) {
-            serverLog(LL_WARNING, "Failed to create ring buffer for supernode %d", i);
-            proxy_aggregator_shutdown();
-            return C_ERR;
+    for (int sn = 0; sn < num_supernodes; sn++) {
+        for (size_t worker = 0; worker < global_proxy_aggregator->workers_per_supernode; worker++) {
+            size_t idx = worker_queue_index(global_proxy_aggregator->workers_per_supernode, sn, (int)worker);
+            char rb_name[64];
+            snprintf(rb_name, sizeof(rb_name), "supernode_%d_worker_%zu", sn, worker);
+            global_proxy_aggregator->ring_buffers[idx] = ring_buffer_create(RING_BUFFER_SIZE, rb_name);
+            
+            if (!global_proxy_aggregator->ring_buffers[idx]) {
+                serverLog(LL_WARNING,
+                          "Failed to create ring buffer for supernode %d worker %zu",
+                          sn, worker);
+                proxy_aggregator_shutdown();
+                return C_ERR;
+            }
         }
     }
     
@@ -558,7 +681,8 @@ int proxy_aggregator_init(int num_supernodes) {
         return C_ERR;
     }
     
-    serverLog(LL_NOTICE, "Proxy aggregator initialized with %d supernodes", num_supernodes);
+    serverLog(LL_NOTICE, "Proxy aggregator initialized with %d supernodes x %zu workers",
+              num_supernodes, global_proxy_aggregator->workers_per_supernode);
     return C_OK;
 }
 
@@ -579,7 +703,6 @@ void proxy_aggregator_shutdown(void) {
             
             for (size_t j = 0; j < bucket->count; j++) {
                 if (bucket->requests[j]) {
-                    zfree(bucket->requests[j]->key);
                     zfree(bucket->requests[j]);
                 }
             }
@@ -618,14 +741,20 @@ int proxy_enqueue_request(const char *key, void *client_ctx,
     
     /* 通过一致性哈希确定目标超节点 */
     int supernode_id = consistent_hash_get_node(global_proxy_aggregator->hash_ring, key);
-    batch_bucket_t *bucket = &global_proxy_aggregator->buckets[supernode_id];
+    uint32_t key_hash = murmur3_hash(key, strlen(key));
+    int worker_id = (int)(key_hash % global_proxy_aggregator->workers_per_supernode);
+    size_t bucket_index = worker_queue_index(global_proxy_aggregator->workers_per_supernode,
+                                             supernode_id, worker_id);
+    batch_bucket_t *bucket = &global_proxy_aggregator->buckets[bucket_index];
     
     /* 创建请求 */
     proxy_request_t *req = zmalloc(sizeof(proxy_request_t));
     if (!req) return C_ERR;
     
     req->request_id = atomic_fetch_add(&next_request_id, 1);
-    req->key = zstrdup(key);
+    req->key_hash = key_hash;
+    req->target_supernode_id = supernode_id;
+    req->target_worker_id = worker_id;
     req->submit_time_us = get_time_us();
     req->client_context = client_ctx;
     req->completed = 0;
@@ -638,7 +767,6 @@ int proxy_enqueue_request(const char *key, void *client_ctx,
     
     if (bucket->count >= bucket->capacity) {
         pthread_mutex_unlock(&bucket->mutex);
-        zfree(req->key);
         zfree(req);
         return C_ERR; /* 桶已满 */
     }
@@ -671,7 +799,9 @@ sds proxy_aggregator_get_stats(void) {
     uint64_t timeout = atomic_load(&global_proxy_aggregator->timeout_flushes);
     
     stats = sdscatprintf(stats, "Proxy Aggregator Stats:\n");
-    stats = sdscatprintf(stats, "  Supernodes: %zu\n", global_proxy_aggregator->num_buckets);
+    stats = sdscatprintf(stats, "  Supernodes: %zu\n", global_proxy_aggregator->num_supernodes);
+    stats = sdscatprintf(stats, "  Workers per supernode: %zu\n",
+                         global_proxy_aggregator->workers_per_supernode);
     stats = sdscatprintf(stats, "  Total requests: %llu\n", (unsigned long long)total_req);
     stats = sdscatprintf(stats, "  Total flushes: %llu\n", (unsigned long long)total_flush);
     stats = sdscatprintf(stats, "  Batch full flushes: %llu\n", (unsigned long long)batch_full);
@@ -683,4 +813,20 @@ sds proxy_aggregator_get_stats(void) {
     }
     
     return stats;
+}
+
+ring_buffer_t *proxy_aggregator_get_ring_buffer(int supernode_id, int worker_id) {
+    if (!global_proxy_aggregator) return NULL;
+    if (supernode_id < 0 || worker_id < 0) return NULL;
+    if ((size_t)supernode_id >= global_proxy_aggregator->num_supernodes) return NULL;
+    if ((size_t)worker_id >= global_proxy_aggregator->workers_per_supernode) return NULL;
+
+    size_t idx = worker_queue_index(global_proxy_aggregator->workers_per_supernode,
+                                    supernode_id, worker_id);
+    return global_proxy_aggregator->ring_buffers[idx];
+}
+
+int proxy_aggregator_get_workers_per_supernode(void) {
+    if (!global_proxy_aggregator) return 0;
+    return (int)global_proxy_aggregator->workers_per_supernode;
 }
