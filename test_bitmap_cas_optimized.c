@@ -19,6 +19,7 @@
 #define TOTAL_OPS (NUM_THREADS * OPS_PER_THREAD)
 #define NUM_BITS (TOTAL_OPS * 2)
 #define HIGH_CONTENTION_BITS 64
+#define CAS_BOUNDED_MAX_RETRIES 4
 
 /* 对齐的原子字 - 防止伪共享 */
 typedef struct {
@@ -39,8 +40,11 @@ typedef struct {
     atomic_uint_fast64_t total_retries;
 } stats_t;
 
+typedef int (*bitmap_try_acquire_fn)(bitmap_t *bitmap, uint64_t bit_index);
+
 typedef struct {
     const char *name;
+    bitmap_try_acquire_fn try_acquire;
     stats_t stats;
 } bitmap_impl_t;
 
@@ -50,6 +54,28 @@ typedef enum {
 } access_mode_t;
 
 static bitmap_impl_t *current_impl = NULL;
+
+static inline void bitmap_record_success(int retry_count) {
+    atomic_fetch_add_explicit(&current_impl->stats.total_acquires, 1,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&current_impl->stats.total_retries, retry_count,
+                              memory_order_relaxed);
+}
+
+static inline void bitmap_record_failure(int retry_count) {
+    atomic_fetch_add_explicit(&current_impl->stats.failed_acquires, 1,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&current_impl->stats.total_retries, retry_count,
+                              memory_order_relaxed);
+}
+
+static inline void bitmap_cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
 
 /* 获取当前时间（微秒）*/
 static inline uint64_t get_time_us(void) {
@@ -106,8 +132,7 @@ int bitmap_try_acquire_cas(bitmap_t *bitmap, uint64_t bit_index) {
     do {
         /* 检查是否已被占用 */
         if ((old_val & mask) != 0) {
-            atomic_fetch_add_explicit(&current_impl->stats.failed_acquires, 1,
-                                      memory_order_relaxed);
+            bitmap_record_failure(retry_count);
             return 0;  /* 已被占用 */
         }
         
@@ -118,10 +143,7 @@ int bitmap_try_acquire_cas(bitmap_t *bitmap, uint64_t bit_index) {
         if (atomic_compare_exchange_weak_explicit(target_word, &old_val, new_val,
                                                   memory_order_acquire,
                                                   memory_order_relaxed)) {
-            atomic_fetch_add_explicit(&current_impl->stats.total_acquires, 1,
-                                      memory_order_relaxed);
-            atomic_fetch_add_explicit(&current_impl->stats.total_retries, retry_count,
-                                      memory_order_relaxed);
+            bitmap_record_success(retry_count);
             return 1;  /* 成功 */
         }
         
@@ -129,13 +151,45 @@ int bitmap_try_acquire_cas(bitmap_t *bitmap, uint64_t bit_index) {
         retry_count++;
         
         /* CPU Pause（减少竞争）*/
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-        __asm__ __volatile__("yield" ::: "memory");
-#endif
+        bitmap_cpu_relax();
         
     } while (1);
+}
+
+/* 尝试获取锁（有界重试 CAS 版本）*/
+int bitmap_try_acquire_cas_bounded(bitmap_t *bitmap, uint64_t bit_index) {
+    uint64_t word_index = bit_index / 64;
+    uint64_t bit_offset = bit_index % 64;
+    const uint64_t mask = 1ULL << bit_offset;
+
+    if (word_index >= bitmap->num_words) return 0;
+
+    atomic_uint_fast64_t *target_word = &bitmap->bits[word_index].word;
+    uint64_t old_val = atomic_load_explicit(target_word, memory_order_relaxed);
+    int retry_count = 0;
+
+    while (1) {
+        if ((old_val & mask) != 0) {
+            bitmap_record_failure(retry_count);
+            return 0;
+        }
+
+        uint64_t new_val = old_val | mask;
+        if (atomic_compare_exchange_weak_explicit(target_word, &old_val, new_val,
+                                                  memory_order_acquire,
+                                                  memory_order_relaxed)) {
+            bitmap_record_success(retry_count);
+            return 1;
+        }
+
+        retry_count++;
+        if (retry_count >= CAS_BOUNDED_MAX_RETRIES) {
+            bitmap_record_failure(retry_count);
+            return 0;
+        }
+
+        bitmap_cpu_relax();
+    }
 }
 
 /* 尝试获取锁（当前 fetch_or 版本）*/
@@ -149,13 +203,11 @@ int bitmap_try_acquire_fetch_or(bitmap_t *bitmap, uint64_t bit_index) {
     uint64_t prev = atomic_fetch_or_explicit(&bitmap->bits[word_index].word,
                                              mask, memory_order_acquire);
     if (prev & mask) {
-        atomic_fetch_add_explicit(&current_impl->stats.failed_acquires, 1,
-                                  memory_order_relaxed);
+        bitmap_record_failure(0);
         return 0;
     }
 
-    atomic_fetch_add_explicit(&current_impl->stats.total_acquires, 1,
-                              memory_order_relaxed);
+    bitmap_record_success(0);
     return 1;
 }
 
@@ -214,11 +266,7 @@ void *worker_thread(void *arg) {
         }
         
         /* 尝试获取 */
-        if (current_impl && strcmp(current_impl->name, "fetch_or current implementation") == 0) {
-            if (!bitmap_try_acquire_fetch_or(data->bitmap, bit)) continue;
-        } else {
-            if (!bitmap_try_acquire_cas(data->bitmap, bit)) continue;
-        }
+        if (!current_impl->try_acquire(data->bitmap, bit)) continue;
 
         {
             /* 模拟使用资源 */
@@ -346,8 +394,18 @@ void run_test(bitmap_impl_t *impl, const char *test_name, int num_threads,
 
 /* 主函数 */
 int main(void) {
-    bitmap_impl_t cas_impl = {.name = "CAS optimized"};
-    bitmap_impl_t fetch_or_impl = {.name = "fetch_or current implementation"};
+    bitmap_impl_t cas_impl = {
+        .name = "CAS optimized",
+        .try_acquire = bitmap_try_acquire_cas
+    };
+    bitmap_impl_t cas_bounded_impl = {
+        .name = "CAS bounded retries",
+        .try_acquire = bitmap_try_acquire_cas_bounded
+    };
+    bitmap_impl_t fetch_or_impl = {
+        .name = "fetch_or current implementation",
+        .try_acquire = bitmap_try_acquire_fetch_or
+    };
 
     printf("========================================\n");
     printf("Bitmap CAS Optimization Test\n");
@@ -357,23 +415,30 @@ int main(void) {
     printf("  Alignment: 64 bytes (cache line)\n");
     printf("  Atomic type: atomic_uint_fast64_t\n");
     printf("  Memory order: acquire/release/relaxed\n");
-    printf("  Compared implementations: compare_exchange_weak vs fetch_or\n");
+    printf("  Compared implementations: compare_exchange_weak vs bounded compare_exchange_weak vs fetch_or\n");
     printf("  High-contention window: %d bits shared by all threads\n", HIGH_CONTENTION_BITS);
+    printf("  Bounded CAS max retries: %d\n", CAS_BOUNDED_MAX_RETRIES);
     printf("\n");
     
     /* 运行不同线程数的测试 */
     run_test(&cas_impl, "Low Concurrency", 2, ACCESS_MODE_PARTITIONED);
+    run_test(&cas_bounded_impl, "Low Concurrency", 2, ACCESS_MODE_PARTITIONED);
     run_test(&fetch_or_impl, "Low Concurrency", 2, ACCESS_MODE_PARTITIONED);
     run_test(&cas_impl, "Medium Concurrency", 4, ACCESS_MODE_PARTITIONED);
+    run_test(&cas_bounded_impl, "Medium Concurrency", 4, ACCESS_MODE_PARTITIONED);
     run_test(&fetch_or_impl, "Medium Concurrency", 4, ACCESS_MODE_PARTITIONED);
     run_test(&cas_impl, "High Concurrency", 8, ACCESS_MODE_PARTITIONED);
+    run_test(&cas_bounded_impl, "High Concurrency", 8, ACCESS_MODE_PARTITIONED);
     run_test(&fetch_or_impl, "High Concurrency", 8, ACCESS_MODE_PARTITIONED);
     run_test(&cas_impl, "Very High Concurrency", 16, ACCESS_MODE_PARTITIONED);
+    run_test(&cas_bounded_impl, "Very High Concurrency", 16, ACCESS_MODE_PARTITIONED);
     run_test(&fetch_or_impl, "Very High Concurrency", 16, ACCESS_MODE_PARTITIONED);
 
     run_test(&cas_impl, "Hotspot Concurrency", 8, ACCESS_MODE_HIGH_CONTENTION);
+    run_test(&cas_bounded_impl, "Hotspot Concurrency", 8, ACCESS_MODE_HIGH_CONTENTION);
     run_test(&fetch_or_impl, "Hotspot Concurrency", 8, ACCESS_MODE_HIGH_CONTENTION);
     run_test(&cas_impl, "Hotspot Very High Concurrency", 16, ACCESS_MODE_HIGH_CONTENTION);
+    run_test(&cas_bounded_impl, "Hotspot Very High Concurrency", 16, ACCESS_MODE_HIGH_CONTENTION);
     run_test(&fetch_or_impl, "Hotspot Very High Concurrency", 16, ACCESS_MODE_HIGH_CONTENTION);
     
     printf("\n========================================\n");
