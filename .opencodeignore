@@ -1,0 +1,5 @@
+# opencodeignore — files to skip when loading context into opencode agents
+# Syntax: same as .gitignore (glob patterns)
+
+# Chinese architecture mirror (agents use architecture.md instead)
+architecture_CN.md
