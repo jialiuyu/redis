@@ -1865,6 +1865,12 @@ typedef enum childInfoType {
 
 typedef struct hotkeyStats hotkeyStats;
 
+typedef struct proxyConfig {
+    int batch_limit;              /* 0 means default */
+    int time_limit_us;            /* 0 means default */
+    int max_supernodes;           /* 0 means default */
+} proxyConfig;
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -1922,6 +1928,7 @@ struct redisServer {
     int vector_engine_type; /* Type of vector engine to use */
     int vector_engine_enabled;   /* Whether vector engine is enabled */
     int supernode_workers;       /* SuperNode worker count, 0 means auto-detect */
+    proxyConfig proxy;           /* Proxy aggregator configuration */
     ub_mem_config_t ub;          /* UB data-plane configuration */
     /* Networking */
     int port;                   /* TCP listening port */

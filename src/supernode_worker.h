@@ -15,8 +15,9 @@
 #define __SUPERNODE_WORKER_H
 
 #include "server.h"
-#include "proxy_aggregator.h"
+#include "ring_buffer.h"
 #include "sve_operation.h"
+#include "supernode_protocol.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>

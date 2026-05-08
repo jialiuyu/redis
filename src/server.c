@@ -2331,6 +2331,9 @@ void initServerConfig(void) {
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.page_size = sysconf(_SC_PAGESIZE);
     server.supernode_workers = 0;
+    server.proxy.batch_limit = 0;
+    server.proxy.time_limit_us = 0;
+    server.proxy.max_supernodes = 0;
     server.pause_cron = 0;
     server.dict_resizing = 1;
 

@@ -7,10 +7,12 @@
 
 #include "supernode_worker.h"
 #include "macro.h"
+#include "proxy_aggregator.h"
 #include "server.h"
 #include "ub_client.h"
 
 #include <stddef.h>
+#include <time.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <string.h>
@@ -33,16 +35,39 @@ typedef struct supernode {
     int running;
 } supernode_t;
 
-supernode_t *global_supernode = NULL;
+static supernode_t *global_supernode = NULL;
 
 /* ========== Worker 线程 ========== */
+
+#define SVE_WORKER_SPIN_PHASE1 64U
+#define SVE_WORKER_SPIN_PHASE2 256U
+
+static inline void sve_worker_idle_wait(unsigned int *idle_iters) {
+    if (*idle_iters < SVE_WORKER_SPIN_PHASE1) {
+        /* Pure spin first to catch the next batch without a syscall. */
+        __asm__ volatile("" ::: "memory");
+    } else if (*idle_iters < SVE_WORKER_SPIN_PHASE2) {
+#if defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+        __asm__ volatile("pause" ::: "memory");
+#else
+        __asm__ volatile("" ::: "memory");
+#endif
+    } else {
+        struct timespec ts = {0, 1000}; /* 1 microsecond */
+        nanosleep(&ts, NULL);
+    }
+
+    (*idle_iters)++;
+}
 
 int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) {
     RETURN_IF(!ctx || !packet, C_ERR);
 
-    uint64_t start_time = get_time_us();
+    uint64_t start_time = ustime();
 
-    if (packet->magic != 0xCAC0BEEF) {
+    if (packet->magic != BATCH_PACKET_MAGIC) {
         serverLog(LL_WARNING, "Invalid batch packet magic: 0x%x", packet->magic);
         return C_ERR;
     }
@@ -71,10 +96,10 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
     zfree(results);
     zfree(emb_ids);
 
-    uint64_t latency = get_time_us() - start_time;
-    atomic_fetch_add(&ctx->total_batches, 1);
-    atomic_fetch_add(&ctx->total_requests, packet->num_requests);
-    atomic_fetch_add(&ctx->total_latency_us, latency);
+    uint64_t latency = ustime() - start_time;
+    atomic_fetch_add_explicit(&ctx->total_batches, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_requests, packet->num_requests, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_latency_us, latency, memory_order_relaxed);
 
     serverLog(LL_DEBUG, "Worker %d completed batch in %llu μs",
               ctx->worker_id, (unsigned long long)latency);
@@ -83,6 +108,7 @@ int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) 
 
 void *sve_worker_thread(void *arg) {
     sve_worker_context_t *ctx = (sve_worker_context_t *)arg;
+    unsigned int idle_iters = 0;
 
     serverLog(LL_NOTICE, "SVE Worker %d started", ctx->worker_id);
 
@@ -99,11 +125,12 @@ void *sve_worker_thread(void *arg) {
 
         int ret = ring_buffer_peek(ctx->input_rb, &payload, &payload_len);
         if (ret == C_OK && payload_len > 0) {
+            idle_iters = 0;
             if (sve_worker_process_batch(ctx, (batch_packet_t *)payload) == C_OK) {
                 ring_buffer_commit_read(ctx->input_rb, payload_len);
             }
         } else {
-            usleep(10);
+            sve_worker_idle_wait(&idle_iters);
         }
     }
 
@@ -174,7 +201,7 @@ int supernode_init(int node_id, int num_workers) {
     if (!global_supernode->input_rbs) goto failed;
 
     for (int i = 0; i < num_workers; i++) {
-        ring_buffer_t *rb = proxy_aggregator_get_ring_buffer(node_id, i);
+        ring_buffer_t *rb = proxy_aggregator_get_worker_rb(node_id, i);
         if (!rb) {
             char rb_name[64];
             snprintf(rb_name, sizeof(rb_name), "supernode_%d_worker_%d", node_id, i);
@@ -280,12 +307,12 @@ sds supernode_get_stats(void) {
 
     for (int i = 0; i < global_supernode->num_workers; i++) {
         sve_worker_context_t *c = &global_supernode->workers[i];
-        tb += atomic_load(&c->total_batches);
-        tr += atomic_load(&c->total_requests);
-        ts += atomic_load(&c->sve_operations);
-        tt += atomic_load(&c->total_latency_us);
-        bls += atomic_load(&c->op_stats.lock_success);
-        blf += atomic_load(&c->op_stats.lock_failure);
+        tb += atomic_load_explicit(&c->total_batches, memory_order_relaxed);
+        tr += atomic_load_explicit(&c->total_requests, memory_order_relaxed);
+        ts += atomic_load_explicit(&c->sve_operations, memory_order_relaxed);
+        tt += atomic_load_explicit(&c->total_latency_us, memory_order_relaxed);
+        bls += atomic_load_explicit(&c->op_stats.lock_success, memory_order_relaxed);
+        blf += atomic_load_explicit(&c->op_stats.lock_failure, memory_order_relaxed);
     }
 
     stats = sdscatprintf(stats, "  Total batches: %llu\n", (unsigned long long)tb);
@@ -320,11 +347,11 @@ sds sve_worker_get_stats(sve_worker_context_t *ctx) {
 
     stats = sdscatprintf(stats, "Worker %d:\n", ctx->worker_id);
     stats = sdscatprintf(stats, "  Batches: %llu  Requests: %llu\n",
-                         (unsigned long long)atomic_load(&ctx->total_batches),
-                         (unsigned long long)atomic_load(&ctx->total_requests));
+                         (unsigned long long)atomic_load_explicit(&ctx->total_batches, memory_order_relaxed),
+                         (unsigned long long)atomic_load_explicit(&ctx->total_requests, memory_order_relaxed));
     stats = sdscatprintf(stats, "  Bitmap lock success: %llu\n",
-                         (unsigned long long)atomic_load(&ctx->op_stats.lock_success));
+                         (unsigned long long)atomic_load_explicit(&ctx->op_stats.lock_success, memory_order_relaxed));
     stats = sdscatprintf(stats, "  Bitmap lock failure: %llu\n",
-                         (unsigned long long)atomic_load(&ctx->op_stats.lock_failure));
+                         (unsigned long long)atomic_load_explicit(&ctx->op_stats.lock_failure, memory_order_relaxed));
     return stats;
 }
