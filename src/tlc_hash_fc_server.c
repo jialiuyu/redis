@@ -23,6 +23,7 @@
 #include "three_layer_cache_ub.h"
 #include "hash_strategy.h"
 #include "eviction_strategy.h"
+#include "placement_strategy.h"
 
 /* Cache module — standalone, no SVE2/HA deps */
 extern int  fc_cache_init(three_layer_cache_t *c);
@@ -43,6 +44,277 @@ extern int  fc_cache_cold_append(cold_layer_t *c, uint64_t key, const void *val)
 #include <signal.h>
 #include <time.h>
 #include <stdatomic.h>
+
+/* ---- L0 Register-grade Signature Cache ----
+ * Per-thread tiny cache: 8 entries of (16-bit sig + warm_idx).
+ * Lookup uses NEON (ARM) or SSE2 (x86) parallel compare for zero-memory
+ * hit/miss determination.
+ */
+#ifdef ENABLE_L0_CACHE
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
+#ifndef L0_CACHE_SIZE
+#define L0_CACHE_SIZE 8
+#endif
+
+typedef struct {
+    uint16_t sig[L0_CACHE_SIZE];
+    int32_t  widx[L0_CACHE_SIZE];
+    uint64_t key[L0_CACHE_SIZE];
+    uint32_t lru_age[L0_CACHE_SIZE];  /* timestamp: larger = more recently used */
+    uint64_t lru_counter;             /* monotonic timestamp counter */
+    uint64_t valid;                   /* bit i = slot i valid (up to 64 entries) */
+} l0_sig_cache_t;
+
+static inline uint16_t hash_sig16(uint64_t key) {
+    /* Re-use murmur3 finalizer, keep high 16 bits */
+    uint32_t h = _hs_murmur3_mix64(key);
+    return (uint16_t)(h >> 16);
+}
+
+static inline int32_t l0_lookup(l0_sig_cache_t *l0, uint64_t key) {
+    uint16_t sig = hash_sig16(key);
+    uint64_t valid = l0->valid;
+    if (!valid) return -1;
+
+    int idx = -1;
+
+#if defined(__aarch64__)
+    uint16x8_t v_sig = vdupq_n_u16(sig);
+    int match_idx = -1;
+    for (int base = 0; base < L0_CACHE_SIZE; base += 8) {
+        uint16x8_t v_cache = vld1q_u16(l0->sig + base);
+        uint16x8_t v_eq = vceqq_u16(v_sig, v_cache);
+        uint8x8_t  v_narrow = vmovn_u16(v_eq);
+        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(v_narrow), 0);
+        while (mask) {
+            int lane = __builtin_ctzll(mask) >> 3; /* 8 bits per lane -> /8 */
+            int i = base + lane;
+            if ((valid & (1ULL << i)) && l0->key[i] == key) {
+                match_idx = i;
+                goto l0_found;
+            }
+            mask &= ~(0xFFULL << (lane * 8));
+        }
+    }
+l0_found:
+    if (match_idx >= 0) {
+        idx = l0->widx[match_idx];
+        l0->lru_age[match_idx] = (uint32_t)l0->lru_counter++;
+    }
+#elif defined(__x86_64__)
+    __m128i v_sig = _mm_set1_epi16((short)sig);
+    int match_idx = -1;
+    for (int base = 0; base < L0_CACHE_SIZE; base += 8) {
+        __m128i v_cache = _mm_loadu_si128((__m128i const*)(l0->sig + base));
+        __m128i v_eq = _mm_cmpeq_epi16(v_sig, v_cache);
+        int mask = _mm_movemask_epi8(v_eq);
+        while (mask) {
+            int lane = __builtin_ctz(mask) >> 1; /* 2 bytes per lane -> /2 */
+            int i = base + lane;
+            if ((valid & (1ULL << i)) && l0->key[i] == key) {
+                match_idx = i;
+                goto l0_found;
+            }
+            mask &= ~(3 << (lane * 2));
+        }
+    }
+l0_found:
+    if (match_idx >= 0) {
+        idx = l0->widx[match_idx];
+        l0->lru_age[match_idx] = (uint32_t)l0->lru_counter++;
+    }
+#else
+    for (int i = 0; i < L0_CACHE_SIZE; i++) {
+        if ((valid & (1ULL << i)) && l0->sig[i] == sig && l0->key[i] == key) {
+            idx = l0->widx[i];
+            l0->lru_age[i] = (uint32_t)l0->lru_counter++;
+            break;
+        }
+    }
+#endif
+    return idx;
+}
+
+static inline void l0_promote(l0_sig_cache_t *l0, uint64_t key, int32_t widx) {
+    uint64_t valid = l0->valid;
+    uint32_t idx;
+
+#if L0_CACHE_SIZE >= 64
+    uint64_t full_mask = 0xFFFFFFFFFFFFFFFFULL;
+#else
+    uint64_t full_mask = (1ULL << L0_CACHE_SIZE) - 1;
+#endif
+    if ((valid & full_mask) != full_mask) {
+        /* find first empty slot */
+        idx = (uint32_t)__builtin_ctzll(~valid & full_mask);
+    } else {
+        /* find LRU entry (minimum age) */
+        idx = 0;
+        uint32_t min_age = l0->lru_age[0];
+        for (int i = 1; i < L0_CACHE_SIZE; i++) {
+            if (l0->lru_age[i] < min_age) {
+                min_age = l0->lru_age[i];
+                idx = (uint32_t)i;
+            }
+        }
+    }
+
+    l0->sig[idx] = hash_sig16(key);
+    l0->widx[idx] = widx;
+    l0->key[idx] = key;
+    l0->valid |= (1ULL << idx);
+    l0->lru_age[idx] = (uint32_t)l0->lru_counter++;
+}
+
+/* ---- Frozen L0 cache: read-only snapshot after warmup ---- */
+typedef struct {
+    uint16_t sig[L0_CACHE_SIZE];
+    uint64_t key[L0_CACHE_SIZE];
+    int32_t  widx[L0_CACHE_SIZE];
+    uint64_t valid;
+} l0_frozen_cache_t;
+
+static inline int32_t l0_lookup_frozen(l0_frozen_cache_t *l0, uint64_t key) {
+    uint16_t sig = hash_sig16(key);
+    uint64_t valid = l0->valid;
+    if (!valid) return -1;
+
+#if defined(__aarch64__)
+    uint16x8_t v_sig = vdupq_n_u16(sig);
+    for (int base = 0; base < L0_CACHE_SIZE; base += 8) {
+        uint16x8_t v_cache = vld1q_u16(l0->sig + base);
+        uint16x8_t v_eq = vceqq_u16(v_sig, v_cache);
+        uint8x8_t  v_narrow = vmovn_u16(v_eq);
+        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(v_narrow), 0);
+        while (mask) {
+            int lane = __builtin_ctzll(mask) >> 3; /* 8 bits per lane -> /8 */
+            int i = base + lane;
+            if ((valid & (1ULL << i)) && l0->key[i] == key) {
+                return l0->widx[i];
+            }
+            mask &= ~(0xFFULL << (lane * 8));
+        }
+    }
+#elif defined(__x86_64__)
+    __m128i v_sig = _mm_set1_epi16((short)sig);
+    for (int base = 0; base < L0_CACHE_SIZE; base += 8) {
+        __m128i v_cache = _mm_loadu_si128((__m128i const*)(l0->sig + base));
+        __m128i v_eq = _mm_cmpeq_epi16(v_sig, v_cache);
+        int mask = _mm_movemask_epi8(v_eq);
+        while (mask) {
+            int lane = __builtin_ctz(mask) >> 1; /* 2 bytes per lane -> /2 */
+            int i = base + lane;
+            if ((valid & (1ULL << i)) && l0->key[i] == key) {
+                return l0->widx[i];
+            }
+            mask &= ~(3 << (lane * 2));
+        }
+    }
+#else
+    for (int i = 0; i < L0_CACHE_SIZE; i++) {
+        if ((valid & (1ULL << i)) && l0->sig[i] == sig && l0->key[i] == key) {
+            return l0->widx[i];
+        }
+    }
+#endif
+    return -1;
+}
+
+/* ---- L0 Warmup Cache: large-window LFU, linear scan (only during warmup) ---- */
+#ifndef L0_WARMUP_SIZE
+#define L0_WARMUP_SIZE 256
+#endif
+
+typedef struct {
+    uint16_t sig[L0_WARMUP_SIZE];
+    uint64_t key[L0_WARMUP_SIZE];
+    int32_t  widx[L0_WARMUP_SIZE];
+    uint32_t freq[L0_WARMUP_SIZE];
+    int      count;
+} l0_warmup_cache_t;
+
+static inline int32_t l0_lookup_warmup(l0_warmup_cache_t *l0, uint64_t key) {
+    uint16_t sig = hash_sig16(key);
+    for (int i = 0; i < l0->count; i++) {
+        if (l0->sig[i] == sig && l0->key[i] == key) {
+            l0->freq[i]++;
+            return l0->widx[i];
+        }
+    }
+    return -1;
+}
+
+static inline void l0_warmup_promote(l0_warmup_cache_t *l0, uint64_t key, int32_t widx) {
+    if (l0->count < L0_WARMUP_SIZE) {
+        int idx = l0->count++;
+        l0->sig[idx] = hash_sig16(key);
+        l0->key[idx] = key;
+        l0->widx[idx] = widx;
+        l0->freq[idx] = 1;
+    } else {
+        int idx = 0;
+        uint32_t min_freq = l0->freq[0];
+        for (int i = 1; i < L0_WARMUP_SIZE; i++) {
+            if (l0->freq[i] < min_freq) {
+                min_freq = l0->freq[i];
+                idx = i;
+            }
+        }
+        l0->sig[idx] = hash_sig16(key);
+        l0->key[idx] = key;
+        l0->widx[idx] = widx;
+        l0->freq[idx] = 1;
+    }
+}
+
+static inline void l0_freeze_from_warmup(l0_warmup_cache_t *src, l0_frozen_cache_t *dst) {
+    int indices[L0_WARMUP_SIZE];
+    for (int i = 0; i < src->count; i++) indices[i] = i;
+
+    /* selection sort by freq descending */
+    for (int i = 0; i < src->count - 1; i++) {
+        for (int j = i + 1; j < src->count; j++) {
+            if (src->freq[indices[j]] > src->freq[indices[i]]) {
+                int tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
+            }
+        }
+    }
+
+    int n = (src->count < L0_CACHE_SIZE) ? src->count : L0_CACHE_SIZE;
+    dst->valid = 0;
+    for (int i = 0; i < n; i++) {
+        int src_idx = indices[i];
+        dst->sig[i] = src->sig[src_idx];
+        dst->key[i] = src->key[src_idx];
+        dst->widx[i] = src->widx[src_idx];
+        dst->valid |= (1ULL << i);
+    }
+}
+
+#ifndef L0_WARMUP_OPS
+#define L0_WARMUP_OPS 500000
+#endif
+
+#ifdef ENABLE_COLLISION_STATS
+static volatile uint64_t g_l0_hits;
+static volatile uint64_t g_l0_misses;
+#define L0_HIT_INC()  __sync_fetch_and_add(&g_l0_hits, (uint64_t)1)
+#define L0_MISS_INC() __sync_fetch_and_add(&g_l0_misses, (uint64_t)1)
+#else
+#define L0_HIT_INC()  ((void)0)
+#define L0_MISS_INC() ((void)0)
+#endif /* ENABLE_COLLISION_STATS */
+#else
+#define L0_HIT_INC()  ((void)0)
+#define L0_MISS_INC() ((void)0)
+#endif /* ENABLE_L0_CACHE */
 
 #define UDS_PATH       "/tmp/tlc_hash_bench.sock"
 #define MAX_SLOTS      64
@@ -113,21 +385,12 @@ static atomic_int g_num_channels_fc = 0;
 /* ---- HOT PUT with hash_strategy.h + eviction_strategy.h ---- */
 static inline void hot_put_fc(uint64_t key, int32_t warm_idx) {
     uint32_t mask = g_cache.hot.mask;
-    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++) {
-        uint32_t s = hash_probe(key, mask, (int)i);
-        hot_index_t cur = g_cache.hot.table[s];
-        if (cur.warm_idx < 0 || cur.key == key) {
-            if (cur.key == key) eviction_on_put_hit(s);
-            hot_index_t nv = {key, warm_idx, 0};
-            g_cache.hot.table[s] = nv;
-            COLL_INC(g_hot_put_probe[i]);
-            return;
-        }
-    }
-    uint32_t victim = eviction_select_victim(key, mask);
-    hot_index_t nv = {key, warm_idx, 0};
-    g_cache.hot.table[victim] = nv;
-    COLL_INC(g_hot_put_probe[HASH_MAX_PROBES]);
+    int probe_bucket = placement_insert_hot(g_cache.hot.table,
+                                            key, warm_idx, mask);
+    if (probe_bucket >= 0 && probe_bucket < HASH_MAX_PROBES)
+        COLL_INC(g_hot_put_probe[probe_bucket]);
+    else
+        COLL_INC(g_hot_put_probe[HASH_MAX_PROBES]);
 }
 
 /* ---- Direct Lookup — matches v16 structure, uses hash_strategy.h ---- */
@@ -135,19 +398,14 @@ static inline int32_t direct_lookup(uint64_t key) {
     uint32_t hot_mask = g_cache.hot.mask;
     int32_t warm_idx = -1;
     int hot_collided = 0;
+    int probe_bucket = HASH_MAX_PROBES;
 
-    /* HOT lookup — hash_strategy.h probes */
-    for (uint32_t j = 0; j < HASH_MAX_PROBES; j++) {
-        uint32_t s = hash_probe(key, hot_mask, (int)j);
-        hot_index_t e = g_cache.hot.table[s];
-        if (e.warm_idx >= 0 && e.key == key) {
-            warm_idx = e.warm_idx;
-            eviction_on_get(s);
-            COLL_INC(g_hot_get_probe[j]);
-            break;
-        }
-        if (e.warm_idx >= 0) hot_collided = 1;
-        if (e.warm_idx < 0) break;
+    warm_idx = placement_lookup_hot(g_cache.hot.table,
+                                    key, hot_mask, &probe_bucket, &hot_collided);
+    if (warm_idx >= 0) {
+        if (probe_bucket >= 0 && probe_bucket < HASH_MAX_PROBES)
+            COLL_INC(g_hot_get_probe[probe_bucket]);
+        return warm_idx;
     }
 
     if (warm_idx < 0) {
@@ -271,6 +529,23 @@ static void *channel_poll(void *arg) {
     uint8_t req_buf[AERON_MSG_SIZE];
     uint8_t resp_buf[8];
 
+#ifdef ENABLE_L0_CACHE
+    fprintf(stderr, "[ch%d] L0 cache init\n", ch->id);
+#ifdef ENABLE_L0_WARMUP
+    l0_warmup_cache_t warmup_cache;
+    memset(&warmup_cache, 0, sizeof(warmup_cache));
+    l0_frozen_cache_t frozen_cache;
+    memset(&frozen_cache, 0, sizeof(frozen_cache));
+    bool l0_frozen = false;
+    uint64_t local_get_count = 0;
+#else
+    l0_sig_cache_t l0_cache_local;
+    memset(&l0_cache_local, 0, sizeof(l0_cache_local));
+    l0_sig_cache_t *l0_cache = &l0_cache_local;
+#endif
+    uint64_t local_l0_hits = 0, local_l0_misses = 0;
+#endif
+
     while (g_running && ch->active) {
         int rlen = aeron_poll(ch->req, req_buf, sizeof(req_buf));
         if (rlen <= 0) { __asm__ volatile("" ::: "memory"); continue; }
@@ -279,8 +554,47 @@ static void *channel_poll(void *arg) {
 
         if (op == OP_GET && rlen >= 9) {
             uint64_t key; memcpy(&key, req_buf + 1, 8);
-            int32_t warm_idx = fc_get(ch->id, key);
+            int32_t warm_idx = -1;
 
+#ifdef ENABLE_L0_CACHE
+#ifdef ENABLE_L0_WARMUP
+            if (l0_frozen) {
+                warm_idx = l0_lookup_frozen(&frozen_cache, key);
+            } else if (local_get_count < L0_WARMUP_OPS) {
+                warm_idx = l0_lookup_warmup(&warmup_cache, key);
+                local_get_count++;
+            } else {
+                l0_freeze_from_warmup(&warmup_cache, &frozen_cache);
+                l0_frozen = true;
+                warm_idx = l0_lookup_frozen(&frozen_cache, key);
+            }
+#else
+            warm_idx = l0_lookup(l0_cache, key);
+#endif
+            if (warm_idx >= 0) {
+                L0_HIT_INC();
+                local_l0_hits++;
+                resp_buf[0] = 0x00;
+                memcpy(resp_buf + 1, &warm_idx, 4);
+                while (aeron_publish(ch->resp, resp_buf, 5) != 0)
+                    __asm__ volatile("" ::: "memory");
+                continue;
+            }
+            L0_MISS_INC();
+            local_l0_misses++;
+#endif
+            warm_idx = fc_get(ch->id, key);
+#ifdef ENABLE_L0_CACHE
+#ifdef ENABLE_L0_WARMUP
+            if (!l0_frozen && warm_idx >= 0) {
+                l0_warmup_promote(&warmup_cache, key, warm_idx);
+            }
+#else
+            if (warm_idx >= 0) {
+                l0_promote(l0_cache, key, warm_idx);
+            }
+#endif
+#endif
             if (warm_idx >= 0) {
                 resp_buf[0] = 0x00;
                 memcpy(resp_buf + 1, &warm_idx, 4);
@@ -307,6 +621,16 @@ static void *channel_poll(void *arg) {
                 __asm__ volatile("" ::: "memory");
         }
     }
+#ifdef ENABLE_L0_CACHE
+#ifdef ENABLE_L0_WARMUP
+    fprintf(stderr, "[ch%d] L0 local hits=%lu misses=%lu frozen_valid=%lu warmup_valid=%lu\n",
+            ch->id, (unsigned long)local_l0_hits, (unsigned long)local_l0_misses,
+            (unsigned long)frozen_cache.valid, (unsigned long)warmup_cache.count);
+#else
+    fprintf(stderr, "[ch%d] L0 local hits=%lu misses=%lu valid=%d\n",
+            ch->id, (unsigned long)local_l0_hits, (unsigned long)local_l0_misses, l0_cache->valid);
+#endif
+#endif
     return NULL;
 }
 
@@ -374,13 +698,21 @@ static void *io_thread(void *arg) {
                 atomic_store(&g_total_hot_get, 0);
                 atomic_store(&g_total_warm_get, 0);
 #endif
+#ifdef ENABLE_COLLISION_STATS
+#ifdef ENABLE_L0_CACHE
+                g_l0_hits = 0;
+                g_l0_misses = 0;
+#endif
+#endif
                 uint8_t ok = 0; write_full(fd, &ok, 1); break;
             }
             case OP_DUMP_COLLISION: {
 #ifdef ENABLE_COLLISION_STATS
                 uint32_t sid = HASH_STRATEGY;
                 write_full(fd, &sid, 4);
-                char sname[32]; strncpy(sname, hash_strategy_name(), 31); sname[31] = 0;
+                char sname[32];
+                snprintf(sname, sizeof(sname), "%s+%s",
+                         hash_strategy_name(), placement_strategy_name());
                 write_full(fd, sname, 32);
                 for (int i = 0; i <= HASH_MAX_PROBES; i++) {
                     uint64_t v = atomic_load(&g_hot_get_probe[i]);
@@ -418,13 +750,26 @@ static void *io_thread(void *arg) {
                 uint64_t warm_occ = (uint64_t)atomic_load(&g_cache.warm.count);
                 if (warm_occ > g_cache.warm.capacity) warm_occ = g_cache.warm.capacity;
                 write_full(fd, &warm_occ, 8);
+#ifdef ENABLE_L0_CACHE
+                uint64_t l0_h = g_l0_hits;
+                uint64_t l0_m = g_l0_misses;
+                fprintf(stderr, "[DUMP] L0 hits=%lu misses=%lu\n", (unsigned long)l0_h, (unsigned long)l0_m);
+                write_full(fd, &l0_h, 8);
+                write_full(fd, &l0_m, 8);
+#else
+                uint64_t zero64 = 0;
+                write_full(fd, &zero64, 8);
+                write_full(fd, &zero64, 8);
+#endif
 #else
                 uint32_t sid = HASH_STRATEGY;
                 write_full(fd, &sid, 4);
-                char sname[32]; strncpy(sname, hash_strategy_name(), 31); sname[31] = 0;
+                char sname[32];
+                snprintf(sname, sizeof(sname), "%s+%s",
+                         hash_strategy_name(), placement_strategy_name());
                 write_full(fd, sname, 32);
                 uint64_t zero = 0;
-                for (int i = 0; i < (5 + 5 + 7 + 2 + 2); i++) write_full(fd, &zero, 8);
+                for (int i = 0; i < (5 + 5 + 7 + 2 + 2 + 2); i++) write_full(fd, &zero, 8);
 #endif
                 break;
             }
@@ -452,8 +797,14 @@ int main(void) {
     signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); signal(SIGPIPE, SIG_IGN);
 
     printf("=== TLC Hash FC Bench Server ===\n");
-    printf("Strategy: %s (id=%d)  Probes: %d  Eviction: %s\n",
-        hash_strategy_name(), HASH_STRATEGY, HASH_MAX_PROBES, eviction_strategy_name());
+    printf("Strategy: %s (id=%d)  Probes: %d  Placement: %s  Eviction: %s\n",
+        hash_strategy_name(), HASH_STRATEGY, HASH_MAX_PROBES,
+        placement_strategy_name(), eviction_strategy_name());
+#ifdef ENABLE_L0_CACHE
+    printf("L0 Cache: ENABLED  size=%d\n", L0_CACHE_SIZE);
+#else
+    printf("L0 Cache: DISABLED\n");
+#endif
 #ifdef ENABLE_COLLISION_STATS
     printf("Collision stats: ON\n");
 #else

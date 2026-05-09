@@ -331,6 +331,9 @@ static int hot_init(hot_layer_t *h, size_t cap, ub_mem_manager_t *mgr) {
     if (!h->table) return -1;
     mgr->hot_region = h->table;
     memset(h->table, 0xFF, hot_size); /* warm_idx = -1 for all */
+#if PLACEMENT_STRATEGY == PLACEMENT_HOPSCOTCH
+    for (size_t _hi = 0; _hi < cap; _hi++) h->table[_hi].hop_info = 0;
+#endif
     printf("  HOT: %zu entries (%zu KB) strategy=%s backing=mmap\n",
            cap, hot_size/1024, hash_strategy_name());
     return 0;
@@ -348,6 +351,9 @@ static int hot_init(hot_layer_t *h, size_t cap, ub_mem_manager_t *mgr) {
     }
     mgr->hot_region = h->table;
     memset(h->table, 0xFF, hot_size); /* warm_idx = -1 for all */
+#if PLACEMENT_STRATEGY == PLACEMENT_HOPSCOTCH
+    for (size_t _hi = 0; _hi < cap; _hi++) h->table[_hi].hop_info = 0;
+#endif
     printf("  HOT: %zu entries (%zu KB) strategy=%s backing=%s",
            cap, hot_size/1024, hash_strategy_name(),
 #ifdef USE_UB_MEM

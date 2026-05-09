@@ -46,7 +46,7 @@
 /* ---- Real UB device parameters (only when USE_UB_MEM is defined) ---- */
 #ifdef USE_UB_MEM
 #ifndef UB_MEMID_BASE
-#define UB_MEMID_BASE    5               /* Base memid; node i → /dev/obmm_shmdev(UB_MEMID_BASE+i) */
+#define UB_MEMID_BASE    3               /* Base memid; node i → /dev/obmm_shmdev(UB_MEMID_BASE+i) */
 #endif
 #ifndef UB_SHM_SIZE
 #define UB_SHM_SIZE      (2ULL * 1024 * 1024 * 1024)  /* Per-node mapping size */
@@ -58,7 +58,7 @@
 #define UB_HOT_CACHEABLE 1               /* Dedicated HOT slice uses cacheable UB mapping */
 #endif
 #ifndef UB_HOT_MEMID
-#define UB_HOT_MEMID     3               /* Dedicated HOT device; override if your platform provisions a different mmap-capable memid */
+#define UB_HOT_MEMID     1               /* Dedicated HOT device; override if your platform provisions a different mmap-capable memid */
 #endif
 #ifndef UB_HOT_SLICE_SIZE
 #define UB_HOT_SLICE_SIZE (64ULL * 1024 * 1024)  /* Reserve 64 MiB for HOT on the local UB node */
@@ -119,7 +119,7 @@ typedef enum { RB_EVENT_NONE=0, RB_EVENT_WRITE=1, RB_EVENT_PROMOTE=2,
 typedef struct {
     uint64_t key;
     int32_t  warm_idx;
-    uint32_t _pad;
+    uint32_t hop_info;
 } hot_index_t;  /* 16 bytes */
 
 typedef struct {

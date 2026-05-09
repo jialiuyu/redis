@@ -40,8 +40,16 @@ static inline void eviction_on_get(uint32_t slot) { (void)slot; }
 
 static inline void eviction_on_put_hit(uint32_t slot) { (void)slot; }
 
+static inline uint32_t eviction_select_victim_slots(const uint32_t *slots, uint32_t n) {
+    (void)n;
+    return slots[0];
+}
+
 static inline uint32_t eviction_select_victim(uint64_t key, uint32_t mask) {
-    return hash_primary(key, mask);
+    uint32_t slots[HASH_MAX_PROBES];
+    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++)
+        slots[i] = hash_probe(key, mask, (int)i);
+    return eviction_select_victim_slots(slots, HASH_MAX_PROBES);
 }
 
 static inline void eviction_destroy(void) {}
@@ -71,20 +79,27 @@ static inline void eviction_on_put_hit(uint32_t slot) {
     if (slot < _clock_capacity) _clock_ref_bits[slot] = 1;
 }
 
-static inline uint32_t eviction_select_victim(uint64_t key, uint32_t mask) {
-    /* Scan 4 probe slots, evict first with ref_bit == 0 */
-    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++) {
-        uint32_t s = hash_probe(key, mask, (int)i);
+static inline uint32_t eviction_select_victim_slots(const uint32_t *slots, uint32_t n) {
+    /* Scan candidate slots, evict first with ref_bit == 0 */
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t s = slots[i];
         if (s < _clock_capacity && _clock_ref_bits[s] == 0)
             return s;
     }
-    /* All 4 have ref=1 — clear all, round-robin eviction */
-    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++) {
-        uint32_t s = hash_probe(key, mask, (int)i);
+    /* All have ref=1 — clear all, round-robin eviction */
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t s = slots[i];
         if (s < _clock_capacity) _clock_ref_bits[s] = 0;
     }
-    uint32_t probe_idx = (_clock_evict_rr++) % HASH_MAX_PROBES;
-    return hash_probe(key, mask, (int)probe_idx);
+    uint32_t probe_idx = (_clock_evict_rr++) % n;
+    return slots[probe_idx];
+}
+
+static inline uint32_t eviction_select_victim(uint64_t key, uint32_t mask) {
+    uint32_t slots[HASH_MAX_PROBES];
+    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++)
+        slots[i] = hash_probe(key, mask, (int)i);
+    return eviction_select_victim_slots(slots, HASH_MAX_PROBES);
 }
 
 static inline void eviction_destroy(void) {
@@ -110,9 +125,16 @@ static inline void eviction_on_get(uint32_t slot) { (void)slot; }
 
 static inline void eviction_on_put_hit(uint32_t slot) { (void)slot; }
 
+static inline uint32_t eviction_select_victim_slots(const uint32_t *slots, uint32_t n) {
+    uint32_t probe_idx = (_rr_counter++) % n;
+    return slots[probe_idx];
+}
+
 static inline uint32_t eviction_select_victim(uint64_t key, uint32_t mask) {
-    uint32_t probe_idx = (_rr_counter++) % HASH_MAX_PROBES;
-    return hash_probe(key, mask, (int)probe_idx);
+    uint32_t slots[HASH_MAX_PROBES];
+    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++)
+        slots[i] = hash_probe(key, mask, (int)i);
+    return eviction_select_victim_slots(slots, HASH_MAX_PROBES);
 }
 
 static inline void eviction_destroy(void) {}

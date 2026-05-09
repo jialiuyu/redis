@@ -19,6 +19,7 @@
 #include <sys/un.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <stdint.h>
 
 #include "../src/aeron_ipc.h"
@@ -246,7 +247,7 @@ static void dump_collision(const char *path) {
     uint8_t req[1]; req[0] = OP_DUMP_COLLISION;
     write_full(fd, req, 1);
 
-    /* Read response: strategy_id(4) + name(32) + hot_get[5]*8 + hot_put[5]*8 + warm_get[7]*8 + total_hot*8 + total_warm*8 + hot_occ*8 + warm_occ*8 */
+    /* Read response: strategy_id(4) + name(32) + hot_get[5]*8 + hot_put[5]*8 + warm_get[7]*8 + total_hot*8 + total_warm*8 + hot_occ*8 + warm_occ*8 + l0_hits*8 + l0_misses*8 */
     uint32_t sid; read_full(fd, &sid, 4);
     char sname[33] = {0}; read_full(fd, sname, 32);
     uint64_t hot_get[5], hot_put[5], warm_get[7], total_hot, total_warm, hot_occ, warm_occ;
@@ -257,6 +258,12 @@ static void dump_collision(const char *path) {
     read_full(fd, &total_warm, 8);
     read_full(fd, &hot_occ, 8);
     read_full(fd, &warm_occ, 8);
+    uint64_t l0_hits = 0, l0_misses = 0;
+    int r1 = read_full(fd, &l0_hits, 8);
+    int r2 = read_full(fd, &l0_misses, 8);
+    if (r1 < 0 || r2 < 0) {
+        fprintf(stderr, "L0 read failed: r1=%d r2=%d errno=%d\n", r1, r2, errno);
+    }
     close(fd);
 
     /* HOT stats */
@@ -301,6 +308,14 @@ static void dump_collision(const char *path) {
         printf("  Collision rate (probe>1): %.2f%%\n", 100.0*(warm_queries - warm_get[0])/warm_queries);
     }
 
+    /* L0 Cache stats */
+    uint64_t l0_total = l0_hits + l0_misses;
+    if (l0_total > 0) {
+        printf("\n--- L0 Cache Stats ---\n");
+        printf("  L0 hits:  %lu (%.2f%%)\n", (unsigned long)l0_hits, 100.0*l0_hits/l0_total);
+        printf("  L0 miss:  %lu (%.2f%%)\n", (unsigned long)l0_misses, 100.0*l0_misses/l0_total);
+    }
+
     /* Utilization */
     printf("\n--- Cache Utilization ---\n");
     printf("  HOT unique keys: %lu / %lu  (%.1f%%)\n",
@@ -321,6 +336,7 @@ int main(int argc, char *argv[]) {
     const char *csv_file = NULL;
     const char *eviction = NULL;
     const char *strategy = NULL;
+    const char *csv_tag = NULL;
     const char *sock = "/tmp/tlc_hash_bench.sock";
     const char *shm_prefix = NULL;
 
@@ -331,6 +347,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i],"--fill")&&i+1<argc) fill=(uint64_t)atol(argv[++i]);
         else if (!strcmp(argv[i],"--rw")&&i+1<argc) rw=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--csv")&&i+1<argc) csv_file=argv[++i];
+        else if (!strcmp(argv[i],"--csv-tag")&&i+1<argc) csv_tag=argv[++i];
         else if (!strcmp(argv[i],"--eviction")&&i+1<argc) eviction=argv[++i];
         else if (!strcmp(argv[i],"--strategy")&&i+1<argc) strategy=argv[++i];
         else if (!strcmp(argv[i],"--sock")&&i+1<argc) sock=argv[++i];
@@ -391,6 +408,7 @@ int main(int argc, char *argv[]) {
         uint64_t hg[5] = {0}, hp[5] = {0}, wg[7] = {0}, th = 0, tw = 0, ho = 0, wo = 0;
         int have_csv_data = 1;
 
+        uint64_t l0_h = 0, l0_m = 0;
         if (skip_collision) {
             snprintf(sname, sizeof(sname), "%s",
                      strategy ? strategy : "SKIP_COLLISION");
@@ -407,6 +425,8 @@ int main(int argc, char *argv[]) {
                 for(int i=0;i<7;i++) read_full(fd,&wg[i],8);
                 read_full(fd,&th,8); read_full(fd,&tw,8);
                 read_full(fd,&ho,8); read_full(fd,&wo,8);
+                if (read_full(fd, &l0_h, 8) < 0) l0_h = 0;
+                if (read_full(fd, &l0_m, 8) < 0) l0_m = 0;
                 close(fd);
             } else {
                 fprintf(stderr, "CSV: connect failed\n");
@@ -420,8 +440,9 @@ int main(int argc, char *argv[]) {
                 uint64_t hot_queries = hg[0] + hg[1] + hg[2] + hg[3] + hg[4];
                 uint64_t warm_queries = wg[0] + wg[1] + wg[2] + wg[3] + wg[4] + wg[5] + wg[6];
 
-                fprintf(fp, "%s,%s,%zu,%d,%lu,%lu,%.2f,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f\n",
-                    sname, eviction ? eviction : "", ops, threads, (unsigned long)max_key,
+                uint64_t l0_total_csv = l0_h + l0_m;
+                fprintf(fp, "%s,%s,%s,%zu,%d,%lu,%lu,%.2f,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%lu,%lu,%.2f\n",
+                    sname, eviction ? eviction : "", csv_tag ? csv_tag : "", ops, threads, (unsigned long)max_key,
                     (unsigned long)measure_result.qps, measure_result.mops,
                     (unsigned long)measure_result.avg_ns,
                     (unsigned long)measure_result.get_miss,
@@ -429,7 +450,9 @@ int main(int argc, char *argv[]) {
                     pct_u64(hg[2], hot_queries), pct_u64(hg[3], hot_queries),
                     pct_u64(hg[4], hot_queries),
                     pct_u64(wg[0], warm_queries), pct_u64(wg[6], warm_queries),
-                    100.0 * ho / (1 << 17), 100.0 * wo / (1 << 20));
+                    100.0 * ho / (1 << 17), 100.0 * wo / (1 << 20),
+                    (unsigned long)l0_h, (unsigned long)l0_m,
+                    l0_total_csv > 0 ? 100.0*l0_h/l0_total_csv : 0.0);
                 fclose(fp);
                 printf("  CSV appended to %s\n", csv_file);
             }

@@ -740,43 +740,164 @@ endif
 HBENCH_LDFLAGS = -pthread -lm -lpthread
 
 # FC (Flat Combining) version — v16-based architecture
-# Hash strategy: v1=1, v2=2, v2fixed=3, v2full64=4
+# Hash strategy: v1=1, v2fixed=3, v2full64=4
 # Eviction strategy: blind=0, clock=1
+# Placement strategy: baseline=0, robin_hood=1, two_choice=2, hopscotch=3
 FC_BENCH_SRCS = tlc_hash_fc_server.c tlc_hash_fc_cache.c
 ifeq ($(USE_UB_MEM),1)
 FC_BENCH_SRCS += ub_client.c
 endif
 
 define FC_BENCH_RULE
-$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
 	@mkdir -p $(OUT_DIR)
-	$$(CC) $$(HBENCH_CFLAGS) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+	$$(CC) $$(HBENCH_CFLAGS) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
 
-$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)_stats: $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_stats: $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
 	@mkdir -p $(OUT_DIR)
-	$$(CC) $$(HBENCH_CFLAGS) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DENABLE_COLLISION_STATS -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+	$$(CC) $$(HBENCH_CFLAGS) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -DENABLE_COLLISION_STATS -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
 endef
 
-$(eval $(call FC_BENCH_RULE,v1,blind,1,0))
-$(eval $(call FC_BENCH_RULE,v1,clock,1,1))
-$(eval $(call FC_BENCH_RULE,v1,rr,1,2))
-$(eval $(call FC_BENCH_RULE,v2,blind,2,0))
-$(eval $(call FC_BENCH_RULE,v2,clock,2,1))
-$(eval $(call FC_BENCH_RULE,v2,rr,2,2))
-$(eval $(call FC_BENCH_RULE,v2fixed,blind,3,0))
-$(eval $(call FC_BENCH_RULE,v2fixed,clock,3,1))
-$(eval $(call FC_BENCH_RULE,v2fixed,rr,3,2))
-$(eval $(call FC_BENCH_RULE,v2full64,blind,4,0))
-$(eval $(call FC_BENCH_RULE,v2full64,clock,4,1))
-$(eval $(call FC_BENCH_RULE,v2full64,rr,4,2))
-$(eval $(call FC_BENCH_RULE,v3oddeven,blind,5,0))
-$(eval $(call FC_BENCH_RULE,v3oddeven,clock,5,1))
-$(eval $(call FC_BENCH_RULE,v3oddeven,rr,5,2))
+$(eval $(call FC_BENCH_RULE,v1,blind,1,0,0,))
+$(eval $(call FC_BENCH_RULE,v1,clock,1,1,0,))
+$(eval $(call FC_BENCH_RULE,v2fixed,blind,3,0,0,))
+$(eval $(call FC_BENCH_RULE,v2fixed,clock,3,1,0,))
+$(eval $(call FC_BENCH_RULE,v2full64,blind,4,0,0,))
+$(eval $(call FC_BENCH_RULE,v2full64,clock,4,1,0,))
 
-FC_BENCH_ALL = $(foreach h,v1 v2 v2fixed v2full64 v3oddeven,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind blind_stats clock clock_stats rr rr_stats))
+$(eval $(call FC_BENCH_RULE,v1,blind,1,0,1,_rh))
+$(eval $(call FC_BENCH_RULE,v1,clock,1,1,1,_rh))
+$(eval $(call FC_BENCH_RULE,v2fixed,blind,3,0,1,_rh))
+$(eval $(call FC_BENCH_RULE,v2fixed,clock,3,1,1,_rh))
+$(eval $(call FC_BENCH_RULE,v2full64,blind,4,0,1,_rh))
+$(eval $(call FC_BENCH_RULE,v2full64,clock,4,1,1,_rh))
+
+$(eval $(call FC_BENCH_RULE,v1,blind,1,0,2,_2c))
+$(eval $(call FC_BENCH_RULE,v1,clock,1,1,2,_2c))
+$(eval $(call FC_BENCH_RULE,v2fixed,blind,3,0,2,_2c))
+$(eval $(call FC_BENCH_RULE,v2fixed,clock,3,1,2,_2c))
+$(eval $(call FC_BENCH_RULE,v2full64,blind,4,0,2,_2c))
+$(eval $(call FC_BENCH_RULE,v2full64,clock,4,1,2,_2c))
+
+$(eval $(call FC_BENCH_RULE,v1,blind,1,0,3,_hs))
+$(eval $(call FC_BENCH_RULE,v1,clock,1,1,3,_hs))
+$(eval $(call FC_BENCH_RULE,v2fixed,blind,3,0,3,_hs))
+$(eval $(call FC_BENCH_RULE,v2fixed,clock,3,1,3,_hs))
+$(eval $(call FC_BENCH_RULE,v2full64,blind,4,0,3,_hs))
+$(eval $(call FC_BENCH_RULE,v2full64,clock,4,1,3,_hs))
+
+$(eval $(call FC_BENCH_RULE,crc32,blind,6,0,0,_crc))
+$(eval $(call FC_BENCH_RULE,crc32,clock,6,1,0,_crc))
+
+$(eval $(call FC_BENCH_RULE,crc32fib,blind,7,0,0,_cf))
+$(eval $(call FC_BENCH_RULE,crc32fib,clock,7,1,0,_cf))
+
+# ---- L0 cache variants (focused: v1, v2fixed, crc32, crc32fib + baseline only) ----
+define FC_BENCH_RULE_L0
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_l0: $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DENABLE_L0_CACHE -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_stats_l0: $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DENABLE_L0_CACHE -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -DENABLE_COLLISION_STATS -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+endef
+
+define FC_BENCH_RULE_L0_SIZE
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_l0_$(7): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DENABLE_L0_CACHE -DL0_CACHE_SIZE=$(7) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_stats_l0_$(7): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DENABLE_L0_CACHE -DL0_CACHE_SIZE=$(7) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -DENABLE_COLLISION_STATS -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+endef
+
+$(eval $(call FC_BENCH_RULE_L0,v1,blind,1,0,0,))
+$(eval $(call FC_BENCH_RULE_L0,v1,clock,1,1,0,))
+$(eval $(call FC_BENCH_RULE_L0,v2fixed,blind,3,0,0,))
+$(eval $(call FC_BENCH_RULE_L0,v2fixed,clock,3,1,0,))
+$(eval $(call FC_BENCH_RULE_L0,crc32,blind,6,0,0,_crc))
+$(eval $(call FC_BENCH_RULE_L0,crc32,clock,6,1,0,_crc))
+$(eval $(call FC_BENCH_RULE_L0,crc32fib,blind,7,0,0,_cf))
+$(eval $(call FC_BENCH_RULE_L0,crc32fib,clock,7,1,0,_cf))
+
+# L0 size variants: 16 and 32
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v1,blind,1,0,0,,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v1,clock,1,1,0,,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v2fixed,blind,3,0,0,,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v2fixed,clock,3,1,0,,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32,blind,6,0,0,_crc,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32,clock,6,1,0,_crc,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32fib,blind,7,0,0,_cf,16))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32fib,clock,7,1,0,_cf,16))
+
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v1,blind,1,0,0,,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v1,clock,1,1,0,,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v2fixed,blind,3,0,0,,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v2fixed,clock,3,1,0,,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32,blind,6,0,0,_crc,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32,clock,6,1,0,_crc,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32fib,blind,7,0,0,_cf,32))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32fib,clock,7,1,0,_cf,32))
+
+# L0 size variants: 64
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v1,blind,1,0,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v1,clock,1,1,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v2fixed,blind,3,0,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,v2fixed,clock,3,1,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32,blind,6,0,0,_crc,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32,clock,6,1,0,_crc,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32fib,blind,7,0,0,_cf,64))
+$(eval $(call FC_BENCH_RULE_L0_SIZE,crc32fib,clock,7,1,0,_cf,64))
+
+# L0 warmup variants (freeze after warmup, read-only L0)
+define FC_BENCH_RULE_L0_WARMUP
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_l0w_$(7): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DENABLE_L0_CACHE -DENABLE_L0_WARMUP -DL0_CACHE_SIZE=$(7) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+
+$(OUT_DIR)/tlc_hash_fc_server_$(1)_$(2)$(6)_stats_l0w_$(7): $$(FC_BENCH_SRCS) hash_strategy.h eviction_strategy.h placement_strategy.h
+	@mkdir -p $(OUT_DIR)
+	$$(CC) $$(HBENCH_CFLAGS) -DENABLE_L0_CACHE -DENABLE_L0_WARMUP -DL0_CACHE_SIZE=$(7) -DHASH_STRATEGY=$(3) -DEVICTION_STRATEGY=$(4) -DPLACEMENT_STRATEGY=$(5) -DENABLE_COLLISION_STATS -o $$@ $$(FC_BENCH_SRCS) $$(HBENCH_LDFLAGS)
+endef
+
+# L0 warmup: 64 entry for key hash strategies
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,v1,blind,1,0,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,v1,clock,1,1,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,v2fixed,blind,3,0,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,v2fixed,clock,3,1,0,,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,crc32,blind,6,0,0,_crc,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,crc32,clock,6,1,0,_crc,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,crc32fib,blind,7,0,0,_cf,64))
+$(eval $(call FC_BENCH_RULE_L0_WARMUP,crc32fib,clock,7,1,0,_cf,64))
+
+FC_BENCH_ALL = \
+$(foreach h,v1 v2fixed v2full64,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind blind_stats clock clock_stats)) \
+$(foreach h,v1 v2fixed v2full64,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_rh blind_rh_stats clock_rh clock_rh_stats)) \
+$(foreach h,v1 v2fixed v2full64,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_2c blind_2c_stats clock_2c clock_2c_stats)) \
+$(foreach h,v1 v2fixed v2full64,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_hs blind_hs_stats clock_hs clock_hs_stats)) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32_,blind_crc blind_crc_stats clock_crc clock_crc_stats) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32fib_,blind_cf blind_cf_stats clock_cf clock_cf_stats) \
+$(foreach h,v1 v2fixed,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_l0 blind_stats_l0 clock_l0 clock_stats_l0)) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32_,blind_crc_l0 blind_crc_stats_l0 clock_crc_l0 clock_crc_stats_l0) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32fib_,blind_cf_l0 blind_cf_stats_l0 clock_cf_l0 clock_cf_stats_l0) \
+$(foreach h,v1 v2fixed,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_l0_16 blind_stats_l0_16 clock_l0_16 clock_stats_l0_16)) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32_,blind_crc_l0_16 blind_crc_stats_l0_16 clock_crc_l0_16 clock_crc_stats_l0_16) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32fib_,blind_cf_l0_16 blind_cf_stats_l0_16 clock_cf_l0_16 clock_cf_stats_l0_16) \
+$(foreach h,v1 v2fixed,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_l0_32 blind_stats_l0_32 clock_l0_32 clock_stats_l0_32)) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32_,blind_crc_l0_32 blind_crc_stats_l0_32 clock_crc_l0_32 clock_crc_stats_l0_32) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32fib_,blind_cf_l0_32 blind_cf_stats_l0_32 clock_cf_l0_32 clock_cf_stats_l0_32) \
+$(foreach h,v1 v2fixed,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_l0_64 blind_stats_l0_64 clock_l0_64 clock_stats_l0_64)) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32_,blind_crc_l0_64 blind_crc_stats_l0_64 clock_crc_l0_64 clock_crc_stats_l0_64) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32fib_,blind_cf_l0_64 blind_cf_stats_l0_64 clock_cf_l0_64 clock_cf_stats_l0_64) \
+$(foreach h,v1 v2fixed,$(addprefix $(OUT_DIR)/tlc_hash_fc_server_$(h)_,blind_l0w_64 blind_stats_l0w_64 clock_l0w_64 clock_stats_l0w_64)) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32_,blind_crc_l0w_64 blind_crc_stats_l0w_64 clock_crc_l0w_64 clock_crc_stats_l0w_64) \
+$(addprefix $(OUT_DIR)/tlc_hash_fc_server_crc32fib_,blind_cf_l0w_64 blind_cf_stats_l0w_64 clock_cf_l0w_64 clock_cf_stats_l0w_64)
 
 hash-bench-server: $(FC_BENCH_ALL)
-	@echo "Built 30 targets: 5 hash × 3 eviction × 2 (perf/stats)"
+	@echo "Built $(words $(FC_BENCH_ALL)) targets (56 baseline + 64 L0 + 16 L0W)"
+
 
 hash-bench-clean:
 	rm -f $(OUT_DIR)/tlc_hash_fc_server_*
