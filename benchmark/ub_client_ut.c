@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -48,6 +49,10 @@ typedef struct {
     size_t fill_rows;
     const char *table_name;
     const char *element;
+    size_t warmup_runs;
+    size_t repeat_runs;
+    const char *csv_path;
+    const char *case_name;
     /* comma-separated list of indices for gather mode */
     const char *gather_indices_str;
     ub_element_index_mode_t resolver_mode;
@@ -183,6 +188,7 @@ static void usage(const char *prog)
             "      --shm-path <path>|--shm-memid <id> --vector-dimension <n>\n"
             "      [--shm-size <bytes>] [--table-offset <bytes>] [--table-size <bytes>]\n"
             "      [--vector-stride-bytes <bytes>] [--cacheable yes|no] [--use-ownership yes|no]\n"
+            "      [--warmup <n>] [--repeat <n>] [--csv <path>] [--case-name <name>]\n"
             "      [--verify] [--verbose]\n"
             "\n"
             "  gather mode: reads the specified row indices via ub_client_perform_gather_load\n"
@@ -637,6 +643,182 @@ static double elapsed_ns(const struct timespec *start, const struct timespec *en
            (double)(end->tv_nsec - start->tv_nsec);
 }
 
+typedef struct {
+    double *samples;
+    size_t count;
+} gather_samples_t;
+
+typedef struct {
+    double min_ns;
+    double median_ns;
+    double p95_ns;
+    double avg_ns;
+    double median_ns_per_row;
+    double median_ns_per_float;
+    double median_mb_s;
+} gather_bench_result_t;
+
+static int compare_double(const void *a, const void *b);
+static double percentile_sorted(const double *vals, size_t n, double pct);
+static int summarize_gather_samples(const double *samples,
+                                    size_t sample_count,
+                                    size_t rows,
+                                    size_t dim,
+                                    gather_bench_result_t *out);
+static int append_gather_csv(const char *csv_path,
+                             const char *case_name,
+                             const char *source,
+                             const ub_ut_options_t *opts,
+                             size_t rows,
+                             const gather_bench_result_t *result,
+                             int verify_ok);
+
+static int compare_double(const void *a, const void *b)
+{
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+
+    return (da > db) - (da < db);
+}
+
+static double percentile_sorted(const double *vals, size_t n, double pct)
+{
+    size_t idx;
+
+    if (n == 0) {
+        return 0.0;
+    }
+    if (pct <= 0.0) {
+        return vals[0];
+    }
+    if (pct >= 100.0) {
+        return vals[n - 1];
+    }
+    idx = (size_t)ceil((pct / 100.0) * (double)n) - 1;
+    if (idx >= n) {
+        idx = n - 1;
+    }
+    return vals[idx];
+}
+
+static int summarize_gather_samples(const double *samples,
+                                    size_t sample_count,
+                                    size_t rows,
+                                    size_t dim,
+                                    gather_bench_result_t *out)
+{
+    double *sorted = NULL;
+    double sum = 0.0;
+    size_t bytes = rows * dim * sizeof(float);
+
+    if (!samples || !out || sample_count == 0 || rows == 0 || dim == 0) {
+        return -1;
+    }
+
+    sorted = calloc(sample_count, sizeof(double));
+    if (!sorted) {
+        return -1;
+    }
+    memcpy(sorted, samples, sample_count * sizeof(double));
+    qsort(sorted, sample_count, sizeof(double), compare_double);
+
+    for (size_t i = 0; i < sample_count; i++) {
+        sum += samples[i];
+    }
+
+    out->min_ns = sorted[0];
+    out->median_ns = percentile_sorted(sorted, sample_count, 50.0);
+    out->p95_ns = percentile_sorted(sorted, sample_count, 95.0);
+    out->avg_ns = sum / (double)sample_count;
+    out->median_ns_per_row = out->median_ns / (double)rows;
+    out->median_ns_per_float = out->median_ns / (double)(rows * dim);
+    out->median_mb_s = out->median_ns > 0.0
+        ? ((double)bytes / (1024.0 * 1024.0)) / (out->median_ns / 1e9)
+        : 0.0;
+
+    free(sorted);
+    return 0;
+}
+
+static int append_gather_csv(const char *csv_path,
+                             const char *case_name,
+                             const char *source,
+                             const ub_ut_options_t *opts,
+                             size_t rows,
+                             const gather_bench_result_t *result,
+                             int verify_ok)
+{
+    static const char *header =
+        "case_name,source,dim,rows,bytes,cacheable,use_ownership,warmup,repeat,"
+        "min_ns,median_ns,p95_ns,avg_ns,median_ns_per_row,"
+        "median_ns_per_float,median_mb_s,verify_ok\n";
+    FILE *fp;
+    long end_pos;
+    size_t bytes;
+
+    if (csv_path == NULL || case_name == NULL || source == NULL ||
+        opts == NULL || result == NULL) {
+        return -1;
+    }
+
+    fp = fopen(csv_path, "a+");
+    if (fp == NULL) {
+        ut_log("fopen(%s) failed: %s", csv_path, strerror(errno));
+        return -1;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        ut_log("fseek(%s) failed: %s", csv_path, strerror(errno));
+        fclose(fp);
+        return -1;
+    }
+
+    end_pos = ftell(fp);
+    if (end_pos < 0) {
+        ut_log("ftell(%s) failed: %s", csv_path, strerror(errno));
+        fclose(fp);
+        return -1;
+    }
+
+    if (end_pos == 0 && fputs(header, fp) == EOF) {
+        ut_log("failed to write csv header: %s", csv_path);
+        fclose(fp);
+        return -1;
+    }
+
+    bytes = rows * opts->vector_dimension * sizeof(float);
+    if (fprintf(fp,
+                "%s,%s,%zu,%zu,%zu,%d,%d,%zu,%zu,%.0f,%.0f,%.0f,%.0f,%.3f,%.6f,%.3f,%d\n",
+                case_name,
+                source,
+                opts->vector_dimension,
+                rows,
+                bytes,
+                opts->cacheable,
+                opts->use_ownership,
+                opts->warmup_runs,
+                opts->repeat_runs,
+                result->min_ns,
+                result->median_ns,
+                result->p95_ns,
+                result->avg_ns,
+                result->median_ns_per_row,
+                result->median_ns_per_float,
+                result->median_mb_s,
+                verify_ok) < 0) {
+        ut_log("failed to append csv row: %s", csv_path);
+        fclose(fp);
+        return -1;
+    }
+
+    if (fclose(fp) != 0) {
+        ut_log("fclose(%s) failed: %s", csv_path, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
 /*
  * gather mode: parse a comma-separated list of row indices, call
  * ub_client_perform_gather_load for all of them in one shot, then
@@ -649,15 +831,27 @@ static int run_gather(const ub_ut_options_t *opts)
 {
     ub_mem_config_t cfg;
     ub_address_space_t *addr_space = NULL;
+    ub_address_space_t mock_as;
     uint64_t *indices = NULL;
     float *results = NULL;
+    unsigned char *mock_table = NULL;
+    gather_samples_t timing = {0};
+    gather_bench_result_t bench = {0};
     size_t num_indices = 0;
+    size_t total_bytes = 0;
     size_t i;
     int rc = 1;
+    int verify_ok = 1;
+    const char *csv_source = opts->mock_local ? "mock_local" : "ub";
+    const char *display_source = opts->mock_local ? "local malloc (no UB)" : "UB.MEM";
 
     if (opts->table_name == NULL || opts->gather_indices_str == NULL ||
         opts->vector_dimension == 0) {
         ut_log("gather requires --table-name, --gather-indices, --vector-dimension");
+        return 1;
+    }
+    if (opts->repeat_runs == 0) {
+        ut_log("gather requires --repeat >= 1");
         return 1;
     }
 
@@ -715,6 +909,7 @@ static int run_gather(const ub_ut_options_t *opts)
         free(indices);
         return 1;
     }
+    total_bytes = num_indices * opts->vector_dimension * sizeof(float);
 
     build_ub_config(opts, &cfg);
 
@@ -731,75 +926,76 @@ static int run_gather(const ub_ut_options_t *opts)
         goto out;
     }
 
+    if (opts->mock_local) {
+        /* Mock path: allocate a local table filled with fixture pattern,
+         * build a fake addr_space pointing into it. This benchmarks pure
+         * gather_load (SVE or memcpy) without any UB link overhead. */
+        size_t stride = effective_stride(opts);
+        size_t table_bytes = num_indices * stride;
+        mock_table = calloc(table_bytes, 1);
+        if (!mock_table) {
+            ut_log("OOM allocating mock table");
+            goto out;
+        }
+        fill_fixture_vectors((float *)mock_table, num_indices,
+                             opts->vector_dimension, stride);
+
+        memset(&mock_as, 0, sizeof(mock_as));
+        mock_as.mapped_addr      = mock_table;
+        mock_as.mapping_addr     = mock_table;
+        mock_as.mapping_size     = table_bytes;
+        mock_as.size             = table_bytes;
+        mock_as.data_offset      = 0;
+        mock_as.vector_stride_bytes = stride;
+        mock_as.shm_fd           = -1;
+        mock_as.cacheable        = 0;
+        mock_as.use_ownership    = 0;
+        addr_space = &mock_as;
+    } else {
+        if (ub_client_load_embedding_table(opts->table_name, &addr_space) != 0 ||
+            addr_space == NULL) {
+            ut_log("ub_client_load_embedding_table failed");
+            goto out;
+        }
+    }
+
+    timing.samples = calloc(opts->repeat_runs, sizeof(double));
+    if (timing.samples == NULL) {
+        ut_log("OOM allocating timing samples");
+        goto out;
+    }
+    timing.count = opts->repeat_runs;
+
     /* --- timed: only ub_client_perform_gather_load --- */
     {
         struct timespec t0, t1;
-        double load_ns;
-        size_t total_bytes = num_indices * opts->vector_dimension * sizeof(float);
 
-        if (opts->mock_local) {
-            /* Mock path: allocate a local table filled with fixture pattern,
-             * build a fake addr_space pointing into it. This benchmarks pure
-             * gather_load (SVE or memcpy) without any UB link overhead. */
-            size_t stride = effective_stride(opts);
-            size_t table_bytes = num_indices * stride;
-            unsigned char *mock_table = calloc(table_bytes, 1);
-            if (!mock_table) {
-                ut_log("OOM allocating mock table");
-                ub_client_cleanup();
-                goto out;
-            }
-            fill_fixture_vectors((float *)mock_table, num_indices,
-                                 opts->vector_dimension, stride);
-
-            /* Build a stack addr_space pointing into the mock table */
-            ub_address_space_t mock_as;
-            memset(&mock_as, 0, sizeof(mock_as));
-            mock_as.mapped_addr      = mock_table;
-            mock_as.mapping_addr     = mock_table;
-            mock_as.mapping_size     = table_bytes;
-            mock_as.size             = table_bytes;
-            mock_as.data_offset      = 0;
-            mock_as.vector_stride_bytes = stride;
-            mock_as.shm_fd           = -1;
-            mock_as.cacheable        = 0;
-            mock_as.use_ownership    = 0;
-            addr_space = &mock_as;
-
-            clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (size_t warm = 0; warm < opts->warmup_runs; warm++) {
             if (ub_client_perform_gather_load(addr_space,
                                               indices,
                                               num_indices,
                                               results,
                                               opts->vector_dimension) != 0) {
-                ut_log("ub_client_perform_gather_load failed (mock)");
-                free(mock_table);
-                ub_client_cleanup();
+                ut_log("ub_client_perform_gather_load failed during warmup%s",
+                       opts->mock_local ? " (mock)" : "");
                 goto out;
             }
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            free(mock_table);
-        } else {
-            if (ub_client_load_embedding_table(opts->table_name, &addr_space) != 0 ||
-                addr_space == NULL) {
-                ut_log("ub_client_load_embedding_table failed");
-                ub_client_cleanup();
-                goto out;
-            }
-
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            if (ub_client_perform_gather_load(addr_space,
-                                              indices,
-                                              num_indices,
-                                              results,
-                                              opts->vector_dimension) != 0) {
-                ut_log("ub_client_perform_gather_load failed");
-                ub_client_cleanup();
-                goto out;
-            }
-            clock_gettime(CLOCK_MONOTONIC, &t1);
         }
-        load_ns = elapsed_ns(&t0, &t1);
+
+        for (size_t rep = 0; rep < timing.count; rep++) {
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (ub_client_perform_gather_load(addr_space,
+                                              indices,
+                                              num_indices,
+                                              results,
+                                              opts->vector_dimension) != 0) {
+                ut_log("ub_client_perform_gather_load failed during measure%s",
+                       opts->mock_local ? " (mock)" : "");
+                goto out;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            timing.samples[rep] = elapsed_ns(&t0, &t1);
+        }
 
         /* Print and optionally verify each row */
         rc = 0;
@@ -817,9 +1013,31 @@ static int run_gather(const ub_ut_options_t *opts)
 
             if (opts->verify) {
                 if (verify_vector_row(row, vec, opts->vector_dimension) != 0) {
+                    verify_ok = 0;
                     rc = 1;
                 }
             }
+        }
+
+        if (summarize_gather_samples(timing.samples,
+                                     timing.count,
+                                     num_indices,
+                                     opts->vector_dimension,
+                                     &bench) != 0) {
+            ut_log("failed to summarize gather samples");
+            rc = 1;
+            goto out;
+        }
+
+        if (opts->csv_path != NULL &&
+            append_gather_csv(opts->csv_path,
+                              opts->case_name ? opts->case_name : "default",
+                              csv_source,
+                              opts,
+                              num_indices,
+                              &bench,
+                              verify_ok) != 0) {
+            rc = 1;
         }
 
         if (rc == 0) {
@@ -827,20 +1045,21 @@ static int run_gather(const ub_ut_options_t *opts)
             ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
 #ifdef USE_SVE
             ut_log("  method      : SVE gather-load (sve1 contiguous ld1w/st1w)");
-            ut_log("  gather_load : %.0f ns (%.3f us)", load_ns, load_ns / 1e3);
 #else
             ut_log("  method      : scalar memcpy");
-            ut_log("  memcpy      : %.0f ns (%.3f us)", load_ns, load_ns / 1e3);
 #endif
-            ut_log("  source      : %s", opts->mock_local ? "local malloc (no UB)" : "UB.MEM");
+            ut_log("  source      : %s", display_source);
             ut_log("  data        : %zu bytes (%.2f MB)",
                    total_bytes, (double)total_bytes / (1024.0 * 1024.0));
-            if (load_ns > 0) {
-                double bw_mbs = (double)total_bytes / (load_ns / 1e3); /* bytes/us = MB/s */
-                double per_row_ns = load_ns / (double)num_indices;
-                ut_log("  throughput  : %.1f MB/s", bw_mbs);
-                ut_log("  per row     : %.1f ns / row  (%zu rows)", per_row_ns, num_indices);
-            }
+            ut_log("  warmup      : %zu", opts->warmup_runs);
+            ut_log("  repeat      : %zu", timing.count);
+            ut_log("  min         : %.0f ns", bench.min_ns);
+            ut_log("  median      : %.0f ns", bench.median_ns);
+            ut_log("  p95         : %.0f ns", bench.p95_ns);
+            ut_log("  average     : %.0f ns", bench.avg_ns);
+            ut_log("  throughput  : %.3f MB/s", bench.median_mb_s);
+            ut_log("  per row     : %.3f ns / row  (%zu rows)", bench.median_ns_per_row, num_indices);
+            ut_log("  per float   : %.6f ns / float", bench.median_ns_per_float);
             if (opts->verbose && stats) {
                 ut_log("%s", stats);
             }
@@ -848,8 +1067,10 @@ static int run_gather(const ub_ut_options_t *opts)
         }
     }
 
-    ub_client_cleanup();
 out:
+    ub_client_cleanup();
+    free(timing.samples);
+    free(mock_table);
     free(results);
     free(indices);
     return rc;
@@ -961,6 +1182,10 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
         {"table-name", required_argument, NULL, 'n'},
         {"element", required_argument, NULL, 'e'},
         {"gather-indices", required_argument, NULL, 'g'},
+        {"warmup", required_argument, NULL, 'W'},
+        {"repeat", required_argument, NULL, 'T'},
+        {"csv", required_argument, NULL, 'C'},
+        {"case-name", required_argument, NULL, 'N'},
         {"expected-index", required_argument, NULL, 'i'},
         {"resolver", required_argument, NULL, 'R'},
         {"cacheable", required_argument, NULL, 'c'},
@@ -976,10 +1201,6 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
     size_t tmp_size;
     int tmp_bool;
 
-    memset(opts, 0, sizeof(*opts));
-    opts->table_name = "ut_vectors";
-    opts->resolver_mode = UB_ELEMENT_INDEX_SUFFIX_NUMERIC;
-
     if (argc < 2 || parse_mode(argv[1], &opts->mode) != 0) {
         return -1;
     }
@@ -988,7 +1209,7 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
     }
 
     optind = 2;
-    while ((ch = getopt_long(argc, argv, "p:m:s:o:t:S:d:r:n:e:g:i:R:c:u:VMvh",
+    while ((ch = getopt_long(argc, argv, "p:m:s:o:t:S:d:r:n:e:g:W:T:C:N:i:R:c:u:VMvh",
                              long_opts, NULL)) != -1) {
         switch (ch) {
         case 'p':
@@ -1044,6 +1265,24 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
             break;
         case 'g':
             opts->gather_indices_str = optarg;
+            break;
+        case 'W':
+            if (parse_size_arg(optarg, &tmp_size) != 0) {
+                return -1;
+            }
+            opts->warmup_runs = tmp_size;
+            break;
+        case 'T':
+            if (parse_size_arg(optarg, &tmp_size) != 0) {
+                return -1;
+            }
+            opts->repeat_runs = tmp_size;
+            break;
+        case 'C':
+            opts->csv_path = optarg;
+            break;
+        case 'N':
+            opts->case_name = optarg;
             break;
         case 'i':
             if (parse_u64_arg(optarg, &tmp_u64) != 0) {
@@ -1123,6 +1362,15 @@ static int parse_args(int argc, char **argv, ub_ut_options_t *opts)
 int main(int argc, char **argv)
 {
     ub_ut_options_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.vector_dimension = 4;
+    opts.table_name = "ut_vectors";
+    opts.resolver_mode = UB_ELEMENT_INDEX_SUFFIX_NUMERIC;
+    opts.cacheable = 0;
+    opts.use_ownership = 0;
+    opts.warmup_runs = 3;
+    opts.repeat_runs = 5;
+    opts.case_name = "default";
     int parse_rc = parse_args(argc, argv, &opts);
 
     if (parse_rc != 0) {

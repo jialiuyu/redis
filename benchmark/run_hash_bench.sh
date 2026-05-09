@@ -1,13 +1,13 @@
 #!/bin/bash
 # run_hash_bench.sh — Full hash×eviction benchmark: 1 round 20M queries
-# Usage: ./run_hash_bench.sh [ops] [threads]
+# Usage: ./run_hash_bench.sh [ops] [threads] [max_key] [rw]
 set -e
 
 OPS=${1:-20000000}
 THREADS=${2:-8}
 MAX_KEY=${3:-1100000}
 FILL=$MAX_KEY
-RW=80
+RW=${4:-80}
 SOCK="/tmp/tlc_hash_bench.sock"
 V16_SOCK="/tmp/tlc_v16.sock"
 V16_SHM="tlc_v16"
@@ -33,16 +33,27 @@ mkdir -p benchmark/results
 
 echo "=== Hash Bench: ${OPS} ops, ${THREADS} threads, max-key ${MAX_KEY}, ${RW}R/${100-RW}W ==="
 echo "csv: ${CSV}"
-echo "hash,eviction,ops,threads,max_key,qps,mops,avg_ns,put_ok,get_ok,get_miss,hits_1probe,hits_2probe,hits_3probe,hits_4probe,misses,warm_1probe,warm_miss,hot_util%,warm_util%" > "$CSV"
+echo "hash,eviction,ops,threads,max_key,qps,mops,avg_ns,get_miss,hits_1probe,hits_2probe,hits_3probe,hits_4probe,misses,warm_1probe,warm_miss,hot_util%,warm_util%" > "$CSV"
+
+kill_bench() {
+    ps -eo pid=,args= | awk '/tlc_hash_bench/ && $0 !~ /awk/ {print $1}' | xargs -r kill -9 2>/dev/null || true
+}
 
 kill_server() {
-    pkill -9 -f "tlc_hash_fc_server_|tlc_v16_server" 2>/dev/null || true
+    ps -eo pid=,args= | awk '/tlc_hash_fc_server_|tlc_v16_server/ && $0 !~ /awk/ {print $1}' | xargs -r kill -9 2>/dev/null || true
     sleep 1
     rm -f "$SOCK" "$V16_SOCK"
     # Clean up shm
     for f in /dev/shm/tlc_hb_*; do rm -f "$f" 2>/dev/null; done
     for f in /dev/shm/tlc_v16_*; do rm -f "$f" 2>/dev/null; done
 }
+
+cleanup() {
+    kill_bench
+    kill_server
+}
+
+trap cleanup EXIT INT TERM HUP
 
 run_combo() {
     local hash=$1

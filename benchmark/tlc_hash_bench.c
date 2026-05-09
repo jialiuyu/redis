@@ -99,6 +99,10 @@ static int connect_uds(const char *path) {
     return fd;
 }
 
+static double pct_u64(uint64_t num, uint64_t den) {
+    return den ? (100.0 * (double)num / (double)den) : 0.0;
+}
+
 typedef struct {
     int tid; size_t nops; int wpct; uint64_t max_key;
     const char *uds_path; const char *shm_prefix;
@@ -413,16 +417,18 @@ int main(int argc, char *argv[]) {
         if (have_csv_data) {
             FILE *fp = fopen(csv_file, "a");
             if (fp) {
-                fprintf(fp, "%s,%s,%zu,%d,%lu,%lu,%.2f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.1f,%.1f\n",
+                uint64_t hot_queries = hg[0] + hg[1] + hg[2] + hg[3] + hg[4];
+                uint64_t warm_queries = wg[0] + wg[1] + wg[2] + wg[3] + wg[4] + wg[5] + wg[6];
+
+                fprintf(fp, "%s,%s,%zu,%d,%lu,%lu,%.2f,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f\n",
                     sname, eviction ? eviction : "", ops, threads, (unsigned long)max_key,
                     (unsigned long)measure_result.qps, measure_result.mops,
                     (unsigned long)measure_result.avg_ns,
-                    (unsigned long)measure_result.put_ok,
-                    (unsigned long)measure_result.get_ok,
                     (unsigned long)measure_result.get_miss,
-                    (unsigned long)hg[0], (unsigned long)hg[1], (unsigned long)hg[2],
-                    (unsigned long)hg[3], (unsigned long)hg[4],
-                    (unsigned long)wg[0], (unsigned long)wg[6],
+                    pct_u64(hg[0], hot_queries), pct_u64(hg[1], hot_queries),
+                    pct_u64(hg[2], hot_queries), pct_u64(hg[3], hot_queries),
+                    pct_u64(hg[4], hot_queries),
+                    pct_u64(wg[0], warm_queries), pct_u64(wg[6], warm_queries),
                     100.0 * ho / (1 << 17), 100.0 * wo / (1 << 20));
                 fclose(fp);
                 printf("  CSV appended to %s\n", csv_file);
