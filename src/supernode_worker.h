@@ -14,7 +14,6 @@
 #ifndef __SUPERNODE_WORKER_H
 #define __SUPERNODE_WORKER_H
 
-#include "server.h"
 #include "ring_buffer.h"
 #include "sve_operation.h"
 #include "supernode_protocol.h"

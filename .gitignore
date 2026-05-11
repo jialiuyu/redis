@@ -211,3 +211,5 @@ benchmark/ARCHITECTURE_DEEP_DIVE.md
 benchmark/read_output.txt
 benchmark/write_output.txt
 SVE_OPERATION_DESIGN.md
+benchmark/*_ut
+benchmark/*_bench
