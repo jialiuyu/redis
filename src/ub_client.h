@@ -52,7 +52,7 @@ typedef struct ub_address_space {
 
 typedef struct {
     int initialized;
-    ub_mem_config_t config;
+    const ub_mem_config_t *config;
     ub_address_space_t *global_ubas;
     uint64_t total_requests;
     uint64_t total_responses;

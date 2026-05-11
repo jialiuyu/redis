@@ -5,6 +5,7 @@
  */
 
 #include "ub_client.h"
+#include "macro.h"
 #include "server.h"
 #include "sve_config.h"
 
@@ -24,87 +25,6 @@
 #endif
 
 ub_client_t *global_ub_client = NULL;
-
-static int same_string(const char *left, const char *right)
-{
-    if (left == right) {
-        return 1;
-    }
-    if (left == NULL || right == NULL) {
-        return 0;
-    }
-    return strcmp(left, right) == 0;
-}
-
-static char *dup_config_string(const char *value)
-{
-    size_t len;
-    char *copy;
-
-    if (value == NULL) {
-        return NULL;
-    }
-    len = strlen(value) + 1;
-    copy = zcalloc(len);
-    if (copy != NULL) {
-        memcpy(copy, value, len);
-    }
-    return copy;
-}
-
-static void free_config_strings(ub_mem_config_t *cfg)
-{
-    if (cfg == NULL) {
-        return;
-    }
-    if (cfg->table_name) {
-        zfree(cfg->table_name);
-        cfg->table_name = NULL;
-    }
-    if (cfg->shm_path) {
-        zfree(cfg->shm_path);
-        cfg->shm_path = NULL;
-    }
-}
-
-static int copy_config(ub_mem_config_t *dst, const ub_mem_config_t *src)
-{
-    memset(dst, 0, sizeof(*dst));
-    dst->vector_dimension = src->vector_dimension;
-    dst->cacheable = src->cacheable;
-    dst->use_ownership = src->use_ownership;
-    dst->element_index_mode = src->element_index_mode;
-    dst->shm_memid = src->shm_memid;
-    dst->shm_size = src->shm_size;
-    dst->table_offset = src->table_offset;
-    dst->table_size = src->table_size;
-    dst->vector_stride_bytes = src->vector_stride_bytes;
-    dst->table_name = dup_config_string(src->table_name);
-    if (src->table_name != NULL && dst->table_name == NULL) {
-        return C_ERR;
-    }
-    dst->shm_path = dup_config_string(src->shm_path);
-    if (src->shm_path != NULL && dst->shm_path == NULL) {
-        free_config_strings(dst);
-        return C_ERR;
-    }
-    return C_OK;
-}
-
-static int config_equals(const ub_mem_config_t *left, const ub_mem_config_t *right)
-{
-    return left->vector_dimension == right->vector_dimension &&
-           left->cacheable == right->cacheable &&
-           left->use_ownership == right->use_ownership &&
-           left->element_index_mode == right->element_index_mode &&
-           left->shm_memid == right->shm_memid &&
-           left->shm_size == right->shm_size &&
-           left->table_offset == right->table_offset &&
-           left->table_size == right->table_size &&
-           left->vector_stride_bytes == right->vector_stride_bytes &&
-           same_string(left->table_name, right->table_name) &&
-           same_string(left->shm_path, right->shm_path);
-}
 
 static size_t configured_vector_stride(const ub_mem_config_t *cfg, size_t vector_dim)
 {
@@ -266,26 +186,6 @@ static void destroy_addr_space(ub_address_space_t *addr_space)
     zfree(addr_space);
 }
 
-static int addr_space_matches_config(const ub_address_space_t *addr_space,
-                                     const ub_mem_config_t *cfg,
-                                     const char *device_path,
-                                     size_t table_size,
-                                     size_t vector_stride)
-{
-    if (!addr_space || !device_path) {
-        return 0;
-    }
-
-    return addr_space->mem_id == cfg->shm_memid &&
-           addr_space->mapping_size == cfg->shm_size &&
-           addr_space->data_offset == cfg->table_offset &&
-           addr_space->size == table_size &&
-           addr_space->vector_stride_bytes == vector_stride &&
-           addr_space->cacheable == cfg->cacheable &&
-           addr_space->use_ownership == cfg->use_ownership &&
-           strcmp(addr_space->device_path, device_path) == 0;
-}
-
 static int create_addr_space(const ub_mem_config_t *cfg, ub_address_space_t **addr_space)
 {
     ub_address_space_t *new_addr_space = NULL;
@@ -419,35 +319,19 @@ static int parse_numeric_suffix(const char *text, uint64_t *value)
 
 int ub_client_init(const ub_mem_config_t *cfg)
 {
-    ub_mem_config_t next_cfg = {0};
-
+    if (global_ub_client) {
+        return C_OK;
+    }
     if (cfg == NULL) {
         errno = EINVAL;
         return C_ERR;
     }
-    if (copy_config(&next_cfg, cfg) != C_OK) {
-        return C_ERR;
-    }
-
-    if (global_ub_client) {
-        if (!config_equals(&global_ub_client->config, &next_cfg)) {
-            destroy_addr_space(global_ub_client->global_ubas);
-            global_ub_client->global_ubas = NULL;
-            free_config_strings(&global_ub_client->config);
-            global_ub_client->config = next_cfg;
-            memset(&next_cfg, 0, sizeof(next_cfg));
-        }
-        free_config_strings(&next_cfg);
-        return C_OK;
-    }
-
     global_ub_client = zcalloc(sizeof(*global_ub_client));
     if (!global_ub_client) {
         return C_ERR;
     }
 
-    global_ub_client->config = next_cfg;
-    memset(&next_cfg, 0, sizeof(next_cfg));
+    global_ub_client->config = cfg;
     global_ub_client->initialized = 1;
     serverLog(LL_NOTICE, "UB client initialized in data-plane mode");
     return C_OK;
@@ -461,7 +345,6 @@ void ub_client_cleanup(void)
 
     destroy_addr_space(global_ub_client->global_ubas);
     global_ub_client->global_ubas = NULL;
-    free_config_strings(&global_ub_client->config);
 
     zfree(global_ub_client);
     global_ub_client = NULL;
@@ -473,39 +356,23 @@ int ub_client_load_embedding_table(const char *resource_name,
                                    ub_address_space_t **addr_space)
 {
     const ub_mem_config_t *cfg;
-    char device_path[UB_DEVICE_PATH_MAX];
-    size_t table_size;
-    size_t vector_stride;
 
     if (!addr_space || !global_ub_client || !global_ub_client->initialized) {
         return C_ERR;
     }
-    cfg = &global_ub_client->config;
+    cfg = global_ub_client->config;
     if (!resource_name_matches(cfg, resource_name)) {
         serverLog(LL_WARNING, "UB table resource mismatch for key %s",
                   resource_name ? resource_name : "(null)");
         return C_ERR;
     }
-    if (configured_table_size(cfg, &table_size) != C_OK ||
-        configured_device_path(cfg, device_path) != C_OK) {
-        return C_ERR;
-    }
-
-    vector_stride = configured_vector_stride(cfg, cfg->vector_dimension);
-    if (addr_space_matches_config(global_ub_client->global_ubas,
-                                  cfg,
-                                  device_path,
-                                  table_size,
-                                  vector_stride)) {
+    if (global_ub_client->global_ubas) {
         global_ub_client->cache_hits++;
         *addr_space = global_ub_client->global_ubas;
         return C_OK;
     }
 
     global_ub_client->cache_misses++;
-    destroy_addr_space(global_ub_client->global_ubas);
-    global_ub_client->global_ubas = NULL;
-
     if (create_addr_space(cfg, &global_ub_client->global_ubas) != C_OK) {
         return C_ERR;
     }
@@ -518,21 +385,16 @@ int ub_client_resolve_element_index(const char *element_name,
                                     uint64_t *index,
                                     size_t vector_dim)
 {
-    const ub_mem_config_t *cfg = global_ub_client ? &global_ub_client->config : NULL;
+    RETURN_IF(!element_name || !index, C_ERR);
+    const ub_mem_config_t *cfg = global_ub_client ? global_ub_client->config : NULL;
     ub_address_space_t *addr_space = global_ub_client ? global_ub_client->global_ubas : NULL;
+    RETURN_IF(!addr_space || !cfg, C_ERR);
     size_t vector_stride = configured_vector_stride(cfg, vector_dim);
-    uint64_t capacity;
+    RETURN_IF(vector_stride == 0, C_ERR);
+    uint64_t capacity = addr_space->size / vector_stride;
+    RETURN_IF(capacity == 0, C_ERR);
+
     uint64_t resolved = 0;
-
-    if (!element_name || !index || !addr_space || cfg == NULL || vector_stride == 0) {
-        return C_ERR;
-    }
-
-    capacity = addr_space->size / vector_stride;
-    if (capacity == 0) {
-        return C_ERR;
-    }
-
     switch (cfg->element_index_mode) {
     case UB_ELEMENT_INDEX_NUMERIC:
         if (parse_u64_strict(element_name, &resolved) != C_OK) {
@@ -815,37 +677,37 @@ sds ub_client_get_config(const char *key)
     }
 
     if (!strcasecmp(key, "ub-table-name")) {
-        return global_ub_client->config.table_name ? sdsnew(global_ub_client->config.table_name) : NULL;
+        return global_ub_client->config->table_name ? sdsnew(global_ub_client->config->table_name) : NULL;
     }
     if (!strcasecmp(key, "ub-shm-path")) {
-        return global_ub_client->config.shm_path ? sdsnew(global_ub_client->config.shm_path) : NULL;
+        return global_ub_client->config->shm_path ? sdsnew(global_ub_client->config->shm_path) : NULL;
     }
     if (!strcasecmp(key, "ub-shm-memid")) {
-        return sdscatprintf(sdsempty(), "%llu", global_ub_client->config.shm_memid);
+        return sdscatprintf(sdsempty(), "%llu", global_ub_client->config->shm_memid);
     }
     if (!strcasecmp(key, "ub-shm-size")) {
-        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.shm_size);
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config->shm_size);
     }
     if (!strcasecmp(key, "ub-table-offset")) {
-        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.table_offset);
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config->table_offset);
     }
     if (!strcasecmp(key, "ub-table-size")) {
-        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.table_size);
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config->table_size);
     }
     if (!strcasecmp(key, "ub-vector-stride-bytes")) {
-        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config.vector_stride_bytes);
+        return sdscatprintf(sdsempty(), "%zu", global_ub_client->config->vector_stride_bytes);
     }
     if (!strcasecmp(key, "vector-dimension")) {
-        return sdscatprintf(sdsempty(), "%d", global_ub_client->config.vector_dimension);
+        return sdscatprintf(sdsempty(), "%d", global_ub_client->config->vector_dimension);
     }
     if (!strcasecmp(key, "ub-cacheable")) {
-        return sdsnew(global_ub_client->config.cacheable ? "yes" : "no");
+        return sdsnew(global_ub_client->config->cacheable ? "yes" : "no");
     }
     if (!strcasecmp(key, "ub-use-ownership")) {
-        return sdsnew(global_ub_client->config.use_ownership ? "yes" : "no");
+        return sdsnew(global_ub_client->config->use_ownership ? "yes" : "no");
     }
     if (!strcasecmp(key, "ub-element-index-mode")) {
-        switch (global_ub_client->config.element_index_mode) {
+        switch (global_ub_client->config->element_index_mode) {
         case UB_ELEMENT_INDEX_NUMERIC:
             return sdsnew("numeric");
         case UB_ELEMENT_INDEX_SUFFIX_NUMERIC:
