@@ -220,9 +220,30 @@ ub_client_ut: $(UB_UT_SRCS)
 
 .PHONY: ub_client_ut
 
+# SVE cross-embedding gather benchmark on UB.MEM
+# make sve_gather_ub_bench USE_SVE=yes [USE_CC_MODE=yes]
+SVE_GATHER_CFLAGS = -O3 -Wall -march=native -pthread -std=gnu11 \
+    -I../src -I../deps/libobmm -DSVE_OP_STANDALONE -DUB_CLIENT_STANDALONE
+SVE_GATHER_SRCS = sve_gather_ub_bench.c ../src/sve_operation.c ../src/ub_client.c
+SVE_GATHER_LIBS = -lm -lpthread
+
+ifeq ($(USE_CC_MODE),yes)
+    SVE_GATHER_CFLAGS += -DUSE_CC_MODE
+    SVE_GATHER_LIBS += ../deps/libobmm/libobmm_ownership.a
+endif
+ifeq ($(USE_SVE),yes)
+    SVE_GATHER_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+sve_gather_ub_bench: $(SVE_GATHER_SRCS)
+	$(CC) $(SVE_GATHER_CFLAGS) -o $@ $(SVE_GATHER_SRCS) $(SVE_GATHER_LIBS)
+	@echo "✅ Built: $@"
+
+.PHONY: sve_gather_ub_bench
+
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_gather_ub_bench
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "✅ Cleaned build artifacts"
@@ -301,6 +322,11 @@ help:
 	@echo "SVE row-copy compare:"
 	@echo "  make sve_row_copy_compare USE_SVE=yes"
 	@echo "  ./sve_row_copy_compare"
+	@echo ""
+	@echo "SVE cross-embedding gather UB benchmark:"
+	@echo "  make sve_gather_ub_bench USE_SVE=yes [USE_CC_MODE=yes]"
+	@echo "  ./sve_gather_ub_bench --shm-memid <id> --shm-size 8G --vector-dimension 300"
+	@echo "  ./sve_gather_ub_bench --mock-local --verify"
 	@echo "  ./ub_client_ut selftest"
 	@echo "  ./ub_client_ut write-fixture --shm-memid <id> --shm-size <N> --vector-dimension 128 --fill-rows 1024"
 	@echo "  ./ub_client_ut gather --shm-memid <id> --shm-size <N> --vector-dimension 128 --table-name ut_vectors --gather-indices 0,1,42 --verify"

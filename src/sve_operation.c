@@ -1,9 +1,14 @@
 #include "sve_operation.h"
 #include "macro.h"
-#include "zmalloc.h"
-
 #include <stdlib.h>
 #include <stdio.h>
+
+#ifdef SVE_OP_STANDALONE
+static inline void *zcalloc(size_t n) { return calloc(1, n); }
+static inline void  zfree(void *p)    { free(p); }
+#else
+#include "zmalloc.h"
+#endif
 
 /* ============================================================
  * Bitmap 操作
@@ -126,6 +131,128 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
 /* ============================================================
  * Streaming Load / Store（非临时内存访问）
  * ============================================================ */
+
+int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,
+                                uint64_t *emb_ids,
+                                size_t num_ids,
+                                float *results) {
+    const size_t dim = ctx ? ctx->vector_dim : 0;
+
+    RETURN_IF(!ctx || !ctx->ubas || !ctx->bitmap || !ctx->stats ||
+              !ctx->ubas->mapped_addr || !emb_ids || !results ||
+              num_ids == 0 || dim == 0, -1);
+
+    const char *table_base = (const char *)ctx->ubas->mapped_addr;
+    const size_t stride = ctx->vector_stride_bytes;
+
+#ifdef USE_ARM_SVE
+    const size_t vl = (size_t)svcntw();
+
+    for (size_t blk_start = 0; blk_start < num_ids; blk_start += vl) {
+        size_t blk_len = num_ids - blk_start;
+        if (blk_len > vl) blk_len = vl;
+
+        int acquired[SVE_OP_VL];
+
+        for (;;) {
+            int all_ok = 1;
+            for (size_t i = 0; i < blk_len; i++)
+                acquired[i] = 0;
+
+            for (size_t i = 0; i < blk_len; i++) {
+                if (emb_ids[blk_start + i] >= ctx->table_row_capacity)
+                    continue;
+                if (bitmap_try_acquire(ctx->bitmap,
+                            emb_ids[blk_start + i]) == 0) {
+                    acquired[i] = 1;
+                } else {
+                    all_ok = 0;
+                    break;
+                }
+            }
+
+            if (all_ok) break;
+
+            for (size_t i = 0; i < blk_len; i++) {
+                if (acquired[i]) {
+                    bitmap_release(ctx->bitmap, emb_ids[blk_start + i]);
+                    acquired[i] = 0;
+                }
+            }
+            atomic_fetch_add_explicit(&ctx->stats->lock_failure, 1,
+                                      memory_order_relaxed);
+            __asm__ __volatile__("yield" ::: "memory");
+        }
+
+        atomic_fetch_add_explicit(&ctx->stats->lock_success, 1,
+                                  memory_order_relaxed);
+
+        const float *src_ptrs[SVE_OP_VL];
+        float *dst_ptrs[SVE_OP_VL];
+        int any_valid = 0;
+        for (size_t i = 0; i < blk_len; i++) {
+            if (acquired[i]) {
+                src_ptrs[i] = (const float *)(table_base +
+                    emb_ids[blk_start + i] * stride);
+                dst_ptrs[i] = &results[(blk_start + i) * dim];
+                any_valid = 1;
+            } else {
+                src_ptrs[i] = NULL;
+                dst_ptrs[i] = NULL;
+            }
+        }
+
+        if (any_valid) {
+            size_t col_off = 0;
+            while (col_off + vl <= dim) {
+                for (size_t i = 0; i < blk_len; i++) {
+                    if (!acquired[i]) continue;
+                    svfloat32_t v = svld1_f32(svptrue_b32(), src_ptrs[i] + col_off);
+                    svst1_f32(svptrue_b32(), dst_ptrs[i] + col_off, v);
+                }
+                col_off += vl;
+            }
+
+            if (col_off < dim) {
+                svbool_t pg = svwhilelt_b32_u64((uint64_t)col_off, (uint64_t)dim);
+                for (size_t i = 0; i < blk_len; i++) {
+                    if (!acquired[i]) continue;
+                    svfloat32_t v = svld1_f32(pg, src_ptrs[i] + col_off);
+                    svst1_f32(pg, dst_ptrs[i] + col_off, v);
+                }
+            }
+        }
+
+        for (size_t i = 0; i < blk_len; i++) {
+            if (acquired[i]) {
+                bitmap_release(ctx->bitmap, emb_ids[blk_start + i]);
+            }
+        }
+    }
+#else
+    for (size_t i = 0; i < num_ids; i++) {
+        while (bitmap_try_acquire(ctx->bitmap, emb_ids[i]) != 0) {
+            atomic_fetch_add_explicit(&ctx->stats->lock_failure, 1,
+                                      memory_order_relaxed);
+            __asm__ __volatile__("yield" ::: "memory");
+        }
+
+        atomic_fetch_add_explicit(&ctx->stats->lock_success, 1,
+                                  memory_order_relaxed);
+        if (emb_ids[i] >= ctx->table_row_capacity) {
+            bitmap_release(ctx->bitmap, emb_ids[i]);
+            return -1;
+        }
+
+        const float *src = (const float *)(table_base +
+                            emb_ids[i] * stride);
+        memcpy(&results[i * dim], src, dim * sizeof(float));
+        bitmap_release(ctx->bitmap, emb_ids[i]);
+    }
+#endif
+
+    return 0;
+}
 
 void sve_streaming_load(const void *src, void *dst, size_t size) {
 #ifdef USE_ARM_SVE

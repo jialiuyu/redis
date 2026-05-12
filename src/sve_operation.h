@@ -79,6 +79,12 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
                           size_t num_ids,
                           float *results);
 
+/* 跨 embedding SVE gather 并行读取 */
+int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,
+                               uint64_t *emb_ids,
+                               size_t num_ids,
+                               float *results);
+
 /* 非临时内存拷贝（SVE streaming load / 标量 memcpy）*/
 void sve_streaming_load(const void *src, void *dst, size_t size);
 void sve_streaming_store(const void *src, void *dst, size_t size);
