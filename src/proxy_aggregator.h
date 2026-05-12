@@ -12,7 +12,7 @@
 #ifndef __PROXY_AGGREGATOR_H
 #define __PROXY_AGGREGATOR_H
 
-#include "ring_buffer.h"
+#include "server.h"
 #include <stdint.h>
 
 /* 聚合配置 */
@@ -31,10 +31,6 @@ void proxy_aggregator_shutdown(void);
 /* 请求提交 */
 int proxy_enqueue_request(const char *key, void *client_ctx, 
                          float *result_buffer, size_t vector_dim);
-
-/* 查询接口 */
-ring_buffer_t *proxy_aggregator_get_worker_rb(int supernode_id, int worker_id);
-int proxy_aggregator_get_workers_per_supernode(void);
 
 /* 统计信息 */
 sds proxy_aggregator_get_stats(void);

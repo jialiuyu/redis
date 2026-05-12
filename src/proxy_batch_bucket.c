@@ -28,6 +28,7 @@ int proxy_batch_bucket_init(proxy_batch_bucket_t *bucket, size_t capacity,
     bucket->capacity = capacity;
     bucket->target_supernode_id = target_supernode_id;
     bucket->target_worker_id = target_worker_id;
+    bucket->rb = NULL;
     bucket->last_flush_time_us = now_us;
     if (pthread_mutex_init(&bucket->mutex, NULL) != 0) {
         zfree(bucket->requests);
@@ -54,31 +55,6 @@ void proxy_batch_bucket_cleanup(proxy_batch_bucket_t *bucket) {
         pthread_mutex_destroy(&bucket->mutex);
         bucket->mutex_initialized = 0;
     }
-}
-
-void proxy_batch_bucket_lock(proxy_batch_bucket_t *bucket) {
-    RETURN_IF(!bucket || !bucket->mutex_initialized);
-    pthread_mutex_lock(&bucket->mutex);
-}
-
-void proxy_batch_bucket_unlock(proxy_batch_bucket_t *bucket) {
-    RETURN_IF(!bucket || !bucket->mutex_initialized);
-    pthread_mutex_unlock(&bucket->mutex);
-}
-
-size_t proxy_batch_bucket_count(const proxy_batch_bucket_t *bucket) {
-    RETURN_IF(!bucket, 0);
-    return bucket->count;
-}
-
-size_t proxy_batch_bucket_capacity(const proxy_batch_bucket_t *bucket) {
-    RETURN_IF(!bucket, 0);
-    return bucket->capacity;
-}
-
-uint64_t proxy_batch_bucket_age_us(const proxy_batch_bucket_t *bucket, uint64_t now_us) {
-    RETURN_IF(!bucket || now_us < bucket->last_flush_time_us, 0);
-    return now_us - bucket->last_flush_time_us;
 }
 
 void proxy_batch_bucket_reset(proxy_batch_bucket_t *bucket, uint64_t flush_time_us) {
@@ -156,9 +132,4 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
     }
 
     return C_OK;
-}
-
-int proxy_batch_bucket_target_supernode_id(const proxy_batch_bucket_t *bucket) {
-    RETURN_IF(!bucket, -1);
-    return bucket->target_supernode_id;
 }

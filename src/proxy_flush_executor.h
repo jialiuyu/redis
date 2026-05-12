@@ -30,11 +30,13 @@ typedef enum proxyFlushTrigger {
 } proxyFlushTrigger;
 
 void proxy_flush_executor_init(proxy_flush_executor_t *executor);
+
+// proxy_executor_flush_bucket_locked
 int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
-                                             proxy_batch_bucket_t *bucket,
-                                             ring_buffer_t *rb,
-                                             int flush_reason_full,
-                                             uint64_t flush_time_us,
-                                             proxyFlushTrigger trigger);
+                                       proxy_batch_bucket_t *bucket,
+                                       ring_buffer_t *rb,
+                                       int flush_reason_full,
+                                       uint64_t flush_time_us,
+                                       proxyFlushTrigger trigger);
 
 #endif /* __PROXY_FLUSH_EXECUTOR_H */

@@ -80,6 +80,7 @@ sds sdscatprintf(sds s, const char *fmt, ...) {
 #include "../src/proxy_router.c"
 #include "../src/proxy_flush_scheduler.c"
 #include "../src/proxy_batch_bucket.c"
+#include "../src/proxy_active_bucket_heap.c"
 #include "../src/ring_buffer.c"
 #include "../src/proxy_flush_executor.c"
 #include "../src/proxy_aggregator.c"
@@ -90,16 +91,14 @@ static proxy_aggregator_t *create_test_aggregator(size_t num_buckets, uint64_t t
 
     agg->num_buckets = num_buckets;
     agg->config.time_limit_us = time_limit_us;
-    agg->active_bucket_indices = zcalloc(sizeof(size_t) * num_buckets);
-    agg->active_bucket_slots = zcalloc(sizeof(size_t) * num_buckets);
-    agg->active_bucket_registered = zcalloc(sizeof(uint8_t) * num_buckets);
-    assert(agg->active_bucket_indices && agg->active_bucket_slots && agg->active_bucket_registered);
     assert(pthread_mutex_init(&agg->active_buckets_lock, NULL) == 0);
     assert(pthread_cond_init(&agg->active_buckets_cond, NULL) == 0);
     agg->active_buckets_lock_initialized = 1;
     agg->active_buckets_cond_initialized = 1;
     agg->buckets = proxy_batch_bucket_create_array(num_buckets);
     assert(agg->buckets != NULL);
+    assert(proxy_active_bucket_heap_init(&agg->active_bucket_heap, agg->buckets,
+                                         num_buckets, time_limit_us) == C_OK);
 
     for (size_t i = 0; i < num_buckets; i++) {
         assert(proxy_batch_bucket_init(&agg->buckets[i], 4, (int)i, 0, 1000 + i) == C_OK);
@@ -119,9 +118,7 @@ static void destroy_test_aggregator(proxy_aggregator_t *agg) {
     if (agg->active_buckets_cond_initialized) {
         pthread_cond_destroy(&agg->active_buckets_cond);
     }
-    zfree(agg->active_bucket_indices);
-    zfree(agg->active_bucket_slots);
-    zfree(agg->active_bucket_registered);
+    proxy_active_bucket_heap_cleanup(&agg->active_bucket_heap);
     zfree(agg);
 }
 
@@ -136,15 +133,15 @@ static void test_active_bucket_heap_order(void) {
     proxy_active_bucket_add(agg, 1);
     proxy_active_bucket_add(agg, 2);
 
-    assert(agg->active_bucket_count == 3);
-    assert(agg->active_bucket_indices[0] == 1);
+    assert(agg->active_bucket_heap.count == 3);
+    assert(agg->active_bucket_heap.indices[0] == 1);
 
     proxy_active_bucket_remove(agg, 1);
-    assert(agg->active_bucket_count == 2);
-    assert(agg->active_bucket_indices[0] == 2);
+    assert(agg->active_bucket_heap.count == 2);
+    assert(agg->active_bucket_heap.indices[0] == 2);
 
     proxy_active_bucket_add(agg, 2);
-    assert(agg->active_bucket_count == 2);
+    assert(agg->active_bucket_heap.count == 2);
 
     destroy_test_aggregator(agg);
 }

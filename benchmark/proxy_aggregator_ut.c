@@ -86,7 +86,9 @@ void sdsfree(sds s) {
 #include "../src/proxy_router.c"
 #include "../src/proxy_flush_scheduler.c"
 #include "../src/proxy_batch_bucket.c"
+#include "../src/proxy_active_bucket_heap.c"
 #include "../src/ring_buffer.c"
+#include "../src/ring_buffer_mgr.c"
 #include "../src/proxy_flush_executor.c"
 #include "../src/proxy_aggregator.c"
 
@@ -96,25 +98,6 @@ static void reset_server_proxy(int workers, int batch_limit, int time_limit_us, 
     server.proxy.batch_limit = batch_limit;
     server.proxy.time_limit_us = time_limit_us;
     server.proxy.max_supernodes = max_supernodes;
-}
-
-static ring_buffer_t *test_rb_create(size_t size) {
-    ring_buffer_t *rb = calloc(1, sizeof(*rb));
-    assert(rb != NULL);
-    rb->buffer = calloc(1, size);
-    assert(rb->buffer != NULL);
-    rb->size = size;
-    rb->fd = -1;
-    atomic_init(&rb->head, 0);
-    atomic_init(&rb->tail, 0);
-    atomic_init(&rb->refcount, 1);
-    return rb;
-}
-
-static void test_rb_destroy(ring_buffer_t *rb) {
-    if (!rb) return;
-    free(rb->buffer);
-    free(rb);
 }
 
 static void setup_test_proxy(int workers, int batch_limit, int time_limit_us, int max_supernodes) {
@@ -127,21 +110,17 @@ static void setup_test_proxy(int workers, int batch_limit, int time_limit_us, in
     proxy->num_buckets = proxy->num_supernodes * proxy->config.workers_per_node;
     proxy->buckets = proxy_batch_bucket_create_array(proxy->num_buckets);
     assert(proxy->buckets != NULL);
-    proxy->ring_buffers = zcalloc(sizeof(ring_buffer_t *) * proxy->num_buckets);
-    assert(proxy->ring_buffers != NULL);
 
     assert(pthread_mutex_init(&proxy->active_buckets_lock, NULL) == 0);
     assert(pthread_cond_init(&proxy->active_buckets_cond, NULL) == 0);
     proxy->active_buckets_lock_initialized = 1;
     proxy->active_buckets_cond_initialized = 1;
-    proxy->active_bucket_indices = zcalloc(sizeof(size_t) * proxy->num_buckets);
-    proxy->active_bucket_slots = zcalloc(sizeof(size_t) * proxy->num_buckets);
-    proxy->active_bucket_registered = zcalloc(sizeof(uint8_t) * proxy->num_buckets);
-    assert(proxy->active_bucket_indices && proxy->active_bucket_slots && proxy->active_bucket_registered);
 
     proxy_flush_executor_init(&proxy->executor);
     flush_scheduler_init(&proxy->scheduler, proxy->config.batch_limit, proxy->config.time_limit_us);
     assert(proxy_router_init(&proxy->router, (int)proxy->num_supernodes, proxy->config.workers_per_node) == C_OK);
+    assert(ring_buffer_mgr_init(proxy->config.workers_per_node, RING_BUFFER_SIZE) == C_OK);
+    assert(ring_buffer_mgr_ensure_supernodes(proxy->num_supernodes) == C_OK);
     atomic_init(&proxy->total_requests, 0);
 
     for (size_t sn = 0; sn < proxy->num_supernodes; sn++) {
@@ -149,9 +128,14 @@ static void setup_test_proxy(int workers, int batch_limit, int time_limit_us, in
             size_t idx = worker_queue_index(proxy->config.workers_per_node, (int)sn, (int)worker);
             assert(proxy_batch_bucket_init(&proxy->buckets[idx], proxy->config.batch_limit,
                                            (int)sn, (int)worker, ustime()) == C_OK);
-            proxy->ring_buffers[idx] = test_rb_create(1 << 20);
+            proxy->buckets[idx].rb = ring_buffer_mgr_get((int)sn, (int)worker);
+            assert(proxy->buckets[idx].rb != NULL);
         }
     }
+    assert(proxy_active_bucket_heap_init(&proxy->active_bucket_heap,
+                                         proxy->buckets,
+                                         proxy->num_buckets,
+                                         proxy->config.time_limit_us) == C_OK);
 }
 
 static void teardown_test_proxy(void) {
@@ -168,18 +152,11 @@ static void teardown_test_proxy(void) {
     if (proxy->buckets) {
         proxy_batch_bucket_destroy_array(proxy->buckets, proxy->num_buckets);
     }
-    if (proxy->ring_buffers) {
-        for (size_t i = 0; i < proxy->num_buckets; i++) {
-            test_rb_destroy(proxy->ring_buffers[i]);
-        }
-        zfree(proxy->ring_buffers);
-    }
     proxy_router_cleanup(&proxy->router);
+    ring_buffer_mgr_shutdown();
     if (proxy->active_buckets_lock_initialized) pthread_mutex_destroy(&proxy->active_buckets_lock);
     if (proxy->active_buckets_cond_initialized) pthread_cond_destroy(&proxy->active_buckets_cond);
-    zfree(proxy->active_bucket_indices);
-    zfree(proxy->active_bucket_slots);
-    zfree(proxy->active_bucket_registered);
+    proxy_active_bucket_heap_cleanup(&proxy->active_bucket_heap);
     zfree(proxy);
     proxy = NULL;
 }
@@ -193,7 +170,7 @@ static void start_test_flush_thread(void) {
 static void test_immediate_flush_success(void) {
     setup_test_proxy(1, 1, 1000000, 1);
 
-    ring_buffer_t *rb = proxy_aggregator_get_worker_rb(0, 0);
+    ring_buffer_t *rb = ring_buffer_mgr_get(0, 0);
     assert(rb != NULL);
     assert(proxy_enqueue_request("alpha", NULL, NULL, 0) == C_OK);
 
@@ -219,7 +196,7 @@ static void test_immediate_flush_success(void) {
 static void test_immediate_deferred_and_rejected(void) {
     setup_test_proxy(1, 1, 1000000, 1);
 
-    ring_buffer_t *rb = proxy_aggregator_get_worker_rb(0, 0);
+    ring_buffer_t *rb = ring_buffer_mgr_get(0, 0);
     assert(rb != NULL);
 
     void *payload = NULL;

@@ -34,7 +34,3 @@ flush_decision_t flush_scheduler_on_poll(flush_scheduler_t *scheduler, size_t co
 
     return decision;
 }
-
-int flush_scheduler_idle_sleep_us(int processed_any) {
-    return processed_any ? 1 : 10;
-}

@@ -2,6 +2,7 @@
 #define __PROXY_BATCH_BUCKET_H
 
 #include "supernode_protocol.h"
+#include "ring_buffer.h"
 
 #include <pthread.h>
 #include <stdint.h>
@@ -25,6 +26,7 @@ typedef struct proxy_batch_bucket {
     size_t capacity;                    /* 容量 */
     int target_supernode_id;            /* 目标超节点 ID */
     int target_worker_id;               /* 目标 Worker ID */
+    ring_buffer_t *rb;                  /* 目标 worker 对应的 ring buffer */
     uint64_t last_flush_time_us;        /* 上次刷新时间 */
     pthread_mutex_t mutex;
     int mutex_initialized;
@@ -36,13 +38,6 @@ int proxy_batch_bucket_init(proxy_batch_bucket_t *bucket, size_t capacity,
                             int target_supernode_id, int target_worker_id,
                             uint64_t now_us);
 void proxy_batch_bucket_cleanup(proxy_batch_bucket_t *bucket);
-
-void proxy_batch_bucket_lock(proxy_batch_bucket_t *bucket);
-void proxy_batch_bucket_unlock(proxy_batch_bucket_t *bucket);
-
-size_t proxy_batch_bucket_count(const proxy_batch_bucket_t *bucket);
-size_t proxy_batch_bucket_capacity(const proxy_batch_bucket_t *bucket);
-uint64_t proxy_batch_bucket_age_us(const proxy_batch_bucket_t *bucket, uint64_t now_us);
 void proxy_batch_bucket_reset(proxy_batch_bucket_t *bucket, uint64_t flush_time_us);
 
 proxy_request_t *proxy_request_create(uint64_t request_id, uint32_t key_hash,
@@ -59,7 +54,5 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
                                    size_t packet_size,
                                    uint64_t timestamp_us,
                                    uint64_t batch_id);
-
-int proxy_batch_bucket_target_supernode_id(const proxy_batch_bucket_t *bucket);
 
 #endif /* __PROXY_BATCH_BUCKET_H */

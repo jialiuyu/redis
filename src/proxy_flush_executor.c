@@ -32,13 +32,29 @@ static void proxy_flush_executor_record_immediate_metrics(proxy_flush_executor_t
     }
 }
 
+/*
+ * Flush one bucket into its bound ring buffer.
+ *
+ * Usage:
+ * - Called by either the request thread (immediate flush path) or the
+ *   background flush thread.
+ * - Serializes the current bucket content into one batch packet and publishes
+ *   it to the target ring buffer.
+ *
+ * Important:
+ * - The caller must already hold bucket->mutex.
+ * - This function assumes the bucket cannot be appended to concurrently while
+ *   it is building and publishing the batch packet.
+ * - On success, the bucket is reset in place; on failure, the bucket content
+ *   is left intact so the caller can retry later.
+ */
 int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
                                             proxy_batch_bucket_t *bucket,
                                             ring_buffer_t *rb,
                                             int flush_reason_full,
                                             uint64_t flush_time_us,
                                             proxyFlushTrigger trigger) {
-    RETURN_IF(!executor || !bucket || !rb || proxy_batch_bucket_count(bucket) == 0, C_ERR);
+    RETURN_IF(!executor || !bucket || !rb || bucket->count == 0, C_ERR);
 
     size_t packet_size = proxy_batch_bucket_packet_size(bucket);
     RETURN_IF(packet_size == 0, C_ERR);
@@ -73,7 +89,7 @@ int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
         }
 
         serverLog(LL_DEBUG, "Flushed batch: %zu requests to supernode %d",
-                  proxy_batch_bucket_count(bucket), proxy_batch_bucket_target_supernode_id(bucket));
+                  bucket->count, bucket->target_supernode_id);
         proxy_batch_bucket_reset(bucket, flush_time_us);
         proxy_flush_executor_record_immediate_metrics(executor, trigger, 1);
     }

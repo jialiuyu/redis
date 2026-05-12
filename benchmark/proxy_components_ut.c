@@ -91,9 +91,6 @@ static void test_flush_scheduler(void) {
     flush_decision_t d4 = flush_scheduler_on_poll(&scheduler, 2, 250);
     assert(d4.should_flush == 1);
     assert(d4.flush_reason_full == 0);
-
-    assert(flush_scheduler_idle_sleep_us(1) == 1);
-    assert(flush_scheduler_idle_sleep_us(0) == 10);
 }
 
 static void test_proxy_batch_bucket_packet(void) {
@@ -106,7 +103,7 @@ static void test_proxy_batch_bucket_packet(void) {
 
     assert(proxy_batch_bucket_append(&bucket, r1) == C_OK);
     assert(proxy_batch_bucket_append(&bucket, r2) == C_OK);
-    assert(proxy_batch_bucket_count(&bucket) == 2);
+    assert(bucket.count == 2);
 
     size_t packet_size = proxy_batch_bucket_packet_size(&bucket);
     assert(packet_size == sizeof(batch_packet_t) + 2 * sizeof(((batch_packet_t *)0)->requests[0]));
@@ -125,7 +122,7 @@ static void test_proxy_batch_bucket_packet(void) {
 
     free(packet);
     proxy_batch_bucket_reset(&bucket, 200);
-    assert(proxy_batch_bucket_count(&bucket) == 0);
+    assert(bucket.count == 0);
     proxy_batch_bucket_cleanup(&bucket);
 }
 
@@ -160,7 +157,7 @@ static void test_proxy_flush_executor_success(void) {
 
     assert(proxy_executor_flush_bucket_locked(&executor, &bucket, rb, 1, 200,
            PROXY_FLUSH_TRIGGER_IMMEDIATE_APPEND) == C_OK);
-    assert(proxy_batch_bucket_count(&bucket) == 0);
+    assert(bucket.count == 0);
     assert(atomic_load_explicit(&executor.stats.total_flushes, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&executor.stats.immediate_flush_attempts, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&executor.stats.immediate_flush_successes, memory_order_relaxed) == 1);

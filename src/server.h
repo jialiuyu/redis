@@ -1866,9 +1866,9 @@ typedef enum childInfoType {
 typedef struct hotkeyStats hotkeyStats;
 
 typedef struct proxyConfig {
-    int batch_limit;              /* 0 means default */
-    int time_limit_us;            /* 0 means default */
-    int max_supernodes;           /* 0 means default */
+    size_t batch_limit;           /* 0 means default */
+    uint64_t time_limit_us;       /* 0 means default */
+    size_t max_supernodes;        /* 0 means default */
 } proxyConfig;
 
 struct redisServer {
