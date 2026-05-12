@@ -6,7 +6,31 @@
 
 #include "ub_client.h"
 #include "macro.h"
+
+#ifdef UB_CLIENT_STANDALONE
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#define C_OK       0
+#define C_ERR     (-1)
+#define LL_DEBUG    0
+#define LL_VERBOSE  1
+#define LL_NOTICE   2
+#define LL_WARNING  3
+#define UNUSED(x)   ((void)(x))
+static inline void serverLog(int level, const char *fmt, ...) {
+    (void)level;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+static inline void *zcalloc(size_t size) { return calloc(1, size); }
+static inline void  zfree(void *ptr)     { free(ptr); }
+#else
 #include "server.h"
+#endif
 #include "sve_config.h"
 
 #include <ctype.h>
