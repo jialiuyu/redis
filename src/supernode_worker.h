@@ -16,7 +16,6 @@
 
 #include "ring_buffer.h"
 #include "sve_operation.h"
-#include "supernode_protocol.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -33,9 +32,6 @@ typedef struct sve_worker_context {
     /* 读取路径上下文 */
     sve_gather_ctx_t gather_ctx;
 
-    /* SVE 上下文 */
-    size_t sve_vl;
-
     /* 统计信息 */
     atomic_uint_fast64_t total_batches;
     atomic_uint_fast64_t total_requests;
@@ -50,7 +46,6 @@ void supernode_shutdown(void);
 
 /* Worker 线程 */
 void *sve_worker_thread(void *arg);
-int   sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet);
 
 /* 统计 */
 sds supernode_get_stats(void);

@@ -11,12 +11,10 @@
 #define __SVE_OPERATION_H
 
 #include "ub_client.h"
-#include "sve_config.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <math.h>
 
 /* ---- 配置常量 ---- */
 #ifndef SVE_EMBEDDING_DIM
