@@ -21,15 +21,17 @@
  *    `attributes` is always NULL in query results. VSIM … WITHATTRIBS will
  *    return nil for every element; VSIM … FILTER is not available.
  *
- * 4. Similarity search strategy
+ * 4. Similarity computation strategy
  *    Redis VSIM walks an HNSW graph (approximate, O(log N)).
- *    UB VSIM performs a brute-force full-table scan (exact, O(N·dim)).
- *    UB is faster for small tables; Redis HNSW wins on large datasets.
+ *    UB VSIM currently performs key-scoped brute-force score computation
+ *    (exact, O(N·dim)) and returns one score per active row.
+ *    It does not perform top-k selection internally.
  */
 
 #include "macro.h"
 #include "vector_engine.h"
 #include "ub_client.h"
+#include "ub_metadata.h"
 #include "sve_config.h"
 #include "zmalloc.h"
 #include "server.h"
@@ -46,11 +48,6 @@
 /* ============================================================
  * VSIM helper types and functions
  * ============================================================ */
-
-typedef struct {
-    uint64_t index;   /* Row index in the embedding table */
-    float score;      /* Cosine similarity with the query vector */
-} vsim_candidate_t;
 
 #ifdef USE_ARM_SVE
 /* SVE-optimized cosine similarity for ARM processors */
@@ -119,16 +116,6 @@ static float cosine_similarity_f32(const float *a, const float *b, size_t dim)
 #endif
 }
 
-static int vsim_score_cmp(const void *x, const void *y)
-{
-    const vsim_candidate_t *ca = (const vsim_candidate_t *)x;
-    const vsim_candidate_t *cb = (const vsim_candidate_t *)y;
-
-    if (cb->score > ca->score) return 1;
-    if (cb->score < ca->score) return -1;
-    return 0;
-}
-
 /* Helper function to extract C string from Redis object */
 static const char *ub_engine_object_to_cstring(void *arg, sds *tmp)
 {
@@ -165,18 +152,26 @@ static inline ub_address_space_t *ub_engine_get_addr_space(void) {
     return ub_cached_addr_space;
 }
 
-/*
- * Resolve element name and index from Redis object or raw C string.
- * Caller must sdsfree both resource_tmp and element_tmp after use.
- */
-static int ub_engine_resolve_element(void *ctx, void *element,
-                                     uint64_t *index,
-                                     sds *element_tmp) {
-    ub_mem_config_t *cfg = &server.ub;
-    const char *element_name = ctx ? ub_engine_object_to_cstring(element, element_tmp)
-                                   : (const char *)element;
-    if (!element_name) return C_ERR;
-    return ub_client_resolve_element_index(element_name, index, cfg->vector_dimension);
+static const char *ub_engine_key_to_cstring(void *key, sds *tmp)
+{
+    if (!key) return NULL;
+    return ub_engine_object_to_cstring(key, tmp);
+}
+
+static ub_vector_set_meta_t *ub_engine_lookup_set_meta(void *key, sds *key_tmp)
+{
+    const char *key_name = ub_engine_key_to_cstring(key, key_tmp);
+    if (!key_name) return NULL;
+    return ub_metadata_get_set(key_name);
+}
+
+static ub_vector_set_meta_t *ub_engine_get_or_create_set_meta(void *key,
+                                                              size_t dim,
+                                                              sds *key_tmp)
+{
+    const char *key_name = ub_engine_key_to_cstring(key, key_tmp);
+    if (!key_name) return NULL;
+    return ub_metadata_get_or_create_set(key_name, dim);
 }
 
 /* ============================================================
@@ -186,6 +181,7 @@ static int ub_engine_resolve_element(void *ctx, void *element,
 static int ub_engine_init(void) {
     serverLog(LL_NOTICE, "Initializing UB Vector Engine");
     if (ub_client_init(&server.ub) != C_OK) return C_ERR;
+    if (ub_metadata_init() != C_OK) return C_ERR;
 
     /* Pre-load the embedding table once */
     if (ub_client_load_embedding_table(server.ub.table_name, &ub_cached_addr_space) != C_OK
@@ -199,6 +195,7 @@ static int ub_engine_init(void) {
 
 static void ub_engine_cleanup(void) {
     ub_cached_addr_space = NULL;  /* owned by ub_client, freed in ub_client_cleanup */
+    ub_metadata_cleanup();
     ub_client_cleanup();
     serverLog(LL_NOTICE, "Cleaning up UB Vector Engine");
 }
@@ -207,22 +204,38 @@ static int ub_engine_vadd(void *ctx, void *key, vector_data_t *vector,
                           void *element, void *attributes) {
     ub_mem_config_t *cfg = &server.ub;
     ub_address_space_t *addr_space = ub_engine_get_addr_space();
-    uint64_t index = 0;
+    ub_vector_set_meta_t *set = NULL;
+    uint64_t row_id = 0;
+    int row_created = 0;
+    sds key_tmp = NULL;
     sds element_tmp = NULL;
     int rc = C_ERR;
 
-    UNUSED(attributes); UNUSED(key);
+    UNUSED(attributes);
 
     if (!addr_space) return C_ERR;
     if (!vector || cfg->vector_dimension <= 0) return C_ERR;
     if (vector->dim != (size_t)cfg->vector_dimension) return C_ERR;
 
-    if (ub_engine_resolve_element(ctx, element, &index, &element_tmp) != C_OK) goto cleanup;
-    if (ub_client_store_single(addr_space, index, vector->data, vector->dim) != C_OK) goto cleanup;
+    set = ub_engine_get_or_create_set_meta(key, vector->dim, &key_tmp);
+    if (!set) goto cleanup;
+    const char *element_name = ctx ? ub_engine_object_to_cstring(element, &element_tmp)
+                                   : (const char *)element;
+    if (!element_name) goto cleanup;
+    if (ub_metadata_lookup_row(set, element_name, &row_id) != C_OK) {
+        if (ub_metadata_alloc_row(set, element_name, &row_id) != C_OK) goto cleanup;
+        row_created = 1;
+    }
+    if (ub_client_store_single(addr_space, row_id, vector->data, vector->dim) != C_OK) goto cleanup;
 
     rc = C_OK;
 
 cleanup:
+    if (rc != C_OK && row_created && set) {
+        const char *element_name = element_tmp ? element_tmp : (const char *)element;
+        if (element_name) ub_metadata_remove_row(set, element_name, NULL);
+    }
+    sdsfree(key_tmp);
     sdsfree(element_tmp);
     return rc;
 }
@@ -230,44 +243,61 @@ cleanup:
 static int ub_engine_vrem(void *ctx, void *key, void *element) {
     ub_mem_config_t *cfg = &server.ub;
     ub_address_space_t *addr_space = ub_engine_get_addr_space();
-    uint64_t index = 0;
+    ub_vector_set_meta_t *set = NULL;
+    uint64_t row_id = 0;
+    sds key_tmp = NULL;
     sds element_tmp = NULL;
     float *zero_buf = NULL;
     int rc = C_ERR;
 
-    UNUSED(key);
-
     if (!addr_space || cfg->vector_dimension <= 0) return C_ERR;
 
-    if (ub_engine_resolve_element(ctx, element, &index, &element_tmp) != C_OK) goto cleanup;
+    set = ub_engine_lookup_set_meta(key, &key_tmp);
+    if (!set) goto cleanup;
+    const char *element_name = ctx ? ub_engine_object_to_cstring(element, &element_tmp)
+                                   : (const char *)element;
+    if (!element_name) goto cleanup;
+    if (ub_metadata_remove_row(set, element_name, &row_id) != C_OK) goto cleanup;
 
     /* Allocate zero-filled buffer for soft delete */
     zero_buf = zcalloc((size_t)cfg->vector_dimension * sizeof(float));
     if (!zero_buf) goto cleanup;
 
-    if (ub_client_store_single(addr_space, index,
+    if (ub_client_store_single(addr_space, row_id,
                               zero_buf, (size_t)cfg->vector_dimension) != C_OK) goto cleanup;
 
     rc = C_OK;
 
 cleanup:
     zfree(zero_buf);
+    sdsfree(key_tmp);
     sdsfree(element_tmp);
     return rc;
 }
 
-// TODO: brute-force full-table scan for now, needs optimization
+/*
+ * WARNING:
+ * ub_engine_vsim() is currently implemented as a score-only similarity kernel.
+ * It computes one similarity score for every active row under the specified key
+ * and returns the full result list. The `count` parameter is intentionally
+ * ignored here. Any top-k selection, thresholding, or ranking policy must be
+ * implemented by the caller or by a later proxy/supernode stage.
+ */
 static int ub_engine_vsim(void *ctx, void *key, vector_data_t *query_vector,
                           size_t count, vector_query_result_t **results,
                           size_t *num_results) {
     ub_mem_config_t *cfg = &server.ub;
     ub_address_space_t *addr_space = ub_engine_get_addr_space();
     float *candidates_buf = NULL;
-    vsim_candidate_t *candidates = NULL;
-    size_t dim, capacity, result_count;
+    uint64_t *rows = NULL;
+    sds *elements = NULL;
+    ub_vector_set_meta_t *set = NULL;
+    sds key_tmp = NULL;
+    size_t dim, row_count;
     int rc = C_ERR;
 
-    UNUSED(ctx); UNUSED(key);
+    UNUSED(ctx);
+    UNUSED(count);
 
     RETURN_IF(!query_vector || !results || !num_results || !addr_space, C_ERR);
 
@@ -276,51 +306,54 @@ static int ub_engine_vsim(void *ctx, void *key, vector_data_t *query_vector,
 
     if (addr_space->vector_stride_bytes == 0) return C_ERR;
 
-    capacity = addr_space->size / addr_space->vector_stride_bytes;
-    if (capacity == 0) {
+    set = ub_engine_lookup_set_meta(key, &key_tmp);
+    if (!set) {
         *num_results = 0;
         *results = NULL;
         return C_OK;
     }
 
-    /* Allocate temporary buffers — no indices array needed */
-    candidates_buf = zmalloc(capacity * dim * sizeof(float));
-    candidates = zmalloc(capacity * sizeof(vsim_candidate_t));
-    if (!candidates_buf || !candidates) goto cleanup;
-
-    /* Contiguous load: all rows starting from index 0 */
-    if (ub_client_perform_contiguous_load(addr_space, 0, capacity,
-                                          candidates_buf, dim) != C_OK) {
+    row_count = ub_metadata_collect_rows(set, &rows, &elements);
+    if (row_count == 0) {
+        *num_results = 0;
+        *results = NULL;
         goto cleanup;
     }
 
-    /* Compute cosine similarity for each candidate */
-    for (size_t i = 0; i < capacity; i++) {
-        candidates[i].index = (uint64_t)i;
-        candidates[i].score = cosine_similarity_f32(query_vector->data,
-                                                    candidates_buf + i * dim,
-                                                    dim);
+    /*
+     * Load all rows for the current key into a contiguous buffer and compute
+     * one similarity score per row. This path intentionally does not do top-k
+     * selection; it acts as a pure similarity-compute kernel.
+     */
+    candidates_buf = zmalloc(row_count * dim * sizeof(float));
+    if (!candidates_buf) goto cleanup;
+
+    if (ub_client_perform_gather_load(addr_space, rows, row_count,
+                                      candidates_buf, dim) != C_OK) {
+        goto cleanup;
     }
 
-    /* Sort by score descending */
-    qsort(candidates, capacity, sizeof(vsim_candidate_t), vsim_score_cmp);
-
-    /* Build top-k results */
-    result_count = count < capacity ? count : capacity;
-    *results = vector_query_result_create(result_count);
+    *results = vector_query_result_create(row_count);
     if (!*results) goto cleanup;
 
-    for (size_t i = 0; i < result_count; i++) {
-        (*results)[i].element = sdscatprintf(sdsempty(), "%" PRIu64, candidates[i].index);
-        (*results)[i].score = (double)candidates[i].score;
+    for (size_t i = 0; i < row_count; i++) {
+        (*results)[i].element = sdsdup(elements[i]);
+        (*results)[i].score = (double)cosine_similarity_f32(query_vector->data,
+                                                            candidates_buf + i * dim,
+                                                            dim);
         (*results)[i].attributes = NULL;
     }
-    *num_results = result_count;
+    *num_results = row_count;
     rc = C_OK;
 
 cleanup:
     zfree(candidates_buf);
-    zfree(candidates);
+    zfree(rows);
+    if (elements) {
+        for (size_t i = 0; i < row_count; i++) sdsfree(elements[i]);
+        zfree(elements);
+    }
+    sdsfree(key_tmp);
     return rc;
 }
 
@@ -328,22 +361,36 @@ cleanup:
 int ub_engine_vemb(void *ctx, void *key, void *element, vector_data_t *result) {
     ub_mem_config_t *cfg = &server.ub;
     ub_address_space_t *addr_space = ub_engine_get_addr_space();
-    uint64_t index = 0;
+    ub_vector_set_meta_t *set = NULL;
+    uint64_t row_id = 0;
+    sds key_tmp = NULL;
     sds element_tmp = NULL;
     int rc = C_ERR;
 
-    UNUSED(key);
-
     if (!result || !addr_space || cfg->vector_dimension <= 0) return C_ERR;
 
-    if (ub_engine_resolve_element(ctx, element, &index, &element_tmp) != C_OK) goto cleanup;
+    set = ub_engine_lookup_set_meta(key, &key_tmp);
+    if (!set) {
+        rc = C_OK;
+        goto cleanup;
+    }
+    const char *element_name = ctx ? ub_engine_object_to_cstring(element, &element_tmp)
+                                   : (const char *)element;
+    if (!element_name) {
+        rc = C_OK;
+        goto cleanup;
+    }
+    if (ub_metadata_lookup_row(set, element_name, &row_id) != C_OK) {
+        rc = C_OK;
+        goto cleanup;
+    }
 
-    result->dim = (size_t)cfg->vector_dimension;
+    result->dim = set->dim;
     result->is_fp32 = 1;
     result->data = zmalloc(sizeof(float) * result->dim);
     if (!result->data) goto cleanup;
 
-    if (ub_client_load_single(addr_space, index,
+    if (ub_client_load_single(addr_space, row_id,
                              result->data, result->dim) != C_OK) {
         zfree(result->data);
         result->data = NULL;
@@ -354,22 +401,31 @@ int ub_engine_vemb(void *ctx, void *key, void *element, vector_data_t *result) {
     rc = C_OK;
 
 cleanup:
+    sdsfree(key_tmp);
     sdsfree(element_tmp);
     return rc;
 }
 
 static int ub_engine_vcard(void *ctx, void *key) {
-    ub_address_space_t *addr_space = ub_engine_get_addr_space();
+    ub_vector_set_meta_t *set;
+    sds key_tmp = NULL;
 
-    UNUSED(ctx); UNUSED(key);
+    UNUSED(ctx);
 
-    if (!addr_space || addr_space->vector_stride_bytes == 0) return 0;
-    return (int)(addr_space->size / addr_space->vector_stride_bytes);
+    set = ub_engine_lookup_set_meta(key, &key_tmp);
+    sdsfree(key_tmp);
+    return set ? (int)ub_metadata_cardinality(set) : 0;
 }
 
 static int ub_engine_vdim(void *ctx, void *key) {
-    UNUSED(ctx); UNUSED(key);
-    return server.ub.vector_dimension > 0 ? server.ub.vector_dimension : 0;
+    ub_vector_set_meta_t *set;
+    sds key_tmp = NULL;
+
+    UNUSED(ctx);
+
+    set = ub_engine_lookup_set_meta(key, &key_tmp);
+    sdsfree(key_tmp);
+    return set ? (int)set->dim : (server.ub.vector_dimension > 0 ? server.ub.vector_dimension : 0);
 }
 
 static int ub_engine_set_config(const char *key, const char *value) {

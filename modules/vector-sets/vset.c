@@ -760,8 +760,28 @@ int VADD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
      * before CAS branch. UB path does not support CAS threaded insert. */
     vector_engine_t *ve = vector_engine_get();
     if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vadd) {
+        if (attrib) {
+            RedisModule_Free(vec);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support SETATTR");
+        }
+        if (cas) {
+            RedisModule_Free(vec);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support CAS");
+        }
+        if (reduce_dim) {
+            RedisModule_Free(vec);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support REDUCE");
+        }
+        if (quant_type != HNSW_QUANT_Q8) {
+            RedisModule_Free(vec);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine only supports default FP32/VALUES path");
+        }
         vector_data_t vd = { .data = vec, .dim = dim, .is_fp32 = 1 };
-        int ret = ve->vadd(ctx, key, &vd, val, attrib);
+        int ret = ve->vadd(ctx, argv[1], &vd, val, attrib);
         RedisModule_Free(vec);
         if (ret == C_OK) {
             RedisModule_ReplyWithBool(ctx, 1);
@@ -1147,10 +1167,33 @@ int VSIM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
      * execution. UB path handles search internally. */
     vector_engine_t *ve = vector_engine_get();
     if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vsim) {
+        if (withattribs) {
+            RedisModule_Free(vec);
+            if (filter_expr) exprFree(filter_expr);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support WITHATTRIBS");
+        }
+        if (ground_truth) {
+            RedisModule_Free(vec);
+            if (filter_expr) exprFree(filter_expr);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support TRUTH");
+        }
+        if (filter_expr || filter_ef > 0) {
+            RedisModule_Free(vec);
+            if (filter_expr) exprFree(filter_expr);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support FILTER");
+        }
+        if (ef > 0) {
+            RedisModule_Free(vec);
+            return RedisModule_ReplyWithError(ctx,
+                "ERR UB engine does not support EF");
+        }
         vector_data_t query_vd = { .data = vec, .dim = dim, .is_fp32 = 1 };
         vector_query_result_t *results = NULL;
         size_t num_results = 0;
-        int ret = ve->vsim(ctx, key, &query_vd, (size_t)count,
+        int ret = ve->vsim(ctx, argv[1], &query_vd, (size_t)count,
                            &results, &num_results);
         if (ret != C_OK) {
             RedisModule_Free(vec);
@@ -1413,10 +1456,13 @@ int VEMB_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         ve->vemb) {
 
         vector_data_t result = {0};
-        int ub_ret = ve->vemb(ctx, key, element, &result);
+        int ub_ret = ve->vemb(ctx, argv[1], element, &result);
 
-        if (ub_ret != C_OK || !result.data) {
+        if (ub_ret != C_OK) {
             return RedisModule_ReplyWithError(ctx, "ERR UB engine vemb failed");
+        }
+        if (!result.data) {
+            return RedisModule_ReplyWithNull(ctx);
         }
 
         if (raw_output) {
