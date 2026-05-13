@@ -122,8 +122,11 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	@echo "✅ Built: $@"
 
 # Ring buffer unit test
-ring_buffer_ut: ring_buffer_ut.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -o $@ $< -pthread -lm
+ring_buffer_ut: ring_buffer_ut.c test_runtime_shim.c ../src/ring_buffer.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c $< ../src/ring_buffer.c -pthread -lm
 	@echo "✅ Built: $@"
 
 ring_buffer_batch_bench: ring_buffer_batch_bench.c

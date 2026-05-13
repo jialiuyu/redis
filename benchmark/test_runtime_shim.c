@@ -38,6 +38,7 @@ void _serverLog(int level, const char *fmt, ...) {
     (void)fmt;
 }
 
+#ifndef TEST_RUNTIME_WITH_SERVER
 void serverLog(int level, const char *fmt, ...) {
     va_list ap;
 
@@ -47,6 +48,7 @@ void serverLog(int level, const char *fmt, ...) {
     fputc('\n', stderr);
     va_end(ap);
 }
+#endif
 
 void serverLogFromHandler(int level, const char *fmt, ...) {
     (void)level;
