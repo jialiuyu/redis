@@ -1,80 +1,11 @@
 #include <assert.h>
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/time.h>
 #include <time.h>
 
-#include "../src/server.h"
-
-struct redisServer server = {0};
-
-void _serverLog(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-void serverLogFromHandler(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-long long ustime(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
-}
-
-mstime_t mstime(void) {
-    return ustime() / 1000;
-}
-
-void *zmalloc(size_t size) {
-    return malloc(size ? size : 1);
-}
-
-void *zcalloc(size_t size) {
-    return calloc(1, size ? size : 1);
-}
-
-void zfree(void *ptr) {
-    free(ptr);
-}
-
-char *zstrdup(const char *s) {
-    if (!s) return NULL;
-    size_t len = strlen(s) + 1;
-    char *out = malloc(len);
-    if (!out) return NULL;
-    memcpy(out, s, len);
-    return out;
-}
-
-sds sdsempty(void) {
-    return zstrdup("");
-}
-
-sds sdscat(sds s, const char *t) {
-    size_t slen = strlen(s);
-    size_t tlen = strlen(t);
-    s = realloc(s, slen + tlen + 1);
-    assert(s != NULL);
-    memcpy(s + slen, t, tlen + 1);
-    return s;
-}
-
-sds sdscatprintf(sds s, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    char buf[1024];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    return sdscat(s, buf);
-}
+#include "test_runtime_shim.h"
 
 #include "../src/consistent_hash.c"
 #include "../src/proxy_router.c"

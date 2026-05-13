@@ -6,54 +6,6 @@
 #include <time.h>
 
 #include "../src/server.h"
-
-void _serverLog(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-void serverLogFromHandler(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-void _serverPanic(const char *file, int line, const char *fmt, ...) {
-    (void)file;
-    (void)line;
-    (void)fmt;
-    abort();
-}
-
-void bugReportStart(void) {
-}
-
-void _serverAssert(const char *estr, const char *file, int line) {
-    fprintf(stderr, "assertion failed: %s (%s:%d)\n", estr, file, line);
-    abort();
-}
-
-void *zmalloc(size_t size) {
-    return malloc(size ? size : 1);
-}
-
-void *zcalloc(size_t size) {
-    return calloc(1, size ? size : 1);
-}
-
-void zfree(void *ptr) {
-    free(ptr);
-}
-
-char *zstrdup(const char *s) {
-    size_t len = strlen(s) + 1;
-    char *out = malloc(len);
-    if (!out) {
-        return NULL;
-    }
-    memcpy(out, s, len);
-    return out;
-}
-
 #include "../src/monotonic.c"
 
 static uint64_t ustime_gettimeofday(void) {

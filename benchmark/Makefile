@@ -134,11 +134,12 @@ ring_buffer_compare_bench: ring_buffer_compare_bench.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -o $@ $< -pthread -lm
 	@echo "✅ Built: $@"
 
-proxy_components_ut: proxy_components_ut.c ../src/consistent_hash.c ../src/proxy_router.c ../src/proxy_flush_scheduler.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/ring_buffer.c
-	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 \
+proxy_components_ut: proxy_components_ut.c test_runtime_shim.c ../src/consistent_hash.c ../src/proxy_router.c ../src/proxy_flush_scheduler.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/ring_buffer.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
 		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
 		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
 		-o $@ \
+		test_runtime_shim.c \
 		proxy_components_ut.c \
 		../src/consistent_hash.c \
 		../src/proxy_router.c \
@@ -149,25 +150,25 @@ proxy_components_ut: proxy_components_ut.c ../src/consistent_hash.c ../src/proxy
 		-lpthread -lm
 	@echo "✅ Built: $@"
 
-proxy_scheduler_ut: proxy_scheduler_ut.c
-	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 \
+proxy_scheduler_ut: proxy_scheduler_ut.c test_runtime_shim.c ../src/ring_buffer_mgr.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
 		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
 		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
-		-o $@ $< -lpthread -lm
+		-o $@ test_runtime_shim.c $< ../src/ring_buffer_mgr.c -lpthread -lm
 	@echo "✅ Built: $@"
 
-proxy_aggregator_ut: proxy_aggregator_ut.c
-	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 \
+proxy_aggregator_ut: proxy_aggregator_ut.c test_runtime_shim.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
 		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
 		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
-		-o $@ proxy_aggregator_ut.c -lpthread -lm
+		-o $@ test_runtime_shim.c proxy_aggregator_ut.c -lpthread -lm
 	@echo "✅ Built: $@"
 
-monotonic_clock_bench: monotonic_clock_bench.c
-	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 \
+monotonic_clock_bench: monotonic_clock_bench.c test_runtime_shim.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
 		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
 		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
-		-o $@ $< -lpthread -lm
+		-o $@ test_runtime_shim.c $< -lpthread -lm
 	@echo "✅ Built: $@"
 
 # Scatter/Gather vs Baseline benchmark
@@ -221,8 +222,8 @@ ifeq ($(USE_SVE),yes)
     UB_UT_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
 endif
 
-ub_client_ut: $(UB_UT_SRCS)
-	$(CC) $(UB_UT_CFLAGS) -o $@ $(UB_UT_SRCS) $(UB_UT_LIBS)
+ub_client_ut: test_runtime_shim.c $(UB_UT_SRCS)
+	$(CC) $(UB_UT_CFLAGS) -o $@ test_runtime_shim.c $(UB_UT_SRCS) $(UB_UT_LIBS)
 	@echo "✅ Built: $@"
 
 .PHONY: ub_client_ut
@@ -242,8 +243,8 @@ ifeq ($(USE_SVE),yes)
     SVE_GATHER_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
 endif
 
-sve_gather_ub_bench: $(SVE_GATHER_SRCS)
-	$(CC) $(SVE_GATHER_CFLAGS) -o $@ $(SVE_GATHER_SRCS) $(SVE_GATHER_LIBS)
+sve_gather_ub_bench: test_runtime_shim.c $(SVE_GATHER_SRCS)
+	$(CC) $(SVE_GATHER_CFLAGS) -o $@ test_runtime_shim.c $(SVE_GATHER_SRCS) $(SVE_GATHER_LIBS)
 	@echo "✅ Built: $@"
 
 .PHONY: sve_gather_ub_bench

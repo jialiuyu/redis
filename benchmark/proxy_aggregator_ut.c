@@ -1,86 +1,10 @@
 #include <assert.h>
-#include <stdarg.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 
-#include "../src/server.h"
-
-struct redisServer server = {0};
-
-void _serverLog(int level, const char *fmt, ...) {
-    va_list ap;
-    (void)level;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-}
-
-void serverLogFromHandler(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-long long ustime(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
-}
-
-mstime_t mstime(void) {
-    return ustime() / 1000;
-}
-
-void *zmalloc(size_t size) {
-    return malloc(size ? size : 1);
-}
-
-void *zcalloc(size_t size) {
-    return calloc(1, size ? size : 1);
-}
-
-void zfree(void *ptr) {
-    free(ptr);
-}
-
-char *zstrdup(const char *s) {
-    if (!s) return NULL;
-    size_t len = strlen(s) + 1;
-    char *out = malloc(len);
-    if (!out) return NULL;
-    memcpy(out, s, len);
-    return out;
-}
-
-sds sdsempty(void) {
-    return zstrdup("");
-}
-
-sds sdscat(sds s, const char *t) {
-    size_t slen = strlen(s);
-    size_t tlen = strlen(t);
-    s = realloc(s, slen + tlen + 1);
-    assert(s != NULL);
-    memcpy(s + slen, t, tlen + 1);
-    return s;
-}
-
-sds sdscatprintf(sds s, const char *fmt, ...) {
-    va_list ap;
-    char buf[2048];
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    return sdscat(s, buf);
-}
-
-void sdsfree(sds s) {
-    free(s);
-}
+#include "test_runtime_shim.h"
 
 #include "../src/consistent_hash.c"
 #include "../src/proxy_router.c"
@@ -93,7 +17,7 @@ void sdsfree(sds s) {
 #include "../src/proxy_aggregator.c"
 
 static void reset_server_proxy(int workers, int batch_limit, int time_limit_us, int max_supernodes) {
-    memset(&server, 0, sizeof(server));
+    test_runtime_reset_server();
     server.supernode_workers = workers;
     server.proxy.batch_limit = batch_limit;
     server.proxy.time_limit_us = time_limit_us;

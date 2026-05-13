@@ -22,7 +22,6 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <inttypes.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,71 +36,7 @@
 #include "../deps/libobmm/obmm_ownership.h"
 #endif
 
-/* ============================================================
- * Standalone stubs (same pattern as ub_client_ut.c)
- * ============================================================ */
-
-void serverLog(int level, const char *fmt, ...)
-{
-    va_list ap;
-    (void)level;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-}
-
-void *zcalloc(size_t size) { return calloc(1, size); }
-void zfree(void *ptr)      { free(ptr); }
-
-sds sdsempty(void)
-{
-    char *buf = malloc(1);
-    if (!buf) return NULL;
-    buf[0] = '\0';
-    return buf;
-}
-
-sds sdsnew(const char *init)
-{
-    size_t len = init ? strlen(init) : 0;
-    char *buf = malloc(len + 1);
-    if (!buf) return NULL;
-    if (len) memcpy(buf, init, len);
-    buf[len] = '\0';
-    return buf;
-}
-
-sds sdscat(sds s, const char *t)
-{
-    size_t slen = s ? strlen(s) : 0;
-    size_t tlen = t ? strlen(t) : 0;
-    char *buf = realloc(s, slen + tlen + 1);
-    if (!buf) { free(s); return NULL; }
-    if (tlen) memcpy(buf + slen, t, tlen);
-    buf[slen + tlen] = '\0';
-    return buf;
-}
-
-sds sdscatprintf(sds s, const char *fmt, ...)
-{
-    va_list ap, ap_copy;
-    int needed;
-    size_t slen = s ? strlen(s) : 0;
-    char *buf;
-
-    va_start(ap, fmt);
-    va_copy(ap_copy, ap);
-    needed = vsnprintf(NULL, 0, fmt, ap_copy);
-    va_end(ap_copy);
-    if (needed < 0) { va_end(ap); free(s); return NULL; }
-
-    buf = realloc(s, slen + (size_t)needed + 1);
-    if (!buf) { va_end(ap); free(s); return NULL; }
-    vsnprintf(buf + slen, (size_t)needed + 1, fmt, ap);
-    va_end(ap);
-    return buf;
-}
+#include "test_runtime_shim.h"
 
 /* ============================================================
  * Benchmark configuration

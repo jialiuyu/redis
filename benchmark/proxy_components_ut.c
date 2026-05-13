@@ -1,59 +1,16 @@
 #include <assert.h>
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
-#include "../src/server.h"
+#include "test_runtime_shim.h"
 #include "../src/consistent_hash.h"
 #include "../src/proxy_router.h"
 #include "../src/proxy_flush_scheduler.h"
 #include "../src/proxy_batch_bucket.h"
 #include "../src/proxy_flush_executor.h"
 #include "../src/ring_buffer.h"
-
-struct redisServer server = {0};
-
-void _serverLog(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-void serverLogFromHandler(int level, const char *fmt, ...) {
-    (void)level;
-    (void)fmt;
-}
-
-long long ustime(void) {
-    return 1000000;
-}
-
-mstime_t mstime(void) {
-    return 1000;
-}
-
-void *zmalloc(size_t size) {
-    return malloc(size ? size : 1);
-}
-
-void *zcalloc(size_t size) {
-    return calloc(1, size ? size : 1);
-}
-
-void zfree(void *ptr) {
-    free(ptr);
-}
-
-char *zstrdup(const char *s) {
-    if (!s) return NULL;
-    size_t len = strlen(s) + 1;
-    char *out = malloc(len);
-    if (!out) return NULL;
-    memcpy(out, s, len);
-    return out;
-}
 
 static ring_buffer_t *test_rb_create(size_t size) {
     ring_buffer_t *rb = calloc(1, sizeof(*rb));
