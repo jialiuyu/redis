@@ -2,7 +2,7 @@
 
 ## 概述
 
-本实现基于设计文档 `UB_SVE-redis.pdf` 和 `design.md`，实现了一个 240 亿 IOPS 的极高性能全用户态批处理架构。
+本实现基于设计文档 `UB_SVE-redis.pdf` 和 `docs/design.md`，实现了一个 240 亿 IOPS 的极高性能全用户态批处理架构。
 
 ### 核心设计
 
@@ -107,7 +107,7 @@ redis/src/
 redis/
 ├── UB_SVE_INTEGRATION_README.md  # 本文档
 ├── test_ub_sve_integration.sh    # 集成测试脚本
-└── design.md                     # 设计文档
+└── docs/design.md                # 设计文档
 ```
 
 ## 编译和构建
@@ -323,7 +323,7 @@ make test
 ## 参考文档
 
 - `UB_SVE-redis.pdf` - 原始设计文档
-- `design.md` - 最新方案细化
+- `docs/design.md` - 最新方案细化
 - `detail_proxy_sve_2layerbutin_onemachine.pdf` - 详细设计
 
 ## 联系方式

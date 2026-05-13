@@ -230,7 +230,7 @@ cat SUPERNODE_REAL_RESULTS.md
 cat REDIS_BASELINE_RESULTS.md
 
 # 最终总结
-cat FINAL_SUMMARY.md
+cat ../docs/benchmark/FINAL_SUMMARY.md
 ```
 
 ## 命令行参数
@@ -409,7 +409,7 @@ make supernode_real_benchmark
 1. 阅读详细文档:
    - [COMPARISON_REPORT.md](COMPARISON_REPORT.md) - 完整对比报告
    - [SUPERNODE_REAL_RESULTS.md](SUPERNODE_REAL_RESULTS.md) - SuperNode 详细结果
-   - [FINAL_SUMMARY.md](FINAL_SUMMARY.md) - 最终总结
+   - [FINAL_SUMMARY.md](../docs/benchmark/FINAL_SUMMARY.md) - 最终总结
 
 2. 尝试不同配置:
    - 调整批量大小
@@ -430,7 +430,7 @@ make supernode_real_benchmark
 
 如有问题，请查看:
 - [README.md](README.md) - 项目概述
-- [BENCHMARK_COMPLETION_SUMMARY.md](BENCHMARK_COMPLETION_SUMMARY.md) - 完成总结
+- [BENCHMARK_COMPLETION_SUMMARY.md](../docs/benchmark/BENCHMARK_COMPLETION_SUMMARY.md) - 完成总结
 
 ---
 

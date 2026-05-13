@@ -2,7 +2,7 @@
 
 ## 工作概述
 
-根据设计文档 `UB_SVE-redis.pdf` 和 `design.md`，已完成 Redis 前端批量请求聚合 + UB.mem 共享内存池 + SVE2 向量计算的超高性能架构的**完整代码实现**。
+根据设计文档 `UB_SVE-redis.pdf` 和 `docs/design.md`，已完成 Redis 前端批量请求聚合 + UB.mem 共享内存池 + SVE2 向量计算的超高性能架构的**完整代码实现**。
 
 ## 完成时间
 

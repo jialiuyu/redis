@@ -26,8 +26,8 @@ This document summarizes all completed work on the Redis UB+SVE benchmark suite.
 ### Files Created/Modified
 - `redis/benchmark/redis_traditional_benchmark.c` - Real Redis client
 - `redis/benchmark/REDIS_BASELINE_RESULTS.md` - Results analysis
-- `redis/benchmark/REDIS_BASELINE_IMPLEMENTATION.md` - Implementation details
-- `redis/benchmark/QUICKSTART_REDIS_BASELINE.md` - Quick start guide
+- `docs/benchmark/REDIS_BASELINE_IMPLEMENTATION.md` - Implementation details
+- `docs/benchmark/QUICKSTART_REDIS_BASELINE.md` - Quick start guide
 - `redis/benchmark/Makefile` - Build system
 
 ---
@@ -61,8 +61,8 @@ This document summarizes all completed work on the Redis UB+SVE benchmark suite.
 - `redis/benchmark/supernode_real_benchmark.c` - Client implementation
 - `redis/benchmark/SUPERNODE_REAL_RESULTS.md` - Results analysis
 - `redis/benchmark/COMPARISON_REPORT.md` - Detailed comparison
-- `redis/benchmark/FINAL_SUMMARY.md` - Executive summary
-- `redis/benchmark/QUICKSTART_SUPERNODE.md` - Quick start guide
+- `docs/benchmark/FINAL_SUMMARY.md` - Executive summary
+- `docs/benchmark/QUICKSTART_SUPERNODE.md` - Quick start guide
 
 ---
 
@@ -144,7 +144,7 @@ int sve_detect_capabilities(sve_context_t *ctx);
 - `redis/benchmark/sve_compute_standalone.c` - Real SVE2 implementation
 - `redis/benchmark/supernode_benchmark.c` - Uses real SVE2
 - `redis/benchmark/Makefile` - SVE2 compilation support
-- `redis/benchmark/SVE2_REAL_IMPLEMENTATION_COMPLETE.md` - Documentation
+- `docs/benchmark/SVE2_REAL_IMPLEMENTATION_COMPLETE.md` - Documentation
 
 ---
 
@@ -189,23 +189,23 @@ make benchmark
 ## Documentation
 
 ### Quick Start Guides
-- `QUICKSTART_REDIS_BASELINE.md` - Redis setup
-- `QUICKSTART_SUPERNODE.md` - SuperNode setup
-- `COMPLETE_BENCHMARK_GUIDE.md` - Complete guide
+- `docs/benchmark/QUICKSTART_REDIS_BASELINE.md` - Redis setup
+- `docs/benchmark/QUICKSTART_SUPERNODE.md` - SuperNode setup
+- `docs/benchmark/COMPLETE_BENCHMARK_GUIDE.md` - Complete guide
 
 ### Implementation Details
-- `REDIS_BASELINE_IMPLEMENTATION.md` - Redis implementation
-- `SVE2_REAL_IMPLEMENTATION_COMPLETE.md` - SVE2 implementation
+- `docs/benchmark/REDIS_BASELINE_IMPLEMENTATION.md` - Redis implementation
+- `docs/benchmark/SVE2_REAL_IMPLEMENTATION_COMPLETE.md` - SVE2 implementation
 
 ### Results and Analysis
 - `REDIS_BASELINE_RESULTS.md` - Redis results
 - `SUPERNODE_REAL_RESULTS.md` - SuperNode results
 - `COMPARISON_REPORT.md` - Detailed comparison
-- `FINAL_SUMMARY.md` - Executive summary
+- `docs/benchmark/FINAL_SUMMARY.md` - Executive summary
 
 ### Main Documentation
 - `README.md` - Overview and usage (Chinese)
-- `BENCHMARK_COMPLETION_SUMMARY.md` - Completion summary
+- `docs/benchmark/BENCHMARK_COMPLETION_SUMMARY.md` - Completion summary
 
 ---
 

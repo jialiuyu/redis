@@ -156,7 +156,7 @@ redis/
 ├── UB_SVE_INTEGRATION_README.md    # 完整集成文档
 ├── IMPLEMENTATION_SUMMARY.md       # 实现总结
 │
-├── design.md                       # 设计文档
+├── docs/design.md                  # 设计文档
 ├── UB_SVE-redis.pdf               # 原始设计文档
 └── detail_proxy_sve_2layerbutin_onemachine.pdf  # 详细设计
 ```
@@ -408,7 +408,7 @@ sudo sysctl -w kernel.shmall=4194304
 ### 设计文档
 
 - `UB_SVE-redis.pdf` - 原始设计文档
-- `design.md` - 最新方案细化
+- `docs/design.md` - 最新方案细化
 - `detail_proxy_sve_2layerbutin_onemachine.pdf` - 详细设计
 
 ### 实现文档

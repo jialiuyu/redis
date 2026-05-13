@@ -160,7 +160,7 @@ make redis_traditional_benchmark
 
 ### 新增的文件
 - `redis/benchmark/REDIS_BASELINE_RESULTS.md` - 详细测试结果
-- `redis/benchmark/REDIS_BASELINE_IMPLEMENTATION.md` - 实现总结（本文件）
+- `docs/benchmark/REDIS_BASELINE_IMPLEMENTATION.md` - 实现总结（本文件）
 - `redis/benchmark/test_redis_baseline.sh` - 自动化测试脚本
 - `redis/benchmark/results/redis_baseline_10M.txt` - 10M 查询测试结果
 

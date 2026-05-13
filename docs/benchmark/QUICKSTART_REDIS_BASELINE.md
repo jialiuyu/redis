@@ -218,7 +218,7 @@ Max: 194879.26 μs (很高的最大延迟)
 ## 相关文档
 
 - [REDIS_BASELINE_RESULTS.md](REDIS_BASELINE_RESULTS.md) - 详细测试结果
-- [REDIS_BASELINE_IMPLEMENTATION.md](REDIS_BASELINE_IMPLEMENTATION.md) - 实现细节
+- [REDIS_BASELINE_IMPLEMENTATION.md](../docs/benchmark/REDIS_BASELINE_IMPLEMENTATION.md) - 实现细节
 - [README.md](README.md) - Benchmark 套件总览
 
 ## 联系方式
