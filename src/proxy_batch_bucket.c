@@ -103,6 +103,15 @@ int proxy_batch_bucket_append(proxy_batch_bucket_t *bucket, proxy_request_t *req
 
 size_t proxy_batch_bucket_packet_size(const proxy_batch_bucket_t *bucket) {
     RETURN_IF(!bucket || bucket->count == 0, 0);
+    if (bucket->count == 1 &&
+        bucket->requests[0] &&
+        bucket->requests[0]->owner &&
+        bucket->requests[0]->owner->op_type == PROXY_VECTOR_OP_VSIM) {
+        proxy_vector_request_t *owner = bucket->requests[0]->owner;
+        return sizeof(batch_vsim_packet_t) +
+               sizeof(float) * owner->query_dim +
+               sizeof(uint64_t) * owner->candidate_count;
+    }
     return sizeof(batch_packet_t) + bucket->count * sizeof(((batch_packet_t *)0)->requests[0]);
 }
 
@@ -112,6 +121,32 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
                                    uint64_t timestamp_us,
                                    uint64_t batch_id) {
     RETURN_IF(!bucket || !packet || packet_size < proxy_batch_bucket_packet_size(bucket), C_ERR);
+
+    if (bucket->count == 1 &&
+        bucket->requests[0] &&
+        bucket->requests[0]->owner &&
+        bucket->requests[0]->owner->op_type == PROXY_VECTOR_OP_VSIM) {
+        proxy_vector_request_t *owner = bucket->requests[0]->owner;
+        batch_vsim_packet_t *vsim = (batch_vsim_packet_t *)packet;
+        vsim->magic = BATCH_PACKET_MAGIC;
+        vsim->packet_size = (uint32_t)packet_size;
+        vsim->op_type = BATCH_PACKET_OP_VSIM;
+        vsim->flags = owner->withscores ? 1u : 0u;
+        vsim->supernode_id = bucket->target_supernode_id;
+        vsim->worker_id = bucket->target_worker_id;
+        vsim->timestamp_us = timestamp_us;
+        vsim->batch_id = batch_id;
+        vsim->request_id = owner->request_id;
+        vsim->query_dim = (uint32_t)owner->query_dim;
+        vsim->requested_count = (uint32_t)owner->requested_count;
+        vsim->candidate_count = (uint32_t)owner->candidate_count;
+        vsim->reserved = 0;
+        memcpy(vsim->payload, owner->query_vector, sizeof(float) * owner->query_dim);
+        memcpy((uint8_t *)(vsim->payload + owner->query_dim),
+               owner->candidate_rows,
+               sizeof(uint64_t) * owner->candidate_count);
+        return C_OK;
+    }
 
     packet->magic = BATCH_PACKET_MAGIC;
     packet->packet_size = packet_size;

@@ -1200,61 +1200,9 @@ int VSIM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
             return RedisModule_ReplyWithError(ctx,
                 "ERR UB engine does not support EF");
         }
-        vector_data_t query_vd = { .data = vec, .dim = dim, .is_fp32 = 1 };
-        vector_query_result_t *results = NULL;
-        size_t num_results = 0;
-        int ret = ve->vsim(ctx, argv[1], &query_vd, (size_t)count,
-                           &results, &num_results);
-        if (ret != C_OK) {
-            RedisModule_Free(vec);
-            if (filter_expr) exprFree(filter_expr);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine vsim failed");
-        }
-
-        /* Format results — mirror VSIM_execute reply structure. */
-        int resp3 = RedisModule_GetContextFlags(ctx) &
-                     REDISMODULE_CTX_FLAGS_RESP3;
-        int reply_with_map = resp3 && (withscores || withattribs);
-
-        if (reply_with_map)
-            RedisModule_ReplyWithMap(ctx, REDISMODULE_POSTPONED_LEN);
-        else
-            RedisModule_ReplyWithArray(ctx, REDISMODULE_POSTPONED_LEN);
-
-        long long arraylen = 0;
-        for (size_t i = 0; i < num_results; i++) {
-            RedisModule_ReplyWithStringBuffer(ctx, results[i].element,
-                                              sdslen(results[i].element));
-            arraylen++;
-
-            if (resp3 && withscores && withattribs)
-                RedisModule_ReplyWithArray(ctx, 2);
-
-            if (withscores) {
-                RedisModule_ReplyWithDouble(ctx, results[i].score);
-            }
-            if (withattribs) {
-                if (results[i].attributes)
-                    RedisModule_ReplyWithStringBuffer(ctx,
-                        results[i].attributes,
-                        sdslen(results[i].attributes));
-                else
-                    RedisModule_ReplyWithNull(ctx);
-            }
-        }
-
-        if (reply_with_map) {
-            RedisModule_ReplySetMapLength(ctx, arraylen);
-        } else {
-            int items_per_ele = 1 + withscores + withattribs;
-            RedisModule_ReplySetArrayLength(ctx, arraylen * items_per_ele);
-        }
-
-        vector_query_result_destroy(results, num_results);
-        RedisModule_Free(vec);
+        int ret = proxy_submit_vsim(ctx, argv[1], vec, dim, (size_t)count, withscores);
         if (filter_expr) exprFree(filter_expr);
-        return REDISMODULE_OK;
+        return ret;
     }
 
     int threaded_request = 1; // Run on a thread, by default.

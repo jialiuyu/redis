@@ -1439,6 +1439,19 @@ UB 路径改成：
 
 - `VSIM` 经由 `proxy -> supernode -> completion -> reply` 返回
 
+当前阶段范围约束：
+
+- 本阶段优先打通“相似度计算内核”链路，对齐 `ub_engine_vsim()` 当前职责：
+  - `query_vector + candidate_rows[] -> full score list`
+- 当前阶段不要求在 supernode 或 proxy 侧实现：
+  - top-k
+  - 排序
+  - `count` 裁剪
+  - `epsilon`/threshold 过滤
+  - 大结果专用传输优化
+- 也就是说，第一版 `VSIM` 只需要稳定返回完整分数结果集；
+  top-k、排序和裁剪逻辑统一作为后续 TODO 处理。
+
 ### 文件级 TODO
 
 #### `src/vector_proxy_request.h`
@@ -1507,6 +1520,7 @@ UB 路径改成：
   - `request_id`
   - `row_id + score`
 - element 名称、属性、RESP 格式化应留在 proxy / Redis module 侧完成。
+- top-k / 排序 / `count` 裁剪暂不在当前阶段实现，统一放到后续结果后处理阶段。
 
 #### `modules/vector-sets/vset.c`
 
@@ -1536,11 +1550,21 @@ UB 路径改成：
 - `static int supernode_process_vsim_batch(...);`
 - `static int supernode_vsim_topk(...);`
 
+其中：
+
+- `supernode_process_vsim_batch(...)` 属于当前阶段必需
+- `supernode_vsim_topk(...)` 明确属于后续优化 TODO，不属于当前阶段交付范围
+
 ### Phase 2B 验收
 
 - `VSIM` 经由 `proxy -> supernode` 返回正确结果
 - `WITHSCORES` 语义与同步版本一致
 - 多个并发 `VSIM` 能进入批次
+
+当前阶段补充说明：
+
+- 这里的“正确结果”以“完整分数结果集可返回”为准
+- 不以 top-k、排序、裁剪完成度作为当前阶段验收前置条件
 
 ## 11.4 Phase 3：`VADD` 写路径一致性
 

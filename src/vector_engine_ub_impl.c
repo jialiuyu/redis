@@ -32,6 +32,7 @@
 #include "vector_engine.h"
 #include "ub_client.h"
 #include "ub_metadata.h"
+#include "sve_compute.h"
 #include "sve_config.h"
 #include "zmalloc.h"
 #include "server.h"
@@ -48,73 +49,6 @@
 /* ============================================================
  * VSIM helper types and functions
  * ============================================================ */
-
-#ifdef USE_ARM_SVE
-/* SVE-optimized cosine similarity for ARM processors */
-static float cosine_similarity_f32_sve(const float *a, const float *b, size_t dim)
-{
-    svfloat32_t dot_vec = svdup_f32(0.0f);
-    svfloat32_t norm_a_vec = svdup_f32(0.0f);
-    svfloat32_t norm_b_vec = svdup_f32(0.0f);
-
-    size_t i = 0;
-    svbool_t pg;
-
-    /* Process vectors using SVE with predication for tail handling */
-    while (i < dim) {
-        pg = svwhilelt_b32(i, dim);
-
-        svfloat32_t va = svld1_f32(pg, &a[i]);
-        svfloat32_t vb = svld1_f32(pg, &b[i]);
-
-        /* Accumulate dot product: dot += a[i] * b[i] */
-        dot_vec = svmla_f32_m(pg, dot_vec, va, vb);
-
-        /* Accumulate squared norms: norm_a += a[i]^2, norm_b += b[i]^2 */
-        norm_a_vec = svmla_f32_m(pg, norm_a_vec, va, va);
-        norm_b_vec = svmla_f32_m(pg, norm_b_vec, vb, vb);
-
-        i += svcntw();
-    }
-
-    /* Horizontal reduction to get scalar results */
-    float dot = svaddv_f32(svptrue_b32(), dot_vec);
-    float norm_a = svaddv_f32(svptrue_b32(), norm_a_vec);
-    float norm_b = svaddv_f32(svptrue_b32(), norm_b_vec);
-
-    float denom = sqrtf(norm_a) * sqrtf(norm_b);
-    if (denom == 0.0f) return 0.0f;
-    return dot / denom;
-}
-#endif /* USE_ARM_SVE */
-
-/* Scalar fallback implementation */
-static float cosine_similarity_f32_scalar(const float *a, const float *b, size_t dim)
-{
-    float dot = 0.0f;
-    float norm_a = 0.0f;
-    float norm_b = 0.0f;
-
-    for (size_t i = 0; i < dim; i++) {
-        dot    += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-
-    float denom = sqrtf(norm_a) * sqrtf(norm_b);
-    if (denom == 0.0f) return 0.0f;
-    return dot / denom;
-}
-
-/* Unified cosine similarity function - dispatches to SVE or scalar */
-static float cosine_similarity_f32(const float *a, const float *b, size_t dim)
-{
-#ifdef USE_ARM_SVE
-    return cosine_similarity_f32_sve(a, b, dim);
-#else
-    return cosine_similarity_f32_scalar(a, b, dim);
-#endif
-}
 
 /* Helper function to extract C string from Redis object */
 static const char *ub_engine_object_to_cstring(void *arg, sds *tmp)
@@ -338,9 +272,9 @@ static int ub_engine_vsim(void *ctx, void *key, vector_data_t *query_vector,
 
     for (size_t i = 0; i < row_count; i++) {
         (*results)[i].element = sdsdup(elements[i]);
-        (*results)[i].score = (double)cosine_similarity_f32(query_vector->data,
-                                                            candidates_buf + i * dim,
-                                                            dim);
+        (*results)[i].score = (double)sve_cosine_similarity_f32(query_vector->data,
+                                                                candidates_buf + i * dim,
+                                                                dim);
         (*results)[i].attributes = NULL;
     }
     *num_results = row_count;

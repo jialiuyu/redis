@@ -232,25 +232,66 @@ static void *result_thread_func(void *arg) {
                 }
 
                 batch_result_packet_t *resp = (batch_result_packet_t *)payload;
-                if (resp->magic != BATCH_PACKET_MAGIC ||
-                    resp->op_type != BATCH_PACKET_OP_VEMB ||
-                    payload_len < sizeof(batch_result_packet_t)) {
+                if (resp->magic != BATCH_PACKET_MAGIC) {
                     break;
                 }
 
-                size_t expected_len = sizeof(batch_result_packet_t) + sizeof(float) * resp->dim;
-                if (payload_len < expected_len) {
-                    break;
-                }
-
-                if (vector_proxy_completion_complete_vemb(resp->request_id,
-                                                          resp->status == C_OK ? resp->data : NULL,
-                                                          resp->dim,
-                                                          (int)resp->status) == C_OK) {
-                    proxy_vector_request_t *req = vector_proxy_completion_lookup(resp->request_id);
-                    if (req && req->bc) {
-                        RedisModule_UnblockClient(req->bc, req);
+                if (resp->op_type == BATCH_PACKET_OP_VEMB) {
+                    if (payload_len < sizeof(batch_result_packet_t)) {
+                        break;
                     }
+                    size_t expected_len = sizeof(batch_result_packet_t) + sizeof(float) * resp->dim;
+                    if (payload_len < expected_len) {
+                        break;
+                    }
+
+                    if (vector_proxy_completion_complete_vemb(resp->request_id,
+                                                              resp->status == C_OK ? resp->data : NULL,
+                                                              resp->dim,
+                                                              (int)resp->status) == C_OK) {
+                        proxy_vector_request_t *req = vector_proxy_completion_lookup(resp->request_id);
+                        if (req && req->bc) {
+                            RedisModule_UnblockClient(req->bc, req);
+                        }
+                    }
+                } else if (resp->op_type == BATCH_PACKET_OP_VSIM) {
+                    batch_vsim_result_packet_t *vsim = (batch_vsim_result_packet_t *)payload;
+                    size_t expected_len = sizeof(batch_vsim_result_packet_t) +
+                                          sizeof(batch_vsim_result_entry_t) * vsim->num_results;
+                    if (payload_len < expected_len) {
+                        break;
+                    }
+
+                    uint64_t *row_ids = NULL;
+                    float *scores = NULL;
+                    if (vsim->num_results > 0) {
+                        row_ids = zmalloc(sizeof(uint64_t) * vsim->num_results);
+                        scores = zmalloc(sizeof(float) * vsim->num_results);
+                        if (!row_ids || !scores) {
+                            zfree(row_ids);
+                            zfree(scores);
+                            break;
+                        }
+                        for (uint32_t j = 0; j < vsim->num_results; j++) {
+                            row_ids[j] = vsim->results[j].row_id;
+                            scores[j] = vsim->results[j].score;
+                        }
+                    }
+
+                    if (vector_proxy_completion_complete_vsim(vsim->request_id,
+                                                              row_ids,
+                                                              scores,
+                                                              vsim->num_results,
+                                                              (int)vsim->status) == C_OK) {
+                        proxy_vector_request_t *req = vector_proxy_completion_lookup(vsim->request_id);
+                        if (req && req->bc) {
+                            RedisModule_UnblockClient(req->bc, req);
+                        }
+                    }
+                    zfree(row_ids);
+                    zfree(scores);
+                } else {
+                    break;
                 }
 
                 ring_buffer_commit_read(rb, payload_len);
@@ -530,6 +571,42 @@ static int proxy_vemb_reply(RedisModuleCtx *ctx, RedisModuleString **argv, int a
     return REDISMODULE_OK;
 }
 
+static int proxy_vsim_reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
+    proxy_vector_request_t *req =
+        (proxy_vector_request_t *)RedisModule_GetBlockedClientPrivateData(ctx);
+    if (!req) {
+        return RedisModule_ReplyWithError(ctx, "ERR missing VSIM proxy request");
+    }
+
+    proxy_vector_request_t *owned_req = NULL;
+    if (vector_proxy_completion_take(req->request_id, &owned_req) != C_OK || !owned_req) {
+        return RedisModule_ReplyWithError(ctx, "ERR missing VSIM completion");
+    }
+
+    if (owned_req->error_code != C_OK) {
+        proxy_vector_request_free(owned_req);
+        return RedisModule_ReplyWithError(ctx, "ERR UB engine vsim failed");
+    }
+
+    RedisModule_ReplyWithArray(ctx, owned_req->withscores ? (long long)(owned_req->result_count * 2) :
+                                                     (long long)owned_req->result_count);
+    for (size_t i = 0; i < owned_req->result_count; i++) {
+        const char *element = owned_req->candidate_elements && owned_req->candidate_elements[i] ?
+                              owned_req->candidate_elements[i] : "";
+        RedisModule_ReplyWithStringBuffer(ctx, element, strlen(element));
+        if (owned_req->withscores) {
+            RedisModule_ReplyWithDouble(ctx, owned_req->result_scores ? owned_req->result_scores[i] : 0.0);
+        }
+    }
+
+    RedisModule_BlockedClientMeasureTimeEnd(RedisModule_GetBlockedClientHandle(ctx));
+    proxy_vector_request_free(owned_req);
+    return REDISMODULE_OK;
+}
+
 int proxy_submit_vemb(RedisModuleCtx *ctx,
                       void *key,
                       void *element,
@@ -604,6 +681,93 @@ int proxy_submit_vemb(RedisModuleCtx *ctx,
 
     sdsfree(key_tmp);
     sdsfree(element_tmp);
+    return REDISMODULE_OK;
+}
+
+int proxy_submit_vsim(RedisModuleCtx *ctx,
+                      void *key,
+                      float *query_vector,
+                      size_t query_dim,
+                      size_t requested_count,
+                      int withscores) {
+    RETURN_IF(!ctx || !key || !query_vector || query_dim == 0, REDISMODULE_ERR);
+    RETURN_IF(!proxy, RedisModule_ReplyWithError(ctx, "ERR proxy aggregator not initialized"));
+
+    RedisModuleString *key_obj = key;
+    size_t key_len;
+    const char *key_cstr = RedisModule_StringPtrLen(key_obj, &key_len);
+    if (!key_cstr) {
+        zfree(query_vector);
+        return RedisModule_ReplyWithError(ctx, "ERR invalid key");
+    }
+
+    sds key_tmp = sdsnewlen(key_cstr, key_len);
+    if (!key_tmp) {
+        zfree(query_vector);
+        return RedisModule_ReplyWithError(ctx, "ERR oom");
+    }
+
+    ub_vector_set_meta_t *set = ub_metadata_get_set(key_tmp);
+    uint64_t *rows = NULL;
+    sds *elements = NULL;
+    size_t candidate_count = set ? ub_metadata_collect_rows(set, &rows, &elements) : 0;
+    if (candidate_count == 0) {
+        sdsfree(key_tmp);
+        zfree(query_vector);
+        RedisModule_ReplyWithEmptyArray(ctx);
+        return REDISMODULE_OK;
+    }
+
+    uint64_t request_id =
+        atomic_fetch_add_explicit(&next_request_id, 1, memory_order_relaxed);
+    RedisModuleBlockedClient *bc =
+        RedisModule_BlockClient(ctx, proxy_vsim_reply, NULL, NULL, 0);
+    if (!bc) {
+        sdsfree(key_tmp);
+        zfree(query_vector);
+        zfree(rows);
+        if (elements) {
+            for (size_t i = 0; i < candidate_count; i++) sdsfree(elements[i]);
+            zfree(elements);
+        }
+        return RedisModule_ReplyWithError(ctx, "ERR failed to block client");
+    }
+
+    proxy_vector_request_t *req =
+        proxy_vector_request_create_vsim(request_id, query_vector, query_dim,
+                                         rows, elements, candidate_count,
+                                         requested_count, withscores, bc);
+    if (!req) {
+        RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        zfree(query_vector);
+        zfree(rows);
+        if (elements) {
+            for (size_t i = 0; i < candidate_count; i++) sdsfree(elements[i]);
+            zfree(elements);
+        }
+        return RedisModule_ReplyWithError(ctx, "ERR oom");
+    }
+
+    if (vector_proxy_completion_register(req) != C_OK) {
+        proxy_vector_request_free(req);
+        RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR failed to register VSIM completion");
+    }
+
+    RedisModule_BlockClientSetPrivateData(bc, req);
+    RedisModule_BlockedClientMeasureTimeStart(bc);
+    if (proxy_enqueue_vector_request(key_tmp, req) != C_OK) {
+        proxy_vector_request_t *taken = NULL;
+        vector_proxy_completion_take(req->request_id, &taken);
+        if (taken) proxy_vector_request_free(taken);
+        RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR failed to enqueue VSIM request");
+    }
+
+    sdsfree(key_tmp);
     return REDISMODULE_OK;
 }
 

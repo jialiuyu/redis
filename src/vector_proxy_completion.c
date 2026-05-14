@@ -143,6 +143,50 @@ int vector_proxy_completion_complete_vemb(uint64_t request_id,
     return req->error_code == C_OK ? C_OK : C_ERR;
 }
 
+int vector_proxy_completion_complete_vsim(uint64_t request_id,
+                                          const uint64_t *row_ids,
+                                          const float *scores,
+                                          size_t num_results,
+                                          int error_code) {
+    RETURN_IF(!g_completion.initialized, C_ERR);
+
+    sds key = completion_request_key(request_id);
+    RETURN_IF(!key, C_ERR);
+
+    pthread_mutex_lock(&g_completion.lock);
+    dictEntry *de = dictFind(g_completion.requests, key);
+    if (!de) {
+        pthread_mutex_unlock(&g_completion.lock);
+        sdsfree(key);
+        return C_ERR;
+    }
+
+    proxy_vector_request_t *req = dictGetVal(de);
+    req->error_code = error_code;
+
+    if (error_code == C_OK && num_results > 0 && row_ids && scores) {
+        req->candidate_rows = zmalloc(sizeof(uint64_t) * num_results);
+        req->result_scores = zmalloc(sizeof(float) * num_results);
+        if (!req->candidate_rows || !req->result_scores) {
+            zfree(req->candidate_rows);
+            zfree(req->result_scores);
+            req->candidate_rows = NULL;
+            req->result_scores = NULL;
+            req->error_code = C_ERR;
+        } else {
+            memcpy(req->candidate_rows, row_ids, sizeof(uint64_t) * num_results);
+            memcpy(req->result_scores, scores, sizeof(float) * num_results);
+            req->result_count = num_results;
+        }
+    } else {
+        req->result_count = 0;
+    }
+
+    pthread_mutex_unlock(&g_completion.lock);
+    sdsfree(key);
+    return req->error_code == C_OK ? C_OK : C_ERR;
+}
+
 int vector_proxy_completion_take(uint64_t request_id, proxy_vector_request_t **req) {
     RETURN_IF(!g_completion.initialized || !req, C_ERR);
     *req = NULL;

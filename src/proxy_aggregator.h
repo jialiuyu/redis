@@ -41,6 +41,12 @@ int proxy_submit_vemb(RedisModuleCtx *ctx,
                       void *key,
                       void *element,
                       int raw_output);
+int proxy_submit_vsim(RedisModuleCtx *ctx,
+                      void *key,
+                      float *query_vector,
+                      size_t query_dim,
+                      size_t requested_count,
+                      int withscores);
 
 /* 统计信息 */
 sds proxy_aggregator_get_stats(void);

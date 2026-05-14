@@ -169,6 +169,13 @@ For UB:
   - `row_id -> element`
   - optional attribute lookups
 
+Current implementation guidance:
+
+- first ship `VSIM` as:
+  - `query_vector + candidate_rows[] -> full (row_id, score) list`
+- treat top-k, sorting, truncation, and large-result optimization as follow-up
+  work, not phase-1 transport blockers
+
 This keeps supernode on a compact, execution-only contract.
 
 ### 7. Single-request fast path, multi-request batch path

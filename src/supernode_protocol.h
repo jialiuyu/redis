@@ -7,6 +7,7 @@
 
 typedef enum batchPacketOpType {
     BATCH_PACKET_OP_VEMB = 1,
+    BATCH_PACKET_OP_VSIM = 2,
 } batchPacketOpType;
 
 typedef struct batch_result_packet {
@@ -19,6 +20,22 @@ typedef struct batch_result_packet {
     uint32_t reserved;
     float data[];
 } __attribute__((packed)) batch_result_packet_t;
+
+typedef struct batch_vsim_result_entry {
+    uint64_t row_id;
+    float score;
+} __attribute__((packed)) batch_vsim_result_entry_t;
+
+typedef struct batch_vsim_result_packet {
+    uint32_t magic;
+    uint32_t packet_size;
+    uint32_t op_type;
+    uint32_t status;
+    uint64_t request_id;
+    uint32_t num_results;
+    uint32_t reserved;
+    batch_vsim_result_entry_t results[];
+} __attribute__((packed)) batch_vsim_result_packet_t;
 
 typedef struct batch_packet {
     uint32_t magic;                     /* 魔数：BATCH_PACKET_MAGIC */
@@ -35,5 +52,22 @@ typedef struct batch_packet {
         uint64_t row_id;                /* UB row id */
     } requests[];
 } __attribute__((packed)) batch_packet_t;
+
+typedef struct batch_vsim_packet {
+    uint32_t magic;
+    uint32_t packet_size;
+    uint32_t op_type;
+    uint32_t flags;
+    uint32_t supernode_id;
+    uint32_t worker_id;
+    uint64_t timestamp_us;
+    uint64_t batch_id;
+    uint64_t request_id;
+    uint32_t query_dim;
+    uint32_t requested_count;
+    uint32_t candidate_count;
+    uint32_t reserved;
+    float payload[];
+} __attribute__((packed)) batch_vsim_packet_t;
 
 #endif /* __SUPERNODE_PROTOCOL_H */

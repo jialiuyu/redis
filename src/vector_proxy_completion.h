@@ -13,6 +13,11 @@ int vector_proxy_completion_complete_vemb(uint64_t request_id,
                                           const float *vector,
                                           size_t dim,
                                           int error_code);
+int vector_proxy_completion_complete_vsim(uint64_t request_id,
+                                          const uint64_t *row_ids,
+                                          const float *scores,
+                                          size_t num_results,
+                                          int error_code);
 int vector_proxy_completion_take(uint64_t request_id, proxy_vector_request_t **req);
 
 #endif /* __VECTOR_PROXY_COMPLETION_H */
