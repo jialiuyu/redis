@@ -1377,6 +1377,18 @@ Phase 1 的验收重点是功能语义，不是性能：
 2. 批量读取这些 row
 3. 将结果写入 completion 表
 
+后续优化 TODO：
+
+- 当前如果 worker 先把批量读取结果落到临时 `results` 缓冲，再逐请求 `memcpy`
+  到 response payload，这只是“多一次 copy 的优化空间”。
+- 不建议优先把 `memcpy` 改成 SVE copy；收益通常不如直接消除中间 copy。
+- 更优方向是把 response 通路改成 batch response packet，允许
+  `sve_serial_contiguous_read()` 直接把批量读取结果写入连续 response payload。
+- 如果未来需要进一步榨干性能，再补：
+  - response payload 对齐约束
+  - fixed-size/aligned slot 布局
+  - 针对 response 区的 SVE store 优化
+
 #### `modules/vector-sets/vset.c`
 
 `VEMB_RedisCommand()`
@@ -1484,6 +1496,17 @@ UB 路径改成：
 2. 获取候选 row 集合
 3. 扫描并计算相似度
 4. 写回完整分数结果
+
+结果通路优化 TODO：
+
+- `VSIM` 不建议长期复用 `VEMB` 风格的逐请求小 response packet。
+- 应优先设计独立的 batch/large response payload：
+  - 小结果：普通 response ring
+  - 大结果：独立 large response ring 或 large payload 区
+- supernode 返回尽量保持紧凑，优先回：
+  - `request_id`
+  - `row_id + score`
+- element 名称、属性、RESP 格式化应留在 proxy / Redis module 侧完成。
 
 #### `modules/vector-sets/vset.c`
 
