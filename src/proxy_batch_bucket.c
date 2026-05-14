@@ -71,8 +71,8 @@ void proxy_batch_bucket_reset(proxy_batch_bucket_t *bucket, uint64_t flush_time_
 
 proxy_request_t *proxy_request_create(uint64_t request_id, uint32_t key_hash,
                                       int target_supernode_id, int target_worker_id,
-                                      uint64_t submit_time_us, void *client_context,
-                                      float *result_buffer, size_t vector_dim) {
+                                      uint64_t submit_time_us,
+                                      proxy_vector_request_t *owner) {
     proxy_request_t *req = zmalloc(sizeof(proxy_request_t));
     RETURN_IF(!req, NULL);
 
@@ -81,11 +81,7 @@ proxy_request_t *proxy_request_create(uint64_t request_id, uint32_t key_hash,
     req->target_supernode_id = target_supernode_id;
     req->target_worker_id = target_worker_id;
     req->submit_time_us = submit_time_us;
-    req->client_context = client_context;
-    req->completed = 0;
-    req->error_code = 0;
-    req->result_vector = result_buffer;
-    req->vector_dim = vector_dim;
+    req->owner = owner;
     return req;
 }
 
@@ -120,6 +116,7 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
     packet->magic = BATCH_PACKET_MAGIC;
     packet->packet_size = packet_size;
     packet->num_requests = bucket->count;
+    packet->op_type = BATCH_PACKET_OP_VEMB;
     packet->supernode_id = bucket->target_supernode_id;
     packet->worker_id = bucket->target_worker_id;
     packet->timestamp_us = timestamp_us;
@@ -128,7 +125,7 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
     for (size_t i = 0; i < bucket->count; i++) {
         proxy_request_t *req = bucket->requests[i];
         packet->requests[i].request_id = req->request_id;
-        packet->requests[i].key_hash = req->key_hash;
+        packet->requests[i].row_id = req->owner ? req->owner->row_id : 0;
     }
 
     return C_OK;

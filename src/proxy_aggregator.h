@@ -12,7 +12,9 @@
 #ifndef __PROXY_AGGREGATOR_H
 #define __PROXY_AGGREGATOR_H
 
-#include "server.h"
+#include "sds.h"
+#include "vector_proxy_request.h"
+#include <stddef.h>
 #include <stdint.h>
 
 /* 聚合配置 */
@@ -31,6 +33,7 @@ void proxy_aggregator_shutdown(void);
 /* 请求提交 */
 int proxy_enqueue_request(const char *key, void *client_ctx, 
                          float *result_buffer, size_t vector_dim);
+int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *req);
 
 /* 统计信息 */
 sds proxy_aggregator_get_stats(void);

@@ -12,6 +12,7 @@
 #include "proxy_flush_executor.h"
 #include "proxy_router.h"
 #include "ring_buffer_mgr.h"
+#include "vector_proxy_completion.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -347,26 +348,33 @@ void proxy_aggregator_shutdown(void) {
 /* 提交请求到聚合器 */
 int proxy_enqueue_request(const char *key, void *client_ctx, 
                          float *result_buffer, size_t vector_dim) {
-    RETURN_IF(!proxy || !key, C_ERR);
-    
+    UNUSED(key);
+    UNUSED(client_ctx);
+    UNUSED(result_buffer);
+    UNUSED(vector_dim);
+    serverLog(LL_WARNING, "proxy_enqueue_request() is deprecated for UB row-based packets");
+    return C_ERR;
+}
+
+int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *owner) {
+    RETURN_IF(!proxy || !key || !owner, C_ERR);
+
     proxy_route_t route;
     RETURN_IF(proxy_router_route(&proxy->router, key, &route) != C_OK, C_ERR);
     size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
                                              route.supernode_id, route.worker_id);
     proxy_batch_bucket_t *bucket = &proxy->buckets[bucket_index];
     RETURN_IF(!bucket->rb, C_ERR);
-    
+
     proxy_request_t *req = proxy_request_create(
-        atomic_fetch_add_explicit(&next_request_id, 1, memory_order_relaxed),
+        owner->request_id,
         route.key_hash,
         route.supernode_id,
         route.worker_id,
         ustime(),
-        client_ctx,
-        result_buffer,
-        vector_dim);
+        owner);
     RETURN_IF(!req, C_ERR);
-    
+
     pthread_mutex_lock(&bucket->mutex);
     if (bucket->count >= bucket->capacity) {
         if (proxy_executor_flush_bucket_locked(&proxy->executor, bucket, bucket->rb, 1,
@@ -374,7 +382,7 @@ int proxy_enqueue_request(const char *key, void *client_ctx,
                                       PROXY_FLUSH_TRIGGER_IMMEDIATE_CAPACITY) != C_OK) {
             pthread_mutex_unlock(&bucket->mutex);
             proxy_request_destroy(req);
-            return C_ERR; /* 桶满且同步 flush 失败 */
+            return C_ERR;
         }
     }
 

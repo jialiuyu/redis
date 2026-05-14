@@ -62,7 +62,7 @@ int vector_engine_init_from_config(vector_engine_config_t *config) {
     vector_engine_t *engine;
 
     if (config == NULL) {
-        type = vector_engine_get_default_type();
+        type = server.vector_engine_type;
     } else {
         type = config->engine_type;
 

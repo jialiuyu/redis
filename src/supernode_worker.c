@@ -5,7 +5,10 @@
  * SVE 计算和 bitmap 操作全部直接调用 sve_operation 模块的 sve_* 函数。
  */
 
+#define REDISMODULE_CORE_MODULE
+
 #include "supernode_worker.h"
+#include "vector_proxy_completion.h"
 #include "macro.h"
 #include "ring_buffer_mgr.h"
 #include "supernode_protocol.h"
@@ -76,11 +79,16 @@ static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *p
               ctx->worker_id, packet->num_requests,
               (unsigned long long)packet->batch_id);
 
+    if (packet->op_type != BATCH_PACKET_OP_VEMB) {
+        serverLog(LL_WARNING, "Unsupported batch packet op_type: %u", packet->op_type);
+        return C_ERR;
+    }
+
     uint64_t *emb_ids = zmalloc(packet->num_requests * sizeof(uint64_t));
     RETURN_IF(!emb_ids, C_ERR);
 
     for (uint32_t i = 0; i < packet->num_requests; i++)
-        emb_ids[i] = packet->requests[i].key_hash % ctx->gather_ctx.table_row_capacity;
+        emb_ids[i] = packet->requests[i].row_id;
 
     float *results = zmalloc(packet->num_requests * ctx->gather_ctx.vector_dim * sizeof(float));
     if (!results) { zfree(emb_ids); return C_ERR; }
@@ -92,6 +100,20 @@ static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *p
      */
     int ret = sve_serial_contiguous_read(&ctx->gather_ctx, emb_ids,
                                          packet->num_requests, results);
+
+    if (ret == C_OK) {
+        for (uint32_t i = 0; i < packet->num_requests; i++) {
+            if (vector_proxy_completion_complete_vemb(packet->requests[i].request_id,
+                                                      results + ((size_t)i * ctx->gather_ctx.vector_dim),
+                                                      ctx->gather_ctx.vector_dim,
+                                                      C_OK) == C_OK) {
+                proxy_vector_request_t *req = vector_proxy_completion_lookup(packet->requests[i].request_id);
+                if (req && req->bc) {
+                    RedisModule_UnblockClient(req->bc, req);
+                }
+            }
+        }
+    }
 
     zfree(results);
     zfree(emb_ids);
