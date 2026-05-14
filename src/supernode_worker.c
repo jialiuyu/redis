@@ -5,6 +5,8 @@
  * SVE 计算和 bitmap 操作全部直接调用 sve_operation 模块的 sve_* 函数。
  */
 
+#define _GNU_SOURCE
+
 #include "supernode_worker.h"
 #include "macro.h"
 #include "ring_buffer_mgr.h"
