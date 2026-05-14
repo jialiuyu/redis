@@ -3,6 +3,8 @@
  * 智能批量聚合器 - 蓄水池策略
  */
 
+#define REDISMODULE_CORE_MODULE
+
 #include "proxy_aggregator.h"
 #include "macro.h"
 #include "server.h"
@@ -13,6 +15,7 @@
 #include "proxy_router.h"
 #include "ring_buffer_mgr.h"
 #include "vector_proxy_completion.h"
+#include "ub_metadata.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -64,8 +67,6 @@ typedef struct proxy_aggregator {
 } proxy_aggregator_t;
 
 static proxy_aggregator_t *proxy = NULL;
-
-/* 原子请求 ID 生成器 */
 static atomic_uint_fast64_t next_request_id = 1;
 
 static inline void proxy_aggregator_config_init(proxy_aggregator_config_t *cfg) {
@@ -411,6 +412,127 @@ int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *owner)
     pthread_mutex_unlock(&bucket->mutex);
     atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);
     return C_OK;
+}
+
+static int proxy_vemb_reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
+    proxy_vector_request_t *req =
+        (proxy_vector_request_t *)RedisModule_GetBlockedClientPrivateData(ctx);
+    if (!req) {
+        return RedisModule_ReplyWithError(ctx, "ERR missing VEMB proxy request");
+    }
+
+    proxy_vector_request_t *owned_req = NULL;
+    if (vector_proxy_completion_take(req->request_id, &owned_req) != C_OK || !owned_req) {
+        return RedisModule_ReplyWithError(ctx, "ERR missing VEMB completion");
+    }
+
+    if (owned_req->error_code != C_OK) {
+        proxy_vector_request_free(owned_req);
+        return RedisModule_ReplyWithError(ctx, "ERR UB engine vemb failed");
+    }
+
+    if (!owned_req->result_vector) {
+        proxy_vector_request_free(owned_req);
+        return RedisModule_ReplyWithNull(ctx);
+    }
+
+    if (owned_req->raw_output) {
+        RedisModule_ReplyWithArray(ctx, 3);
+        RedisModule_ReplyWithSimpleString(ctx, "fp32");
+        RedisModule_ReplyWithStringBuffer(ctx,
+            (const char*)owned_req->result_vector,
+            owned_req->result_dim * sizeof(float));
+        RedisModule_ReplyWithDouble(ctx, 1.0);
+    } else {
+        RedisModule_ReplyWithArray(ctx, owned_req->result_dim);
+        for (size_t i = 0; i < owned_req->result_dim; i++) {
+            RedisModule_ReplyWithDouble(ctx, owned_req->result_vector[i]);
+        }
+    }
+
+    RedisModule_BlockedClientMeasureTimeEnd(RedisModule_GetBlockedClientHandle(ctx));
+    proxy_vector_request_free(owned_req);
+    return REDISMODULE_OK;
+}
+
+int proxy_submit_vemb(RedisModuleCtx *ctx,
+                      void *key,
+                      void *element,
+                      int raw_output) {
+    RETURN_IF(!ctx || !key || !element, REDISMODULE_ERR);
+    RETURN_IF(!proxy, RedisModule_ReplyWithError(ctx, "ERR proxy aggregator not initialized"));
+
+    RedisModuleString *key_obj = key;
+    RedisModuleString *element_obj = element;
+
+    size_t key_len, element_len;
+    const char *key_cstr = RedisModule_StringPtrLen(key_obj, &key_len);
+    const char *element_cstr = RedisModule_StringPtrLen(element_obj, &element_len);
+    if (!key_cstr || !element_cstr) {
+        return RedisModule_ReplyWithError(ctx, "ERR invalid key or element");
+    }
+
+    sds key_tmp = sdsnewlen(key_cstr, key_len);
+    sds element_tmp = sdsnewlen(element_cstr, element_len);
+    if (!key_tmp || !element_tmp) {
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR oom");
+    }
+
+    ub_vector_set_meta_t *set = ub_metadata_get_set(key_tmp);
+    uint64_t row_id = 0;
+    if (!set || ub_metadata_lookup_row(set, element_tmp, &row_id) != C_OK) {
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithNull(ctx);
+    }
+
+    uint64_t request_id =
+        atomic_fetch_add_explicit(&next_request_id, 1, memory_order_relaxed);
+    RedisModuleBlockedClient *bc =
+        RedisModule_BlockClient(ctx, proxy_vemb_reply, NULL, NULL, 0);
+    if (!bc) {
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR failed to block client");
+    }
+
+    proxy_vector_request_t *req =
+        proxy_vector_request_create_vemb(request_id, row_id, raw_output, bc);
+    if (!req) {
+        RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR oom");
+    }
+
+    if (vector_proxy_completion_register(req) != C_OK) {
+        proxy_vector_request_free(req);
+        RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR failed to register VEMB completion");
+    }
+
+    RedisModule_BlockClientSetPrivateData(bc, req);
+    RedisModule_BlockedClientMeasureTimeStart(bc);
+    if (proxy_enqueue_vector_request(key_tmp, req) != C_OK) {
+        proxy_vector_request_t *taken = NULL;
+        vector_proxy_completion_take(req->request_id, &taken);
+        if (taken) proxy_vector_request_free(taken);
+        RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR failed to enqueue VEMB request");
+    }
+
+    sdsfree(key_tmp);
+    sdsfree(element_tmp);
+    return REDISMODULE_OK;
 }
 
 sds proxy_aggregator_get_stats(void) {

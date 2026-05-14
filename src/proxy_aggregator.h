@@ -13,9 +13,13 @@
 #define __PROXY_AGGREGATOR_H
 
 #include "sds.h"
+#include "ub_metadata.h"
 #include "vector_proxy_request.h"
 #include <stddef.h>
 #include <stdint.h>
+
+typedef struct RedisModuleCtx RedisModuleCtx;
+typedef struct RedisModuleString RedisModuleString;
 
 /* 聚合配置 */
 #define PROXY_BATCH_LIMIT 3000          /* 默认批量大小限制 */
@@ -34,6 +38,10 @@ void proxy_aggregator_shutdown(void);
 int proxy_enqueue_request(const char *key, void *client_ctx, 
                          float *result_buffer, size_t vector_dim);
 int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *req);
+int proxy_submit_vemb(RedisModuleCtx *ctx,
+                      void *key,
+                      void *element,
+                      int raw_output);
 
 /* 统计信息 */
 sds proxy_aggregator_get_stats(void);
