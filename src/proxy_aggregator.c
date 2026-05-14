@@ -32,6 +32,7 @@ typedef struct proxy_aggregator_config {
 
 typedef struct proxy_aggregator {
     proxy_batch_bucket_t *buckets; // 批量桶 - 每个 (supernode, worker) 一个 
+    ring_buffer_t **response_rings;
     size_t num_buckets;
     size_t num_supernodes;
 
@@ -56,6 +57,7 @@ typedef struct proxy_aggregator {
 
     /* 工作线程 */
     pthread_t flush_thread;
+    pthread_t result_thread;
     int running;
 
     /* 统计信息 */
@@ -210,6 +212,62 @@ static void *flush_thread_func(void *arg) {
     return NULL;
 }
 
+static void *result_thread_func(void *arg) {
+    proxy_aggregator_t *agg = (proxy_aggregator_t *)arg;
+
+    serverLog(LL_NOTICE, "Proxy aggregator result thread started");
+
+    while (agg->running) {
+        int processed_any = 0;
+
+        for (size_t i = 0; i < agg->num_buckets; i++) {
+            ring_buffer_t *rb = agg->response_rings ? agg->response_rings[i] : NULL;
+            if (!rb) continue;
+
+            while (agg->running) {
+                void *payload = NULL;
+                size_t payload_len = 0;
+                if (ring_buffer_peek(rb, &payload, &payload_len) != C_OK || payload_len == 0) {
+                    break;
+                }
+
+                batch_result_packet_t *resp = (batch_result_packet_t *)payload;
+                if (resp->magic != BATCH_PACKET_MAGIC ||
+                    resp->op_type != BATCH_PACKET_OP_VEMB ||
+                    payload_len < sizeof(batch_result_packet_t)) {
+                    break;
+                }
+
+                size_t expected_len = sizeof(batch_result_packet_t) + sizeof(float) * resp->dim;
+                if (payload_len < expected_len) {
+                    break;
+                }
+
+                if (vector_proxy_completion_complete_vemb(resp->request_id,
+                                                          resp->status == C_OK ? resp->data : NULL,
+                                                          resp->dim,
+                                                          (int)resp->status) == C_OK) {
+                    proxy_vector_request_t *req = vector_proxy_completion_lookup(resp->request_id);
+                    if (req && req->bc) {
+                        RedisModule_UnblockClient(req->bc, req);
+                    }
+                }
+
+                ring_buffer_commit_read(rb, payload_len);
+                processed_any = 1;
+            }
+        }
+
+        if (!processed_any) {
+            struct timespec ts = {0, 10000};
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    serverLog(LL_NOTICE, "Proxy aggregator result thread stopped");
+    return NULL;
+}
+
 /* ========== Proxy Aggregator API ========== */
 
 /* 初始化 Proxy 聚合器 */
@@ -244,6 +302,8 @@ int proxy_aggregator_init(int num_supernodes) {
     proxy->buckets =
         proxy_batch_bucket_create_array(proxy->num_buckets);
     if (!proxy->buckets) goto failed;
+    proxy->response_rings = zcalloc(sizeof(ring_buffer_t *) * proxy->num_buckets);
+    if (!proxy->response_rings) goto failed;
     if (proxy_active_bucket_heap_init(&proxy->active_bucket_heap,
                                       proxy->buckets,
                                       proxy->num_buckets,
@@ -267,8 +327,12 @@ int proxy_aggregator_init(int num_supernodes) {
             if (ret != C_OK) {
                 goto failed;
             }
-            bucket->rb = ring_buffer_mgr_get(sn, (int)worker);
+            bucket->rb = ring_buffer_mgr_get_request(sn, (int)worker);
             if (!bucket->rb) {
+                goto failed;
+            }
+            proxy->response_rings[idx] = ring_buffer_mgr_get_response(sn, (int)worker);
+            if (!proxy->response_rings[idx]) {
                 goto failed;
             }
         }
@@ -291,6 +355,11 @@ int proxy_aggregator_init(int num_supernodes) {
     proxy->running = 1;
     if (pthread_create(&proxy->flush_thread, NULL, flush_thread_func, proxy) != 0) {
         serverLog(LL_WARNING, "Failed to create flush thread");
+        proxy->running = 0;
+        goto failed;
+    }
+    if (pthread_create(&proxy->result_thread, NULL, result_thread_func, proxy) != 0) {
+        serverLog(LL_WARNING, "Failed to create result thread");
         proxy->running = 0;
         goto failed;
     }
@@ -317,6 +386,7 @@ void proxy_aggregator_shutdown(void) {
         }
         pthread_mutex_unlock(&proxy->active_buckets_lock);
         pthread_join(proxy->flush_thread, NULL);
+        pthread_join(proxy->result_thread, NULL);
     }
     
     /* 清理批量桶 */
@@ -324,6 +394,8 @@ void proxy_aggregator_shutdown(void) {
         proxy_batch_bucket_destroy_array(proxy->buckets,
                                          proxy->num_buckets);
     }
+    zfree(proxy->response_rings);
+    proxy->response_rings = NULL;
 
     if (proxy->active_buckets_lock_initialized) {
         pthread_mutex_destroy(&proxy->active_buckets_lock);

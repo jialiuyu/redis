@@ -13,7 +13,6 @@
 #define __PROXY_AGGREGATOR_H
 
 #include "sds.h"
-#include "ub_metadata.h"
 #include "vector_proxy_request.h"
 #include <stddef.h>
 #include <stdint.h>

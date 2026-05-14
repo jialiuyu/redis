@@ -14,8 +14,8 @@
 #ifndef __SUPERNODE_WORKER_H
 #define __SUPERNODE_WORKER_H
 
-#include "ring_buffer.h"
 #include "sve_operation.h"
+#include "ring_buffer.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -26,8 +26,9 @@ typedef struct sve_worker_context {
     pthread_t thread;
     int running;
 
-    /* Ring Buffer（从 Proxy 接收）*/
+    /* Request/response rings */
     ring_buffer_t *input_rb;
+    ring_buffer_t *output_rb;
 
     /* 读取路径上下文 */
     sve_gather_ctx_t gather_ctx;

@@ -5,10 +5,7 @@
  * SVE 计算和 bitmap 操作全部直接调用 sve_operation 模块的 sve_* 函数。
  */
 
-#define REDISMODULE_CORE_MODULE
-
 #include "supernode_worker.h"
-#include "vector_proxy_completion.h"
 #include "macro.h"
 #include "ring_buffer_mgr.h"
 #include "supernode_protocol.h"
@@ -103,14 +100,30 @@ static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *p
 
     if (ret == C_OK) {
         for (uint32_t i = 0; i < packet->num_requests; i++) {
-            if (vector_proxy_completion_complete_vemb(packet->requests[i].request_id,
-                                                      results + ((size_t)i * ctx->gather_ctx.vector_dim),
-                                                      ctx->gather_ctx.vector_dim,
-                                                      C_OK) == C_OK) {
-                proxy_vector_request_t *req = vector_proxy_completion_lookup(packet->requests[i].request_id);
-                if (req && req->bc) {
-                    RedisModule_UnblockClient(req->bc, req);
-                }
+            size_t payload_len = sizeof(batch_result_packet_t) +
+                                 sizeof(float) * ctx->gather_ctx.vector_dim;
+            batch_result_packet_t *resp = NULL;
+            if (!ctx->output_rb ||
+                ring_buffer_reserve(ctx->output_rb, payload_len, (void **)&resp) != C_OK) {
+                ret = C_ERR;
+                break;
+            }
+
+            resp->magic = BATCH_PACKET_MAGIC;
+            resp->packet_size = (uint32_t)payload_len;
+            resp->op_type = BATCH_PACKET_OP_VEMB;
+            resp->status = C_OK;
+            resp->request_id = packet->requests[i].request_id;
+            resp->dim = (uint32_t)ctx->gather_ctx.vector_dim;
+            resp->reserved = 0;
+            memcpy(resp->data,
+                   results + ((size_t)i * ctx->gather_ctx.vector_dim),
+                   sizeof(float) * ctx->gather_ctx.vector_dim);
+
+            if (ring_buffer_commit_write(ctx->output_rb, payload_len) != C_OK) {
+                ring_buffer_cancel_write(ctx->output_rb);
+                ret = C_ERR;
+                break;
             }
         }
     }
@@ -228,13 +241,15 @@ int supernode_init(int node_id, int num_workers) {
     }
 
     for (int i = 0; i < num_workers; i++) {
-        ring_buffer_t *rb = ring_buffer_mgr_get(node_id, i);
-        if (!rb) goto failed;
+        ring_buffer_t *req_rb = ring_buffer_mgr_get_request(node_id, i);
+        ring_buffer_t *resp_rb = ring_buffer_mgr_get_response(node_id, i);
+        if (!req_rb || !resp_rb) goto failed;
         
         sve_worker_context_t *ctx = &global_supernode->workers[i];
         ctx->worker_id = i;
         ctx->running = 1;
-        ctx->input_rb = rb;
+        ctx->input_rb = req_rb;
+        ctx->output_rb = resp_rb;
 
         atomic_init(&ctx->total_batches, 0);
         atomic_init(&ctx->total_requests, 0);

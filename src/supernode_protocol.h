@@ -9,6 +9,17 @@ typedef enum batchPacketOpType {
     BATCH_PACKET_OP_VEMB = 1,
 } batchPacketOpType;
 
+typedef struct batch_result_packet {
+    uint32_t magic;
+    uint32_t packet_size;
+    uint32_t op_type;
+    uint32_t status;
+    uint64_t request_id;
+    uint32_t dim;
+    uint32_t reserved;
+    float data[];
+} __attribute__((packed)) batch_result_packet_t;
+
 typedef struct batch_packet {
     uint32_t magic;                     /* 魔数：BATCH_PACKET_MAGIC */
     uint32_t packet_size;               /* 包大小 */
