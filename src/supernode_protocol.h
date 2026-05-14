@@ -37,7 +37,7 @@ typedef struct batch_vsim_result_packet {
     batch_vsim_result_entry_t results[];
 } __attribute__((packed)) batch_vsim_result_packet_t;
 
-typedef struct batch_packet {
+typedef struct batch_request_header {
     uint32_t magic;                     /* 魔数：BATCH_PACKET_MAGIC */
     uint32_t packet_size;               /* 包大小 */
     uint32_t num_requests;              /* 请求数量 */
@@ -46,7 +46,10 @@ typedef struct batch_packet {
     uint32_t worker_id;                 /* 目标 Worker ID */
     uint64_t timestamp_us;              /* 时间戳 */
     uint64_t batch_id;                  /* 批次 ID */
+} __attribute__((packed)) batch_request_header_t;
 
+typedef struct batch_packet {
+    batch_request_header_t hdr;
     struct {
         uint64_t request_id;
         uint64_t row_id;                /* UB row id */
@@ -54,14 +57,8 @@ typedef struct batch_packet {
 } __attribute__((packed)) batch_packet_t;
 
 typedef struct batch_vsim_packet {
-    uint32_t magic;
-    uint32_t packet_size;
-    uint32_t op_type;
+    batch_request_header_t hdr;
     uint32_t flags;
-    uint32_t supernode_id;
-    uint32_t worker_id;
-    uint64_t timestamp_us;
-    uint64_t batch_id;
     uint64_t request_id;
     uint32_t query_dim;
     uint32_t requested_count;

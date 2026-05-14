@@ -128,14 +128,15 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
         bucket->requests[0]->owner->op_type == PROXY_VECTOR_OP_VSIM) {
         proxy_vector_request_t *owner = bucket->requests[0]->owner;
         batch_vsim_packet_t *vsim = (batch_vsim_packet_t *)packet;
-        vsim->magic = BATCH_PACKET_MAGIC;
-        vsim->packet_size = (uint32_t)packet_size;
-        vsim->op_type = BATCH_PACKET_OP_VSIM;
+        vsim->hdr.magic = BATCH_PACKET_MAGIC;
+        vsim->hdr.packet_size = (uint32_t)packet_size;
+        vsim->hdr.num_requests = 1;
+        vsim->hdr.op_type = BATCH_PACKET_OP_VSIM;
+        vsim->hdr.supernode_id = bucket->target_supernode_id;
+        vsim->hdr.worker_id = bucket->target_worker_id;
+        vsim->hdr.timestamp_us = timestamp_us;
+        vsim->hdr.batch_id = batch_id;
         vsim->flags = owner->withscores ? 1u : 0u;
-        vsim->supernode_id = bucket->target_supernode_id;
-        vsim->worker_id = bucket->target_worker_id;
-        vsim->timestamp_us = timestamp_us;
-        vsim->batch_id = batch_id;
         vsim->request_id = owner->request_id;
         vsim->query_dim = (uint32_t)owner->query_dim;
         vsim->requested_count = (uint32_t)owner->requested_count;
@@ -148,14 +149,14 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
         return C_OK;
     }
 
-    packet->magic = BATCH_PACKET_MAGIC;
-    packet->packet_size = packet_size;
-    packet->num_requests = bucket->count;
-    packet->op_type = BATCH_PACKET_OP_VEMB;
-    packet->supernode_id = bucket->target_supernode_id;
-    packet->worker_id = bucket->target_worker_id;
-    packet->timestamp_us = timestamp_us;
-    packet->batch_id = batch_id;
+    packet->hdr.magic = BATCH_PACKET_MAGIC;
+    packet->hdr.packet_size = packet_size;
+    packet->hdr.num_requests = bucket->count;
+    packet->hdr.op_type = BATCH_PACKET_OP_VEMB;
+    packet->hdr.supernode_id = bucket->target_supernode_id;
+    packet->hdr.worker_id = bucket->target_worker_id;
+    packet->hdr.timestamp_us = timestamp_us;
+    packet->hdr.batch_id = batch_id;
 
     for (size_t i = 0; i < bucket->count; i++) {
         proxy_request_t *req = bucket->requests[i];

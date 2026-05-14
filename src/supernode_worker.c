@@ -174,22 +174,22 @@ static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
                                         batch_packet_t *packet) {
     RETURN_IF(!ctx || !packet, C_ERR);
 
-    uint64_t *emb_ids = zmalloc(packet->num_requests * sizeof(uint64_t));
+    uint64_t *emb_ids = zmalloc(packet->hdr.num_requests * sizeof(uint64_t));
     float *results = NULL;
     int ret = C_ERR;
 
     if (!emb_ids) return C_ERR;
-    for (uint32_t i = 0; i < packet->num_requests; i++)
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++)
         emb_ids[i] = packet->requests[i].row_id;
 
     ret = supernode_load_candidate_vectors(ctx,
                                            emb_ids,
-                                           packet->num_requests,
+                                           packet->hdr.num_requests,
                                            ctx->gather_ctx.vector_dim,
                                            &results);
     if (ret != C_OK) goto cleanup;
 
-    for (uint32_t i = 0; i < packet->num_requests; i++) {
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++) {
         ret = supernode_write_vemb_response(ctx,
                                             packet->requests[i].request_id,
                                             results + ((size_t)i * ctx->gather_ctx.vector_dim),
@@ -204,33 +204,33 @@ cleanup:
     return ret;
 }
 
-static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) {
-    RETURN_IF(!ctx || !packet, C_ERR);
+static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_request_header_t *hdr) {
+    RETURN_IF(!ctx || !hdr, C_ERR);
 
     uint64_t start_time = ustime();
     int ret = C_ERR;
 
-    if (packet->magic != BATCH_PACKET_MAGIC) {
-        serverLog(LL_WARNING, "Invalid batch packet magic: 0x%x", packet->magic);
+    if (hdr->magic != BATCH_PACKET_MAGIC) {
+        serverLog(LL_WARNING, "Invalid batch packet magic: 0x%x", hdr->magic);
         return C_ERR;
     }
 
     serverLog(LL_DEBUG, "Worker %d processing batch: %u requests, batch_id=%llu",
-              ctx->worker_id, packet->num_requests,
-              (unsigned long long)packet->batch_id);
+              ctx->worker_id, hdr->num_requests,
+              (unsigned long long)hdr->batch_id);
 
-    if (packet->op_type == BATCH_PACKET_OP_VSIM) {
-        ret = supernode_process_vsim_batch(ctx, (batch_vsim_packet_t *)packet);
-    } else if (packet->op_type == BATCH_PACKET_OP_VEMB) {
-        ret = supernode_process_vemb_batch(ctx, packet);
+    if (hdr->op_type == BATCH_PACKET_OP_VSIM) {
+        ret = supernode_process_vsim_batch(ctx, (batch_vsim_packet_t *)hdr);
+    } else if (hdr->op_type == BATCH_PACKET_OP_VEMB) {
+        ret = supernode_process_vemb_batch(ctx, (batch_packet_t *)hdr);
     } else {
-        serverLog(LL_WARNING, "Unsupported batch packet op_type: %u", packet->op_type);
+        serverLog(LL_WARNING, "Unsupported batch packet op_type: %u", hdr->op_type);
         return C_ERR;
     }
 
     uint64_t latency = ustime() - start_time;
     atomic_fetch_add_explicit(&ctx->total_batches, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&ctx->total_requests, packet->num_requests, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_requests, hdr->num_requests, memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->total_latency_us, latency, memory_order_relaxed);
 
     serverLog(LL_DEBUG, "Worker %d completed batch in %llu μs",
@@ -278,7 +278,7 @@ void *sve_worker_thread(void *arg) {
         int ret = ring_buffer_peek(ctx->input_rb, &payload, &payload_len);
         if (ret == C_OK && payload_len > 0) {
             idle_iters = 0;
-            if (sve_worker_process_batch(ctx, (batch_packet_t *)payload) == C_OK) {
+            if (sve_worker_process_batch(ctx, (batch_request_header_t *)payload) == C_OK) {
                 ring_buffer_commit_read(ctx->input_rb, payload_len);
             }
         } else {
