@@ -1,3 +1,47 @@
+// trigger_proxy_aggregation.go
+//
+// Concurrent request generator for exercising proxy/supernode batching with
+// the UB vector engine.
+//
+// Typical usage:
+//
+//   go run ./benchmark/trigger_proxy_aggregation.go \
+//     --redis-cli ./src/redis-cli \
+//     --port 6391 \
+//     --key myvectors \
+//     --phase prefill \
+//     --mode vemb \
+//     -d 300 \
+//     -p 100000
+//
+//   go run ./benchmark/trigger_proxy_aggregation.go \
+//     --redis-cli ./src/redis-cli \
+//     --port 6391 \
+//     --key myvectors \
+//     --phase query \
+//     --mode vemb \
+//     --raw \
+//     -c 32 \
+//     -n 128 \
+//     -d 4 \
+//     -p 64
+//
+//   go run ./benchmark/trigger_proxy_aggregation.go \
+//     --redis-cli ./src/redis-cli \
+//     --port 6391 \
+//     --key myvectors \
+//     --mode vsim \
+//     -c 32 \
+//     -n 128 \
+//     -d 4 \
+//     -p 64
+//
+// Notes:
+// - In --phase all or --phase prefill, the script starts by FLUSHALL and
+//   re-populates the target key.
+// - --prefill-count controls how many vectors are inserted before issuing
+//   concurrent VEMB/VSIM requests.
+// - VSIM requests are sent with WITHSCORES.
 package main
 
 import (
@@ -175,6 +219,7 @@ func main() {
 	var host string
 	var port int
 	var key string
+	var phase string
 	var mode string
 	var concurrency int
 	var requests int
@@ -185,6 +230,7 @@ func main() {
 	flag.StringVar(&host, "host", "127.0.0.1", "Redis host")
 	flag.IntVar(&port, "port", 6391, "Redis port")
 	flag.StringVar(&key, "key", "myvectors", "Vector key")
+	flag.StringVar(&phase, "phase", "all", "Phase: prefill|query|all")
 	flag.StringVar(&mode, "mode", "vemb", "Mode: vemb|vsim")
 	flag.IntVar(&concurrency, "concurrency", 32, "Concurrent connections")
 	flag.IntVar(&concurrency, "c", 32, "Concurrent connections (short form)")
@@ -199,15 +245,32 @@ func main() {
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 
-	fmt.Printf("[setup] prefill key=%s dim=%d count=%d\n", key, dim, prefillCount)
 	if redisCLI != "" {
 		if _, err := os.Stat(redisCLI); err != nil {
 			fmt.Fprintf(os.Stderr, "redis-cli not found: %s\n", redisCLI)
 			os.Exit(1)
 		}
 	}
-	if err := prefill(addr, redisCLI, port, key, dim, prefillCount); err != nil {
-		fmt.Fprintf(os.Stderr, "prefill failed: %v\n", err)
+
+	switch phase {
+	case "prefill", "all":
+		fmt.Printf("[setup] prefill key=%s dim=%d count=%d\n", key, dim, prefillCount)
+		if err := prefill(addr, redisCLI, port, key, dim, prefillCount); err != nil {
+			fmt.Fprintf(os.Stderr, "prefill failed: %v\n", err)
+			os.Exit(1)
+		}
+		if phase == "prefill" {
+			fmt.Println("")
+			fmt.Println("=== Prefill Summary ===")
+			fmt.Printf("key:        %s\n", key)
+			fmt.Printf("dim:        %d\n", dim)
+			fmt.Printf("inserted:   %d\n", prefillCount)
+			return
+		}
+	case "query":
+		// Query-only mode assumes data is already present.
+	default:
+		fmt.Fprintf(os.Stderr, "unknown phase: %s\n", phase)
 		os.Exit(1)
 	}
 
