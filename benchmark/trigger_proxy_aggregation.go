@@ -117,64 +117,77 @@ func prefill(addr, key string, dim, count int) error {
 }
 
 func main() {
-	host := flag.String("host", "127.0.0.1", "Redis host")
-	port := flag.Int("port", 6391, "Redis port")
-	key := flag.String("key", "myvectors", "Vector key")
-	mode := flag.String("mode", "vemb", "Mode: vemb|vemb-raw|vsim|vsim-withscores")
-	concurrency := flag.Int("concurrency", 32, "Concurrent connections")
-	requests := flag.Int("requests", 128, "Total requests")
-	dim := flag.Int("dim", 4, "Vector dimension")
-	prefillCount := flag.Int("prefill-count", 64, "Prefill vector count")
+	var host string
+	var port int
+	var key string
+	var mode string
+	var concurrency int
+	var requests int
+	var dim int
+	var prefillCount int
+
+	flag.StringVar(&host, "host", "127.0.0.1", "Redis host")
+	flag.IntVar(&port, "port", 6391, "Redis port")
+	flag.StringVar(&key, "key", "myvectors", "Vector key")
+	flag.StringVar(&mode, "mode", "vemb", "Mode: vemb|vemb-raw|vsim|vsim-withscores")
+	flag.IntVar(&concurrency, "concurrency", 32, "Concurrent connections")
+	flag.IntVar(&concurrency, "c", 32, "Concurrent connections (short form)")
+	flag.IntVar(&requests, "requests", 128, "Total requests")
+	flag.IntVar(&requests, "n", 128, "Total requests (short form)")
+	flag.IntVar(&dim, "dim", 4, "Vector dimension")
+	flag.IntVar(&dim, "d", 4, "Vector dimension (short form)")
+	flag.IntVar(&prefillCount, "prefill-count", 64, "Prefill vector count")
+	flag.IntVar(&prefillCount, "p", 64, "Prefill vector count (short form)")
 	flag.Parse()
 
-	addr := fmt.Sprintf("%s:%d", *host, *port)
+	addr := fmt.Sprintf("%s:%d", host, port)
 
-	fmt.Printf("[setup] prefill key=%s dim=%d count=%d\n", *key, *dim, *prefillCount)
-	if err := prefill(addr, *key, *dim, *prefillCount); err != nil {
+	fmt.Printf("[setup] prefill key=%s dim=%d count=%d\n", key, dim, prefillCount)
+	if err := prefill(addr, key, dim, prefillCount); err != nil {
 		fmt.Fprintf(os.Stderr, "prefill failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	var jobs [][]string
-	switch *mode {
+	switch mode {
 	case "vemb":
-		for i := 0; i < *requests; i++ {
-			jobs = append(jobs, []string{"VEMB", *key, fmt.Sprintf("item:%d", i%*prefillCount)})
+		for i := 0; i < requests; i++ {
+			jobs = append(jobs, []string{"VEMB", key, fmt.Sprintf("item:%d", i%prefillCount)})
 		}
 	case "vemb-raw":
-		for i := 0; i < *requests; i++ {
-			jobs = append(jobs, []string{"VEMB", *key, fmt.Sprintf("item:%d", i%*prefillCount), "RAW"})
+		for i := 0; i < requests; i++ {
+			jobs = append(jobs, []string{"VEMB", key, fmt.Sprintf("item:%d", i%prefillCount), "RAW"})
 		}
 	case "vsim":
 		query := []string{"1"}
-		for i := 1; i < *dim; i++ {
+		for i := 1; i < dim; i++ {
 			query = append(query, "0")
 		}
-		for i := 0; i < *requests; i++ {
-			args := []string{"VSIM", *key, "VALUES", strconv.Itoa(*dim)}
+		for i := 0; i < requests; i++ {
+			args := []string{"VSIM", key, "VALUES", strconv.Itoa(dim)}
 			args = append(args, query...)
 			jobs = append(jobs, args)
 		}
 	case "vsim-withscores":
 		query := []string{"1"}
-		for i := 1; i < *dim; i++ {
+		for i := 1; i < dim; i++ {
 			query = append(query, "0")
 		}
-		for i := 0; i < *requests; i++ {
-			args := []string{"VSIM", *key, "VALUES", strconv.Itoa(*dim)}
+		for i := 0; i < requests; i++ {
+			args := []string{"VSIM", key, "VALUES", strconv.Itoa(dim)}
 			args = append(args, query...)
 			args = append(args, "WITHSCORES")
 			jobs = append(jobs, args)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", *mode)
+		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", mode)
 		os.Exit(1)
 	}
 
-	fmt.Printf("[run] mode=%s requests=%d concurrency=%d key=%s addr=%s\n",
-		*mode, *requests, *concurrency, *key, addr)
+	fmt.Printf("[run] mode=%s requests=%d concurrency=%d dim=%d key=%s addr=%s\n",
+		mode, requests, concurrency, dim, key, addr)
 
-	sem := make(chan struct{}, *concurrency)
+	sem := make(chan struct{}, concurrency)
 	results := make(chan result, len(jobs))
 	var wg sync.WaitGroup
 
@@ -229,6 +242,7 @@ func main() {
 
 	fmt.Println("")
 	fmt.Println("=== Aggregation Trigger Summary ===")
+	fmt.Printf("dim:        %d\n", dim)
 	fmt.Printf("successful: %d\n", ok)
 	fmt.Printf("failed:     %d\n", fail)
 	fmt.Printf("avg ms/op:  %.2f\n", avgMs)
