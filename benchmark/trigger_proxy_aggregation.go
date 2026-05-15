@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 )
 
 type result struct {
+	cmd       []string
 	ok        bool
 	latency   time.Duration
 	response  string
@@ -88,10 +90,48 @@ func redisCall(addr string, args []string) (string, error) {
 	return readRESP(bufio.NewReader(conn))
 }
 
-func prefill(addr, key string, dim, count int) error {
-	if _, err := redisCall(addr, []string{"FLUSHALL"}); err != nil {
+func redisCallCLI(redisCLI string, port int, args []string) (string, string, error) {
+	cmd := append([]string{"-p", strconv.Itoa(port)}, args...)
+	proc := execCommand(redisCLI, cmd)
+	return proc.stdout, proc.stderr, proc.err
+}
+
+type cliResult struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+func execCommand(bin string, args []string) cliResult {
+	cmd := exec.Command(bin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return cliResult{
+		stdout: strings.TrimSpace(stdout.String()),
+		stderr: strings.TrimSpace(stderr.String()),
+		err:    err,
+	}
+}
+
+func prefill(addr, redisCLI string, port int, key string, dim, count int) error {
+	fmt.Printf("[setup] FLUSHALL\n")
+	if redisCLI != "" {
+		stdout, stderr, err := redisCallCLI(redisCLI, port, []string{"FLUSHALL"})
+		if stdout != "" {
+			fmt.Println(stdout)
+		}
+		if stderr != "" {
+			fmt.Fprintln(os.Stderr, stderr)
+		}
+		if err != nil {
+			return err
+		}
+	} else if _, err := redisCall(addr, []string{"FLUSHALL"}); err != nil {
 		return err
 	}
+	fmt.Printf("[setup] inserting %d vectors into key=%s\n", count, key)
 	basis := make([][]string, dim)
 	for i := 0; i < dim; i++ {
 		vec := make([]string, dim)
@@ -109,6 +149,20 @@ func prefill(addr, key string, dim, count int) error {
 		args := []string{"VADD", key, "VALUES", strconv.Itoa(dim)}
 		args = append(args, basis[i%dim]...)
 		args = append(args, fmt.Sprintf("item:%d", i))
+		if redisCLI != "" {
+			stdout, stderr, err := redisCallCLI(redisCLI, port, args)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[setup] VADD failed: %s %s\n", redisCLI, strings.Join(append([]string{"-p", strconv.Itoa(port)}, args...), " "))
+				if stdout != "" {
+					fmt.Fprintln(os.Stderr, stdout)
+				}
+				if stderr != "" {
+					fmt.Fprintln(os.Stderr, stderr)
+				}
+				return err
+			}
+			continue
+		}
 		if _, err := redisCall(addr, args); err != nil {
 			return err
 		}
@@ -117,6 +171,7 @@ func prefill(addr, key string, dim, count int) error {
 }
 
 func main() {
+	var redisCLI string
 	var host string
 	var port int
 	var key string
@@ -126,10 +181,11 @@ func main() {
 	var dim int
 	var prefillCount int
 
+	flag.StringVar(&redisCLI, "redis-cli", "./src/redis-cli", "Path to redis-cli")
 	flag.StringVar(&host, "host", "127.0.0.1", "Redis host")
 	flag.IntVar(&port, "port", 6391, "Redis port")
 	flag.StringVar(&key, "key", "myvectors", "Vector key")
-	flag.StringVar(&mode, "mode", "vemb", "Mode: vemb|vemb-raw|vsim|vsim-withscores")
+	flag.StringVar(&mode, "mode", "vemb", "Mode: vemb|vsim")
 	flag.IntVar(&concurrency, "concurrency", 32, "Concurrent connections")
 	flag.IntVar(&concurrency, "c", 32, "Concurrent connections (short form)")
 	flag.IntVar(&requests, "requests", 128, "Total requests")
@@ -138,12 +194,19 @@ func main() {
 	flag.IntVar(&dim, "d", 4, "Vector dimension (short form)")
 	flag.IntVar(&prefillCount, "prefill-count", 64, "Prefill vector count")
 	flag.IntVar(&prefillCount, "p", 64, "Prefill vector count (short form)")
+	raw := flag.Bool("raw", false, "Use RAW for VEMB")
 	flag.Parse()
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 
 	fmt.Printf("[setup] prefill key=%s dim=%d count=%d\n", key, dim, prefillCount)
-	if err := prefill(addr, key, dim, prefillCount); err != nil {
+	if redisCLI != "" {
+		if _, err := os.Stat(redisCLI); err != nil {
+			fmt.Fprintf(os.Stderr, "redis-cli not found: %s\n", redisCLI)
+			os.Exit(1)
+		}
+	}
+	if err := prefill(addr, redisCLI, port, key, dim, prefillCount); err != nil {
 		fmt.Fprintf(os.Stderr, "prefill failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -152,23 +215,13 @@ func main() {
 	switch mode {
 	case "vemb":
 		for i := 0; i < requests; i++ {
-			jobs = append(jobs, []string{"VEMB", key, fmt.Sprintf("item:%d", i%prefillCount)})
-		}
-	case "vemb-raw":
-		for i := 0; i < requests; i++ {
-			jobs = append(jobs, []string{"VEMB", key, fmt.Sprintf("item:%d", i%prefillCount), "RAW"})
-		}
-	case "vsim":
-		query := []string{"1"}
-		for i := 1; i < dim; i++ {
-			query = append(query, "0")
-		}
-		for i := 0; i < requests; i++ {
-			args := []string{"VSIM", key, "VALUES", strconv.Itoa(dim)}
-			args = append(args, query...)
+			args := []string{"VEMB", key, fmt.Sprintf("item:%d", i%prefillCount)}
+			if *raw {
+				args = append(args, "RAW")
+			}
 			jobs = append(jobs, args)
 		}
-	case "vsim-withscores":
+	case "vsim":
 		query := []string{"1"}
 		for i := 1; i < dim; i++ {
 			query = append(query, "0")
@@ -202,10 +255,10 @@ func main() {
 			lat := time.Since(start)
 			<-sem
 			if err != nil {
-				results <- result{ok: false, latency: lat, errString: err.Error()}
+				results <- result{cmd: a, ok: false, latency: lat, errString: err.Error()}
 				return
 			}
-			results <- result{ok: true, latency: lat, response: resp}
+			results <- result{cmd: a, ok: true, latency: lat, response: resp}
 		}(args)
 	}
 
@@ -226,7 +279,8 @@ func main() {
 		} else {
 			fail++
 			if len(firstFailures) < 5 {
-				firstFailures = append(firstFailures, r.errString)
+				msg := fmt.Sprintf("cmd: %s\nstderr: %s", strings.Join(r.cmd, " "), r.errString)
+				firstFailures = append(firstFailures, msg)
 			}
 		}
 	}
