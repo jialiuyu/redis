@@ -77,121 +77,37 @@ make test
 
 ## 架构
 
-### 数据流
+详细架构参考见 [`architecture.md`](architecture.md)，包含：组件清单、API 签名、数据流、层间交互、file:line 引用、Gotchas。
 
+**涉及 HPC 组件（vector_engine、batch_processor、proxy_aggregator、supernode_worker、sve_compute、ub_client、three_layer_cache）的任何工作，开始前必须先阅读 `architecture.md` 中对应章节。**
+
+数据流概要：
 ```
-客户端请求 → RESP 解析（networking.c）→ 命令查找 → 命令执行 →
-  ↓ 向量相关
-Vector Engine（vector_engine.c）→ Batch Processor（batch_processor.c）→
-Proxy Aggregator（proxy_aggregator.c）→ SuperNode Worker（supernode_worker.c）→
-SVE2 计算（sve_compute.c）→ UB 总线（ub_client.c）→ 三层缓存（three_layer_cache*.c）
+Client (RESP) → networking.c → vector_engine.c → batch_processor.c →
+proxy_aggregator.c → supernode_worker.c → sve_compute.c → ub_client.c → three_layer_cache*.c
 ```
 
-### 核心事件循环（继承自 Redis）
+## 语言与沟通偏好
 
-- `src/ae.c` — 事件循环（epoll/kqueue/evport/select）
-- `src/server.c` / `src/server.h` — 主服务器结构体 `redisServer`，入口 `main()` 在 server.c
-- `src/networking.c` — 客户端连接与 RESP 协议解析
+- **对话与文档**：默认使用中文回复和撰写文档。对于行业标准术语（如 API 名称、数据结构、设计模式、技术专有名词），保留英文原文以保持准确性。例如："一致性哈希"比"consistent hashing"更自然就用中文，但"HNSW index"比"分层可导航小世界图"更清晰就保留英文。
+- **代码注释**：全部使用英文，遵循 C 语言注释规范：
+  - 使用 `/* */` 风格，不使用 `//`（与 Redis 原有代码风格一致）
+  - 函数级注释写在函数定义上方，说明 purpose、parameters、return value
+  - 行内注释简短精炼，只解释"为什么"而非"做什么"
+  - 避免过度注释，代码本身应当自解释
 
-### 向量计算引擎（本项目新增）
+## Git 工作流
 
-| 文件 | 功能 |
-|------|------|
-| `src/vector_engine.c/h` | 向量引擎抽象层，统一 Redis HNSW 和 UB 两种后端，提供 `vadd`/`vrem`/`vsim`/`vemb` 接口 |
-| `src/batch_processor.c/h` | 高吞吐量批量处理，50μs 超时机制，最大 1024 批次 |
-| `src/proxy_aggregator.c/h` | 智能代理聚合器，一致性哈希(MurmurHash3)分片，3000-6000 请求/批，零拷贝 Ring Buffer |
-| `src/supernode_worker.c/h` | 超节点计算引擎，Bitmap CAS 无锁并发，SVE2 Gather Load，UB.mem 共享内存池直接访问 |
-| `src/sve_compute.c/h` | ARM SVE/SVE2 加速向量运算，1M embedding 缓存，支持余弦相似度/GEMM/Adam 优化器 |
-| `src/sve2_gemm.h` | SVE2 矩阵乘法 |
-| `src/sve2_adam.h` | SVE2 Adam 神经网络优化器 |
-| `src/ub_client.c/h` | UB 总线客户端，用户态零拷贝通信，支持 ComputeNode/MemoryTile/FabricManager 实体类型 |
-
-### 三层缓存系统
-
-| 文件 | 功能 |
-|------|------|
-| `src/three_layer_cache.c/h` | 三层缓存基础实现（HOT 索引 → WARM 值 → COLD 追加写） |
-| `src/three_layer_cache_ub.c/h` | UB 共享内存后端，SVE2 融合计算（Gather + Dot-Product），一致性哈希分片 |
-| `src/tlc_server.c` | 缓存服务器主逻辑 |
-| `src/tlc_unified_server.c` | 统一传输层服务器 |
-| `src/tlc_aeron_server.c` | Aeron 传输后端 |
-| `src/tlc_dpdk_server.c` | DPDK 传输后端 |
-| `src/tlc_fc_server.c` | FC 传输后端 |
-| `src/tlc_urma_server.c` | URMA 传输后端 |
-| `src/tlc_v10_server.c` | V10 版本服务器 |
-| `src/tlc_v13_server.c` | V13 版本服务器 |
-| `src/tlc_v14_server.c` | V14 版本服务器 |
-
-### IPC 与通信
-
-| 文件 | 功能 |
-|------|------|
-| `src/aeron_ipc.h` | Aeron 风格无锁共享内存消息总线，SPSC Ring Buffer，目标延迟 < 0.1μs |
-| `src/ikcp.c` | KCP 协议实现（可靠 UDP） |
-| `src/urma.c` | URMA（用户态 RDMA）接口 |
-
-### Redis 核心数据结构
-
-每个 Redis 数据类型有专用 `t_*.c` 文件：`t_string.c`、`t_list.c`、`t_set.c`、`t_zset.c`、`t_hash.c`、`t_stream.c`
-
-内部数据结构：
-- `src/sds.c` — 简单动态字符串
-- `src/dict.c` — 哈希表
-- `src/kvstore.c` — 基于 Slot 的哈希表（集群模式）
-- `src/quicklist.c` / `src/listpack.c` — List 的紧凑存储
-- `src/rax.c` — 基数树（Stream 和 Key 过期使用）
-- `src/ebuckets.c` / `src/estore.c` / `src/fwtree.c` — E-Buckets 分层过期管理 + Fenwick Tree 索引
-- `src/mstr.c` / `src/entry.c` — MSTR 不可变字符串与 Hash 字段级过期
-
-### 持久化与复制
-
-- `src/rdb.c` — RDB 快照
-- `src/aof.c` — AOF 追加持久化
-- `src/replication.c` — 主从复制
-
-### 集群
-
-- `src/cluster.c` / `src/cluster.h` — 核心集群逻辑
-- `src/cluster_legacy.c` — 旧版集群实现
-- `src/cluster_slot_stats.c` — Slot 级别统计
-- `src/sentinel.c` — Redis Sentinel 高可用
-
-### 命令定义
-
-- `src/commands/*.json` — 每个命令一个 JSON 文件
-- `utils/generate-command-code.py` — 从 JSON 生成 `src/commands.def`
-- 修改命令时：编辑 JSON → 运行 `python3 utils/generate-command-code.py`
-
-### 模块系统
-
-- `src/module.c` — 模块 API 实现
-- `src/redismodule.h` — 模块 API 头文件
-- `src/modules/` — 内置模块示例（helloacl、helloblock 等），含 `tlc_module.c`（三层缓存模块）
-- `modules/` — 完整外部模块：RedisBloom、RediSearch、RedisJSON、RedisTimeSeries、vector-sets（HNSW 向量搜索）
-
-### 其他关键基础设施
-
-- `src/config.c` — 配置处理
-- `src/db.c` — 数据库操作（键空间、查找、过期）
-- `src/object.c` — Redis 对象（`robj`）
-- `src/blocked.c` — 阻塞客户端管理
-- `src/evict.c` — 键淘汰
-- `src/expire.c` — 过期子系统
-- `src/keymeta.c` — Key 元数据可扩展框架
-- `src/hotkeys.c` — 热点 Key 追踪
-- `src/memory_prefetch.c` — 命令批处理预取优化
-- `src/iothread.c` — I/O 多线程
-- `src/defrag.c` — 内存碎片整理
-
-### 依赖（`deps/` 目录）
-
-- `jemalloc` — 内存分配器（Linux 默认）
-- `hiredis` — C 客户端库
-- `lua` — Lua 脚本引擎
-- `linenoise` — 行编辑
-- `hdr_histogram` — 延迟直方图
-- `fpconv`、`fast_float` — 浮点转换
-- `xxhash` — 哈希函数
+- **完成工作后自动提交并推送**：每次完成一个任务（功能实现、bug 修复、重构等）后，主动 `git add` 相关文件、`git commit`、`git push`，无需等待用户指示。
+- **Commit message 规范**：
+  - 使用英文撰写
+  - 格式：`<type>(<scope>): <description>`
+  - type：`feat` / `fix` / `refactor` / `perf` / `test` / `docs` / `chore`
+  - scope：模块或子系统名称（如 `vector_engine`、`sve_compute`、`tlc`、`proxy`、`ub`、`supernode`）
+  - description：简短说明做了什么（祈使句），必要时在 body 中补充 why
+  - 示例：`feat(vector_engine): add batch embedding lookup with SVE2 gather load`
+- **不要自动创建 PR**，由用户自行决定何时创建。
+- **不要 force push、不要 reset --hard、不要 rebase 已推送的提交**。
 
 ## 代码约定
 
