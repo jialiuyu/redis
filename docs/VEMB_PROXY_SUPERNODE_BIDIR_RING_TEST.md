@@ -170,3 +170,67 @@ If all commands succeed, it means:
 - worker no longer needs direct completion/unblock ownership
 - proxy result collector is working
 - `VEMB` still completes end to end after the transport split
+
+## 10. Verified Linux Run
+
+The following Linux-side run has already been observed to pass on the current
+bi-directional ring version:
+
+```text
+[root@localhost hpc-redis]# ./src/redis-cli -p 6391
+127.0.0.1:6391> VENGINE GET
+1) engine
+2) UB
+127.0.0.1:6391> FLUSHALL
+OK
+127.0.0.1:6391> VADD myvectors VALUES 4 1 2 3 4 item:1
+(integer) 1
+127.0.0.1:6391> VEMB myvectors item:1
+1) "1"
+2) "2"
+3) "3"
+4) "4"
+127.0.0.1:6391> VEMB myvectors item:1 RAW
+1) fp32
+2) "\x00\x00\x80?\x00\x00\x00@\x00\x00@@\x00\x00\x80@"
+3) "1"
+127.0.0.1:6391> exit
+```
+
+This confirms, for the current refactor state:
+
+- `VENGINE GET` reports `UB`
+- `VADD` writes successfully
+- `VEMB` returns the expected vector
+- `VEMB RAW` returns the expected `fp32` payload
+- the bi-directional `proxy <-> supernode` ring transport does not regress the
+  end-to-end `VEMB` path
+
+## 11. Trigger Aggregation
+
+Single interactive `redis-cli` request/response usually does not trigger proxy
+aggregation reliably.
+
+To force aggregation, use the concurrent benchmark helper:
+
+```bash
+go run ./benchmark/trigger_proxy_aggregation.go \
+  --port 6391 \
+  --key myvectors \
+  --mode vemb \
+  --concurrency 32 \
+  --requests 128
+```
+
+For `VEMB RAW`:
+
+```bash
+go run ./benchmark/trigger_proxy_aggregation.go \
+  --port 6391 \
+  --key myvectors \
+  --mode vemb-raw \
+  --concurrency 32 \
+  --requests 128
+```
+
+Look at server logs and confirm batch sizes greater than 1.
