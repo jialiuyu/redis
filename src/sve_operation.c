@@ -70,52 +70,73 @@ void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
     ctx->vector_stride_bytes = vector_stride_bytes;
     ctx->table_row_capacity = table_row_capacity;
     ctx->stats = stats;
-    ctx->bitmap_latency_us_accum = NULL;
-    ctx->bitmap_latency_ns_accum = NULL;
+    ctx->bitmap_lock_latency_ns_accum = NULL;
+    ctx->bitmap_unlock_latency_ns_accum = NULL;
+    ctx->vector_load_latency_ns_accum = NULL;
 }
 
 int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
                                uint64_t *emb_ids,
                                size_t num_ids,
                                float *results) {
-    const size_t dim = ctx ? ctx->vector_dim : 0;
-    const size_t row_bytes = dim * sizeof(float);
-
     RETURN_IF(!ctx || !ctx->ubas || !ctx->bitmap || !ctx->stats ||
-              !ctx->ubas->mapped_addr || !emb_ids || !results || num_ids == 0 || dim == 0, -1);
+              !ctx->ubas->mapped_addr || !emb_ids || !results || num_ids == 0 || ctx->vector_dim == 0, -1);
+
+    const size_t dim = ctx->vector_dim;
+    const size_t row_bytes = dim * sizeof(float);
+    uint64_t bitmap_lock_ns_sink = 0;
+    uint64_t bitmap_unlock_ns_sink = 0;
+    uint64_t vector_load_ns_sink = 0;
+    uint64_t *bitmap_lock_ns = ctx->bitmap_lock_latency_ns_accum ? ctx->bitmap_lock_latency_ns_accum : &bitmap_lock_ns_sink;
+    uint64_t *bitmap_unlock_ns = ctx->bitmap_unlock_latency_ns_accum ? ctx->bitmap_unlock_latency_ns_accum : &bitmap_unlock_ns_sink;
+    uint64_t *vector_load_ns = ctx->vector_load_latency_ns_accum ? ctx->vector_load_latency_ns_accum : &vector_load_ns_sink;
+    const int measure_bitmap_lock = ctx->bitmap_lock_latency_ns_accum != NULL;
+    const int measure_bitmap_unlock = ctx->bitmap_unlock_latency_ns_accum != NULL;
+    const int measure_vector_load = ctx->vector_load_latency_ns_accum != NULL;
 
     for (size_t i = 0; i < num_ids; i++) {
-        monotime bitmap_start = 0;
-        if (ctx->bitmap_latency_us_accum || ctx->bitmap_latency_ns_accum) {
-            elapsedStartNs(&bitmap_start);
+        monotime lock_start = 0;
+        uint64_t lock_elapsed_ns = 0;
+        if (measure_bitmap_lock) {
+            elapsedStartNs(&lock_start);
         }
         if (bitmap_try_acquire(ctx->bitmap, emb_ids[i]) != 0) {
             atomic_fetch_add_explicit(&ctx->stats->lock_failure, 1, memory_order_relaxed);
+            if (measure_bitmap_lock) {
+                lock_elapsed_ns = elapsedNs(lock_start);
+            }
+            *bitmap_lock_ns += lock_elapsed_ns;
             memset(&results[i * dim], 0, row_bytes);
-            if (ctx->bitmap_latency_us_accum) {
-                *ctx->bitmap_latency_us_accum += elapsedNs(bitmap_start) / 1000ULL;
-            }
-            if (ctx->bitmap_latency_ns_accum) {
-                *ctx->bitmap_latency_ns_accum += elapsedNs(bitmap_start);
-            }
             continue;
         }
 
         atomic_fetch_add_explicit(&ctx->stats->lock_success, 1, memory_order_relaxed);
+        if (measure_bitmap_lock) {
+            lock_elapsed_ns = elapsedNs(lock_start);
+        }
+        *bitmap_lock_ns += lock_elapsed_ns;
         if (emb_ids[i] >= ctx->table_row_capacity) {
             memset(&results[i * dim], 0, row_bytes);
+            monotime release_start = 0;
+            uint64_t release_elapsed_ns = 0;
+            if (measure_bitmap_unlock) {
+                elapsedStartNs(&release_start);
+            }
             bitmap_release(ctx->bitmap, emb_ids[i]);
-            if (ctx->bitmap_latency_us_accum) {
-                *ctx->bitmap_latency_us_accum += elapsedNs(bitmap_start) / 1000ULL;
+            if (measure_bitmap_unlock) {
+                release_elapsed_ns = elapsedNs(release_start);
             }
-            if (ctx->bitmap_latency_ns_accum) {
-                *ctx->bitmap_latency_ns_accum += elapsedNs(bitmap_start);
-            }
+            *bitmap_unlock_ns += release_elapsed_ns;
             return -1;
         }
 
         const float *src = (const float *)((const char *)ctx->ubas->mapped_addr +
                                            emb_ids[i] * ctx->vector_stride_bytes);
+        monotime load_start = 0;
+        uint64_t load_elapsed_ns = 0;
+        if (measure_vector_load) {
+            elapsedStartNs(&load_start);
+        }
 #ifdef USE_ARM_SVE
         {
             const size_t vl = svcntw();
@@ -141,13 +162,100 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
 #else
         memcpy(&results[i * dim], src, row_bytes);
 #endif
+        if (measure_vector_load) {
+            load_elapsed_ns = elapsedNs(load_start);
+        }
+        *vector_load_ns += load_elapsed_ns;
+        monotime release_start = 0;
+        uint64_t release_elapsed_ns = 0;
+        if (measure_bitmap_unlock) {
+            elapsedStartNs(&release_start);
+        }
         bitmap_release(ctx->bitmap, emb_ids[i]);
-        if (ctx->bitmap_latency_us_accum) {
-            *ctx->bitmap_latency_us_accum += elapsedNs(bitmap_start) / 1000ULL;
+        if (measure_bitmap_unlock) {
+            release_elapsed_ns = elapsedNs(release_start);
         }
-        if (ctx->bitmap_latency_ns_accum) {
-            *ctx->bitmap_latency_ns_accum += elapsedNs(bitmap_start);
+        *bitmap_unlock_ns += release_elapsed_ns;
+    }
+
+    return 0;
+}
+
+int sve_serial_contiguous_read_traced(sve_gather_ctx_t *ctx,
+                                      uint64_t *emb_ids,
+                                      size_t num_ids,
+                                      float *results,
+                                      uint64_t *bitmap_lock_latency_ns,
+                                      uint64_t *bitmap_unlock_latency_ns,
+                                      uint64_t *vector_load_latency_ns) {
+    RETURN_IF(!ctx || !ctx->ubas || !ctx->bitmap || !ctx->stats ||
+              !ctx->ubas->mapped_addr || !emb_ids || !results || num_ids == 0 ||
+              ctx->vector_dim == 0 || !bitmap_lock_latency_ns ||
+              !bitmap_unlock_latency_ns || !vector_load_latency_ns, -1);
+
+    const size_t dim = ctx->vector_dim;
+    const size_t row_bytes = dim * sizeof(float);
+
+    *bitmap_lock_latency_ns = 0;
+    *bitmap_unlock_latency_ns = 0;
+    *vector_load_latency_ns = 0;
+
+    for (size_t i = 0; i < num_ids; i++) {
+        monotime lock_start;
+        elapsedStartNs(&lock_start);
+        if (bitmap_try_acquire(ctx->bitmap, emb_ids[i]) != 0) {
+            atomic_fetch_add_explicit(&ctx->stats->lock_failure, 1, memory_order_relaxed);
+            *bitmap_lock_latency_ns += elapsedNs(lock_start);
+            memset(&results[i * dim], 0, row_bytes);
+            continue;
         }
+
+        atomic_fetch_add_explicit(&ctx->stats->lock_success, 1, memory_order_relaxed);
+        *bitmap_lock_latency_ns += elapsedNs(lock_start);
+
+        if (emb_ids[i] >= ctx->table_row_capacity) {
+            memset(&results[i * dim], 0, row_bytes);
+            monotime release_start;
+            elapsedStartNs(&release_start);
+            bitmap_release(ctx->bitmap, emb_ids[i]);
+            *bitmap_unlock_latency_ns += elapsedNs(release_start);
+            return -1;
+        }
+
+        const float *src = (const float *)((const char *)ctx->ubas->mapped_addr +
+                                           emb_ids[i] * ctx->vector_stride_bytes);
+        monotime load_start;
+        elapsedStartNs(&load_start);
+#ifdef USE_ARM_SVE
+        {
+            const size_t vl = svcntw();
+            size_t rem = dim;
+            const float *srcp = src;
+            float *dstp = &results[i * dim];
+
+            while (rem >= vl) {
+                svbool_t pg = svptrue_b32();
+                svfloat32_t v = svld1_f32(pg, srcp);
+                svst1_f32(pg, dstp, v);
+                srcp += vl;
+                dstp += vl;
+                rem -= vl;
+            }
+
+            if (rem > 0) {
+                svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+                svfloat32_t v = svld1_f32(pg, srcp);
+                svst1_f32(pg, dstp, v);
+            }
+        }
+#else
+        memcpy(&results[i * dim], src, row_bytes);
+#endif
+        *vector_load_latency_ns += elapsedNs(load_start);
+        monotime release_start;
+        elapsedStartNs(&release_start);
+        bitmap_release(ctx->bitmap, emb_ids[i]);
+        *bitmap_unlock_latency_ns += elapsedNs(release_start);
     }
 
     return 0;
@@ -161,12 +269,11 @@ int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,
                                 uint64_t *emb_ids,
                                 size_t num_ids,
                                 float *results) {
-    const size_t dim = ctx ? ctx->vector_dim : 0;
-
     RETURN_IF(!ctx || !ctx->ubas || !ctx->bitmap || !ctx->stats ||
               !ctx->ubas->mapped_addr || !emb_ids || !results ||
-              num_ids == 0 || dim == 0, -1);
+              num_ids == 0 || ctx->vector_dim == 0, -1);
 
+    const size_t dim = ctx->vector_dim;
     const char *table_base = (const char *)ctx->ubas->mapped_addr;
     const size_t stride = ctx->vector_stride_bytes;
 

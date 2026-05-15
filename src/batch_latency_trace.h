@@ -18,8 +18,9 @@ typedef struct batch_latency_trace {
     uint64_t proxy_batch_wait_max_us;
     uint64_t proxy_flush_us;
     uint64_t supernode_queue_us;
-    uint64_t supernode_bitmap_ns;
-    uint64_t supernode_gather_ns;
+    uint64_t supernode_bitmap_lock_ns;
+    uint64_t supernode_bitmap_unlock_ns;
+    uint64_t supernode_vector_load_ns;
     uint64_t supernode_compute_ns;
     uint64_t supernode_response_ns;
     uint64_t proxy_result_queue_total_us;
@@ -40,8 +41,9 @@ int batch_latency_trace_begin(uint64_t batch_id,
 
 int batch_latency_trace_record_supernode(uint64_t batch_id,
                                          uint64_t supernode_queue_us,
-                                         uint64_t supernode_bitmap_ns,
-                                         uint64_t supernode_gather_ns,
+                                         uint64_t supernode_bitmap_lock_ns,
+                                         uint64_t supernode_bitmap_unlock_ns,
+                                         uint64_t supernode_vector_load_ns,
                                          uint64_t supernode_compute_ns,
                                          uint64_t supernode_response_ns);
 

@@ -55,8 +55,9 @@ typedef struct {
     size_t vector_stride_bytes;
     uint64_t table_row_capacity;
     sve_operation_stats_t *stats;
-    uint64_t *bitmap_latency_us_accum;
-    uint64_t *bitmap_latency_ns_accum;
+    uint64_t *bitmap_lock_latency_ns_accum;
+    uint64_t *bitmap_unlock_latency_ns_accum;
+    uint64_t *vector_load_latency_ns_accum;
 } sve_gather_ctx_t;
 
 /* ---- Bitmap 操作 ---- */
@@ -78,6 +79,15 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
                           uint64_t *emb_ids,
                           size_t num_ids,
                           float *results);
+
+/* supernode 专用 traced 版本：要求输出累计指针非空，避免热路径条件分支 */
+int sve_serial_contiguous_read_traced(sve_gather_ctx_t *ctx,
+                                      uint64_t *emb_ids,
+                                      size_t num_ids,
+                                      float *results,
+                                      uint64_t *bitmap_lock_latency_ns,
+                                      uint64_t *bitmap_unlock_latency_ns,
+                                      uint64_t *vector_load_latency_ns);
 
 /* 跨 embedding SVE gather 并行读取 */
 int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,

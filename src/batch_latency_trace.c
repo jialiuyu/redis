@@ -37,7 +37,7 @@ static void batch_latency_trace_log_completed(const batch_latency_trace_t *trace
 
     serverLog(LL_NOTICE,
               "batch-trace batch=%llu op=%u req=%u done=%u proxy_wait_avg_us=%.1f proxy_wait_max_us=%llu proxy_flush_us=%llu "
-              "queue_us=%llu bitmap_ns=%llu gather_ns=%llu compute_ns=%llu response_ns=%llu result_queue_avg_us=%.1f "
+              "queue_us=%llu bitmap_lock_ns=%llu bitmap_ublock_ns=%llu vector_load_ns=%llu compute_ns=%llu response_ns=%llu result_queue_avg_us=%.1f "
               "result_queue_max_us=%llu e2e_avg_us=%.1f e2e_max_us=%llu",
               (unsigned long long)trace->batch_id,
               trace->op_type,
@@ -47,8 +47,9 @@ static void batch_latency_trace_log_completed(const batch_latency_trace_t *trace
               (unsigned long long)trace->proxy_batch_wait_max_us,
               (unsigned long long)trace->proxy_flush_us,
               (unsigned long long)trace->supernode_queue_us,
-              (unsigned long long)trace->supernode_bitmap_ns,
-              (unsigned long long)trace->supernode_gather_ns,
+              (unsigned long long)trace->supernode_bitmap_lock_ns,
+              (unsigned long long)trace->supernode_bitmap_unlock_ns,
+              (unsigned long long)trace->supernode_vector_load_ns,
               (unsigned long long)trace->supernode_compute_ns,
               (unsigned long long)trace->supernode_response_ns,
               avg_result_queue,
@@ -133,8 +134,9 @@ int batch_latency_trace_begin(uint64_t batch_id,
 
 int batch_latency_trace_record_supernode(uint64_t batch_id,
                                          uint64_t supernode_queue_us,
-                                         uint64_t supernode_bitmap_ns,
-                                         uint64_t supernode_gather_ns,
+                                         uint64_t supernode_bitmap_lock_ns,
+                                         uint64_t supernode_bitmap_unlock_ns,
+                                         uint64_t supernode_vector_load_ns,
                                          uint64_t supernode_compute_ns,
                                          uint64_t supernode_response_ns) {
     if (!g_batch_traces.initialized) return C_ERR;
@@ -146,8 +148,9 @@ int batch_latency_trace_record_supernode(uint64_t batch_id,
         return C_ERR;
     }
     trace->supernode_queue_us = supernode_queue_us;
-    trace->supernode_bitmap_ns = supernode_bitmap_ns;
-    trace->supernode_gather_ns = supernode_gather_ns;
+    trace->supernode_bitmap_lock_ns = supernode_bitmap_lock_ns;
+    trace->supernode_bitmap_unlock_ns = supernode_bitmap_unlock_ns;
+    trace->supernode_vector_load_ns = supernode_vector_load_ns;
     trace->supernode_compute_ns = supernode_compute_ns;
     trace->supernode_response_ns = supernode_response_ns;
     pthread_mutex_unlock(&g_batch_traces.lock);
@@ -224,7 +227,7 @@ sds batch_latency_trace_dump_recent(const char *title, size_t limit) {
         out = sdscatprintf(
             out,
             "  batch=%llu op=%u req=%u done=%u proxy_wait_avg_us=%.1f proxy_wait_max_us=%llu proxy_flush_us=%llu "
-            "queue_us=%llu bitmap_ns=%llu gather_ns=%llu compute_ns=%llu response_ns=%llu result_queue_avg_us=%.1f "
+            "queue_us=%llu bitmap_lock_ns=%llu bitmap_ublock_ns=%llu vector_load_ns=%llu compute_ns=%llu response_ns=%llu result_queue_avg_us=%.1f "
             "result_queue_max_us=%llu e2e_avg_us=%.1f e2e_max_us=%llu\n",
             (unsigned long long)trace->batch_id,
             trace->op_type,
@@ -234,8 +237,9 @@ sds batch_latency_trace_dump_recent(const char *title, size_t limit) {
             (unsigned long long)trace->proxy_batch_wait_max_us,
             (unsigned long long)trace->proxy_flush_us,
             (unsigned long long)trace->supernode_queue_us,
-            (unsigned long long)trace->supernode_bitmap_ns,
-            (unsigned long long)trace->supernode_gather_ns,
+            (unsigned long long)trace->supernode_bitmap_lock_ns,
+            (unsigned long long)trace->supernode_bitmap_unlock_ns,
+            (unsigned long long)trace->supernode_vector_load_ns,
             (unsigned long long)trace->supernode_compute_ns,
             (unsigned long long)trace->supernode_response_ns,
             avg_result_queue,
