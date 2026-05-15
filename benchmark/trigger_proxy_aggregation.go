@@ -66,6 +66,11 @@ type result struct {
 	errString string
 }
 
+type persistentConn struct {
+	conn net.Conn
+	br   *bufio.Reader
+}
+
 func buildRESP(args []string) []byte {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "*%d\r\n", len(args))
@@ -132,6 +137,33 @@ func redisCall(addr string, args []string) (string, error) {
 		return "", err
 	}
 	return readRESP(bufio.NewReader(conn))
+}
+
+func newPersistentConn(addr string) (*persistentConn, error) {
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return &persistentConn{
+		conn: conn,
+		br:   bufio.NewReader(conn),
+	}, nil
+}
+
+func (pc *persistentConn) close() {
+	if pc != nil && pc.conn != nil {
+		_ = pc.conn.Close()
+	}
+}
+
+func (pc *persistentConn) call(args []string) (string, error) {
+	if err := pc.conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return "", err
+	}
+	if _, err := pc.conn.Write(buildRESP(args)); err != nil {
+		return "", err
+	}
+	return readRESP(pc.br)
 }
 
 func redisCallCLI(redisCLI string, port int, args []string) (string, string, error) {
@@ -303,26 +335,37 @@ func main() {
 	fmt.Printf("[run] mode=%s requests=%d concurrency=%d dim=%d key=%s addr=%s\n",
 		mode, requests, concurrency, dim, key, addr)
 
-	sem := make(chan struct{}, concurrency)
 	results := make(chan result, len(jobs))
 	var wg sync.WaitGroup
 
 	startWall := time.Now()
-	for _, args := range jobs {
+	workerCount := concurrency
+	if workerCount > len(jobs) {
+		workerCount = len(jobs)
+	}
+	for worker := 0; worker < workerCount; worker++ {
 		wg.Add(1)
-		go func(a []string) {
+		go func(workerID int) {
 			defer wg.Done()
-			sem <- struct{}{}
-			start := time.Now()
-			resp, err := redisCall(addr, a)
-			lat := time.Since(start)
-			<-sem
+			pc, err := newPersistentConn(addr)
 			if err != nil {
-				results <- result{cmd: a, ok: false, latency: lat, errString: err.Error()}
+				results <- result{ok: false, errString: err.Error()}
 				return
 			}
-			results <- result{cmd: a, ok: true, latency: lat, response: resp}
-		}(args)
+			defer pc.close()
+
+			for idx := workerID; idx < len(jobs); idx += workerCount {
+				args := jobs[idx]
+				start := time.Now()
+				resp, err := pc.call(args)
+				lat := time.Since(start)
+				if err != nil {
+					results <- result{cmd: args, ok: false, latency: lat, errString: err.Error()}
+					continue
+				}
+				results <- result{cmd: args, ok: true, latency: lat, response: resp}
+			}
+		}(worker)
 	}
 
 	wg.Wait()
