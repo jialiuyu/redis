@@ -6,7 +6,9 @@
 #define REDISMODULE_CORE_MODULE
 
 #include "proxy_aggregator.h"
+#include "batch_latency_trace.h"
 #include "macro.h"
+#include "monotonic.h"
 #include "server.h"
 #include "proxy_batch_bucket.h"
 #include "proxy_active_bucket_heap.h"
@@ -115,10 +117,15 @@ static inline void proxy_flush_thread_idle_wait(int processed_any) {
     nanosleep(&ts, NULL);
 }
 
-static inline struct timespec proxy_timespec_from_abs_us(uint64_t abs_us) {
+static inline struct timespec proxy_timespec_from_rel_us(uint64_t rel_us) {
     struct timespec ts;
-    ts.tv_sec = (time_t)(abs_us / 1000000);
-    ts.tv_nsec = (long)((abs_us % 1000000) * 1000);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(rel_us / 1000000);
+    ts.tv_nsec += (long)((rel_us % 1000000) * 1000);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+    }
     return ts;
 }
 
@@ -137,7 +144,7 @@ static void proxy_flush_thread_wait(proxy_aggregator_t *agg, int processed_any,
             pthread_cond_wait(&agg->active_buckets_cond, &agg->active_buckets_lock);
             atomic_fetch_add_explicit(&agg->active_wait_wakeups, 1, memory_order_relaxed);
         } else if (earliest_deadline_us != UINT64_MAX) {
-            struct timespec deadline_ts = proxy_timespec_from_abs_us(earliest_deadline_us);
+            struct timespec deadline_ts = proxy_timespec_from_rel_us(earliest_deadline_us);
             pthread_cond_timedwait(&agg->active_buckets_cond, &agg->active_buckets_lock, &deadline_ts);
             atomic_fetch_add_explicit(&agg->timed_wait_wakeups, 1, memory_order_relaxed);
         }
@@ -151,14 +158,14 @@ static void *flush_thread_func(void *arg) {
     serverLog(LL_NOTICE, "Proxy aggregator flush thread started");
     
     while (agg->running) {
-        uint64_t current_time = ustime();
+        uint64_t current_time = getMonotonicUs();
         int processed_any = 0;
         int has_ready_bucket = 0;
-        uint64_t earliest_deadline_us = UINT64_MAX;
+        uint64_t earliest_wait_us = UINT64_MAX;
 
         pthread_mutex_lock(&agg->active_buckets_lock);
         size_t bucket_index = 0;
-        (void)proxy_active_bucket_heap_peek(&agg->active_bucket_heap, &bucket_index, &earliest_deadline_us);
+        (void)proxy_active_bucket_heap_peek(&agg->active_bucket_heap, &bucket_index, &earliest_wait_us);
         pthread_mutex_unlock(&agg->active_buckets_lock);
 
         while (agg->running) {
@@ -191,10 +198,9 @@ static void *flush_thread_func(void *arg) {
                         atomic_fetch_add_explicit(&agg->flush_retry_count, 1, memory_order_relaxed);
                     }
                 } else if (agg->scheduler.time_limit_us > 0) {
-                    // 最早应该醒来的绝对时间
-                    uint64_t deadline_us = current_time + (agg->scheduler.time_limit_us - diff);
-                    if (deadline_us < earliest_deadline_us) {
-                        earliest_deadline_us = deadline_us;
+                    uint64_t wait_us = agg->scheduler.time_limit_us - diff;
+                    if (wait_us < earliest_wait_us) {
+                        earliest_wait_us = wait_us;
                     }
                 }
             } else {
@@ -205,7 +211,7 @@ static void *flush_thread_func(void *arg) {
             break;
         }
         
-        proxy_flush_thread_wait(agg, processed_any, has_ready_bucket, earliest_deadline_us);
+        proxy_flush_thread_wait(agg, processed_any, has_ready_bucket, earliest_wait_us);
     }
     
     serverLog(LL_NOTICE, "Proxy aggregator flush thread stopped");
@@ -251,6 +257,15 @@ static void *result_thread_func(void *arg) {
                                                               (int)resp->status) == C_OK) {
                         proxy_vector_request_t *req = vector_proxy_completion_lookup(resp->request_id);
                         if (req && req->bc) {
+                            uint64_t result_queue_us =
+                                req->completion_time_us > 0 ? elapsedUs(req->completion_time_us) : 0;
+                            uint64_t request_e2e_us =
+                                req->submit_time_us > 0 ? elapsedUs(req->submit_time_us) : 0;
+                            if (req->batch_id > 0) {
+                                (void)batch_latency_trace_record_request_completion(req->batch_id,
+                                                                                    result_queue_us,
+                                                                                    request_e2e_us);
+                            }
                             RedisModule_UnblockClient(req->bc, req);
                         }
                     }
@@ -285,6 +300,15 @@ static void *result_thread_func(void *arg) {
                                                               (int)vsim->status) == C_OK) {
                         proxy_vector_request_t *req = vector_proxy_completion_lookup(vsim->request_id);
                         if (req && req->bc) {
+                            uint64_t result_queue_us =
+                                req->completion_time_us > 0 ? elapsedUs(req->completion_time_us) : 0;
+                            uint64_t request_e2e_us =
+                                req->submit_time_us > 0 ? elapsedUs(req->submit_time_us) : 0;
+                            if (req->batch_id > 0) {
+                                (void)batch_latency_trace_record_request_completion(req->batch_id,
+                                                                                    result_queue_us,
+                                                                                    request_e2e_us);
+                            }
                             RedisModule_UnblockClient(req->bc, req);
                         }
                     }
@@ -329,6 +353,7 @@ int proxy_aggregator_init(int num_supernodes) {
     flush_scheduler_init(&proxy->scheduler,
                          proxy->config.batch_limit, proxy->config.time_limit_us);
     proxy_flush_executor_init(&proxy->executor);
+    batch_latency_trace_init();
     
     proxy->num_buckets =
         (size_t)num_supernodes * proxy->config.workers_per_node;
@@ -364,7 +389,7 @@ int proxy_aggregator_init(int num_supernodes) {
         for (size_t worker = 0; worker < proxy->config.workers_per_node; worker++) {
             size_t idx = worker_queue_index(proxy->config.workers_per_node, sn, (int)worker);
             proxy_batch_bucket_t *bucket = &proxy->buckets[idx];
-            int ret = proxy_batch_bucket_init(bucket, proxy->config.batch_limit, sn, (int)worker, ustime());
+            int ret = proxy_batch_bucket_init(bucket, proxy->config.batch_limit, sn, (int)worker, getMonotonicUs());
             if (ret != C_OK) {
                 goto failed;
             }
@@ -452,6 +477,7 @@ void proxy_aggregator_shutdown(void) {
     proxy_router_cleanup(&proxy->router);
     
     ring_buffer_mgr_shutdown();
+    batch_latency_trace_cleanup();
     
     zfree(proxy);
     proxy = NULL;
@@ -485,7 +511,7 @@ int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *owner)
         route.key_hash,
         route.supernode_id,
         route.worker_id,
-        ustime(),
+        getMonotonicUs(),
         owner);
     RETURN_IF(!req, C_ERR);
 
@@ -852,6 +878,10 @@ sds proxy_aggregator_get_stats(void) {
         stats = sdscatprintf(stats, "  Immediate flush success rate: %.1f%%\n",
                              immediate_success_rate);
     }
+
+    sds traces = batch_latency_trace_dump_recent("  Recent batch traces", 16);
+    stats = sdscatsds(stats, traces);
+    sdsfree(traces);
     
     return stats;
 }

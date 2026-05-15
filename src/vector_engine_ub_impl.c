@@ -32,8 +32,10 @@
 #include "vector_engine.h"
 #include "ub_client.h"
 #include "ub_metadata.h"
+#include "proxy_aggregator.h"
 #include "sve_compute.h"
 #include "sve_config.h"
+#include "supernode_worker.h"
 #include "zmalloc.h"
 #include "server.h"
 
@@ -371,7 +373,21 @@ static sds ub_engine_get_config(const char *key) {
 }
 
 static sds ub_engine_get_stats(void) {
-    return ub_client_get_stats();
+    sds stats = ub_client_get_stats();
+    sds proxy_stats = proxy_aggregator_get_stats();
+    sds supernode_stats = supernode_get_stats();
+
+    if (proxy_stats) {
+        stats = sdscat(stats, "\n");
+        stats = sdscatsds(stats, proxy_stats);
+        sdsfree(proxy_stats);
+    }
+    if (supernode_stats) {
+        stats = sdscat(stats, "\n");
+        stats = sdscatsds(stats, supernode_stats);
+        sdsfree(supernode_stats);
+    }
+    return stats;
 }
 
 /* UB Engine Structure */

@@ -55,6 +55,8 @@ typedef struct {
     size_t vector_stride_bytes;
     uint64_t table_row_capacity;
     sve_operation_stats_t *stats;
+    uint64_t *bitmap_latency_us_accum;
+    uint64_t *bitmap_latency_ns_accum;
 } sve_gather_ctx_t;
 
 /* ---- Bitmap 操作 ---- */

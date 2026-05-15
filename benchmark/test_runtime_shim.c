@@ -1,6 +1,7 @@
 #include "test_runtime_shim.h"
 
 #include "../src/sds.h"
+#include "../src/monotonic.h"
 
 #ifdef TEST_RUNTIME_WITH_SERVER
 #include "../src/server.h"
@@ -77,6 +78,33 @@ long long ustime(void) {
 
 mstime_t mstime(void) {
     return ustime() / 1000;
+}
+
+static monotime test_get_monotonic_us(void) {
+    return (monotime)ustime();
+}
+
+static monotime test_get_monotonic_ns(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((uint64_t)tv.tv_sec) * 1000000000ULL + ((uint64_t)tv.tv_usec) * 1000ULL;
+}
+
+monotime (*getMonotonicUs)(void) = test_get_monotonic_us;
+monotime (*getMonotonicNs)(void) = test_get_monotonic_ns;
+
+const char *monotonicInit(void) {
+    getMonotonicUs = test_get_monotonic_us;
+    getMonotonicNs = test_get_monotonic_ns;
+    return "test monotonic";
+}
+
+const char *monotonicInfoString(void) {
+    return "test monotonic";
+}
+
+monotonic_clock_type monotonicGetType(void) {
+    return MONOTONIC_CLOCK_POSIX;
 }
 
 void *zmalloc(size_t size) {

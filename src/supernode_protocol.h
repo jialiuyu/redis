@@ -15,6 +15,7 @@ typedef struct batch_result_packet {
     uint32_t packet_size;
     uint32_t op_type;
     uint32_t status;
+    uint64_t batch_id;
     uint64_t request_id;
     uint32_t dim;
     uint32_t reserved;
@@ -31,6 +32,7 @@ typedef struct batch_vsim_result_packet {
     uint32_t packet_size;
     uint32_t op_type;
     uint32_t status;
+    uint64_t batch_id;
     uint64_t request_id;
     uint32_t num_results;
     uint32_t reserved;

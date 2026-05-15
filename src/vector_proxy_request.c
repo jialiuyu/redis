@@ -1,6 +1,7 @@
 #include "vector_proxy_request.h"
 
 #include "macro.h"
+#include "monotonic.h"
 #include "sds.h"
 #include "zmalloc.h"
 
@@ -16,6 +17,9 @@ proxy_vector_request_t *proxy_vector_request_create_vemb(uint64_t request_id,
     req->row_id = row_id;
     req->raw_output = raw_output;
     req->bc = bc;
+    req->submit_time_us = getMonotonicUs();
+    req->completion_time_us = 0;
+    req->batch_id = 0;
     return req;
 }
 
@@ -41,6 +45,9 @@ proxy_vector_request_t *proxy_vector_request_create_vsim(uint64_t request_id,
     req->requested_count = requested_count;
     req->withscores = withscores;
     req->bc = bc;
+    req->submit_time_us = getMonotonicUs();
+    req->completion_time_us = 0;
+    req->batch_id = 0;
     return req;
 }
 

@@ -16,6 +16,7 @@
 
 #include "sve_operation.h"
 #include "ring_buffer.h"
+#include "monotonic.h"
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -38,6 +39,14 @@ typedef struct sve_worker_context {
     atomic_uint_fast64_t total_requests;
     atomic_uint_fast64_t sve_operations;
     atomic_uint_fast64_t total_latency_us;
+    atomic_uint_fast64_t total_queue_latency_us;
+    atomic_uint_fast64_t max_queue_latency_us;
+    atomic_uint_fast64_t total_gather_latency_us;
+    atomic_uint_fast64_t max_gather_latency_us;
+    atomic_uint_fast64_t total_compute_latency_us;
+    atomic_uint_fast64_t max_compute_latency_us;
+    atomic_uint_fast64_t total_response_latency_us;
+    atomic_uint_fast64_t max_response_latency_us;
     sve_operation_stats_t op_stats;
 } sve_worker_context_t;
 

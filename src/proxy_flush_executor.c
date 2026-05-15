@@ -1,6 +1,8 @@
 #include "proxy_flush_executor.h"
 
+#include "batch_latency_trace.h"
 #include "macro.h"
+#include "monotonic.h"
 #include "server.h"
 
 void proxy_flush_executor_init(proxy_flush_executor_t *executor) {
@@ -56,8 +58,22 @@ int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
                                             proxyFlushTrigger trigger) {
     RETURN_IF(!executor || !bucket || !rb || bucket->count == 0, C_ERR);
 
+    monotime flush_start = getMonotonicUs();
+    uint64_t batching_delay_sum = 0;
+    uint64_t batching_delay_max = 0;
+    for (size_t i = 0; i < bucket->count; i++) {
+        proxy_request_t *req = bucket->requests[i];
+        proxy_vector_request_t *owner = req ? req->owner : NULL;
+        if (!owner || owner->submit_time_us == 0) continue;
+        uint64_t delay = flush_start - owner->submit_time_us;
+        batching_delay_sum += delay;
+        if (delay > batching_delay_max) batching_delay_max = delay;
+    }
+
     size_t packet_size = proxy_batch_bucket_packet_size(bucket);
     RETURN_IF(packet_size == 0, C_ERR);
+    uint64_t batch_id =
+        atomic_fetch_add_explicit(&executor->next_batch_id, 1, memory_order_relaxed);
 
     batch_packet_t *packet = NULL;
     if (ring_buffer_reserve(rb, packet_size, (void **)&packet) != C_OK) {
@@ -65,8 +81,8 @@ int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
         return C_ERR;
     }
     if (proxy_batch_bucket_fill_packet(
-            bucket, packet, packet_size, ustime(),
-            atomic_fetch_add_explicit(&executor->next_batch_id, 1, memory_order_relaxed)) != C_OK) {
+            bucket, packet, packet_size, flush_start,
+            batch_id) != C_OK) {
         ring_buffer_cancel_write(rb);
         proxy_flush_executor_record_immediate_metrics(executor, trigger, 0);
         return C_ERR;
@@ -80,8 +96,19 @@ int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
     }
 
     if (ret == C_OK) {
+        uint64_t flush_latency_us = elapsedUs(flush_start);
         atomic_fetch_add_explicit(&executor->stats.total_flushes, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&executor->stats.total_batches, 1, memory_order_relaxed);
+        for (size_t i = 0; i < bucket->count; i++) {
+            proxy_request_t *req = bucket->requests[i];
+            if (req && req->owner) req->owner->batch_id = batch_id;
+        }
+        (void)batch_latency_trace_begin(batch_id,
+                                        packet->hdr.op_type,
+                                        packet->hdr.num_requests,
+                                        batching_delay_sum,
+                                        batching_delay_max,
+                                        flush_latency_us);
         if (flush_reason_full) {
             atomic_fetch_add_explicit(&executor->stats.batch_full_flushes, 1, memory_order_relaxed);
         } else {

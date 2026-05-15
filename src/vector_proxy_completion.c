@@ -2,6 +2,7 @@
 
 #include "dict.h"
 #include "macro.h"
+#include "monotonic.h"
 #include "sds.h"
 #include "zmalloc.h"
 
@@ -127,6 +128,7 @@ int vector_proxy_completion_complete_vemb(uint64_t request_id,
 
     proxy_vector_request_t *req = dictGetVal(de);
     req->error_code = error_code;
+    req->completion_time_us = getMonotonicUs();
 
     if (error_code == C_OK && vector && dim > 0) {
         req->result_vector = zmalloc(sizeof(float) * dim);
@@ -163,6 +165,7 @@ int vector_proxy_completion_complete_vsim(uint64_t request_id,
 
     proxy_vector_request_t *req = dictGetVal(de);
     req->error_code = error_code;
+    req->completion_time_us = getMonotonicUs();
 
     if (error_code == C_OK && num_results > 0 && row_ids && scores) {
         req->candidate_rows = zmalloc(sizeof(uint64_t) * num_results);

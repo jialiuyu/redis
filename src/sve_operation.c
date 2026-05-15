@@ -1,5 +1,6 @@
 #include "sve_operation.h"
 #include "macro.h"
+#include "monotonic.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -69,6 +70,8 @@ void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
     ctx->vector_stride_bytes = vector_stride_bytes;
     ctx->table_row_capacity = table_row_capacity;
     ctx->stats = stats;
+    ctx->bitmap_latency_us_accum = NULL;
+    ctx->bitmap_latency_ns_accum = NULL;
 }
 
 int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
@@ -82,9 +85,19 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
               !ctx->ubas->mapped_addr || !emb_ids || !results || num_ids == 0 || dim == 0, -1);
 
     for (size_t i = 0; i < num_ids; i++) {
+        monotime bitmap_start = 0;
+        if (ctx->bitmap_latency_us_accum || ctx->bitmap_latency_ns_accum) {
+            elapsedStartNs(&bitmap_start);
+        }
         if (bitmap_try_acquire(ctx->bitmap, emb_ids[i]) != 0) {
             atomic_fetch_add_explicit(&ctx->stats->lock_failure, 1, memory_order_relaxed);
             memset(&results[i * dim], 0, row_bytes);
+            if (ctx->bitmap_latency_us_accum) {
+                *ctx->bitmap_latency_us_accum += elapsedNs(bitmap_start) / 1000ULL;
+            }
+            if (ctx->bitmap_latency_ns_accum) {
+                *ctx->bitmap_latency_ns_accum += elapsedNs(bitmap_start);
+            }
             continue;
         }
 
@@ -92,6 +105,12 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
         if (emb_ids[i] >= ctx->table_row_capacity) {
             memset(&results[i * dim], 0, row_bytes);
             bitmap_release(ctx->bitmap, emb_ids[i]);
+            if (ctx->bitmap_latency_us_accum) {
+                *ctx->bitmap_latency_us_accum += elapsedNs(bitmap_start) / 1000ULL;
+            }
+            if (ctx->bitmap_latency_ns_accum) {
+                *ctx->bitmap_latency_ns_accum += elapsedNs(bitmap_start);
+            }
             return -1;
         }
 
@@ -123,6 +142,12 @@ int sve_serial_contiguous_read(sve_gather_ctx_t *ctx,
         memcpy(&results[i * dim], src, row_bytes);
 #endif
         bitmap_release(ctx->bitmap, emb_ids[i]);
+        if (ctx->bitmap_latency_us_accum) {
+            *ctx->bitmap_latency_us_accum += elapsedNs(bitmap_start) / 1000ULL;
+        }
+        if (ctx->bitmap_latency_ns_accum) {
+            *ctx->bitmap_latency_ns_accum += elapsedNs(bitmap_start);
+        }
     }
 
     return 0;

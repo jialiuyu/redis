@@ -6,7 +6,7 @@
 #include <time.h>
 
 #include "../src/server.h"
-#include "../src/monotonic.c"
+#include "../src/monotonic.h"
 
 static uint64_t ustime_gettimeofday(void) {
     struct timeval tv;
@@ -18,6 +18,12 @@ static uint64_t monotonic_posix_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((uint64_t)ts.tv_sec) * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static uint64_t monotonic_posix_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec) * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 static uint64_t wall_time_seconds_us(void) {
@@ -62,7 +68,9 @@ int main(int argc, char **argv) {
     printf("Iterations: %zu\n\n", iterations);
 
     bench_one("getMonotonicUs()", getMonotonicUs, iterations);
+    bench_one("getMonotonicNs()", getMonotonicNs, iterations);
     bench_one("clock_gettime(MONOTONIC)", monotonic_posix_us, iterations);
+    bench_one("clock_gettime(MONO) ns", monotonic_posix_ns, iterations);
     bench_one("gettimeofday() wall clock", ustime_gettimeofday, iterations);
     bench_one("time(NULL) wall clock", wall_time_seconds_us, iterations);
 

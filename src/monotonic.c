@@ -8,6 +8,7 @@
 
 /* The function pointer for clock retrieval.  */
 monotime (*getMonotonicUs)(void) = NULL;
+monotime (*getMonotonicNs)(void) = NULL;
 
 static char monotonic_info_string[32];
 
@@ -35,9 +36,14 @@ static char monotonic_info_string[32];
 #include <x86intrin.h>
 
 static long mono_ticksPerMicrosecond = 0;
+static long mono_ticksPerNanosecond = 0;
 
 static monotime getMonotonicUs_x86(void) {
     return __rdtsc() / mono_ticksPerMicrosecond;
+}
+
+static monotime getMonotonicNs_x86(void) {
+    return __rdtsc() / mono_ticksPerNanosecond;
 }
 
 static void monotonicInit_x86linux(void) {
@@ -68,6 +74,7 @@ static void monotonicInit_x86linux(void) {
                 buf[pmatch[1].rm_eo] = '\0';
                 double ghz = atof(&buf[pmatch[1].rm_so]);
                 mono_ticksPerMicrosecond = (long)(ghz * 1000);
+                mono_ticksPerNanosecond = (long)(ghz);
                 break;
             }
         }
@@ -87,6 +94,9 @@ static void monotonicInit_x86linux(void) {
         fprintf(stderr, "monotonic: x86 linux, unable to determine clock rate\n");
         return;
     }
+    if (mono_ticksPerNanosecond <= 0) {
+        mono_ticksPerNanosecond = 1;
+    }
     if (!constantTsc) {
         fprintf(stderr, "monotonic: x86 linux, 'constant_tsc' flag not present\n");
         return;
@@ -95,11 +105,13 @@ static void monotonicInit_x86linux(void) {
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "X86 TSC @ %ld ticks/us", mono_ticksPerMicrosecond);
     getMonotonicUs = getMonotonicUs_x86;
+    getMonotonicNs = getMonotonicNs_x86;
 }
 #endif
 
 #if defined(__aarch64__)
 static long mono_ticksPerMicrosecond = 0;
+static uint64_t mono_cntfrq_hz = 0;
 
 /* Read the clock value.
  * CNTVCT_EL0 is a system counter register, that provides the monotonic
@@ -124,8 +136,14 @@ static monotime getMonotonicUs_aarch64(void) {
     return __cntvct() / mono_ticksPerMicrosecond;
 }
 
+static monotime getMonotonicNs_aarch64(void) {
+    __uint128_t ns = (__uint128_t)__cntvct() * 1000000000ULL;
+    return (monotime)(ns / mono_cntfrq_hz);
+}
+
 static void monotonicInit_aarch64(void) {
-    mono_ticksPerMicrosecond = (long)cntfrq_hz() / 1000L / 1000L;
+    mono_cntfrq_hz = cntfrq_hz();
+    mono_ticksPerMicrosecond = (long)(mono_cntfrq_hz / 1000L / 1000L);
     if (mono_ticksPerMicrosecond == 0) {
         fprintf(stderr, "monotonic: aarch64, unable to determine clock rate\n");
         return;
@@ -134,12 +152,14 @@ static void monotonicInit_aarch64(void) {
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "ARM CNTVCT @ %ld ticks/us", mono_ticksPerMicrosecond);
     getMonotonicUs = getMonotonicUs_aarch64;
+    getMonotonicNs = getMonotonicNs_aarch64;
 }
 #endif
 
 
 #if defined(USE_PROCESSOR_CLOCK) && defined(__riscv) && defined(__linux__)
 static long mono_ticksPerMicrosecond = 0;
+static uint64_t mono_timebase_frequency_hz = 0;
 
 static inline uint64_t read_mtime(void) {
     uint64_t val;
@@ -181,8 +201,14 @@ static monotime getMonotonicUs_riscv(void) {
     return read_mtime() / mono_ticksPerMicrosecond;
 }
 
+static monotime getMonotonicNs_riscv(void) {
+    __uint128_t ns = (__uint128_t)read_mtime() * 1000000000ULL;
+    return (monotime)(ns / mono_timebase_frequency_hz);
+}
+
 static void monotonicInit_riscv(void) {
-    mono_ticksPerMicrosecond = (long)get_timebase_frequency() / 1000L / 1000L;
+    mono_timebase_frequency_hz = get_timebase_frequency();
+    mono_ticksPerMicrosecond = (long)(mono_timebase_frequency_hz / 1000L / 1000L);
     if (mono_ticksPerMicrosecond == 0) {
         fprintf(stderr, "monotonic: riscv, unable to determine clock rate\n");
         return;
@@ -190,6 +216,7 @@ static void monotonicInit_riscv(void) {
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "RISC-V mtime @ %ld ticks/us", mono_ticksPerMicrosecond);
     getMonotonicUs = getMonotonicUs_riscv;
+    getMonotonicNs = getMonotonicNs_riscv;
 }
 #endif
 
@@ -203,6 +230,12 @@ static monotime getMonotonicUs_posix(void) {
     return ((uint64_t)ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
 }
 
+static monotime getMonotonicNs_posix(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec) * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static void monotonicInit_posix(void) {
     /* Ensure that CLOCK_MONOTONIC is supported.  This should be supported
      * on any reasonably current OS.  If the assertion below fails, provide
@@ -214,6 +247,7 @@ static void monotonicInit_posix(void) {
     snprintf(monotonic_info_string, sizeof(monotonic_info_string),
             "POSIX clock_gettime");
     getMonotonicUs = getMonotonicUs_posix;
+    getMonotonicNs = getMonotonicNs_posix;
 }
 
 
@@ -232,6 +266,7 @@ const char * monotonicInit(void) {
     #endif
 
     if (getMonotonicUs == NULL) monotonicInit_posix();
+    if (getMonotonicNs == NULL) getMonotonicNs = getMonotonicNs_posix;
 
     return monotonic_info_string;
 }

@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 
+#include "batch_latency_trace.h"
 #include "supernode_worker.h"
 #include "macro.h"
 #include "ring_buffer_mgr.h"
@@ -39,12 +40,20 @@ typedef struct supernode {
 
 static supernode_t *global_supernode = NULL;
 
+typedef struct supernode_batch_stage_times {
+    uint64_t bitmap_latency_ns;
+    uint64_t gather_latency_ns;
+    uint64_t compute_latency_ns;
+    uint64_t response_latency_ns;
+} supernode_batch_stage_times_t;
+
 /* ========== Worker 线程 ========== */
 
 #define SVE_WORKER_SPIN_PHASE1 64U
 #define SVE_WORKER_SPIN_PHASE2 256U
 
 static int supernode_write_vemb_response(sve_worker_context_t *ctx,
+                                         uint64_t batch_id,
                                          uint64_t request_id,
                                          const float *vector,
                                          size_t dim,
@@ -59,6 +68,7 @@ static int supernode_write_vemb_response(sve_worker_context_t *ctx,
     resp->packet_size = (uint32_t)payload_len;
     resp->op_type = BATCH_PACKET_OP_VEMB;
     resp->status = (uint32_t)status;
+    resp->batch_id = batch_id;
     resp->request_id = request_id;
     resp->dim = (uint32_t)dim;
     resp->reserved = 0;
@@ -72,6 +82,7 @@ static int supernode_write_vemb_response(sve_worker_context_t *ctx,
 }
 
 static int supernode_write_vsim_response(sve_worker_context_t *ctx,
+                                         uint64_t batch_id,
                                          uint64_t request_id,
                                          const uint64_t *rows,
                                          const float *scores,
@@ -89,6 +100,7 @@ static int supernode_write_vsim_response(sve_worker_context_t *ctx,
     resp->packet_size = (uint32_t)payload_len;
     resp->op_type = BATCH_PACKET_OP_VSIM;
     resp->status = (uint32_t)status;
+    resp->batch_id = batch_id;
     resp->request_id = request_id;
     resp->num_results = (uint32_t)result_count;
     resp->reserved = 0;
@@ -114,25 +126,36 @@ static int supernode_load_candidate_vectors(sve_worker_context_t *ctx,
                                             uint64_t *rows,
                                             size_t row_count,
                                             size_t dim,
-                                            float **vectors_out) {
+                                            float **vectors_out,
+                                            uint64_t *bitmap_latency_ns,
+                                            uint64_t *gather_latency_ns) {
     RETURN_IF(!ctx || !rows || row_count == 0 || dim == 0 || !vectors_out, C_ERR);
     *vectors_out = NULL;
+    if (bitmap_latency_ns) *bitmap_latency_ns = 0;
+    if (gather_latency_ns) *gather_latency_ns = 0;
 
     float *vectors = supernode_alloc_candidate_vectors(row_count, dim);
     RETURN_IF(!vectors, C_ERR);
 
+    ctx->gather_ctx.bitmap_latency_ns_accum = bitmap_latency_ns;
+    monotime gather_start;
+    elapsedStartNs(&gather_start);
     int ret = sve_serial_contiguous_read(&ctx->gather_ctx, rows, row_count, vectors);
+    uint64_t gather_elapsed_ns = elapsedNs(gather_start);
+    ctx->gather_ctx.bitmap_latency_ns_accum = NULL;
     if (ret != C_OK) {
         zfree(vectors);
         return C_ERR;
     }
+    if (gather_latency_ns) *gather_latency_ns = gather_elapsed_ns;
 
     *vectors_out = vectors;
     return C_OK;
 }
 
 static int supernode_process_vsim_batch(sve_worker_context_t *ctx,
-                                        batch_vsim_packet_t *vsim) {
+                                        batch_vsim_packet_t *vsim,
+                                        supernode_batch_stage_times_t *times) {
     RETURN_IF(!ctx || !vsim, C_ERR);
     RETURN_IF(vsim->query_dim == 0 || vsim->candidate_count == 0, C_ERR);
 
@@ -140,29 +163,52 @@ static int supernode_process_vsim_batch(sve_worker_context_t *ctx,
     const uint64_t *rows = (const uint64_t *)((const uint8_t *)(vsim->payload + vsim->query_dim));
     float *candidates = NULL;
     float *scores = NULL;
+    uint64_t bitmap_latency_ns = 0;
+    uint64_t gather_latency_ns = 0;
+    uint64_t compute_latency_ns = 0;
+    uint64_t response_latency_ns = 0;
     int ret = C_ERR;
 
     ret = supernode_load_candidate_vectors(ctx,
                                            (uint64_t *)rows,
                                            vsim->candidate_count,
                                            vsim->query_dim,
-                                           &candidates);
+                                           &candidates,
+                                           &bitmap_latency_ns,
+                                           &gather_latency_ns);
     if (ret != C_OK) return C_ERR;
 
     scores = zmalloc(sizeof(float) * vsim->candidate_count);
     if (!scores) goto cleanup;
 
+    monotime compute_start;
+    elapsedStartNs(&compute_start);
     for (size_t i = 0; i < vsim->candidate_count; i++) {
         const float *cand = candidates + i * vsim->query_dim;
         scores[i] = sve_cosine_similarity_f32(query, cand, vsim->query_dim);
     }
+    compute_latency_ns = elapsedNs(compute_start);
 
+    monotime response_start;
+    elapsedStartNs(&response_start);
     ret = supernode_write_vsim_response(ctx,
+                                        vsim->hdr.batch_id,
                                         vsim->request_id,
                                         rows,
                                         scores,
                                         vsim->candidate_count,
                                         C_OK);
+    response_latency_ns = elapsedNs(response_start);
+    atomic_fetch_add_explicit(&ctx->sve_operations, vsim->candidate_count, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_gather_latency_us, gather_latency_ns / 1000ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_compute_latency_us, compute_latency_ns / 1000ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_response_latency_us, response_latency_ns / 1000ULL, memory_order_relaxed);
+    if (times) {
+        times->bitmap_latency_ns = bitmap_latency_ns;
+        times->gather_latency_ns = gather_latency_ns;
+        times->compute_latency_ns = compute_latency_ns;
+        times->response_latency_ns = response_latency_ns;
+    }
 
 cleanup:
     zfree(candidates);
@@ -171,11 +217,15 @@ cleanup:
 }
 
 static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
-                                        batch_packet_t *packet) {
+                                        batch_packet_t *packet,
+                                        supernode_batch_stage_times_t *times) {
     RETURN_IF(!ctx || !packet, C_ERR);
 
     uint64_t *emb_ids = zmalloc(packet->hdr.num_requests * sizeof(uint64_t));
     float *results = NULL;
+    uint64_t bitmap_latency_ns = 0;
+    uint64_t gather_latency_ns = 0;
+    uint64_t response_latency_ns = 0;
     int ret = C_ERR;
 
     if (!emb_ids) return C_ERR;
@@ -186,16 +236,30 @@ static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
                                            emb_ids,
                                            packet->hdr.num_requests,
                                            ctx->gather_ctx.vector_dim,
-                                           &results);
+                                           &results,
+                                           &bitmap_latency_ns,
+                                           &gather_latency_ns);
     if (ret != C_OK) goto cleanup;
 
+    monotime response_start;
+    elapsedStartNs(&response_start);
     for (uint32_t i = 0; i < packet->hdr.num_requests; i++) {
         ret = supernode_write_vemb_response(ctx,
+                                            packet->hdr.batch_id,
                                             packet->requests[i].request_id,
                                             results + ((size_t)i * ctx->gather_ctx.vector_dim),
                                             ctx->gather_ctx.vector_dim,
                                             C_OK);
         if (ret != C_OK) break;
+    }
+    response_latency_ns = elapsedNs(response_start);
+    atomic_fetch_add_explicit(&ctx->total_gather_latency_us, gather_latency_ns / 1000ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_response_latency_us, response_latency_ns / 1000ULL, memory_order_relaxed);
+    if (times) {
+        times->bitmap_latency_ns = bitmap_latency_ns;
+        times->gather_latency_ns = gather_latency_ns;
+        times->compute_latency_ns = 0;
+        times->response_latency_ns = response_latency_ns;
     }
 
 cleanup:
@@ -207,8 +271,11 @@ cleanup:
 static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_request_header_t *hdr) {
     RETURN_IF(!ctx || !hdr, C_ERR);
 
-    uint64_t start_time = ustime();
+    uint64_t worker_start_us = getMonotonicUs();
+    monotime start_time;
+    start_time = worker_start_us;
     int ret = C_ERR;
+    supernode_batch_stage_times_t times = {0};
 
     if (hdr->magic != BATCH_PACKET_MAGIC) {
         serverLog(LL_WARNING, "Invalid batch packet magic: 0x%x", hdr->magic);
@@ -220,18 +287,30 @@ static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_request_hea
               (unsigned long long)hdr->batch_id);
 
     if (hdr->op_type == BATCH_PACKET_OP_VSIM) {
-        ret = supernode_process_vsim_batch(ctx, (batch_vsim_packet_t *)hdr);
+        ret = supernode_process_vsim_batch(ctx, (batch_vsim_packet_t *)hdr, &times);
     } else if (hdr->op_type == BATCH_PACKET_OP_VEMB) {
-        ret = supernode_process_vemb_batch(ctx, (batch_packet_t *)hdr);
+        ret = supernode_process_vemb_batch(ctx, (batch_packet_t *)hdr, &times);
     } else {
         serverLog(LL_WARNING, "Unsupported batch packet op_type: %u", hdr->op_type);
         return C_ERR;
     }
 
-    uint64_t latency = ustime() - start_time;
+    uint64_t latency = elapsedUs(start_time);
+    uint64_t queue_latency_us = 0;
+    if (hdr->timestamp_us > 0) {
+        if (worker_start_us > hdr->timestamp_us) queue_latency_us = worker_start_us - hdr->timestamp_us;
+    }
     atomic_fetch_add_explicit(&ctx->total_batches, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->total_requests, hdr->num_requests, memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->total_latency_us, latency, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_queue_latency_us, queue_latency_us, memory_order_relaxed);
+
+    (void)batch_latency_trace_record_supernode(hdr->batch_id,
+                                               queue_latency_us,
+                                               times.bitmap_latency_ns,
+                                               times.gather_latency_ns,
+                                               times.compute_latency_ns,
+                                               times.response_latency_ns);
 
     serverLog(LL_DEBUG, "Worker %d completed batch in %llu μs",
               ctx->worker_id, (unsigned long long)latency);
@@ -353,6 +432,7 @@ int supernode_init(int node_id, int num_workers) {
     if (ring_buffer_mgr_init((size_t)num_workers, RING_BUFFER_SIZE) != C_OK) {
         goto failed;
     }
+    batch_latency_trace_init();
     if (ring_buffer_mgr_ensure_supernodes((size_t)node_id + 1) != C_OK) {
         goto failed;
     }
@@ -372,6 +452,14 @@ int supernode_init(int node_id, int num_workers) {
         atomic_init(&ctx->total_requests, 0);
         atomic_init(&ctx->sve_operations, 0);
         atomic_init(&ctx->total_latency_us, 0);
+        atomic_init(&ctx->total_queue_latency_us, 0);
+        atomic_init(&ctx->max_queue_latency_us, 0);
+        atomic_init(&ctx->total_gather_latency_us, 0);
+        atomic_init(&ctx->max_gather_latency_us, 0);
+        atomic_init(&ctx->total_compute_latency_us, 0);
+        atomic_init(&ctx->max_compute_latency_us, 0);
+        atomic_init(&ctx->total_response_latency_us, 0);
+        atomic_init(&ctx->max_response_latency_us, 0);
         atomic_init(&ctx->op_stats.lock_success, 0);
         atomic_init(&ctx->op_stats.lock_failure, 0);
         sve_gather_ctx_init(&ctx->gather_ctx,
@@ -414,6 +502,7 @@ void supernode_shutdown(void) {
     }
 
     ring_buffer_mgr_shutdown();
+    batch_latency_trace_cleanup();
 
     if (global_supernode->global_bitmap) {
         bitmap_destroy(global_supernode->global_bitmap);
@@ -467,6 +556,10 @@ sds supernode_get_stats(void) {
         stats = sdscatprintf(stats, "  Avg batch latency: %.1f μs\n", (double)tt / tb);
         stats = sdscatprintf(stats, "  Avg batch size: %.1f\n", (double)tr / tb);
     }
+
+    sds traces = batch_latency_trace_dump_recent("  Recent batch traces", 16);
+    stats = sdscatsds(stats, traces);
+    sdsfree(traces);
 
     stats = sdscat(stats, "  Scatter/Gather:\n");
     stats = sdscatprintf(stats, "    Gather ops: %llu  elements: %llu\n",

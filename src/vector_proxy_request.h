@@ -2,6 +2,7 @@
 #define __VECTOR_PROXY_REQUEST_H
 
 #include "sds.h"
+#include "monotonic.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -31,6 +32,9 @@ typedef struct proxy_vector_request {
     float *result_scores;
     size_t result_count;
     int error_code;
+    monotime submit_time_us;
+    monotime completion_time_us;
+    uint64_t batch_id;
 } proxy_vector_request_t;
 
 proxy_vector_request_t *proxy_vector_request_create_vemb(uint64_t request_id,
