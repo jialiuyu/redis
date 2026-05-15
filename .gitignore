@@ -188,6 +188,8 @@ Makefile.dep
 /src/redis-check-rdb
 /src/redis-check-aof
 /src/tlc-*-server
+/src/.make-settings
+/src/release.h
 
 /benchmark/redis_traditional_benchmark
 /benchmark/supernode_benchmark
@@ -217,3 +219,5 @@ benchmark/write_output.txt
 SVE_OPERATION_DESIGN.md
 benchmark/*_ut
 benchmark/*_bench
+/deps/lua/src/lua
+/deps/lua/src/luac
