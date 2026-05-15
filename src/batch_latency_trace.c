@@ -1,6 +1,7 @@
 #include "batch_latency_trace.h"
 
 #include "macro.h"
+#include "server.h"
 #include "zmalloc.h"
 
 #include <pthread.h>
@@ -23,6 +24,38 @@ typedef struct batch_latency_trace_registry {
 } batch_latency_trace_registry_t;
 
 static batch_latency_trace_registry_t g_batch_traces = {0};
+
+static void batch_latency_trace_log_completed(const batch_latency_trace_t *trace) {
+    RETURN_IF(!trace);
+
+    double avg_wait = trace->num_requests > 0 ?
+        (double)trace->proxy_batch_wait_total_us / (double)trace->num_requests : 0.0;
+    double avg_result_queue = trace->completed_requests > 0 ?
+        (double)trace->proxy_result_queue_total_us / (double)trace->completed_requests : 0.0;
+    double avg_e2e = trace->completed_requests > 0 ?
+        (double)trace->request_e2e_total_us / (double)trace->completed_requests : 0.0;
+
+    serverLog(LL_NOTICE,
+              "batch-trace batch=%llu op=%u req=%u done=%u proxy_wait_avg_us=%.1f proxy_wait_max_us=%llu proxy_flush_us=%llu "
+              "queue_us=%llu bitmap_ns=%llu gather_ns=%llu compute_ns=%llu response_ns=%llu result_queue_avg_us=%.1f "
+              "result_queue_max_us=%llu e2e_avg_us=%.1f e2e_max_us=%llu",
+              (unsigned long long)trace->batch_id,
+              trace->op_type,
+              trace->num_requests,
+              trace->completed_requests,
+              avg_wait,
+              (unsigned long long)trace->proxy_batch_wait_max_us,
+              (unsigned long long)trace->proxy_flush_us,
+              (unsigned long long)trace->supernode_queue_us,
+              (unsigned long long)trace->supernode_bitmap_ns,
+              (unsigned long long)trace->supernode_gather_ns,
+              (unsigned long long)trace->supernode_compute_ns,
+              (unsigned long long)trace->supernode_response_ns,
+              avg_result_queue,
+              (unsigned long long)trace->proxy_result_queue_max_us,
+              avg_e2e,
+              (unsigned long long)trace->request_e2e_max_us);
+}
 
 static batch_latency_trace_t *batch_latency_trace_find_locked(uint64_t batch_id) {
     for (size_t i = 0; i < g_batch_traces.count; i++) {
@@ -126,6 +159,9 @@ int batch_latency_trace_record_request_completion(uint64_t batch_id,
                                                   uint64_t request_e2e_us) {
     if (!g_batch_traces.initialized) return C_ERR;
 
+    batch_latency_trace_t snapshot = {0};
+    int should_log = 0;
+
     pthread_mutex_lock(&g_batch_traces.lock);
     batch_latency_trace_t *trace = batch_latency_trace_find_locked(batch_id);
     if (!trace) {
@@ -142,7 +178,15 @@ int batch_latency_trace_record_request_completion(uint64_t batch_id,
     if (request_e2e_us > trace->request_e2e_max_us) {
         trace->request_e2e_max_us = request_e2e_us;
     }
+    if (trace->completed_requests >= trace->num_requests) {
+        snapshot = *trace;
+        should_log = 1;
+    }
     pthread_mutex_unlock(&g_batch_traces.lock);
+
+    if (should_log) {
+        batch_latency_trace_log_completed(&snapshot);
+    }
     return C_OK;
 }
 
