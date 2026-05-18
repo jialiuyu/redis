@@ -5,7 +5,6 @@
 #include "zmalloc.h"
 
 #include <errno.h>
-#include <ctype.h>
 #include <inttypes.h>
 #include <string.h>
 
@@ -104,7 +103,6 @@ static void ub_metadata_release_set(void *ptr) {
     dictRelease(set->element_to_row);
     dictRelease(set->row_to_element);
     pthread_rwlock_destroy(&set->lock);
-    sdsfree(set->suffix_numeric_prefix);
     sdsfree(set->key);
     zfree(set);
 }
@@ -131,30 +129,6 @@ static dictType ub_metadata_registry_dict_type = {
 
 static sds ub_metadata_row_key(uint64_t row_id) {
     return sdscatprintf(sdsempty(), "%" PRIu64, row_id);
-}
-
-static int ub_metadata_parse_numeric_suffix(const char *text,
-                                            size_t len,
-                                            size_t *prefix_len,
-                                            uint64_t *value) {
-    if (!text || len == 0 || !prefix_len || !value) return C_ERR;
-
-    size_t start = len;
-    while (start > 0 && isdigit((unsigned char)text[start - 1]))
-        start--;
-    if (start == len) return C_ERR;
-
-    uint64_t parsed = 0;
-    for (size_t i = start; i < len; i++) {
-        unsigned int digit = (unsigned int)(text[i] - '0');
-        if (parsed > (UINT64_MAX - digit) / 10)
-            return C_ERR;
-        parsed = parsed * 10 + digit;
-    }
-
-    *prefix_len = start;
-    *value = parsed;
-    return C_OK;
 }
 
 int ub_metadata_init(void) {
@@ -238,32 +212,6 @@ int ub_metadata_lookup_row(ub_vector_set_meta_t *set, const char *element, uint6
     return C_OK;
 }
 
-int ub_metadata_lookup_dense_suffix_row(ub_vector_set_meta_t *set,
-                                        const char *element,
-                                        size_t element_len,
-                                        uint64_t *row_id) {
-    if (!set || !element || !row_id) return C_ERR;
-
-    size_t prefix_len = 0;
-    uint64_t parsed = 0;
-    if (ub_metadata_parse_numeric_suffix(element, element_len,
-                                         &prefix_len, &parsed) != C_OK) {
-        return C_ERR;
-    }
-
-    pthread_rwlock_rdlock(&set->lock);
-    int ok = set->suffix_numeric_dense &&
-             set->suffix_numeric_prefix &&
-             prefix_len == sdslen(set->suffix_numeric_prefix) &&
-             memcmp(element, set->suffix_numeric_prefix, prefix_len) == 0 &&
-             parsed < set->cardinality;
-    pthread_rwlock_unlock(&set->lock);
-    if (!ok) return C_ERR;
-
-    *row_id = parsed;
-    return C_OK;
-}
-
 int ub_metadata_alloc_row(ub_vector_set_meta_t *set, const char *element, uint64_t *row_id) {
     if (!set || !element || !row_id) return C_ERR;
 
@@ -276,35 +224,16 @@ int ub_metadata_alloc_row(ub_vector_set_meta_t *set, const char *element, uint64
         return C_OK;
     }
 
-    size_t suffix_prefix_len = 0;
-    uint64_t suffix_value = 0;
-    int suffix_ok = ub_metadata_parse_numeric_suffix(element,
-                                                     strlen(element),
-                                                     &suffix_prefix_len,
-                                                     &suffix_value) == C_OK;
-    int keep_dense = !set->suffix_numeric_disabled &&
-                     suffix_ok &&
-                     suffix_value == set->next_row_id;
-    if (keep_dense && set->suffix_numeric_prefix) {
-        keep_dense = suffix_prefix_len == sdslen(set->suffix_numeric_prefix) &&
-                     memcmp(element, set->suffix_numeric_prefix, suffix_prefix_len) == 0;
-    }
-
     uint64_t assigned = set->next_row_id++;
     uint64_t *row_copy = ub_metadata_uint64_dup(assigned);
     ub_row_entry_t *entry = zcalloc(sizeof(*entry));
     sds elem_copy = sdsnew(element);
     sds row_key = ub_metadata_row_key(assigned);
-    sds suffix_prefix = NULL;
-    if (keep_dense && !set->suffix_numeric_prefix)
-        suffix_prefix = sdsnewlen(element, suffix_prefix_len);
-    if (!row_copy || !entry || !elem_copy || !row_key ||
-        (keep_dense && !set->suffix_numeric_prefix && !suffix_prefix)) {
+    if (!row_copy || !entry || !elem_copy || !row_key) {
         zfree(row_copy);
         zfree(entry);
         sdsfree(elem_copy);
         sdsfree(row_key);
-        sdsfree(suffix_prefix);
         pthread_rwlock_unlock(&set->lock);
         return C_ERR;
     }
@@ -327,17 +256,6 @@ int ub_metadata_alloc_row(ub_vector_set_meta_t *set, const char *element, uint64
     }
 
     set->cardinality++;
-    if (keep_dense) {
-        if (!set->suffix_numeric_prefix)
-            set->suffix_numeric_prefix = suffix_prefix;
-        else
-            sdsfree(suffix_prefix);
-        set->suffix_numeric_dense = 1;
-    } else {
-        sdsfree(suffix_prefix);
-        set->suffix_numeric_dense = 0;
-        set->suffix_numeric_disabled = 1;
-    }
     *row_id = assigned;
     pthread_rwlock_unlock(&set->lock);
     return C_OK;
@@ -359,8 +277,6 @@ int ub_metadata_remove_row(ub_vector_set_meta_t *set, const char *element, uint6
     dictDelete(set->row_to_element, row_key);
     sdsfree(row_key);
     if (set->cardinality > 0) set->cardinality--;
-    set->suffix_numeric_dense = 0;
-    set->suffix_numeric_disabled = 1;
     if (row_id) *row_id = removed;
     pthread_rwlock_unlock(&set->lock);
     return C_OK;

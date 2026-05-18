@@ -20,7 +20,6 @@
 #include "ring_buffer_mgr.h"
 #include "server.h"
 #include "supernode_protocol.h"
-#include "ub_client.h"
 #include "ub_metadata.h"
 
 #include <stdatomic.h>
@@ -133,62 +132,6 @@ static inline size_t proxy_fc_slot_index(uint64_t request_id, size_t slot_count)
 static inline size_t proxy_fc_worker_for_row(uint64_t row_id) {
     return proxy && proxy->active_workers > 0 ?
         (size_t)(row_id % proxy->active_workers) : 0;
-}
-
-static int proxy_key_matches_configured_table(const char *key, size_t key_len) {
-    const char *table = server.ub.table_name;
-    RETURN_IF(!key || !table, 0);
-    size_t table_len = strlen(table);
-    return key_len == table_len && memcmp(key, table, key_len) == 0;
-}
-
-static int proxy_resolve_vemb_row_fast(const char *key,
-                                       size_t key_len,
-                                       const char *element,
-                                       size_t element_len,
-                                       ub_vector_set_meta_t **set_out,
-                                       uint64_t *row_id_out) {
-    RETURN_IF(!key || !element || !set_out || !row_id_out, C_ERR);
-    RETURN_IF(server.ub.element_index_mode != UB_ELEMENT_INDEX_SUFFIX_NUMERIC, C_ERR);
-    RETURN_IF(!proxy_key_matches_configured_table(key, key_len), C_ERR);
-
-    sds key_tmp = sdsnewlen(key, key_len);
-    RETURN_IF(!key_tmp, C_ERR);
-    ub_vector_set_meta_t *set = ub_metadata_get_set(key_tmp);
-    sdsfree(key_tmp);
-    RETURN_IF(!set, C_ERR);
-
-    *set_out = set;
-    return ub_metadata_lookup_dense_suffix_row(set, element, element_len, row_id_out);
-}
-
-static int proxy_resolve_vemb_row_metadata(const char *key,
-                                           size_t key_len,
-                                           const char *element,
-                                           size_t element_len,
-                                           ub_vector_set_meta_t **set_out,
-                                           uint64_t *row_id_out) {
-    RETURN_IF(!key || !element || !set_out || !row_id_out, C_ERR);
-
-    sds key_tmp = sdsnewlen(key, key_len);
-    sds element_tmp = sdsnewlen(element, element_len);
-    if (!key_tmp || !element_tmp) {
-        sdsfree(key_tmp);
-        sdsfree(element_tmp);
-        return C_ERR;
-    }
-
-    ub_vector_set_meta_t *set = ub_metadata_get_set(key_tmp);
-    uint64_t row_id = 0;
-    int rc = set ? ub_metadata_lookup_row(set, element_tmp, &row_id) : C_ERR;
-    sdsfree(key_tmp);
-    sdsfree(element_tmp);
-    if (rc != C_OK)
-        return C_ERR;
-
-    *set_out = set;
-    *row_id_out = row_id;
-    return C_OK;
 }
 
 static int proxy_fc_board_init(proxy_fc_board_t *board,
@@ -620,14 +563,19 @@ int proxy_submit_vemb(RedisModuleCtx *ctx, void *key, void *element, int raw_out
     if (!key_cstr || !element_cstr)
         return RedisModule_ReplyWithError(ctx, "ERR invalid key or element");
 
-    ub_vector_set_meta_t *set = NULL;
+    sds key_tmp = sdsnewlen(key_cstr, key_len);
+    sds element_tmp = sdsnewlen(element_cstr, element_len);
+    if (!key_tmp || !element_tmp) {
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
+        return RedisModule_ReplyWithError(ctx, "ERR oom");
+    }
+
+    ub_vector_set_meta_t *set = ub_metadata_get_set(key_tmp);
     uint64_t row_id = 0;
-    if (proxy_resolve_vemb_row_fast(key_cstr, key_len,
-                                    element_cstr, element_len,
-                                    &set, &row_id) != C_OK &&
-        proxy_resolve_vemb_row_metadata(key_cstr, key_len,
-                                        element_cstr, element_len,
-                                        &set, &row_id) != C_OK) {
+    if (!set || ub_metadata_lookup_row(set, element_tmp, &row_id) != C_OK) {
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
         return RedisModule_ReplyWithNull(ctx);
     }
 
@@ -636,6 +584,8 @@ int proxy_submit_vemb(RedisModuleCtx *ctx, void *key, void *element, int raw_out
     RedisModuleBlockedClient *bc =
         RedisModule_BlockClient(ctx, proxy_vemb_reply, NULL, NULL, 0);
     if (!bc) {
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
         return RedisModule_ReplyWithError(ctx, "ERR failed to block client");
     }
 
@@ -647,6 +597,8 @@ int proxy_submit_vemb(RedisModuleCtx *ctx, void *key, void *element, int raw_out
                                          set->dim);
     if (!req) {
         RedisModule_AbortBlock(bc);
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
         return RedisModule_ReplyWithError(ctx, "ERR oom");
     }
 
@@ -655,10 +607,14 @@ int proxy_submit_vemb(RedisModuleCtx *ctx, void *key, void *element, int raw_out
     if (proxy_fc_submit_vemb(req) != C_OK) {
         RedisModule_AbortBlock(bc);
         proxy_vector_request_free(req);
+        sdsfree(key_tmp);
+        sdsfree(element_tmp);
         return RedisModule_ReplyWithError(ctx, "ERR failed to publish VEMB request");
     }
 
     atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);
+    sdsfree(key_tmp);
+    sdsfree(element_tmp);
     return REDISMODULE_OK;
 }
 

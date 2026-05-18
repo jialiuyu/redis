@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench ring_buffer_ut ring_buffer_batch_bench ring_buffer_compare_bench proxy_components_ut proxy_scheduler_ut proxy_aggregator_ut vector_proxy_completion_ut ub_metadata_ut monotonic_clock_bench
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench ring_buffer_ut ring_buffer_batch_bench ring_buffer_compare_bench proxy_components_ut proxy_scheduler_ut proxy_aggregator_ut vector_proxy_completion_ut monotonic_clock_bench
 
 # 所有目标
 all: $(TARGETS)
@@ -184,20 +184,6 @@ vector_proxy_completion_ut: vector_proxy_completion_ut.c test_runtime_shim.c ../
 		../src/vector_proxy_completion.c \
 		../src/vector_proxy_request.c \
 		../src/dict.c \
-		../src/siphash.c \
-		../src/mt19937-64.c \
-		-lpthread -lm
-	@echo "✅ Built: $@"
-
-ub_metadata_ut: ub_metadata_ut.c ../src/ub_metadata.c ../src/dict.c ../src/sds.c ../src/siphash.c ../src/mt19937-64.c
-	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
-		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
-		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
-		-o $@ \
-		ub_metadata_ut.c \
-		../src/ub_metadata.c \
-		../src/dict.c \
-		../src/sds.c \
 		../src/siphash.c \
 		../src/mt19937-64.c \
 		-lpthread -lm

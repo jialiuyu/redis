@@ -19,9 +19,6 @@ typedef struct ub_vector_set_meta {
     size_t dim;
     size_t cardinality;
     uint64_t next_row_id;
-    int suffix_numeric_dense;
-    int suffix_numeric_disabled;
-    sds suffix_numeric_prefix;
     dict *element_to_row;      /* element -> uint64_t* */
     dict *row_to_element;      /* row_id(string) -> ub_row_entry_t* */
     pthread_rwlock_t lock;
@@ -40,10 +37,6 @@ ub_vector_set_meta_t *ub_metadata_get_or_create_set(const char *key, size_t dim)
 ub_vector_set_meta_t *ub_metadata_get_set(const char *key);
 
 int ub_metadata_lookup_row(ub_vector_set_meta_t *set, const char *element, uint64_t *row_id);
-int ub_metadata_lookup_dense_suffix_row(ub_vector_set_meta_t *set,
-                                        const char *element,
-                                        size_t element_len,
-                                        uint64_t *row_id);
 int ub_metadata_alloc_row(ub_vector_set_meta_t *set, const char *element, uint64_t *row_id);
 int ub_metadata_remove_row(ub_vector_set_meta_t *set, const char *element, uint64_t *row_id);
 size_t ub_metadata_cardinality(const ub_vector_set_meta_t *set);
