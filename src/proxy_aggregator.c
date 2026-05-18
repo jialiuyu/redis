@@ -85,6 +85,20 @@ typedef struct proxy_aggregator {
 static proxy_aggregator_t *proxy = NULL;
 static atomic_uint_fast64_t next_request_id = 1;
 
+static void proxy_fc_board_cleanup(proxy_fc_board_t *board);
+
+static void proxy_aggregator_free(proxy_aggregator_t *p) {
+    RETURN_IF(!p);
+    if (p->boards) {
+        for (size_t i = 0; i < p->num_boards; i++)
+            proxy_fc_board_cleanup(&p->boards[i]);
+        zfree(p->boards);
+    }
+    batch_latency_trace_cleanup();
+    ring_buffer_mgr_shutdown();
+    zfree(p);
+}
+
 static size_t proxy_fc_effective_slots(void) {
     size_t slots = server.proxy.vemb_fc_slots > 0 ?
         server.proxy.vemb_fc_slots : PROXY_FC_DEFAULT_SLOTS;
@@ -403,6 +417,7 @@ static int proxy_fc_submit_vemb(proxy_vector_request_t *owner) {
 int proxy_aggregator_drain_worker(int worker_id, uint64_t now_us) {
     RETURN_IF(!proxy || worker_id < 0, C_ERR);
     RETURN_IF((size_t)worker_id >= proxy->active_workers, C_OK);
+    RETURN_IF(!proxy->boards || (size_t)worker_id >= proxy->num_boards, C_ERR);
     proxy_fc_board_t *board = &proxy->boards[worker_id];
     return proxy_fc_try_combine(board, board->slot_count, now_us, 0);
 }
@@ -411,36 +426,36 @@ int proxy_aggregator_init(int num_supernodes) {
     if (proxy) return C_OK;
     if (num_supernodes <= 0) num_supernodes = 1;
 
-    proxy = zcalloc(sizeof(*proxy));
-    RETURN_IF(!proxy, C_ERR);
-    proxy->workers_per_node = server.supernode_workers > 0 ?
+    proxy_aggregator_t *p = zcalloc(sizeof(*p));
+    RETURN_IF(!p, C_ERR);
+    p->workers_per_node = server.supernode_workers > 0 ?
         (size_t)server.supernode_workers : (size_t)max((int)sysconf(_SC_NPROCESSORS_ONLN), 1);
-    proxy->active_workers = server.proxy.vemb_fc_workers > 0 ?
-        server.proxy.vemb_fc_workers : proxy->workers_per_node;
-    if (proxy->active_workers > proxy->workers_per_node)
-        proxy->active_workers = proxy->workers_per_node;
-    if (proxy->active_workers == 0) proxy->active_workers = 1;
-    proxy->fc_slots = proxy_fc_effective_slots();
-    proxy->batch_limit = proxy_fc_effective_batch_limit(proxy->fc_slots);
-    proxy->fc_max_scan = server.proxy.vemb_fc_max_scan;
-    proxy->time_limit_us = proxy_fc_effective_time_limit_us();
-    proxy->num_boards = proxy->workers_per_node;
+    p->active_workers = server.proxy.vemb_fc_workers > 0 ?
+        server.proxy.vemb_fc_workers : p->workers_per_node;
+    if (p->active_workers > p->workers_per_node)
+        p->active_workers = p->workers_per_node;
+    if (p->active_workers == 0) p->active_workers = 1;
+    p->fc_slots = proxy_fc_effective_slots();
+    p->batch_limit = proxy_fc_effective_batch_limit(p->fc_slots);
+    p->fc_max_scan = server.proxy.vemb_fc_max_scan;
+    p->time_limit_us = proxy_fc_effective_time_limit_us();
+    p->num_boards = p->workers_per_node;
 
-    if (ring_buffer_mgr_init(proxy->workers_per_node, RING_BUFFER_SIZE) != C_OK)
+    if (ring_buffer_mgr_init(p->workers_per_node, RING_BUFFER_SIZE) != C_OK)
         goto failed;
     if (ring_buffer_mgr_ensure_supernodes((size_t)num_supernodes) != C_OK)
         goto failed;
     if (batch_latency_trace_init() != C_OK)
         goto failed;
 
-    proxy->boards = zcalloc(sizeof(*proxy->boards) * proxy->num_boards);
-    if (!proxy->boards) goto failed;
-    for (size_t worker = 0; worker < proxy->num_boards; worker++) {
+    p->boards = zcalloc(sizeof(*p->boards) * p->num_boards);
+    if (!p->boards) goto failed;
+    for (size_t worker = 0; worker < p->num_boards; worker++) {
         ring_buffer_t *request_ring = ring_buffer_mgr_get_request(0, (int)worker);
         if (!request_ring) goto failed;
-        if (proxy_fc_board_init(&proxy->boards[worker],
-                                proxy->fc_slots,
-                                proxy->batch_limit,
+        if (proxy_fc_board_init(&p->boards[worker],
+                                p->fc_slots,
+                                p->batch_limit,
                                 0,
                                 (int)worker,
                                 request_ring) != C_OK) {
@@ -448,43 +463,39 @@ int proxy_aggregator_init(int num_supernodes) {
         }
     }
 
-    atomic_init(&proxy->total_requests, 0);
-    atomic_init(&proxy->published, 0);
-    atomic_init(&proxy->combine_rounds, 0);
-    atomic_init(&proxy->combined_requests, 0);
-    atomic_init(&proxy->direct_rounds, 0);
-    atomic_init(&proxy->batch_rounds, 0);
-    atomic_init(&proxy->slot_busy, 0);
-    atomic_init(&proxy->ring_busy, 0);
-    atomic_init(&proxy->submit_failures, 0);
-    atomic_init(&proxy->pending_max, 0);
-    atomic_init(&proxy->next_batch_id, 0);
+    atomic_init(&p->total_requests, 0);
+    atomic_init(&p->published, 0);
+    atomic_init(&p->combine_rounds, 0);
+    atomic_init(&p->combined_requests, 0);
+    atomic_init(&p->direct_rounds, 0);
+    atomic_init(&p->batch_rounds, 0);
+    atomic_init(&p->slot_busy, 0);
+    atomic_init(&p->ring_busy, 0);
+    atomic_init(&p->submit_failures, 0);
+    atomic_init(&p->pending_max, 0);
+    atomic_init(&p->next_batch_id, 0);
+
+    proxy = p;
 
     serverLog(LL_NOTICE,
               "FC-only VEMB proxy initialized: workers=%zu active_workers=%zu slots=%zu batch_limit=%zu time_limit_us=%llu",
-              proxy->workers_per_node,
-              proxy->active_workers,
-              proxy->fc_slots,
-              proxy->batch_limit,
-              (unsigned long long)proxy->time_limit_us);
+              p->workers_per_node,
+              p->active_workers,
+              p->fc_slots,
+              p->batch_limit,
+              (unsigned long long)p->time_limit_us);
     return C_OK;
 
 failed:
-    proxy_aggregator_shutdown();
+    proxy_aggregator_free(p);
     return C_ERR;
 }
 
 void proxy_aggregator_shutdown(void) {
     if (!proxy) return;
-    if (proxy->boards) {
-        for (size_t i = 0; i < proxy->num_boards; i++)
-            proxy_fc_board_cleanup(&proxy->boards[i]);
-        zfree(proxy->boards);
-    }
-    batch_latency_trace_cleanup();
-    ring_buffer_mgr_shutdown();
-    zfree(proxy);
+    proxy_aggregator_t *p = proxy;
     proxy = NULL;
+    proxy_aggregator_free(p);
     serverLog(LL_NOTICE, "FC-only VEMB proxy shutdown");
 }
 

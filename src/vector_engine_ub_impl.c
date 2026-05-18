@@ -126,13 +126,13 @@ static int ub_engine_init(void) {
         return C_ERR;
     }
 
-    if (supernode_init(0, server.supernode_workers) != C_OK) {
-        serverLog(LL_WARNING, "UB Vector Engine: failed to initialize local SuperNode");
-        return C_ERR;
-    }
     if (proxy_aggregator_init(1) != C_OK) {
         serverLog(LL_WARNING, "UB Vector Engine: failed to initialize FC proxy");
-        supernode_shutdown();
+        return C_ERR;
+    }
+    if (supernode_init(0, server.supernode_workers) != C_OK) {
+        serverLog(LL_WARNING, "UB Vector Engine: failed to initialize local SuperNode");
+        proxy_aggregator_shutdown();
         return C_ERR;
     }
 
