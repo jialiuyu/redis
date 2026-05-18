@@ -150,6 +150,36 @@ static vector_engine_type_t current_engine_type = VECTOR_ENGINE_REDIS;
 int VENGINE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
 int supernode_init(int node_id, int num_workers);
 
+static int VectorSetCreateCommand(RedisModuleCtx *ctx, const char *name,
+                                  RedisModuleCmdFunc cmdfunc,
+                                  const char *strflags,
+                                  int firstkey, int lastkey, int keystep) {
+    if (RedisModule_CreateCommand(ctx, name, cmdfunc, strflags,
+                                  firstkey, lastkey, keystep) == REDISMODULE_ERR) {
+        RedisModule_Log(ctx, "warning", "Failed to create command %s", name);
+        return REDISMODULE_ERR;
+    }
+    return REDISMODULE_OK;
+}
+
+static RedisModuleCommand *VectorSetGetCommand(RedisModuleCtx *ctx, const char *name) {
+    RedisModuleCommand *cmd = RedisModule_GetCommand(ctx, name);
+    if (!cmd) {
+        RedisModule_Log(ctx, "warning", "Failed to get command %s after registration", name);
+    }
+    return cmd;
+}
+
+static int VectorSetSetCommandInfo(RedisModuleCtx *ctx, const char *name,
+                                   RedisModuleCommand *cmd,
+                                   const RedisModuleCommandInfo *info) {
+    if (RedisModule_SetCommandInfo(cmd, info) == REDISMODULE_ERR) {
+        RedisModule_Log(ctx, "warning", "Failed to set command info for %s", name);
+        return REDISMODULE_ERR;
+    }
+    return REDISMODULE_OK;
+}
+
 // Default EF value if not specified during creation.
 #define VSET_DEFAULT_C_EF 200
 
@@ -2408,14 +2438,17 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     };
 
     VectorSetType = RedisModule_CreateDataType(ctx,"vectorset",0,&tm);
-    if (VectorSetType == NULL) return REDISMODULE_ERR;
+    if (VectorSetType == NULL) {
+        RedisModule_Log(ctx, "warning", "Failed to create data type vectorset");
+        return REDISMODULE_ERR;
+    }
 
     // Register command VADD
-    if (RedisModule_CreateCommand(ctx,"VADD",
+    if (VectorSetCreateCommand(ctx,"VADD",
         VADD_RedisCommand,"write deny-oom",1,1,1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
-    RedisModuleCommand *vadd_cmd = RedisModule_GetCommand(ctx, "VADD");
+    RedisModuleCommand *vadd_cmd = VectorSetGetCommand(ctx, "VADD");
     if (vadd_cmd == NULL) return REDISMODULE_ERR;
 
     RedisModuleCommandArg vadd_args[] = {
@@ -2454,7 +2487,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         .arity = -5,
         .args = vadd_args,
     };
-    if (RedisModule_SetCommandInfo(vadd_cmd, &vadd_info) == REDISMODULE_ERR) return REDISMODULE_ERR;
+    if (VectorSetSetCommandInfo(ctx, "VADD", vadd_cmd, &vadd_info) == REDISMODULE_ERR) return REDISMODULE_ERR;
 
     // Register command VREM
     if (RedisModule_CreateCommand(ctx,"VREM",
