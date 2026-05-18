@@ -365,8 +365,13 @@ static int supernode_process_fc_vemb_batch(sve_worker_context_t *ctx,
 
         if (ret == C_OK) {
             size_t bytes = sizeof(float) * ctx->gather_ctx.vector_dim;
-            if (!req->result_vector)
+            if (!req->result_vector ||
+                (!req->result_inline && req->result_capacity < ctx->gather_ctx.vector_dim)) {
+                if (!req->result_inline) zfree(req->result_vector);
                 req->result_vector = zmalloc(bytes);
+                req->result_capacity = req->result_vector ?
+                    ctx->gather_ctx.vector_dim : 0;
+            }
             if (req->result_vector) {
                 memcpy(req->result_vector,
                        results + ((size_t)i * ctx->gather_ctx.vector_dim),

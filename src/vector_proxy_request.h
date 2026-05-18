@@ -22,6 +22,8 @@ typedef struct proxy_vector_request {
     RedisModuleBlockedClient *bc;
     float *result_vector;
     size_t result_dim;
+    size_t result_capacity;
+    int result_inline;
     int completed;
     float *query_vector;
     size_t query_dim;
@@ -37,12 +39,14 @@ typedef struct proxy_vector_request {
     monotime submit_time_us;
     monotime completion_time_us;
     uint64_t batch_id;
+    float inline_result[];
 } proxy_vector_request_t;
 
 proxy_vector_request_t *proxy_vector_request_create_vemb(uint64_t request_id,
                                                          uint64_t row_id,
                                                          int raw_output,
-                                                         RedisModuleBlockedClient *bc);
+                                                         RedisModuleBlockedClient *bc,
+                                                         size_t result_capacity);
 proxy_vector_request_t *proxy_vector_request_create_vsim(uint64_t request_id,
                                                          float *query_vector,
                                                          size_t query_dim,

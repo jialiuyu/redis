@@ -579,7 +579,11 @@ int proxy_submit_vemb(RedisModuleCtx *ctx, void *key, void *element, int raw_out
     }
 
     proxy_vector_request_t *req =
-        proxy_vector_request_create_vemb(request_id, row_id, raw_output, bc);
+        proxy_vector_request_create_vemb(request_id,
+                                         row_id,
+                                         raw_output,
+                                         bc,
+                                         set->dim);
     if (!req) {
         RedisModule_AbortBlock(bc);
         sdsfree(key_tmp);

@@ -8,8 +8,16 @@
 proxy_vector_request_t *proxy_vector_request_create_vemb(uint64_t request_id,
                                                          uint64_t row_id,
                                                          int raw_output,
-                                                         RedisModuleBlockedClient *bc) {
-    proxy_vector_request_t *req = zcalloc(sizeof(*req));
+                                                         RedisModuleBlockedClient *bc,
+                                                         size_t result_capacity) {
+    size_t inline_bytes = 0;
+    if (result_capacity > 0) {
+        RETURN_IF(result_capacity > (SIZE_MAX - sizeof(proxy_vector_request_t)) /
+                                    sizeof(float), NULL);
+        inline_bytes = result_capacity * sizeof(float);
+    }
+
+    proxy_vector_request_t *req = zcalloc(sizeof(*req) + inline_bytes);
     RETURN_IF(!req, NULL);
 
     req->op_type = PROXY_VECTOR_OP_VEMB;
@@ -20,6 +28,11 @@ proxy_vector_request_t *proxy_vector_request_create_vemb(uint64_t request_id,
     req->submit_time_us = getMonotonicUs();
     req->completion_time_us = 0;
     req->batch_id = 0;
+    req->result_capacity = result_capacity;
+    if (result_capacity > 0) {
+        req->result_vector = req->inline_result;
+        req->result_inline = 1;
+    }
     return req;
 }
 
@@ -53,7 +66,7 @@ proxy_vector_request_t *proxy_vector_request_create_vsim(uint64_t request_id,
 
 void proxy_vector_request_free(proxy_vector_request_t *req) {
     RETURN_IF(!req);
-    zfree(req->result_vector);
+    if (!req->result_inline) zfree(req->result_vector);
     zfree(req->query_vector);
     zfree(req->candidate_rows);
     zfree(req->result_rows);

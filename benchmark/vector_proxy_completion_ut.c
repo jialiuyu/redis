@@ -30,8 +30,8 @@
 static int test_vemb_completion_lifecycle(void) {
     ASSERT_OK(vector_proxy_completion_init());
 
-    proxy_vector_request_t *req = proxy_vector_request_create_vemb(101, 7, 0, NULL);
-    proxy_vector_request_t *dup = proxy_vector_request_create_vemb(101, 8, 0, NULL);
+    proxy_vector_request_t *req = proxy_vector_request_create_vemb(101, 7, 0, NULL, 0);
+    proxy_vector_request_t *dup = proxy_vector_request_create_vemb(101, 8, 0, NULL, 0);
     ASSERT_TRUE(req != NULL);
     ASSERT_TRUE(dup != NULL);
 
@@ -61,7 +61,7 @@ static int test_vemb_completion_lifecycle(void) {
 }
 
 static int test_vemb_error_completion(void) {
-    proxy_vector_request_t *req = proxy_vector_request_create_vemb(102, 9, 0, NULL);
+    proxy_vector_request_t *req = proxy_vector_request_create_vemb(102, 9, 0, NULL, 0);
     ASSERT_TRUE(req != NULL);
     ASSERT_OK(vector_proxy_completion_register(req));
 
@@ -126,7 +126,7 @@ static void *completion_thread_main(void *arg) {
     for (size_t i = 0; i < thread_arg->iterations; i++) {
         uint64_t request_id = thread_arg->base_id + i;
         proxy_vector_request_t *req =
-            proxy_vector_request_create_vemb(request_id, request_id + 100, 0, NULL);
+            proxy_vector_request_create_vemb(request_id, request_id + 100, 0, NULL, 0);
         if (!req) {
             thread_arg->failed = 1;
             return NULL;
