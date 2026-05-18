@@ -1,7 +1,8 @@
 // vemb_fc_server_bench.go
 //
-// FC server-side benchmark driver. Start Redis with
-// benchmark/redis-vemb-fc-bench.conf, then run:
+// Unified server-side VEMB RAW benchmark driver. Start Redis with either
+// benchmark/redis-vemb-fc-bench.conf or benchmark/redis-vemb-redis-bench.conf,
+// then run:
 //
 //	go run ./benchmark/vemb_fc_server_bench.go
 //
@@ -173,18 +174,36 @@ func redisCall(addr string, timeout time.Duration, args ...string) (redisValue, 
 	return rc.call(timeout, args...)
 }
 
-func ensureOK(addr string, timeout time.Duration) error {
+func detectEngine(addr string, timeout time.Duration) (string, error) {
 	if _, err := redisCall(addr, timeout, "PING"); err != nil {
-		return err
+		return "", err
 	}
 	resp, err := redisCall(addr, timeout, "VENGINE", "GET")
 	if err != nil {
-		return err
+		return "", err
 	}
-	if !strings.Contains(resp.String(), "UB") {
-		return fmt.Errorf("expected VENGINE GET to include UB, got %q", resp.String())
+	text := strings.ToUpper(resp.String())
+	if strings.Contains(text, "UB") {
+		return "ub", nil
 	}
-	return nil
+	if strings.Contains(text, "REDIS") {
+		return "redis", nil
+	}
+	return "", fmt.Errorf("unexpected VENGINE GET response: %q", resp.String())
+}
+
+func ensureOK(addr string, timeout time.Duration, requestedEngine string) (string, error) {
+	actual, err := detectEngine(addr, timeout)
+	if err != nil {
+		return "", err
+	}
+	if requestedEngine == "auto" || requestedEngine == "" {
+		return actual, nil
+	}
+	if requestedEngine != actual {
+		return "", fmt.Errorf("expected vector engine %s but server reports %s", requestedEngine, actual)
+	}
+	return actual, nil
 }
 
 func configGet(addr string, timeout time.Duration, name string) (string, error) {
@@ -268,6 +287,17 @@ func preflight(addr string, timeout time.Duration, dim, prefillCount int, ubShmP
 	return nil
 }
 
+func preflightRedis(addr string, timeout time.Duration, dim int) error {
+	serverDim, err := configGetInt(addr, timeout, "vector-dimension")
+	if err != nil {
+		return err
+	}
+	if serverDim != int64(dim) {
+		return fmt.Errorf("server vector-dimension=%d but bench -d=%d; restart Redis with matching config", serverDim, dim)
+	}
+	return nil
+}
+
 func writeFile(path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s failed: %v\n", path, err)
@@ -296,6 +326,9 @@ func captureStats(addr string, timeout time.Duration, outDir, tag string) {
 func keepStatsLine(line string) bool {
 	patterns := []string{
 		"Proxy Aggregator",
+		"Redis Vector Engine",
+		"Implementation:",
+		"Status:",
 		"FC Proxy Stats",
 		"Workers:",
 		"Active FC workers",
@@ -356,7 +389,7 @@ func keepStatsLine(line string) bool {
 	return false
 }
 
-func prefill(addr, key string, dim, count int, timeout time.Duration, flush bool) error {
+func prefill(addr, key string, dim, count int, timeout time.Duration, flush bool, vaddNoquant bool) error {
 	if flush {
 		fmt.Println("[setup] FLUSHALL")
 		if _, err := redisCall(addr, timeout, "FLUSHALL"); err != nil {
@@ -389,6 +422,9 @@ func prefill(addr, key string, dim, count int, timeout time.Duration, flush bool
 		args := []string{"VADD", key, "VALUES", strconv.Itoa(dim)}
 		args = append(args, basis[i%dim]...)
 		args = append(args, fmt.Sprintf("item:%d", i))
+		if vaddNoquant {
+			args = append(args, "NOQUANT")
+		}
 		if _, err := rc.call(timeout, args...); err != nil {
 			return fmt.Errorf("VADD item:%d failed: %w", i, err)
 		}
@@ -400,8 +436,8 @@ func prefill(addr, key string, dim, count int, timeout time.Duration, flush bool
 	return nil
 }
 
-func runVemb(addr, key string, prefillCount, concurrency, requests int, timeout time.Duration) benchResult {
-	name := fmt.Sprintf("fc_c%d_n%d", concurrency, requests)
+func runVemb(addr, key, engine string, prefillCount, concurrency, requests int, timeout time.Duration) benchResult {
+	name := fmt.Sprintf("%s_c%d_n%d", engine, concurrency, requests)
 	latencies := make([]time.Duration, requests)
 	var latIndex atomic.Int64
 	var ok atomic.Int64
@@ -582,6 +618,8 @@ func main() {
 	var flush bool
 	var timeout time.Duration
 	var ubShmPath string
+	var engine string
+	var redisNoquant bool
 
 	flag.StringVar(&host, "host", "127.0.0.1", "Redis host")
 	flag.IntVar(&port, "port", 6391, "Redis port")
@@ -599,17 +637,16 @@ func main() {
 	flag.BoolVar(&flush, "flush", true, "FLUSHALL before prefill")
 	flag.DurationVar(&timeout, "timeout", 10*time.Second, "Per-command timeout")
 	flag.StringVar(&ubShmPath, "ub-shm-path", "", "UB backing file path override for preflight size check; empty uses Redis config")
+	flag.StringVar(&engine, "engine", "ub", "Expected vector engine: ub, redis, or auto")
+	flag.BoolVar(&redisNoquant, "redis-noquant", false, "Use VADD ... NOQUANT during Redis-engine prefill for fp32 RAW payloads")
 	flag.Parse()
-
-	addr := fmt.Sprintf("%s:%d", host, port)
-	if outDir == "" {
-		outDir = filepath.Join("benchmark", "results", "vemb_fc_"+time.Now().Format("20060102_150405"))
-	}
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir %s failed: %v\n", outDir, err)
+	engine = strings.ToLower(engine)
+	if engine != "ub" && engine != "redis" && engine != "auto" {
+		fmt.Fprintln(os.Stderr, "-engine must be ub, redis, or auto")
 		os.Exit(1)
 	}
 
+	addr := fmt.Sprintf("%s:%d", host, port)
 	concurrencies, err := parseConcurrencies(concurrencyList)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -621,23 +658,44 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := ensureOK(addr, timeout); err != nil {
-		fmt.Fprintf(os.Stderr, "Redis FC server is not ready at %s: %v\n", addr, err)
-		fmt.Fprintln(os.Stderr, "Start it with: ./src/redis-server benchmark/redis-vemb-fc-bench.conf")
+	actualEngine, err := ensureOK(addr, timeout, engine)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Redis vector server is not ready at %s: %v\n", addr, err)
+		fmt.Fprintln(os.Stderr, "Start UB with:    ./src/redis-server benchmark/redis-vemb-fc-bench.conf")
+		fmt.Fprintln(os.Stderr, "Start Redis with: ./src/redis-server benchmark/redis-vemb-redis-bench.conf")
 		os.Exit(1)
 	}
-	if err := preflight(addr, timeout, dim, prefillCount, ubShmPath); err != nil {
-		fmt.Fprintf(os.Stderr, "preflight failed: %v\n", err)
+	if actualEngine == "ub" {
+		if redisNoquant {
+			fmt.Fprintln(os.Stderr, "-redis-noquant is only valid with vector-engine redis")
+			os.Exit(1)
+		}
+		if err := preflight(addr, timeout, dim, prefillCount, ubShmPath); err != nil {
+			fmt.Fprintf(os.Stderr, "preflight failed: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		if err := preflightRedis(addr, timeout, dim); err != nil {
+			fmt.Fprintf(os.Stderr, "preflight failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if outDir == "" {
+		outDir = filepath.Join("benchmark", "results",
+			fmt.Sprintf("vemb_%s_%s", actualEngine, time.Now().Format("20060102_150405")))
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir %s failed: %v\n", outDir, err)
 		os.Exit(1)
 	}
 
 	config := fmt.Sprintf(
-		"addr=%s\nkey=%s\ndim=%d\nprefill=%d\nrequests=%d\nconcurrency=%s\nskip_prefill=%v\nflush=%v\ntimeout=%s\nub_shm_path=%s\n",
-		addr, key, dim, prefillCount, requests, concurrencyList, skipPrefill, flush, timeout, ubShmPath)
+		"addr=%s\nkey=%s\nengine=%s\ndim=%d\nprefill=%d\nrequests=%d\nconcurrency=%s\nskip_prefill=%v\nflush=%v\ntimeout=%s\nub_shm_path=%s\nredis_noquant=%v\n",
+		addr, key, actualEngine, dim, prefillCount, requests, concurrencyList, skipPrefill, flush, timeout, ubShmPath, redisNoquant)
 	writeFile(filepath.Join(outDir, "config.txt"), config)
 
 	if !skipPrefill {
-		if err := prefill(addr, key, dim, prefillCount, timeout, flush); err != nil {
+		if err := prefill(addr, key, dim, prefillCount, timeout, flush, redisNoquant); err != nil {
 			fmt.Fprintf(os.Stderr, "prefill failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -649,7 +707,7 @@ func main() {
 
 	for _, c := range concurrencies {
 		fmt.Printf("[run] VEMB RAW concurrency=%d requests=%d\n", c, requests)
-		r := runVemb(addr, key, prefillCount, c, requests, timeout)
+		r := runVemb(addr, key, actualEngine, prefillCount, c, requests, timeout)
 		writeRunLog(outDir, r)
 		captureStats(addr, timeout, outDir, r.name)
 
