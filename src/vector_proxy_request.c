@@ -56,6 +56,7 @@ void proxy_vector_request_free(proxy_vector_request_t *req) {
     zfree(req->result_vector);
     zfree(req->query_vector);
     zfree(req->candidate_rows);
+    zfree(req->result_rows);
     zfree(req->result_scores);
     if (req->candidate_elements) {
         for (size_t i = 0; i < req->candidate_count; i++) {

@@ -168,16 +168,16 @@ int vector_proxy_completion_complete_vsim(uint64_t request_id,
     req->completion_time_us = getMonotonicUs();
 
     if (error_code == C_OK && num_results > 0 && row_ids && scores) {
-        req->candidate_rows = zmalloc(sizeof(uint64_t) * num_results);
+        req->result_rows = zmalloc(sizeof(uint64_t) * num_results);
         req->result_scores = zmalloc(sizeof(float) * num_results);
-        if (!req->candidate_rows || !req->result_scores) {
-            zfree(req->candidate_rows);
+        if (!req->result_rows || !req->result_scores) {
+            zfree(req->result_rows);
             zfree(req->result_scores);
-            req->candidate_rows = NULL;
+            req->result_rows = NULL;
             req->result_scores = NULL;
             req->error_code = C_ERR;
         } else {
-            memcpy(req->candidate_rows, row_ids, sizeof(uint64_t) * num_results);
+            memcpy(req->result_rows, row_ids, sizeof(uint64_t) * num_results);
             memcpy(req->result_scores, scores, sizeof(float) * num_results);
             req->result_count = num_results;
         }

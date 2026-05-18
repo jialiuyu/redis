@@ -11,6 +11,7 @@
 typedef struct proxy_request {
     uint64_t request_id;
     uint32_t key_hash;                  /* 预计算 hash，避免重复计算 */
+    uint64_t row_id;                    /* UB row id, copied from owner for VEMB packets */
     int target_supernode_id;            /* 目标超节点 */
     int target_worker_id;               /* 目标 worker */
     uint64_t submit_time_us;
@@ -25,6 +26,8 @@ typedef struct proxy_batch_bucket {
     int target_worker_id;               /* 目标 Worker ID */
     ring_buffer_t *rb;                  /* 目标 worker 对应的 ring buffer */
     uint64_t last_flush_time_us;        /* 上次刷新时间 */
+    uint64_t last_append_time_us;       /* 上次 VEMB/VISM 到达时间 */
+    uint64_t recent_gap_ewma_us;        /* 请求到达间隔 EWMA */
     pthread_mutex_t mutex;
     int mutex_initialized;
 } proxy_batch_bucket_t;
@@ -36,6 +39,7 @@ int proxy_batch_bucket_init(proxy_batch_bucket_t *bucket, size_t capacity,
                             uint64_t now_us);
 void proxy_batch_bucket_cleanup(proxy_batch_bucket_t *bucket);
 void proxy_batch_bucket_reset(proxy_batch_bucket_t *bucket, uint64_t flush_time_us);
+void proxy_batch_bucket_note_arrival(proxy_batch_bucket_t *bucket, uint64_t now_us);
 
 proxy_request_t *proxy_request_create(uint64_t request_id, uint32_t key_hash,
                                       int target_supernode_id, int target_worker_id,

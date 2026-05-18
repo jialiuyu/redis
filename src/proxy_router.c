@@ -31,3 +31,19 @@ int proxy_router_route(proxy_router_t *router, const char *key, proxy_route_t *r
     route->worker_id = (int)(route->key_hash % router->workers_per_node);
     return C_OK;
 }
+
+int proxy_router_route_by_row(proxy_router_t *router, const char *key,
+                              uint64_t row_id, proxy_route_t *route) {
+    RETURN_IF(proxy_router_route(router, key, route) != C_OK, C_ERR);
+
+    route->worker_id = (int)(row_id % router->workers_per_node);
+    return C_OK;
+}
+
+int proxy_router_route_by_request(proxy_router_t *router, const char *key,
+                                  uint64_t request_id, proxy_route_t *route) {
+    RETURN_IF(proxy_router_route(router, key, route) != C_OK, C_ERR);
+
+    route->worker_id = (int)(request_id % router->workers_per_node);
+    return C_OK;
+}

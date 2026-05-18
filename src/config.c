@@ -3218,6 +3218,8 @@ standardConfig static_configs[] = {
     createSizeTConfig("proxy-batch-limit", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.batch_limit, 0, INTEGER_CONFIG, NULL, NULL),
     createULongLongConfig("proxy-time-limit-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.time_limit_us, 0, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("proxy-max-supernodes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.max_supernodes, 0, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("proxy-vemb-adaptive", NULL, MODIFIABLE_CONFIG, server.proxy.vemb_adaptive, 1, NULL, NULL),
+    createULongLongConfig("proxy-vemb-direct-gap-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.vemb_direct_gap_us, 20, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, PREFETCH_BATCH_MAX_SIZE, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vector-dimension", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.ub.vector_dimension, 300, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),

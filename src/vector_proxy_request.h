@@ -29,6 +29,7 @@ typedef struct proxy_vector_request {
     size_t candidate_count;
     size_t requested_count;
     int withscores;
+    uint64_t *result_rows;
     float *result_scores;
     size_t result_count;
     int error_code;

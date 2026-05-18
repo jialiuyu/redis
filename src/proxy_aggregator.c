@@ -25,11 +25,15 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
+#define PROXY_VEMB_DIRECT_GAP_US 20
+
 typedef struct proxy_aggregator_config {
     size_t batch_limit;
     uint64_t time_limit_us;
     size_t max_supernodes;
     size_t workers_per_node;
+    int vemb_adaptive;
+    uint64_t vemb_direct_gap_us;
 } proxy_aggregator_config_t;
 
 typedef struct proxy_aggregator {
@@ -79,12 +83,218 @@ static inline void proxy_aggregator_config_init(proxy_aggregator_config_t *cfg) 
     cfg->time_limit_us = server.proxy.time_limit_us > 0 ? server.proxy.time_limit_us : (uint64_t)PROXY_TIME_LIMIT_US;
     cfg->max_supernodes = server.proxy.max_supernodes > 0 ? server.proxy.max_supernodes : (size_t)PROXY_MAX_SUPERNODES;
     cfg->workers_per_node = server.supernode_workers > 0 ?  server.supernode_workers : (size_t)max((int)sysconf(_SC_NPROCESSORS_ONLN), 1);
+    cfg->vemb_adaptive = server.proxy.vemb_adaptive;
+    cfg->vemb_direct_gap_us = server.proxy.vemb_direct_gap_us > 0 ?
+        server.proxy.vemb_direct_gap_us : (uint64_t)PROXY_VEMB_DIRECT_GAP_US;
 }
 
 static inline size_t worker_queue_index(size_t workers_per_node,
                                         int supernode_id,
                                         int worker_id) {
     return (size_t)supernode_id * workers_per_node + (size_t)worker_id;
+}
+
+static int proxy_route_vector_request(proxy_aggregator_t *agg,
+                                      const char *key,
+                                      proxy_vector_request_t *owner,
+                                      proxy_route_t *route) {
+    RETURN_IF(!agg || !key || !owner || !route, C_ERR);
+
+    if (owner->op_type == PROXY_VECTOR_OP_VEMB) {
+        return proxy_router_route_by_row(&agg->router, key, owner->row_id, route);
+    } else if (owner->op_type == PROXY_VECTOR_OP_VSIM) {
+        return proxy_router_route_by_request(&agg->router, key, owner->request_id, route);
+    }
+
+    return proxy_router_route(&agg->router, key, route);
+}
+
+static inline int proxy_vemb_direct_path_enabled(proxy_aggregator_t *agg) {
+    RETURN_IF(!agg, 0);
+
+    return agg->config.batch_limit <= 1 || agg->config.time_limit_us == 0;
+}
+
+static inline int proxy_vemb_adaptive_direct_selected(proxy_aggregator_t *agg,
+                                                      proxy_batch_bucket_t *bucket) {
+    RETURN_IF(!agg || !bucket, 0);
+    RETURN_IF(!agg->config.vemb_adaptive, 0);
+    RETURN_IF(bucket->count != 0, 0);
+
+    uint64_t now_us = getMonotonicUs();
+    if (bucket->last_append_time_us == 0 ||
+        now_us - bucket->last_append_time_us >= agg->config.vemb_direct_gap_us) {
+        return 1;
+    }
+
+    return bucket->recent_gap_ewma_us >= agg->config.vemb_direct_gap_us;
+}
+
+static void proxy_record_direct_attempt(proxy_aggregator_t *agg, int success) {
+    RETURN_IF(!agg);
+
+    atomic_fetch_add_explicit(&agg->executor.stats.immediate_flush_attempts,
+                              1, memory_order_relaxed);
+    if (success) {
+        atomic_fetch_add_explicit(&agg->executor.stats.immediate_flush_successes, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&agg->executor.stats.total_flushes, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&agg->executor.stats.total_batches, 1, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&agg->executor.stats.enqueue_rejections_full, 1, memory_order_relaxed);
+    }
+}
+
+static int proxy_direct_submit_vemb_locked(proxy_aggregator_t *agg,
+                                           proxy_batch_bucket_t *bucket,
+                                           const proxy_route_t *route,
+                                           proxy_vector_request_t *owner,
+                                           monotime flush_start) {
+    RETURN_IF(!agg || !bucket || !route || !owner ||
+              owner->op_type != PROXY_VECTOR_OP_VEMB, C_ERR);
+    RETURN_IF(!bucket->rb, C_ERR);
+    size_t packet_size = sizeof(batch_packet_t) + sizeof(((batch_packet_t *)0)->requests[0]);
+    RETURN_IF(packet_size > UINT32_MAX, C_ERR);
+
+    uint64_t wait_us = owner->submit_time_us > 0 ?
+        (uint64_t)(flush_start - owner->submit_time_us) : 0;
+    uint64_t batch_id =
+        atomic_fetch_add_explicit(&agg->executor.next_batch_id, 1, memory_order_relaxed);
+
+    batch_packet_t *packet = NULL;
+    if (ring_buffer_reserve(bucket->rb, packet_size, (void **)&packet) != C_OK) {
+        proxy_record_direct_attempt(agg, 0);
+        return C_ERR;
+    }
+
+    packet->hdr.magic = BATCH_PACKET_MAGIC;
+    packet->hdr.packet_size = (uint32_t)packet_size;
+    packet->hdr.num_requests = 1;
+    packet->hdr.op_type = BATCH_PACKET_OP_VEMB;
+    packet->hdr.supernode_id = (uint32_t)route->supernode_id;
+    packet->hdr.worker_id = (uint32_t)route->worker_id;
+    packet->hdr.timestamp_us = flush_start;
+    packet->hdr.batch_id = batch_id;
+    packet->requests[0].request_id = owner->request_id;
+    packet->requests[0].row_id = owner->row_id;
+    owner->batch_id = batch_id;
+
+    int ret = ring_buffer_commit_write(bucket->rb, packet_size);
+    if (ret != C_OK) {
+        owner->batch_id = 0;
+        ring_buffer_cancel_write(bucket->rb);
+        proxy_record_direct_attempt(agg, 0);
+        return ret;
+    }
+
+    uint64_t flush_latency_us = elapsedUs(flush_start);
+    proxy_record_direct_attempt(agg, 1);
+    (void)batch_latency_trace_begin(batch_id,
+                                    BATCH_PACKET_OP_VEMB,
+                                    1,
+                                    wait_us,
+                                    wait_us,
+                                    flush_latency_us);
+    atomic_fetch_add_explicit(&agg->total_requests, 1, memory_order_relaxed);
+    return C_OK;
+}
+
+static int proxy_direct_submit_vemb(const char *key, proxy_vector_request_t *owner) {
+    RETURN_IF(!proxy || !key || !owner || owner->op_type != PROXY_VECTOR_OP_VEMB, C_ERR);
+
+    proxy_route_t route;
+    RETURN_IF(proxy_router_route_by_row(&proxy->router, key, owner->row_id, &route) != C_OK,
+              C_ERR);
+
+    size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
+                                             route.supernode_id, route.worker_id);
+    RETURN_IF(bucket_index >= proxy->num_buckets, C_ERR);
+    proxy_batch_bucket_t *bucket = &proxy->buckets[bucket_index];
+    RETURN_IF(!bucket->rb, C_ERR);
+
+    monotime flush_start = getMonotonicUs();
+    pthread_mutex_lock(&bucket->mutex);
+    proxy_batch_bucket_note_arrival(bucket, flush_start);
+    int ret = proxy_direct_submit_vemb_locked(proxy, bucket, &route, owner, flush_start);
+    pthread_mutex_unlock(&bucket->mutex);
+    return ret;
+}
+
+static int proxy_direct_submit_vsim(const char *key, proxy_vector_request_t *owner) {
+    RETURN_IF(!proxy || !key || !owner || owner->op_type != PROXY_VECTOR_OP_VSIM, C_ERR);
+    RETURN_IF(!owner->query_vector || owner->query_dim == 0 ||
+              !owner->candidate_rows || owner->candidate_count == 0, C_ERR);
+    RETURN_IF(owner->query_dim > UINT32_MAX || owner->requested_count > UINT32_MAX ||
+              owner->candidate_count > UINT32_MAX, C_ERR);
+
+    proxy_route_t route;
+    RETURN_IF(proxy_router_route_by_request(&proxy->router, key, owner->request_id, &route) != C_OK,
+              C_ERR);
+
+    size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
+                                             route.supernode_id, route.worker_id);
+    RETURN_IF(bucket_index >= proxy->num_buckets, C_ERR);
+    proxy_batch_bucket_t *bucket = &proxy->buckets[bucket_index];
+    RETURN_IF(!bucket->rb, C_ERR);
+
+    size_t packet_size = sizeof(batch_vsim_packet_t) +
+                         sizeof(float) * owner->query_dim +
+                         sizeof(uint64_t) * owner->candidate_count;
+    RETURN_IF(packet_size > UINT32_MAX, C_ERR);
+
+    monotime flush_start = getMonotonicUs();
+    uint64_t wait_us = owner->submit_time_us > 0 ?
+        (uint64_t)(flush_start - owner->submit_time_us) : 0;
+    uint64_t batch_id =
+        atomic_fetch_add_explicit(&proxy->executor.next_batch_id, 1, memory_order_relaxed);
+
+    batch_vsim_packet_t *packet = NULL;
+    pthread_mutex_lock(&bucket->mutex);
+    if (ring_buffer_reserve(bucket->rb, packet_size, (void **)&packet) != C_OK) {
+        pthread_mutex_unlock(&bucket->mutex);
+        proxy_record_direct_attempt(proxy, 0);
+        return C_ERR;
+    }
+
+    packet->hdr.magic = BATCH_PACKET_MAGIC;
+    packet->hdr.packet_size = (uint32_t)packet_size;
+    packet->hdr.num_requests = 1;
+    packet->hdr.op_type = BATCH_PACKET_OP_VSIM;
+    packet->hdr.supernode_id = (uint32_t)route.supernode_id;
+    packet->hdr.worker_id = (uint32_t)route.worker_id;
+    packet->hdr.timestamp_us = flush_start;
+    packet->hdr.batch_id = batch_id;
+    packet->flags = owner->withscores ? 1u : 0u;
+    packet->request_id = owner->request_id;
+    packet->query_dim = (uint32_t)owner->query_dim;
+    packet->requested_count = (uint32_t)owner->requested_count;
+    packet->candidate_count = (uint32_t)owner->candidate_count;
+    packet->reserved = 0;
+    memcpy(packet->payload, owner->query_vector, sizeof(float) * owner->query_dim);
+    memcpy((uint8_t *)(packet->payload + owner->query_dim),
+           owner->candidate_rows,
+           sizeof(uint64_t) * owner->candidate_count);
+    owner->batch_id = batch_id;
+
+    int ret = ring_buffer_commit_write(bucket->rb, packet_size);
+    if (ret != C_OK) {
+        owner->batch_id = 0;
+        ring_buffer_cancel_write(bucket->rb);
+        pthread_mutex_unlock(&bucket->mutex);
+        proxy_record_direct_attempt(proxy, 0);
+        return ret;
+    }
+    pthread_mutex_unlock(&bucket->mutex);
+
+    uint64_t flush_latency_us = elapsedUs(flush_start);
+    proxy_record_direct_attempt(proxy, 1);
+    (void)batch_latency_trace_begin(batch_id,
+                                    BATCH_PACKET_OP_VSIM,
+                                    1,
+                                    wait_us,
+                                    wait_us,
+                                    flush_latency_us);
+    atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);
+    return C_OK;
 }
 
 static void proxy_active_bucket_add(proxy_aggregator_t *agg, size_t bucket_index) {
@@ -499,10 +709,15 @@ int proxy_enqueue_request(const char *key, void *client_ctx,
 int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *owner) {
     RETURN_IF(!proxy || !key || !owner, C_ERR);
 
+    if (owner->op_type == PROXY_VECTOR_OP_VSIM) {
+        return proxy_direct_submit_vsim(key, owner);
+    }
+
     proxy_route_t route;
-    RETURN_IF(proxy_router_route(&proxy->router, key, &route) != C_OK, C_ERR);
+    RETURN_IF(proxy_route_vector_request(proxy, key, owner, &route) != C_OK, C_ERR);
     size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
                                              route.supernode_id, route.worker_id);
+    RETURN_IF(bucket_index >= proxy->num_buckets, C_ERR);
     proxy_batch_bucket_t *bucket = &proxy->buckets[bucket_index];
     RETURN_IF(!bucket->rb, C_ERR);
 
@@ -516,6 +731,18 @@ int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *owner)
     RETURN_IF(!req, C_ERR);
 
     pthread_mutex_lock(&bucket->mutex);
+    if (owner->op_type == PROXY_VECTOR_OP_VEMB &&
+        proxy_vemb_adaptive_direct_selected(proxy, bucket)) {
+        monotime submit_time_us = req->submit_time_us;
+        proxy_batch_bucket_note_arrival(bucket, submit_time_us);
+        int ret = proxy_direct_submit_vemb_locked(proxy, bucket, &route, owner, submit_time_us);
+        if (ret == C_OK) {
+            pthread_mutex_unlock(&bucket->mutex);
+            proxy_request_destroy(req);
+            return C_OK;
+        }
+    }
+
     if (bucket->count >= bucket->capacity) {
         if (proxy_executor_flush_bucket_locked(&proxy->executor, bucket, bucket->rb, 1,
                                       req->submit_time_us,
@@ -620,8 +847,21 @@ static int proxy_vsim_reply(RedisModuleCtx *ctx, RedisModuleString **argv, int a
     RedisModule_ReplyWithArray(ctx, owned_req->withscores ? (long long)(owned_req->result_count * 2) :
                                                      (long long)owned_req->result_count);
     for (size_t i = 0; i < owned_req->result_count; i++) {
-        const char *element = owned_req->candidate_elements && owned_req->candidate_elements[i] ?
-                              owned_req->candidate_elements[i] : "";
+        const char *element = "";
+        if (owned_req->candidate_elements &&
+            i < owned_req->candidate_count &&
+            owned_req->candidate_elements[i]) {
+            element = owned_req->candidate_elements[i];
+        } else if (owned_req->result_rows && owned_req->candidate_rows &&
+                   owned_req->candidate_elements) {
+            for (size_t j = 0; j < owned_req->candidate_count; j++) {
+                if (owned_req->candidate_rows[j] == owned_req->result_rows[i] &&
+                    owned_req->candidate_elements[j]) {
+                    element = owned_req->candidate_elements[j];
+                    break;
+                }
+            }
+        }
         RedisModule_ReplyWithStringBuffer(ctx, element, strlen(element));
         if (owned_req->withscores) {
             RedisModule_ReplyWithDouble(ctx, owned_req->result_scores ? owned_req->result_scores[i] : 0.0);
@@ -695,7 +935,10 @@ int proxy_submit_vemb(RedisModuleCtx *ctx,
 
     RedisModule_BlockClientSetPrivateData(bc, req);
     RedisModule_BlockedClientMeasureTimeStart(bc);
-    if (proxy_enqueue_vector_request(key_tmp, req) != C_OK) {
+    int submit_ret = proxy_vemb_direct_path_enabled(proxy) ?
+                     proxy_direct_submit_vemb(key_tmp, req) :
+                     proxy_enqueue_vector_request(key_tmp, req);
+    if (submit_ret != C_OK) {
         proxy_vector_request_t *taken = NULL;
         vector_proxy_completion_take(req->request_id, &taken);
         if (taken) proxy_vector_request_free(taken);
@@ -784,7 +1027,7 @@ int proxy_submit_vsim(RedisModuleCtx *ctx,
 
     RedisModule_BlockClientSetPrivateData(bc, req);
     RedisModule_BlockedClientMeasureTimeStart(bc);
-    if (proxy_enqueue_vector_request(key_tmp, req) != C_OK) {
+    if (proxy_direct_submit_vsim(key_tmp, req) != C_OK) {
         proxy_vector_request_t *taken = NULL;
         vector_proxy_completion_take(req->request_id, &taken);
         if (taken) proxy_vector_request_free(taken);

@@ -20,5 +20,9 @@ typedef struct proxy_router {
 int proxy_router_init(proxy_router_t *router, int num_supernodes, size_t workers_per_node);
 void proxy_router_cleanup(proxy_router_t *router);
 int proxy_router_route(proxy_router_t *router, const char *key, proxy_route_t *route);
+int proxy_router_route_by_row(proxy_router_t *router, const char *key,
+                              uint64_t row_id, proxy_route_t *route);
+int proxy_router_route_by_request(proxy_router_t *router, const char *key,
+                                  uint64_t request_id, proxy_route_t *route);
 
 #endif /* __PROXY_ROUTER_H */

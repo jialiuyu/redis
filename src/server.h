@@ -1869,6 +1869,8 @@ typedef struct proxyConfig {
     size_t batch_limit;           /* 0 means default */
     uint64_t time_limit_us;       /* 0 means default */
     size_t max_supernodes;        /* 0 means default */
+    int vemb_adaptive;            /* auto direct/batch for VEMB */
+    uint64_t vemb_direct_gap_us;  /* direct VEMB when recent arrivals are sparse */
 } proxyConfig;
 
 struct redisServer {

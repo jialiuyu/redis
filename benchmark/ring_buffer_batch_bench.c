@@ -70,19 +70,19 @@ static int prepare_batch(proxy_batch_bucket_t *bucket, int worker_id,
     if (!bucket || bucket->count != 0) return C_ERR;
 
     for (size_t i = 0; i < nreq; i++) {
+        uint64_t row_id = ((uint64_t)worker_id << 32) | (uint64_t)i;
         proxy_request_t *req = proxy_request_create(
             batch_id * 1000 + i,
-            ((uint64_t)worker_id << 32) | (uint64_t)i,
+            (uint32_t)row_id,
             0,
             worker_id,
             batch_id,
-            NULL,
-            NULL,
-            0);
+            NULL);
         if (!req) {
             proxy_batch_bucket_reset(bucket, batch_id);
             return C_ERR;
         }
+        req->row_id = row_id;
         if (proxy_batch_bucket_append(bucket, req) != C_OK) {
             proxy_request_destroy(req);
             proxy_batch_bucket_reset(bucket, batch_id);
@@ -118,17 +118,17 @@ static void *worker_main(void *arg) {
         if (ring_buffer_peek(ctx->rb, &payload, &payload_len) == C_OK) {
             batch_packet_t *pkt = payload;
 
-            if (pkt->magic != BATCH_PACKET_MAGIC) {
+            if (pkt->hdr.magic != BATCH_PACKET_MAGIC) {
                 fprintf(stderr, "bad magic on worker %d\n", ctx->worker_id);
                 exit(2);
             }
-            if ((int)pkt->worker_id != ctx->worker_id) {
+            if ((int)pkt->hdr.worker_id != ctx->worker_id) {
                 fprintf(stderr, "wrong worker route: got %u expected %d\n",
-                        pkt->worker_id, ctx->worker_id);
+                        pkt->hdr.worker_id, ctx->worker_id);
                 exit(3);
             }
             atomic_fetch_add(&ctx->consumed_batches, 1);
-            atomic_fetch_add(&ctx->consumed_requests, pkt->num_requests);
+            atomic_fetch_add(&ctx->consumed_requests, pkt->hdr.num_requests);
             ring_buffer_commit_read(ctx->rb, payload_len);
         }
     }

@@ -30,6 +30,8 @@ int proxy_batch_bucket_init(proxy_batch_bucket_t *bucket, size_t capacity,
     bucket->target_worker_id = target_worker_id;
     bucket->rb = NULL;
     bucket->last_flush_time_us = now_us;
+    bucket->last_append_time_us = 0;
+    bucket->recent_gap_ewma_us = 0;
     if (pthread_mutex_init(&bucket->mutex, NULL) != 0) {
         zfree(bucket->requests);
         bucket->requests = NULL;
@@ -69,6 +71,17 @@ void proxy_batch_bucket_reset(proxy_batch_bucket_t *bucket, uint64_t flush_time_
     bucket->last_flush_time_us = flush_time_us;
 }
 
+void proxy_batch_bucket_note_arrival(proxy_batch_bucket_t *bucket, uint64_t now_us) {
+    RETURN_IF(!bucket || now_us == 0);
+
+    if (bucket->last_append_time_us > 0 && now_us >= bucket->last_append_time_us) {
+        uint64_t gap_us = now_us - bucket->last_append_time_us;
+        bucket->recent_gap_ewma_us = bucket->recent_gap_ewma_us == 0 ?
+            gap_us : ((bucket->recent_gap_ewma_us * 7) + gap_us) / 8;
+    }
+    bucket->last_append_time_us = now_us;
+}
+
 proxy_request_t *proxy_request_create(uint64_t request_id, uint32_t key_hash,
                                       int target_supernode_id, int target_worker_id,
                                       uint64_t submit_time_us,
@@ -78,6 +91,7 @@ proxy_request_t *proxy_request_create(uint64_t request_id, uint32_t key_hash,
 
     req->request_id = request_id;
     req->key_hash = key_hash;
+    req->row_id = owner ? owner->row_id : 0;
     req->target_supernode_id = target_supernode_id;
     req->target_worker_id = target_worker_id;
     req->submit_time_us = submit_time_us;
@@ -94,6 +108,7 @@ int proxy_batch_bucket_append(proxy_batch_bucket_t *bucket, proxy_request_t *req
     RETURN_IF(!bucket || !req || !bucket->requests, C_ERR);
     RETURN_IF(bucket->count >= bucket->capacity, C_ERR);
 
+    proxy_batch_bucket_note_arrival(bucket, req->submit_time_us);
     bucket->requests[bucket->count++] = req;
     if (bucket->count == 1) {
         bucket->last_flush_time_us = req->submit_time_us;
@@ -161,7 +176,7 @@ int proxy_batch_bucket_fill_packet(const proxy_batch_bucket_t *bucket,
     for (size_t i = 0; i < bucket->count; i++) {
         proxy_request_t *req = bucket->requests[i];
         packet->requests[i].request_id = req->request_id;
-        packet->requests[i].row_id = req->owner ? req->owner->row_id : 0;
+        packet->requests[i].row_id = req->row_id;
     }
 
     return C_OK;
