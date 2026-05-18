@@ -24,21 +24,51 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #define PROXY_VEMB_DIRECT_GAP_US 20
+#define PROXY_VEMB_FC_MIN_SLOTS 64
+#define PROXY_VEMB_FC_SLOT_MULTIPLIER 4
+
+typedef enum proxyVembFcSlotState {
+    PROXY_VEMB_FC_SLOT_EMPTY = 0,
+    PROXY_VEMB_FC_SLOT_WRITING = 1,
+    PROXY_VEMB_FC_SLOT_PENDING = 2,
+    PROXY_VEMB_FC_SLOT_CLAIMED = 3,
+} proxyVembFcSlotState;
+
+typedef struct proxy_vemb_fc_slot {
+    _Alignas(64) atomic_int state;
+    uint64_t request_id;
+    uint64_t row_id;
+    uint64_t submit_time_us;
+    proxy_vector_request_t *owner;
+} proxy_vemb_fc_slot_t;
+
+typedef struct proxy_vemb_fc_board {
+    proxy_vemb_fc_slot_t *slots;
+    size_t slot_count;
+    size_t bucket_index;
+    atomic_int combiner_lock;
+    atomic_size_t pending_count;
+} proxy_vemb_fc_board_t;
 
 typedef struct proxy_aggregator_config {
     size_t batch_limit;
     uint64_t time_limit_us;
     size_t max_supernodes;
     size_t workers_per_node;
+    int vemb_submit_mode;
     int vemb_adaptive;
     uint64_t vemb_direct_gap_us;
+    size_t vemb_fc_slots;
+    size_t vemb_fc_max_scan;
 } proxy_aggregator_config_t;
 
 typedef struct proxy_aggregator {
     proxy_batch_bucket_t *buckets; // 批量桶 - 每个 (supernode, worker) 一个 
     ring_buffer_t **response_rings;
+    proxy_vemb_fc_board_t *vemb_fc_boards;
     size_t num_buckets;
     size_t num_supernodes;
 
@@ -72,10 +102,30 @@ typedef struct proxy_aggregator {
     atomic_uint_fast64_t active_wait_wakeups;
     atomic_uint_fast64_t timed_wait_wakeups;
     atomic_uint_fast64_t flush_retry_count;
+    atomic_uint_fast64_t vemb_direct_submits;
+    atomic_uint_fast64_t vsim_direct_submits;
+    atomic_uint_fast64_t vemb_batch_enqueues;
+    atomic_uint_fast64_t vemb_adaptive_checks;
+    atomic_uint_fast64_t vemb_adaptive_selected;
+    atomic_uint_fast64_t vemb_adaptive_bucket_nonempty;
+    atomic_uint_fast64_t vemb_adaptive_gap_selected;
+    atomic_uint_fast64_t vemb_adaptive_ewma_selected;
+    atomic_uint_fast64_t vemb_direct_fallbacks;
+    atomic_uint_fast64_t direct_ring_full;
+    atomic_uint_fast64_t vemb_fc_published;
+    atomic_uint_fast64_t vemb_fc_combines;
+    atomic_uint_fast64_t vemb_fc_combined_requests;
+    atomic_uint_fast64_t vemb_fc_slot_busy;
+    atomic_uint_fast64_t vemb_fc_ring_busy;
+    atomic_uint_fast64_t vemb_fc_fallbacks;
 } proxy_aggregator_t;
 
 static proxy_aggregator_t *proxy = NULL;
 static atomic_uint_fast64_t next_request_id = 1;
+
+static void proxy_active_bucket_add(proxy_aggregator_t *agg, size_t bucket_index);
+static void proxy_active_bucket_remove(proxy_aggregator_t *agg, size_t bucket_index);
+static void proxy_flush_thread_signal(proxy_aggregator_t *agg);
 
 static inline void proxy_aggregator_config_init(proxy_aggregator_config_t *cfg) {
     RETURN_IF(!cfg);
@@ -83,15 +133,39 @@ static inline void proxy_aggregator_config_init(proxy_aggregator_config_t *cfg) 
     cfg->time_limit_us = server.proxy.time_limit_us > 0 ? server.proxy.time_limit_us : (uint64_t)PROXY_TIME_LIMIT_US;
     cfg->max_supernodes = server.proxy.max_supernodes > 0 ? server.proxy.max_supernodes : (size_t)PROXY_MAX_SUPERNODES;
     cfg->workers_per_node = server.supernode_workers > 0 ?  server.supernode_workers : (size_t)max((int)sysconf(_SC_NPROCESSORS_ONLN), 1);
+    cfg->vemb_submit_mode = server.proxy.vemb_submit_mode;
     cfg->vemb_adaptive = server.proxy.vemb_adaptive;
     cfg->vemb_direct_gap_us = server.proxy.vemb_direct_gap_us > 0 ?
         server.proxy.vemb_direct_gap_us : (uint64_t)PROXY_VEMB_DIRECT_GAP_US;
+    cfg->vemb_fc_slots = server.proxy.vemb_fc_slots;
+    cfg->vemb_fc_max_scan = server.proxy.vemb_fc_max_scan;
 }
 
 static inline size_t worker_queue_index(size_t workers_per_node,
                                         int supernode_id,
                                         int worker_id) {
     return (size_t)supernode_id * workers_per_node + (size_t)worker_id;
+}
+
+static inline size_t proxy_vemb_fc_slot_index(uint64_t request_id,
+                                              size_t slot_count) {
+    RETURN_IF(slot_count == 0, 0);
+
+    uint64_t x = request_id;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (size_t)(x % slot_count);
+}
+
+static size_t proxy_vemb_fc_default_slot_count(proxy_aggregator_t *agg) {
+    RETURN_IF(!agg, PROXY_VEMB_FC_MIN_SLOTS);
+
+    size_t slots = agg->config.vemb_fc_slots > 0 ?
+        agg->config.vemb_fc_slots :
+        agg->config.workers_per_node * PROXY_VEMB_FC_SLOT_MULTIPLIER;
+    if (slots < PROXY_VEMB_FC_MIN_SLOTS) slots = PROXY_VEMB_FC_MIN_SLOTS;
+    return slots;
 }
 
 static int proxy_route_vector_request(proxy_aggregator_t *agg,
@@ -115,33 +189,147 @@ static inline int proxy_vemb_direct_path_enabled(proxy_aggregator_t *agg) {
     return agg->config.batch_limit <= 1 || agg->config.time_limit_us == 0;
 }
 
+static inline uint64_t proxy_bucket_gap_us(const proxy_batch_bucket_t *bucket,
+                                           uint64_t now_us) {
+    RETURN_IF(!bucket || bucket->last_append_time_us == 0 ||
+              now_us < bucket->last_append_time_us, 0);
+
+    return now_us - bucket->last_append_time_us;
+}
+
 static inline int proxy_vemb_adaptive_direct_selected(proxy_aggregator_t *agg,
-                                                      proxy_batch_bucket_t *bucket) {
+                                                      proxy_batch_bucket_t *bucket,
+                                                      uint64_t now_us) {
     RETURN_IF(!agg || !bucket, 0);
     RETURN_IF(!agg->config.vemb_adaptive, 0);
-    RETURN_IF(bucket->count != 0, 0);
 
-    uint64_t now_us = getMonotonicUs();
-    if (bucket->last_append_time_us == 0 ||
-        now_us - bucket->last_append_time_us >= agg->config.vemb_direct_gap_us) {
+    atomic_fetch_add_explicit(&agg->vemb_adaptive_checks, 1, memory_order_relaxed);
+    if (bucket->count != 0) {
+        atomic_fetch_add_explicit(&agg->vemb_adaptive_bucket_nonempty,
+                                  1, memory_order_relaxed);
+        return 0;
+    }
+
+    uint64_t gap_us = proxy_bucket_gap_us(bucket, now_us);
+    if (bucket->last_append_time_us == 0 || gap_us >= agg->config.vemb_direct_gap_us) {
+        atomic_fetch_add_explicit(&agg->vemb_adaptive_selected, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&agg->vemb_adaptive_gap_selected, 1, memory_order_relaxed);
         return 1;
     }
 
-    return bucket->recent_gap_ewma_us >= agg->config.vemb_direct_gap_us;
+    if (bucket->recent_gap_ewma_us >= agg->config.vemb_direct_gap_us) {
+        atomic_fetch_add_explicit(&agg->vemb_adaptive_selected, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&agg->vemb_adaptive_ewma_selected, 1, memory_order_relaxed);
+        return 1;
+    }
+
+    return 0;
 }
 
-static void proxy_record_direct_attempt(proxy_aggregator_t *agg, int success) {
+static void proxy_record_direct_attempt(proxy_aggregator_t *agg,
+                                        uint32_t op_type,
+                                        int success) {
     RETURN_IF(!agg);
 
     atomic_fetch_add_explicit(&agg->executor.stats.immediate_flush_attempts,
                               1, memory_order_relaxed);
     if (success) {
         atomic_fetch_add_explicit(&agg->executor.stats.immediate_flush_successes, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&agg->executor.stats.total_flushes, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&agg->executor.stats.total_batches, 1, memory_order_relaxed);
+        if (op_type == BATCH_PACKET_OP_VEMB) {
+            atomic_fetch_add_explicit(&agg->vemb_direct_submits, 1, memory_order_relaxed);
+        } else if (op_type == BATCH_PACKET_OP_VSIM) {
+            atomic_fetch_add_explicit(&agg->vsim_direct_submits, 1, memory_order_relaxed);
+        }
     } else {
         atomic_fetch_add_explicit(&agg->executor.stats.enqueue_rejections_full, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&agg->direct_ring_full, 1, memory_order_relaxed);
     }
+}
+
+static int proxy_submit_vemb_batch_locked(proxy_aggregator_t *agg,
+                                          proxy_batch_bucket_t *bucket,
+                                          const proxy_route_t *route,
+                                          proxy_vector_request_t **owners,
+                                          size_t count,
+                                          monotime flush_start,
+                                          uint32_t proxy_path,
+                                          uint32_t flush_trigger) {
+    RETURN_IF(!agg || !bucket || !route || !owners || count == 0, C_ERR);
+    RETURN_IF(!bucket->rb || count > UINT32_MAX, C_ERR);
+    RETURN_IF(count > (SIZE_MAX - sizeof(batch_packet_t)) /
+              sizeof(((batch_packet_t *)0)->requests[0]), C_ERR);
+
+    size_t packet_size = sizeof(batch_packet_t) +
+                         count * sizeof(((batch_packet_t *)0)->requests[0]);
+    RETURN_IF(packet_size > UINT32_MAX, C_ERR);
+
+    uint64_t wait_sum_us = 0;
+    uint64_t wait_max_us = 0;
+    for (size_t i = 0; i < count; i++) {
+        proxy_vector_request_t *owner = owners[i];
+        RETURN_IF(!owner || owner->op_type != PROXY_VECTOR_OP_VEMB, C_ERR);
+        uint64_t wait_us = owner->submit_time_us > 0 ?
+            (uint64_t)(flush_start - owner->submit_time_us) : 0;
+        wait_sum_us += wait_us;
+        if (wait_us > wait_max_us) wait_max_us = wait_us;
+    }
+
+    uint64_t bucket_gap_us = proxy_bucket_gap_us(bucket, flush_start);
+    uint64_t bucket_ewma_gap_us = bucket->recent_gap_ewma_us;
+    uint64_t batch_id =
+        atomic_fetch_add_explicit(&agg->executor.next_batch_id, 1, memory_order_relaxed);
+
+    batch_packet_t *packet = NULL;
+    if (ring_buffer_reserve(bucket->rb, packet_size, (void **)&packet) != C_OK) {
+        return C_ERR;
+    }
+
+    packet->hdr.magic = BATCH_PACKET_MAGIC;
+    packet->hdr.packet_size = (uint32_t)packet_size;
+    packet->hdr.num_requests = (uint32_t)count;
+    packet->hdr.op_type = BATCH_PACKET_OP_VEMB;
+    packet->hdr.supernode_id = (uint32_t)route->supernode_id;
+    packet->hdr.worker_id = (uint32_t)route->worker_id;
+    packet->hdr.timestamp_us = flush_start;
+    packet->hdr.batch_id = batch_id;
+    for (size_t i = 0; i < count; i++) {
+        packet->requests[i].request_id = owners[i]->request_id;
+        packet->requests[i].row_id = owners[i]->row_id;
+        owners[i]->batch_id = batch_id;
+    }
+
+    int ret = ring_buffer_commit_write(bucket->rb, packet_size);
+    if (ret != C_OK) {
+        for (size_t i = 0; i < count; i++) owners[i]->batch_id = 0;
+        ring_buffer_cancel_write(bucket->rb);
+        return ret;
+    }
+
+    uint64_t flush_latency_us = elapsedUs(flush_start);
+    proxy_batch_bucket_note_arrival(bucket, flush_start);
+    atomic_fetch_add_explicit(&agg->executor.stats.total_flushes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&agg->executor.stats.total_batches, 1, memory_order_relaxed);
+    if (proxy_path == BATCH_TRACE_PROXY_PATH_BATCH) {
+        proxy_flush_executor_record_batch_size(&agg->executor, count);
+    }
+    batch_latency_trace_proxy_meta_t proxy_meta = {
+        .proxy_path = proxy_path,
+        .flush_reason = count == 1 ? BATCH_TRACE_FLUSH_REASON_DIRECT :
+                                     BATCH_TRACE_FLUSH_REASON_FULL,
+        .flush_trigger = flush_trigger,
+        .bucket_depth = (uint32_t)count,
+        .bucket_gap_us = bucket_gap_us,
+        .bucket_ewma_gap_us = bucket_ewma_gap_us,
+    };
+    (void)batch_latency_trace_begin(batch_id,
+                                    BATCH_PACKET_OP_VEMB,
+                                    (uint32_t)count,
+                                    wait_sum_us,
+                                    wait_max_us,
+                                    flush_latency_us,
+                                    &proxy_meta);
+    atomic_fetch_add_explicit(&agg->total_requests, count, memory_order_relaxed);
+    return C_OK;
 }
 
 static int proxy_direct_submit_vemb_locked(proxy_aggregator_t *agg,
@@ -151,50 +339,17 @@ static int proxy_direct_submit_vemb_locked(proxy_aggregator_t *agg,
                                            monotime flush_start) {
     RETURN_IF(!agg || !bucket || !route || !owner ||
               owner->op_type != PROXY_VECTOR_OP_VEMB, C_ERR);
-    RETURN_IF(!bucket->rb, C_ERR);
-    size_t packet_size = sizeof(batch_packet_t) + sizeof(((batch_packet_t *)0)->requests[0]);
-    RETURN_IF(packet_size > UINT32_MAX, C_ERR);
-
-    uint64_t wait_us = owner->submit_time_us > 0 ?
-        (uint64_t)(flush_start - owner->submit_time_us) : 0;
-    uint64_t batch_id =
-        atomic_fetch_add_explicit(&agg->executor.next_batch_id, 1, memory_order_relaxed);
-
-    batch_packet_t *packet = NULL;
-    if (ring_buffer_reserve(bucket->rb, packet_size, (void **)&packet) != C_OK) {
-        proxy_record_direct_attempt(agg, 0);
-        return C_ERR;
-    }
-
-    packet->hdr.magic = BATCH_PACKET_MAGIC;
-    packet->hdr.packet_size = (uint32_t)packet_size;
-    packet->hdr.num_requests = 1;
-    packet->hdr.op_type = BATCH_PACKET_OP_VEMB;
-    packet->hdr.supernode_id = (uint32_t)route->supernode_id;
-    packet->hdr.worker_id = (uint32_t)route->worker_id;
-    packet->hdr.timestamp_us = flush_start;
-    packet->hdr.batch_id = batch_id;
-    packet->requests[0].request_id = owner->request_id;
-    packet->requests[0].row_id = owner->row_id;
-    owner->batch_id = batch_id;
-
-    int ret = ring_buffer_commit_write(bucket->rb, packet_size);
+    proxy_vector_request_t *owners[1] = {owner};
+    int ret = proxy_submit_vemb_batch_locked(agg, bucket, route, owners, 1,
+                                             flush_start,
+                                             BATCH_TRACE_PROXY_PATH_DIRECT,
+                                             BATCH_TRACE_FLUSH_TRIGGER_DIRECT);
     if (ret != C_OK) {
-        owner->batch_id = 0;
-        ring_buffer_cancel_write(bucket->rb);
-        proxy_record_direct_attempt(agg, 0);
+        proxy_record_direct_attempt(agg, BATCH_PACKET_OP_VEMB, 0);
         return ret;
     }
 
-    uint64_t flush_latency_us = elapsedUs(flush_start);
-    proxy_record_direct_attempt(agg, 1);
-    (void)batch_latency_trace_begin(batch_id,
-                                    BATCH_PACKET_OP_VEMB,
-                                    1,
-                                    wait_us,
-                                    wait_us,
-                                    flush_latency_us);
-    atomic_fetch_add_explicit(&agg->total_requests, 1, memory_order_relaxed);
+    proxy_record_direct_attempt(agg, BATCH_PACKET_OP_VEMB, 1);
     return C_OK;
 }
 
@@ -213,10 +368,339 @@ static int proxy_direct_submit_vemb(const char *key, proxy_vector_request_t *own
 
     monotime flush_start = getMonotonicUs();
     pthread_mutex_lock(&bucket->mutex);
-    proxy_batch_bucket_note_arrival(bucket, flush_start);
     int ret = proxy_direct_submit_vemb_locked(proxy, bucket, &route, owner, flush_start);
     pthread_mutex_unlock(&bucket->mutex);
     return ret;
+}
+
+static int proxy_enqueue_vector_request_bucket(const char *key, proxy_vector_request_t *owner) {
+    RETURN_IF(!proxy || !key || !owner, C_ERR);
+
+    proxy_route_t route;
+    RETURN_IF(proxy_route_vector_request(proxy, key, owner, &route) != C_OK, C_ERR);
+    size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
+                                             route.supernode_id, route.worker_id);
+    RETURN_IF(bucket_index >= proxy->num_buckets, C_ERR);
+    proxy_batch_bucket_t *bucket = &proxy->buckets[bucket_index];
+    RETURN_IF(!bucket->rb, C_ERR);
+
+    proxy_request_t *req = proxy_request_create(
+        owner->request_id,
+        route.key_hash,
+        route.supernode_id,
+        route.worker_id,
+        getMonotonicUs(),
+        owner);
+    RETURN_IF(!req, C_ERR);
+
+    pthread_mutex_lock(&bucket->mutex);
+    if (owner->op_type == PROXY_VECTOR_OP_VEMB &&
+        proxy->config.vemb_submit_mode == PROXY_VEMB_SUBMIT_MODE_ADAPTIVE &&
+        proxy_vemb_adaptive_direct_selected(proxy, bucket, req->submit_time_us)) {
+        monotime submit_time_us = req->submit_time_us;
+        int ret = proxy_direct_submit_vemb_locked(proxy, bucket, &route, owner, submit_time_us);
+        if (ret == C_OK) {
+            pthread_mutex_unlock(&bucket->mutex);
+            proxy_request_destroy(req);
+            return C_OK;
+        }
+        atomic_fetch_add_explicit(&proxy->vemb_direct_fallbacks, 1, memory_order_relaxed);
+    }
+
+    if (bucket->count >= bucket->capacity) {
+        if (proxy_executor_flush_bucket_locked(&proxy->executor, bucket, bucket->rb, 1,
+                                      req->submit_time_us,
+                                      PROXY_FLUSH_TRIGGER_IMMEDIATE_CAPACITY) != C_OK) {
+            pthread_mutex_unlock(&bucket->mutex);
+            proxy_request_destroy(req);
+            return C_ERR;
+        }
+    }
+
+    if (proxy_batch_bucket_append(bucket, req) != C_OK) {
+        pthread_mutex_unlock(&bucket->mutex);
+        proxy_request_destroy(req);
+        return C_ERR;
+    }
+    if (owner->op_type == PROXY_VECTOR_OP_VEMB) {
+        atomic_fetch_add_explicit(&proxy->vemb_batch_enqueues, 1, memory_order_relaxed);
+    }
+    proxy_active_bucket_add(proxy, bucket_index);
+
+    flush_decision_t decision =
+        flush_scheduler_on_append(&proxy->scheduler, bucket->count);
+    if (decision.should_flush) {
+        if (proxy_executor_flush_bucket_locked(&proxy->executor, bucket, bucket->rb,
+                                      decision.flush_reason_full,
+                                      req->submit_time_us,
+                                      PROXY_FLUSH_TRIGGER_IMMEDIATE_APPEND) != C_OK) {
+            serverLog(LL_DEBUG,
+                      "Immediate flush deferred for supernode %d worker %d: ring buffer busy",
+                      route.supernode_id, route.worker_id);
+        } else {
+            proxy_active_bucket_remove(proxy, bucket_index);
+        }
+    }
+
+    pthread_mutex_unlock(&bucket->mutex);
+    atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);
+    return C_OK;
+}
+
+static int proxy_vemb_fc_board_init(proxy_vemb_fc_board_t *board,
+                                    size_t slot_count,
+                                    size_t bucket_index) {
+    RETURN_IF(!board || slot_count == 0, C_ERR);
+
+    board->slots = zcalloc(sizeof(proxy_vemb_fc_slot_t) * slot_count);
+    RETURN_IF(!board->slots, C_ERR);
+    board->slot_count = slot_count;
+    board->bucket_index = bucket_index;
+    atomic_init(&board->combiner_lock, 0);
+    atomic_init(&board->pending_count, 0);
+    for (size_t i = 0; i < slot_count; i++) {
+        atomic_init(&board->slots[i].state, PROXY_VEMB_FC_SLOT_EMPTY);
+    }
+    return C_OK;
+}
+
+static void proxy_vemb_fc_board_cleanup(proxy_vemb_fc_board_t *board) {
+    RETURN_IF(!board);
+
+    zfree(board->slots);
+    board->slots = NULL;
+    board->slot_count = 0;
+    board->bucket_index = 0;
+    atomic_store_explicit(&board->pending_count, 0, memory_order_relaxed);
+}
+
+static int proxy_vemb_fc_try_combine(proxy_aggregator_t *agg,
+                                     proxy_vemb_fc_board_t *board,
+                                     const proxy_route_t *route) {
+    RETURN_IF(!agg || !board || !route || !board->slots, C_ERR);
+
+    if (atomic_load_explicit(&board->pending_count, memory_order_acquire) == 0) {
+        return C_OK;
+    }
+
+    if (atomic_load_explicit(&board->combiner_lock, memory_order_relaxed) != 0) {
+        return C_OK;
+    }
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&board->combiner_lock, &expected, 1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed)) {
+        return C_OK;
+    }
+
+    proxy_vector_request_t **owners = NULL;
+    int ret = C_OK;
+    int batch_submit_failed = 0;
+    size_t count = 0;
+    size_t max_count = agg->config.batch_limit > 0 ? agg->config.batch_limit : board->slot_count;
+    if (max_count > board->slot_count) max_count = board->slot_count;
+    size_t scan_limit = board->slot_count;
+    if (agg->config.vemb_fc_max_scan > 0 && scan_limit > agg->config.vemb_fc_max_scan) {
+        scan_limit = agg->config.vemb_fc_max_scan;
+    }
+    if (scan_limit == 0) scan_limit = 1;
+    if (max_count > scan_limit) max_count = scan_limit;
+    owners = zmalloc(sizeof(*owners) * max_count);
+    if (!owners) {
+        atomic_store_explicit(&board->combiner_lock, 0, memory_order_release);
+        return C_ERR;
+    }
+
+    uint64_t route_seed = ((uint64_t)(uint32_t)route->supernode_id << 32) |
+                          (uint32_t)route->worker_id;
+    size_t start = proxy_vemb_fc_slot_index(route_seed + getMonotonicUs(),
+                                            board->slot_count);
+    for (size_t scanned = 0; scanned < scan_limit && count < max_count; scanned++) {
+        proxy_vemb_fc_slot_t *slot = &board->slots[(start + scanned) % board->slot_count];
+        int state = PROXY_VEMB_FC_SLOT_PENDING;
+        if (atomic_compare_exchange_strong_explicit(&slot->state, &state,
+                                                    PROXY_VEMB_FC_SLOT_CLAIMED,
+                                                    memory_order_acq_rel,
+                                                    memory_order_relaxed)) {
+            owners[count++] = slot->owner;
+        }
+    }
+
+    if (count > 0) {
+        monotime flush_start = getMonotonicUs();
+        proxy_batch_bucket_t *bucket = &agg->buckets[board->bucket_index];
+        pthread_mutex_lock(&bucket->mutex);
+        ret = proxy_submit_vemb_batch_locked(agg, bucket, route, owners, count,
+                                             flush_start,
+                                             count == 1 ? BATCH_TRACE_PROXY_PATH_DIRECT :
+                                                          BATCH_TRACE_PROXY_PATH_BATCH,
+                                             BATCH_TRACE_FLUSH_TRIGGER_DIRECT);
+        pthread_mutex_unlock(&bucket->mutex);
+
+        if (ret == C_OK) {
+            atomic_fetch_add_explicit(&agg->vemb_fc_combines, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&agg->vemb_fc_combined_requests, count,
+                                      memory_order_relaxed);
+        } else {
+            batch_submit_failed = 1;
+            atomic_fetch_add_explicit(&agg->vemb_fc_ring_busy, 1, memory_order_relaxed);
+        }
+    }
+
+    int fallback_ret = C_OK;
+    for (size_t i = 0; i < board->slot_count; i++) {
+        proxy_vemb_fc_slot_t *slot = &board->slots[i];
+        if (atomic_load_explicit(&slot->state, memory_order_acquire) ==
+            PROXY_VEMB_FC_SLOT_CLAIMED) {
+            int submitted = !batch_submit_failed;
+            if (batch_submit_failed && slot->owner) {
+                owners[0] = slot->owner;
+                proxy_batch_bucket_t *bucket = &agg->buckets[board->bucket_index];
+                monotime flush_start = slot->submit_time_us > 0 ?
+                    slot->submit_time_us : getMonotonicUs();
+                pthread_mutex_lock(&bucket->mutex);
+                int single_ret = proxy_submit_vemb_batch_locked(agg, bucket, route, owners, 1,
+                                                                flush_start,
+                                                                BATCH_TRACE_PROXY_PATH_DIRECT,
+                                                                BATCH_TRACE_FLUSH_TRIGGER_DIRECT);
+                pthread_mutex_unlock(&bucket->mutex);
+                if (single_ret == C_OK) {
+                    submitted = 1;
+                    atomic_fetch_add_explicit(&agg->vemb_fc_combines, 1,
+                                              memory_order_relaxed);
+                    atomic_fetch_add_explicit(&agg->vemb_fc_combined_requests, 1,
+                                              memory_order_relaxed);
+                } else {
+                    fallback_ret = C_ERR;
+                    atomic_fetch_add_explicit(&agg->vemb_fc_fallbacks, 1,
+                                              memory_order_relaxed);
+                }
+            }
+            if (!slot->owner) submitted = 1;
+            if (submitted) {
+                slot->owner = NULL;
+                slot->request_id = 0;
+                slot->row_id = 0;
+                slot->submit_time_us = 0;
+                atomic_fetch_sub_explicit(&board->pending_count, 1,
+                                          memory_order_acq_rel);
+                atomic_store_explicit(&slot->state, PROXY_VEMB_FC_SLOT_EMPTY,
+                                      memory_order_release);
+            } else {
+                atomic_store_explicit(&slot->state, PROXY_VEMB_FC_SLOT_PENDING,
+                                      memory_order_release);
+            }
+        }
+    }
+
+    zfree(owners);
+    atomic_store_explicit(&board->combiner_lock, 0, memory_order_release);
+    return batch_submit_failed ? fallback_ret : ret;
+}
+
+static int proxy_submit_vemb_fc(const char *key, proxy_vector_request_t *owner) {
+    RETURN_IF(!proxy || !key || !owner || owner->op_type != PROXY_VECTOR_OP_VEMB, C_ERR);
+    RETURN_IF(!proxy->vemb_fc_boards, C_ERR);
+
+    proxy_route_t route;
+    RETURN_IF(proxy_router_route_by_row(&proxy->router, key, owner->row_id, &route) != C_OK,
+              C_ERR);
+    size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
+                                             route.supernode_id, route.worker_id);
+    RETURN_IF(bucket_index >= proxy->num_buckets, C_ERR);
+    proxy_vemb_fc_board_t *board = &proxy->vemb_fc_boards[bucket_index];
+    RETURN_IF(!board->slots || board->slot_count == 0, C_ERR);
+
+    size_t start = proxy_vemb_fc_slot_index(owner->request_id, board->slot_count);
+    proxy_vemb_fc_slot_t *slot = NULL;
+    for (size_t i = 0; i < board->slot_count; i++) {
+        proxy_vemb_fc_slot_t *candidate = &board->slots[(start + i) % board->slot_count];
+        int expected = PROXY_VEMB_FC_SLOT_EMPTY;
+        if (atomic_compare_exchange_strong_explicit(&candidate->state, &expected,
+                                                    PROXY_VEMB_FC_SLOT_WRITING,
+                                                    memory_order_acq_rel,
+                                                    memory_order_relaxed)) {
+            slot = candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        atomic_fetch_add_explicit(&proxy->vemb_fc_slot_busy, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&proxy->vemb_fc_fallbacks, 1, memory_order_relaxed);
+        return proxy_enqueue_vector_request_bucket(key, owner);
+    }
+
+    owner->submit_time_us = getMonotonicUs();
+    slot->request_id = owner->request_id;
+    slot->row_id = owner->row_id;
+    slot->submit_time_us = owner->submit_time_us;
+    slot->owner = owner;
+    atomic_store_explicit(&slot->state, PROXY_VEMB_FC_SLOT_PENDING,
+                          memory_order_release);
+    atomic_fetch_add_explicit(&board->pending_count, 1, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&proxy->vemb_fc_published, 1, memory_order_relaxed);
+    proxy_flush_thread_signal(proxy);
+
+    int ret = proxy_vemb_fc_try_combine(proxy, board, &route);
+    if (ret != C_OK) {
+        int state = PROXY_VEMB_FC_SLOT_PENDING;
+        if (atomic_compare_exchange_strong_explicit(&slot->state, &state,
+                                                    PROXY_VEMB_FC_SLOT_EMPTY,
+                                                    memory_order_acq_rel,
+                                                    memory_order_relaxed)) {
+            atomic_fetch_sub_explicit(&board->pending_count, 1,
+                                      memory_order_acq_rel);
+            slot->owner = NULL;
+            slot->request_id = 0;
+            slot->row_id = 0;
+            slot->submit_time_us = 0;
+            return proxy_enqueue_vector_request_bucket(key, owner);
+        }
+        atomic_fetch_add_explicit(&proxy->vemb_fc_fallbacks, 1, memory_order_relaxed);
+        return C_OK;
+    }
+    return C_OK;
+}
+
+static int proxy_vemb_fc_drain_board(proxy_aggregator_t *agg, size_t bucket_index) {
+    RETURN_IF(!agg || !agg->vemb_fc_boards || bucket_index >= agg->num_buckets, 0);
+
+    proxy_vemb_fc_board_t *board = &agg->vemb_fc_boards[bucket_index];
+    size_t pending_before =
+        atomic_load_explicit(&board->pending_count, memory_order_acquire);
+    RETURN_IF(pending_before == 0, 0);
+
+    proxy_batch_bucket_t *bucket = &agg->buckets[bucket_index];
+    proxy_route_t route = {
+        .supernode_id = bucket->target_supernode_id,
+        .worker_id = bucket->target_worker_id,
+        .key_hash = 0,
+    };
+    (void)proxy_vemb_fc_try_combine(agg, board, &route);
+
+    size_t pending_after =
+        atomic_load_explicit(&board->pending_count, memory_order_acquire);
+    return pending_after < pending_before;
+}
+
+static int proxy_vemb_fc_drain_pending(proxy_aggregator_t *agg,
+                                       int *has_pending) {
+    RETURN_IF(!agg || !agg->vemb_fc_boards, 0);
+
+    int drained_any = 0;
+    int pending = 0;
+    for (size_t i = 0; i < agg->num_buckets; i++) {
+        if (atomic_load_explicit(&agg->vemb_fc_boards[i].pending_count,
+                                 memory_order_acquire) == 0) {
+            continue;
+        }
+        pending = 1;
+        if (proxy_vemb_fc_drain_board(agg, i)) {
+            drained_any = 1;
+        }
+    }
+    if (has_pending) *has_pending = pending;
+    return drained_any;
 }
 
 static int proxy_direct_submit_vsim(const char *key, proxy_vector_request_t *owner) {
@@ -249,9 +733,11 @@ static int proxy_direct_submit_vsim(const char *key, proxy_vector_request_t *own
 
     batch_vsim_packet_t *packet = NULL;
     pthread_mutex_lock(&bucket->mutex);
+    uint64_t bucket_gap_us = proxy_bucket_gap_us(bucket, flush_start);
+    uint64_t bucket_ewma_gap_us = bucket->recent_gap_ewma_us;
     if (ring_buffer_reserve(bucket->rb, packet_size, (void **)&packet) != C_OK) {
         pthread_mutex_unlock(&bucket->mutex);
-        proxy_record_direct_attempt(proxy, 0);
+        proxy_record_direct_attempt(proxy, BATCH_PACKET_OP_VSIM, 0);
         return C_ERR;
     }
 
@@ -280,21 +766,42 @@ static int proxy_direct_submit_vsim(const char *key, proxy_vector_request_t *own
         owner->batch_id = 0;
         ring_buffer_cancel_write(bucket->rb);
         pthread_mutex_unlock(&bucket->mutex);
-        proxy_record_direct_attempt(proxy, 0);
+        proxy_record_direct_attempt(proxy, BATCH_PACKET_OP_VSIM, 0);
         return ret;
     }
+    proxy_batch_bucket_note_arrival(bucket, flush_start);
     pthread_mutex_unlock(&bucket->mutex);
 
     uint64_t flush_latency_us = elapsedUs(flush_start);
-    proxy_record_direct_attempt(proxy, 1);
+    proxy_record_direct_attempt(proxy, BATCH_PACKET_OP_VSIM, 1);
+    atomic_fetch_add_explicit(&proxy->executor.stats.total_flushes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&proxy->executor.stats.total_batches, 1, memory_order_relaxed);
+    batch_latency_trace_proxy_meta_t proxy_meta = {
+        .proxy_path = BATCH_TRACE_PROXY_PATH_DIRECT,
+        .flush_reason = BATCH_TRACE_FLUSH_REASON_DIRECT,
+        .flush_trigger = BATCH_TRACE_FLUSH_TRIGGER_DIRECT,
+        .bucket_depth = 1,
+        .bucket_gap_us = bucket_gap_us,
+        .bucket_ewma_gap_us = bucket_ewma_gap_us,
+    };
     (void)batch_latency_trace_begin(batch_id,
                                     BATCH_PACKET_OP_VSIM,
                                     1,
                                     wait_us,
                                     wait_us,
-                                    flush_latency_us);
+                                    flush_latency_us,
+                                    &proxy_meta);
     atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);
     return C_OK;
+}
+
+static void proxy_flush_thread_signal(proxy_aggregator_t *agg) {
+    RETURN_IF(!agg || !agg->active_buckets_lock_initialized ||
+              !agg->active_buckets_cond_initialized);
+
+    pthread_mutex_lock(&agg->active_buckets_lock);
+    pthread_cond_signal(&agg->active_buckets_cond);
+    pthread_mutex_unlock(&agg->active_buckets_lock);
 }
 
 static void proxy_active_bucket_add(proxy_aggregator_t *agg, size_t bucket_index) {
@@ -373,6 +880,11 @@ static void *flush_thread_func(void *arg) {
         int has_ready_bucket = 0;
         uint64_t earliest_wait_us = UINT64_MAX;
 
+        int has_pending_fc = 0;
+        if (proxy_vemb_fc_drain_pending(agg, &has_pending_fc)) {
+            processed_any = 1;
+        }
+
         pthread_mutex_lock(&agg->active_buckets_lock);
         size_t bucket_index = 0;
         (void)proxy_active_bucket_heap_peek(&agg->active_bucket_heap, &bucket_index, &earliest_wait_us);
@@ -421,7 +933,8 @@ static void *flush_thread_func(void *arg) {
             break;
         }
         
-        proxy_flush_thread_wait(agg, processed_any, has_ready_bucket, earliest_wait_us);
+        proxy_flush_thread_wait(agg, processed_any, has_ready_bucket || has_pending_fc,
+                                earliest_wait_us);
     }
     
     serverLog(LL_NOTICE, "Proxy aggregator flush thread stopped");
@@ -580,6 +1093,8 @@ int proxy_aggregator_init(int num_supernodes) {
     if (!proxy->buckets) goto failed;
     proxy->response_rings = zcalloc(sizeof(ring_buffer_t *) * proxy->num_buckets);
     if (!proxy->response_rings) goto failed;
+    proxy->vemb_fc_boards = zcalloc(sizeof(proxy_vemb_fc_board_t) * proxy->num_buckets);
+    if (!proxy->vemb_fc_boards) goto failed;
     if (proxy_active_bucket_heap_init(&proxy->active_bucket_heap,
                                       proxy->buckets,
                                       proxy->num_buckets,
@@ -611,6 +1126,11 @@ int proxy_aggregator_init(int num_supernodes) {
             if (!proxy->response_rings[idx]) {
                 goto failed;
             }
+            if (proxy_vemb_fc_board_init(&proxy->vemb_fc_boards[idx],
+                                         proxy_vemb_fc_default_slot_count(proxy),
+                                         idx) != C_OK) {
+                goto failed;
+            }
         }
     }
     
@@ -626,6 +1146,22 @@ int proxy_aggregator_init(int num_supernodes) {
     atomic_init(&proxy->active_wait_wakeups, 0);
     atomic_init(&proxy->timed_wait_wakeups, 0);
     atomic_init(&proxy->flush_retry_count, 0);
+    atomic_init(&proxy->vemb_direct_submits, 0);
+    atomic_init(&proxy->vsim_direct_submits, 0);
+    atomic_init(&proxy->vemb_batch_enqueues, 0);
+    atomic_init(&proxy->vemb_adaptive_checks, 0);
+    atomic_init(&proxy->vemb_adaptive_selected, 0);
+    atomic_init(&proxy->vemb_adaptive_bucket_nonempty, 0);
+    atomic_init(&proxy->vemb_adaptive_gap_selected, 0);
+    atomic_init(&proxy->vemb_adaptive_ewma_selected, 0);
+    atomic_init(&proxy->vemb_direct_fallbacks, 0);
+    atomic_init(&proxy->direct_ring_full, 0);
+    atomic_init(&proxy->vemb_fc_published, 0);
+    atomic_init(&proxy->vemb_fc_combines, 0);
+    atomic_init(&proxy->vemb_fc_combined_requests, 0);
+    atomic_init(&proxy->vemb_fc_slot_busy, 0);
+    atomic_init(&proxy->vemb_fc_ring_busy, 0);
+    atomic_init(&proxy->vemb_fc_fallbacks, 0);
     
     /* 启动刷新线程 */
     proxy->running = 1;
@@ -672,6 +1208,13 @@ void proxy_aggregator_shutdown(void) {
     }
     zfree(proxy->response_rings);
     proxy->response_rings = NULL;
+    if (proxy->vemb_fc_boards) {
+        for (size_t i = 0; i < proxy->num_buckets; i++) {
+            proxy_vemb_fc_board_cleanup(&proxy->vemb_fc_boards[i]);
+        }
+        zfree(proxy->vemb_fc_boards);
+        proxy->vemb_fc_boards = NULL;
+    }
 
     if (proxy->active_buckets_lock_initialized) {
         pthread_mutex_destroy(&proxy->active_buckets_lock);
@@ -713,71 +1256,16 @@ int proxy_enqueue_vector_request(const char *key, proxy_vector_request_t *owner)
         return proxy_direct_submit_vsim(key, owner);
     }
 
-    proxy_route_t route;
-    RETURN_IF(proxy_route_vector_request(proxy, key, owner, &route) != C_OK, C_ERR);
-    size_t bucket_index = worker_queue_index(proxy->config.workers_per_node,
-                                             route.supernode_id, route.worker_id);
-    RETURN_IF(bucket_index >= proxy->num_buckets, C_ERR);
-    proxy_batch_bucket_t *bucket = &proxy->buckets[bucket_index];
-    RETURN_IF(!bucket->rb, C_ERR);
-
-    proxy_request_t *req = proxy_request_create(
-        owner->request_id,
-        route.key_hash,
-        route.supernode_id,
-        route.worker_id,
-        getMonotonicUs(),
-        owner);
-    RETURN_IF(!req, C_ERR);
-
-    pthread_mutex_lock(&bucket->mutex);
-    if (owner->op_type == PROXY_VECTOR_OP_VEMB &&
-        proxy_vemb_adaptive_direct_selected(proxy, bucket)) {
-        monotime submit_time_us = req->submit_time_us;
-        proxy_batch_bucket_note_arrival(bucket, submit_time_us);
-        int ret = proxy_direct_submit_vemb_locked(proxy, bucket, &route, owner, submit_time_us);
-        if (ret == C_OK) {
-            pthread_mutex_unlock(&bucket->mutex);
-            proxy_request_destroy(req);
-            return C_OK;
+    if (owner->op_type == PROXY_VECTOR_OP_VEMB) {
+        if (proxy->config.vemb_submit_mode == PROXY_VEMB_SUBMIT_MODE_FC) {
+            return proxy_submit_vemb_fc(key, owner);
+        }
+        if (proxy->config.vemb_submit_mode == PROXY_VEMB_SUBMIT_MODE_DIRECT) {
+            return proxy_direct_submit_vemb(key, owner);
         }
     }
 
-    if (bucket->count >= bucket->capacity) {
-        if (proxy_executor_flush_bucket_locked(&proxy->executor, bucket, bucket->rb, 1,
-                                      req->submit_time_us,
-                                      PROXY_FLUSH_TRIGGER_IMMEDIATE_CAPACITY) != C_OK) {
-            pthread_mutex_unlock(&bucket->mutex);
-            proxy_request_destroy(req);
-            return C_ERR;
-        }
-    }
-
-    if (proxy_batch_bucket_append(bucket, req) != C_OK) {
-        pthread_mutex_unlock(&bucket->mutex);
-        proxy_request_destroy(req);
-        return C_ERR;
-    }
-    proxy_active_bucket_add(proxy, bucket_index);
-
-    flush_decision_t decision =
-        flush_scheduler_on_append(&proxy->scheduler, bucket->count);
-    if (decision.should_flush) {
-        if (proxy_executor_flush_bucket_locked(&proxy->executor, bucket, bucket->rb,
-                                      decision.flush_reason_full,
-                                      req->submit_time_us,
-                                      PROXY_FLUSH_TRIGGER_IMMEDIATE_APPEND) != C_OK) {
-            serverLog(LL_DEBUG,
-                      "Immediate flush deferred for supernode %d worker %d: ring buffer busy",
-                      route.supernode_id, route.worker_id);
-        } else {
-            proxy_active_bucket_remove(proxy, bucket_index);
-        }
-    }
-
-    pthread_mutex_unlock(&bucket->mutex);
-    atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);
-    return C_OK;
+    return proxy_enqueue_vector_request_bucket(key, owner);
 }
 
 static int proxy_vemb_reply(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
@@ -1079,6 +1567,53 @@ sds proxy_aggregator_get_stats(void) {
     uint64_t enqueue_rejections =
         atomic_load_explicit(&proxy->executor.stats.enqueue_rejections_full,
                              memory_order_relaxed);
+    uint64_t batch_flush_requests =
+        atomic_load_explicit(&proxy->executor.stats.batch_flush_requests,
+                             memory_order_relaxed);
+    uint64_t batch_size_1 =
+        atomic_load_explicit(&proxy->executor.stats.batch_size_hist_1,
+                             memory_order_relaxed);
+    uint64_t batch_size_2_4 =
+        atomic_load_explicit(&proxy->executor.stats.batch_size_hist_2_4,
+                             memory_order_relaxed);
+    uint64_t batch_size_5_16 =
+        atomic_load_explicit(&proxy->executor.stats.batch_size_hist_5_16,
+                             memory_order_relaxed);
+    uint64_t batch_size_17_plus =
+        atomic_load_explicit(&proxy->executor.stats.batch_size_hist_17_plus,
+                             memory_order_relaxed);
+    uint64_t vemb_direct_submits =
+        atomic_load_explicit(&proxy->vemb_direct_submits, memory_order_relaxed);
+    uint64_t vsim_direct_submits =
+        atomic_load_explicit(&proxy->vsim_direct_submits, memory_order_relaxed);
+    uint64_t vemb_batch_enqueues =
+        atomic_load_explicit(&proxy->vemb_batch_enqueues, memory_order_relaxed);
+    uint64_t vemb_adaptive_checks =
+        atomic_load_explicit(&proxy->vemb_adaptive_checks, memory_order_relaxed);
+    uint64_t vemb_adaptive_selected =
+        atomic_load_explicit(&proxy->vemb_adaptive_selected, memory_order_relaxed);
+    uint64_t vemb_adaptive_bucket_nonempty =
+        atomic_load_explicit(&proxy->vemb_adaptive_bucket_nonempty, memory_order_relaxed);
+    uint64_t vemb_adaptive_gap_selected =
+        atomic_load_explicit(&proxy->vemb_adaptive_gap_selected, memory_order_relaxed);
+    uint64_t vemb_adaptive_ewma_selected =
+        atomic_load_explicit(&proxy->vemb_adaptive_ewma_selected, memory_order_relaxed);
+    uint64_t vemb_direct_fallbacks =
+        atomic_load_explicit(&proxy->vemb_direct_fallbacks, memory_order_relaxed);
+    uint64_t direct_ring_full =
+        atomic_load_explicit(&proxy->direct_ring_full, memory_order_relaxed);
+    uint64_t vemb_fc_published =
+        atomic_load_explicit(&proxy->vemb_fc_published, memory_order_relaxed);
+    uint64_t vemb_fc_combines =
+        atomic_load_explicit(&proxy->vemb_fc_combines, memory_order_relaxed);
+    uint64_t vemb_fc_combined_requests =
+        atomic_load_explicit(&proxy->vemb_fc_combined_requests, memory_order_relaxed);
+    uint64_t vemb_fc_slot_busy =
+        atomic_load_explicit(&proxy->vemb_fc_slot_busy, memory_order_relaxed);
+    uint64_t vemb_fc_ring_busy =
+        atomic_load_explicit(&proxy->vemb_fc_ring_busy, memory_order_relaxed);
+    uint64_t vemb_fc_fallbacks =
+        atomic_load_explicit(&proxy->vemb_fc_fallbacks, memory_order_relaxed);
     
     pthread_mutex_lock(&proxy->active_buckets_lock);
     size_t active_bucket_count = proxy->active_bucket_heap.count;
@@ -1101,6 +1636,13 @@ sds proxy_aggregator_get_stats(void) {
     stats = sdscatprintf(stats, "  Total flushes: %llu\n", (unsigned long long)total_flush);
     stats = sdscatprintf(stats, "  Batch full flushes: %llu\n", (unsigned long long)batch_full);
     stats = sdscatprintf(stats, "  Timeout flushes: %llu\n", (unsigned long long)timeout);
+    stats = sdscatprintf(stats, "  Batch flush requests: %llu\n",
+                         (unsigned long long)batch_flush_requests);
+    stats = sdscatprintf(stats, "  Batch size histogram: 1=%llu 2-4=%llu 5-16=%llu 17+=%llu\n",
+                         (unsigned long long)batch_size_1,
+                         (unsigned long long)batch_size_2_4,
+                         (unsigned long long)batch_size_5_16,
+                         (unsigned long long)batch_size_17_plus);
     stats = sdscatprintf(stats, "  Immediate flush attempts: %llu\n",
                          (unsigned long long)immediate_attempts);
     stats = sdscatprintf(stats, "  Immediate flush successes: %llu\n",
@@ -1109,10 +1651,55 @@ sds proxy_aggregator_get_stats(void) {
                          (unsigned long long)immediate_deferred);
     stats = sdscatprintf(stats, "  Enqueue rejections (full): %llu\n",
                          (unsigned long long)enqueue_rejections);
+    stats = sdscatprintf(stats, "  VEMB direct submits: %llu\n",
+                         (unsigned long long)vemb_direct_submits);
+    stats = sdscatprintf(stats, "  VSIM direct submits: %llu\n",
+                         (unsigned long long)vsim_direct_submits);
+    stats = sdscatprintf(stats, "  VEMB batch enqueues: %llu\n",
+                         (unsigned long long)vemb_batch_enqueues);
+    stats = sdscatprintf(stats, "  VEMB adaptive checks: %llu\n",
+                         (unsigned long long)vemb_adaptive_checks);
+    stats = sdscatprintf(stats, "  VEMB adaptive selected: %llu\n",
+                         (unsigned long long)vemb_adaptive_selected);
+    stats = sdscatprintf(stats, "  VEMB adaptive bucket nonempty: %llu\n",
+                         (unsigned long long)vemb_adaptive_bucket_nonempty);
+    stats = sdscatprintf(stats, "  VEMB adaptive gap selected: %llu\n",
+                         (unsigned long long)vemb_adaptive_gap_selected);
+    stats = sdscatprintf(stats, "  VEMB adaptive EWMA selected: %llu\n",
+                         (unsigned long long)vemb_adaptive_ewma_selected);
+    stats = sdscatprintf(stats, "  VEMB direct fallbacks: %llu\n",
+                         (unsigned long long)vemb_direct_fallbacks);
+    stats = sdscatprintf(stats, "  Direct ring full: %llu\n",
+                         (unsigned long long)direct_ring_full);
+    stats = sdscatprintf(stats, "  VEMB FC published: %llu\n",
+                         (unsigned long long)vemb_fc_published);
+    stats = sdscatprintf(stats, "  VEMB FC combines: %llu\n",
+                         (unsigned long long)vemb_fc_combines);
+    stats = sdscatprintf(stats, "  VEMB FC combined requests: %llu\n",
+                         (unsigned long long)vemb_fc_combined_requests);
+    stats = sdscatprintf(stats, "  VEMB FC slot busy: %llu\n",
+                         (unsigned long long)vemb_fc_slot_busy);
+    stats = sdscatprintf(stats, "  VEMB FC ring busy: %llu\n",
+                         (unsigned long long)vemb_fc_ring_busy);
+    stats = sdscatprintf(stats, "  VEMB FC fallbacks: %llu\n",
+                         (unsigned long long)vemb_fc_fallbacks);
     
     if (total_flush > 0) {
-        double avg_batch_size = (double)total_req / total_flush;
-        stats = sdscatprintf(stats, "  Average batch size: %.1f\n", avg_batch_size);
+        double avg_submit_size = (double)total_req / total_flush;
+        stats = sdscatprintf(stats, "  Average submit size: %.1f\n", avg_submit_size);
+    }
+
+    if (batch_full + timeout > 0) {
+        double avg_batch_size =
+            (double)batch_flush_requests / (double)(batch_full + timeout);
+        stats = sdscatprintf(stats, "  Average batch flush size: %.1f\n", avg_batch_size);
+    }
+
+    if (vemb_fc_combines > 0) {
+        double avg_fc_batch =
+            (double)vemb_fc_combined_requests / (double)vemb_fc_combines;
+        stats = sdscatprintf(stats, "  Average VEMB FC batch size: %.1f\n",
+                             avg_fc_batch);
     }
 
     if (immediate_attempts > 0) {

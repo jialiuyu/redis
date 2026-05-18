@@ -1865,12 +1865,22 @@ typedef enum childInfoType {
 
 typedef struct hotkeyStats hotkeyStats;
 
+typedef enum proxyVembSubmitMode {
+    PROXY_VEMB_SUBMIT_MODE_BATCH = 0,
+    PROXY_VEMB_SUBMIT_MODE_DIRECT = 1,
+    PROXY_VEMB_SUBMIT_MODE_ADAPTIVE = 2,
+    PROXY_VEMB_SUBMIT_MODE_FC = 3,
+} proxyVembSubmitMode;
+
 typedef struct proxyConfig {
     size_t batch_limit;           /* 0 means default */
     uint64_t time_limit_us;       /* 0 means default */
     size_t max_supernodes;        /* 0 means default */
+    int vemb_submit_mode;         /* batch | direct | adaptive | fc */
     int vemb_adaptive;            /* auto direct/batch for VEMB */
     uint64_t vemb_direct_gap_us;  /* direct VEMB when recent arrivals are sparse */
+    size_t vemb_fc_slots;         /* 0 means default */
+    size_t vemb_fc_max_scan;      /* 0 means scan all FC slots */
 } proxyConfig;
 
 struct redisServer {

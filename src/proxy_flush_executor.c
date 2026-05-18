@@ -12,11 +12,50 @@ void proxy_flush_executor_init(proxy_flush_executor_t *executor) {
     atomic_init(&executor->stats.total_flushes, 0);
     atomic_init(&executor->stats.batch_full_flushes, 0);
     atomic_init(&executor->stats.timeout_flushes, 0);
+    atomic_init(&executor->stats.batch_flush_requests, 0);
+    atomic_init(&executor->stats.batch_size_hist_1, 0);
+    atomic_init(&executor->stats.batch_size_hist_2_4, 0);
+    atomic_init(&executor->stats.batch_size_hist_5_16, 0);
+    atomic_init(&executor->stats.batch_size_hist_17_plus, 0);
     atomic_init(&executor->stats.immediate_flush_attempts, 0);
     atomic_init(&executor->stats.immediate_flush_successes, 0);
     atomic_init(&executor->stats.immediate_flush_deferred, 0);
     atomic_init(&executor->stats.enqueue_rejections_full, 0);
     atomic_init(&executor->next_batch_id, 1);
+}
+
+uint32_t proxy_flush_trigger_trace_value(proxyFlushTrigger trigger) {
+    switch (trigger) {
+    case PROXY_FLUSH_TRIGGER_BACKGROUND:
+        return BATCH_TRACE_FLUSH_TRIGGER_BACKGROUND;
+    case PROXY_FLUSH_TRIGGER_IMMEDIATE_CAPACITY:
+        return BATCH_TRACE_FLUSH_TRIGGER_IMMEDIATE_CAPACITY;
+    case PROXY_FLUSH_TRIGGER_IMMEDIATE_APPEND:
+        return BATCH_TRACE_FLUSH_TRIGGER_IMMEDIATE_APPEND;
+    default:
+        return BATCH_TRACE_FLUSH_TRIGGER_UNKNOWN;
+    }
+}
+
+void proxy_flush_executor_record_batch_size(proxy_flush_executor_t *executor,
+                                            size_t batch_size) {
+    RETURN_IF(!executor || batch_size == 0);
+
+    atomic_fetch_add_explicit(&executor->stats.batch_flush_requests,
+                              batch_size, memory_order_relaxed);
+    if (batch_size == 1) {
+        atomic_fetch_add_explicit(&executor->stats.batch_size_hist_1,
+                                  1, memory_order_relaxed);
+    } else if (batch_size <= 4) {
+        atomic_fetch_add_explicit(&executor->stats.batch_size_hist_2_4,
+                                  1, memory_order_relaxed);
+    } else if (batch_size <= 16) {
+        atomic_fetch_add_explicit(&executor->stats.batch_size_hist_5_16,
+                                  1, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&executor->stats.batch_size_hist_17_plus,
+                                  1, memory_order_relaxed);
+    }
 }
 
 static void proxy_flush_executor_record_immediate_metrics(proxy_flush_executor_t *executor,
@@ -99,16 +138,31 @@ int proxy_executor_flush_bucket_locked(proxy_flush_executor_t *executor,
         uint64_t flush_latency_us = elapsedUs(flush_start);
         atomic_fetch_add_explicit(&executor->stats.total_flushes, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&executor->stats.total_batches, 1, memory_order_relaxed);
+        proxy_flush_executor_record_batch_size(executor, bucket->count);
         for (size_t i = 0; i < bucket->count; i++) {
             proxy_request_t *req = bucket->requests[i];
             if (req && req->owner) req->owner->batch_id = batch_id;
         }
+        uint64_t bucket_gap_us = 0;
+        if (bucket->last_append_time_us > 0 && flush_start >= bucket->last_append_time_us) {
+            bucket_gap_us = flush_start - bucket->last_append_time_us;
+        }
+        batch_latency_trace_proxy_meta_t proxy_meta = {
+            .proxy_path = BATCH_TRACE_PROXY_PATH_BATCH,
+            .flush_reason = flush_reason_full ? BATCH_TRACE_FLUSH_REASON_FULL :
+                                                 BATCH_TRACE_FLUSH_REASON_TIMEOUT,
+            .flush_trigger = proxy_flush_trigger_trace_value(trigger),
+            .bucket_depth = (uint32_t)bucket->count,
+            .bucket_gap_us = bucket_gap_us,
+            .bucket_ewma_gap_us = bucket->recent_gap_ewma_us,
+        };
         (void)batch_latency_trace_begin(batch_id,
                                         packet->hdr.op_type,
                                         packet->hdr.num_requests,
                                         batching_delay_sum,
                                         batching_delay_max,
-                                        flush_latency_us);
+                                        flush_latency_us,
+                                        &proxy_meta);
         if (flush_reason_full) {
             atomic_fetch_add_explicit(&executor->stats.batch_full_flushes, 1, memory_order_relaxed);
         } else {

@@ -115,6 +115,10 @@ void *zcalloc(size_t size) {
     return calloc(1, size ? size : 1);
 }
 
+void *ztrycalloc(size_t size) {
+    return calloc(1, size ? size : 1);
+}
+
 void *zrealloc(void *ptr, size_t size) {
     return realloc(ptr, size ? size : 1);
 }

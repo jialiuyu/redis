@@ -152,6 +152,57 @@ static int supernode_load_candidate_vectors(sve_worker_context_t *ctx,
     return C_OK;
 }
 
+static int supernode_load_candidate_vectors_into(sve_worker_context_t *ctx,
+                                                 uint64_t *rows,
+                                                 size_t row_count,
+                                                 size_t dim,
+                                                 float *vectors,
+                                                 uint64_t *bitmap_lock_latency_ns,
+                                                 uint64_t *bitmap_unlock_latency_ns,
+                                                 uint64_t *vector_load_latency_ns) {
+    RETURN_IF(!ctx || !rows || row_count == 0 || dim == 0 || !vectors, C_ERR);
+    RETURN_IF(dim != ctx->gather_ctx.vector_dim, C_ERR);
+
+    return sve_serial_contiguous_read_traced(&ctx->gather_ctx,
+                                             rows,
+                                             row_count,
+                                             vectors,
+                                             bitmap_lock_latency_ns,
+                                             bitmap_unlock_latency_ns,
+                                             vector_load_latency_ns);
+}
+
+static int supernode_vemb_ensure_scratch(sve_worker_context_t *ctx,
+                                         size_t rows) {
+    RETURN_IF(!ctx || rows == 0 || ctx->gather_ctx.vector_dim == 0, C_ERR);
+    if (rows <= ctx->vemb_scratch_capacity) return C_OK;
+    RETURN_IF(rows > SIZE_MAX / ctx->gather_ctx.vector_dim, C_ERR);
+
+    uint64_t *row_scratch = zrealloc(ctx->vemb_row_scratch,
+                                     sizeof(uint64_t) * rows);
+    RETURN_IF(!row_scratch, C_ERR);
+    ctx->vemb_row_scratch = row_scratch;
+
+    float *vector_scratch = zrealloc(ctx->vemb_vector_scratch,
+                                     sizeof(float) * rows * ctx->gather_ctx.vector_dim);
+    RETURN_IF(!vector_scratch, C_ERR);
+    ctx->vemb_vector_scratch = vector_scratch;
+    ctx->vemb_scratch_capacity = rows;
+    atomic_fetch_add_explicit(&ctx->vemb_scratch_grows, 1, memory_order_relaxed);
+    atomic_store_explicit(&ctx->vemb_scratch_rows, rows, memory_order_relaxed);
+    return C_OK;
+}
+
+static void supernode_worker_cleanup_scratch(sve_worker_context_t *ctx) {
+    RETURN_IF(!ctx);
+
+    zfree(ctx->vemb_row_scratch);
+    zfree(ctx->vemb_vector_scratch);
+    ctx->vemb_row_scratch = NULL;
+    ctx->vemb_vector_scratch = NULL;
+    ctx->vemb_scratch_capacity = 0;
+}
+
 static int supernode_process_vsim_batch(sve_worker_context_t *ctx,
                                         batch_vsim_packet_t *vsim,
                                         supernode_batch_stage_times_t *times) {
@@ -222,28 +273,32 @@ static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
                                         batch_packet_t *packet,
                                         supernode_batch_stage_times_t *times) {
     RETURN_IF(!ctx || !packet, C_ERR);
+    RETURN_IF(packet->hdr.num_requests == 0, C_ERR);
 
-    uint64_t *emb_ids = zmalloc(packet->hdr.num_requests * sizeof(uint64_t));
-    float *results = NULL;
     uint64_t bitmap_lock_latency_ns = 0;
     uint64_t bitmap_unlock_latency_ns = 0;
     uint64_t vector_load_latency_ns = 0;
     uint64_t response_latency_ns = 0;
     int ret = C_ERR;
 
-    if (!emb_ids) return C_ERR;
+    if (supernode_vemb_ensure_scratch(ctx, packet->hdr.num_requests) != C_OK) {
+        return C_ERR;
+    }
+    uint64_t *emb_ids = ctx->vemb_row_scratch;
+    float *results = ctx->vemb_vector_scratch;
+
     for (uint32_t i = 0; i < packet->hdr.num_requests; i++)
         emb_ids[i] = packet->requests[i].row_id;
 
-    ret = supernode_load_candidate_vectors(ctx,
-                                           emb_ids,
-                                           packet->hdr.num_requests,
-                                           ctx->gather_ctx.vector_dim,
-                                           &results,
-                                           &bitmap_lock_latency_ns,
-                                           &bitmap_unlock_latency_ns,
-                                           &vector_load_latency_ns);
-    if (ret != C_OK) goto cleanup;
+    ret = supernode_load_candidate_vectors_into(ctx,
+                                                emb_ids,
+                                                packet->hdr.num_requests,
+                                                ctx->gather_ctx.vector_dim,
+                                                results,
+                                                &bitmap_lock_latency_ns,
+                                                &bitmap_unlock_latency_ns,
+                                                &vector_load_latency_ns);
+    if (ret != C_OK) return C_ERR;
 
     monotime response_start;
     elapsedStartNs(&response_start);
@@ -267,9 +322,6 @@ static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
         times->response_latency_ns = response_latency_ns;
     }
 
-cleanup:
-    zfree(results);
-    zfree(emb_ids);
     return ret;
 }
 
@@ -466,6 +518,8 @@ int supernode_init(int node_id, int num_workers) {
         atomic_init(&ctx->max_compute_latency_us, 0);
         atomic_init(&ctx->total_response_latency_us, 0);
         atomic_init(&ctx->max_response_latency_us, 0);
+        atomic_init(&ctx->vemb_scratch_grows, 0);
+        atomic_init(&ctx->vemb_scratch_rows, 0);
         atomic_init(&ctx->op_stats.lock_success, 0);
         atomic_init(&ctx->op_stats.lock_failure, 0);
         sve_gather_ctx_init(&ctx->gather_ctx,
@@ -503,6 +557,7 @@ void supernode_shutdown(void) {
                 ctx->running = 0;
                 pthread_join(ctx->thread, NULL);
             }
+            supernode_worker_cleanup_scratch(ctx);
         }
         zfree(global_supernode->workers);
     }
@@ -541,6 +596,7 @@ sds supernode_get_stats(void) {
     uint64_t tb = 0, tr = 0, ts = 0, tt = 0;
     uint64_t bls = 0, blf = 0;
     uint64_t go = 0, so = 0, ge = 0, se = 0;
+    uint64_t vemb_scratch_grows = 0, vemb_scratch_rows = 0;
 
     for (int i = 0; i < global_supernode->num_workers; i++) {
         sve_worker_context_t *c = &global_supernode->workers[i];
@@ -550,6 +606,11 @@ sds supernode_get_stats(void) {
         tt += atomic_load_explicit(&c->total_latency_us, memory_order_relaxed);
         bls += atomic_load_explicit(&c->op_stats.lock_success, memory_order_relaxed);
         blf += atomic_load_explicit(&c->op_stats.lock_failure, memory_order_relaxed);
+        vemb_scratch_grows += atomic_load_explicit(&c->vemb_scratch_grows,
+                                                   memory_order_relaxed);
+        uint64_t rows = atomic_load_explicit(&c->vemb_scratch_rows,
+                                             memory_order_relaxed);
+        if (rows > vemb_scratch_rows) vemb_scratch_rows = rows;
     }
 
     stats = sdscatprintf(stats, "  Total batches: %llu\n", (unsigned long long)tb);
@@ -557,6 +618,10 @@ sds supernode_get_stats(void) {
     stats = sdscatprintf(stats, "  Bitmap lock success: %llu\n", (unsigned long long)bls);
     stats = sdscatprintf(stats, "  Bitmap lock failure: %llu\n", (unsigned long long)blf);
     stats = sdscatprintf(stats, "  SVE operations: %llu\n", (unsigned long long)ts);
+    stats = sdscatprintf(stats, "  VEMB scratch grows: %llu\n",
+                         (unsigned long long)vemb_scratch_grows);
+    stats = sdscatprintf(stats, "  VEMB scratch max rows: %llu\n",
+                         (unsigned long long)vemb_scratch_rows);
 
     if (tb > 0) {
         stats = sdscatprintf(stats, "  Avg batch latency: %.1f μs\n", (double)tt / tb);

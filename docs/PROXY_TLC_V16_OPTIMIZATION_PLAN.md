@@ -401,14 +401,19 @@ Current `VSIM` returns all candidates:
 result_count = candidate_count
 ```
 
-This is expensive in:
+This is the intended behavior for the current benchmark and correctness phase:
+`VSIM` performs a full scan over the candidate set and computes a score for each
+candidate. For `p=1000, dim=300`, that means each query loads and scores 1000
+vectors.
+
+This can become expensive in:
 
 1. worker response packet size
 2. response ring bandwidth
 3. proxy result copy
 4. Redis reply formatting
 
-Target:
+Future TODO:
 
 ```text
 supernode computes top-k by requested_count
@@ -428,9 +433,145 @@ Expected effect:
 2. Lower proxy result handling cost.
 3. Lower client response size.
 
-## 7. Test Plan
+Current decision:
 
-### 7.1 Unit Tests
+```text
+Do not optimize VSIM full-scan/top-k in the current phase.
+Keep it as a TODO until proxy fast-path behavior is validated and VEMB/VSIM
+baseline numbers are stable.
+```
+
+## 7. TLC V16 Borrowing Matrix
+
+This section maps the concrete `tlc_v16_server` / `tlc_v16_bench` techniques to
+the current proxy/supernode architecture.
+
+### 7.1 Directly Useful
+
+1. Flat-combining publication board.
+   - Source pattern: `g_slots`, `g_combiner_lock`, and `fc_get()` in
+     `src/tlc_v16_server.c`.
+   - Proxy mapping: add per-worker `VEMB` publication boards.
+   - Redis command threads publish work and attempt TTAS combiner election.
+   - Losing command threads must not spin for the UB result. They block the
+     Redis client, publish work, and return. Result completion stays
+     asynchronous through the response rings.
+
+2. TTAS combiner election.
+   - Source pattern: relaxed load checks the lock first, then CAS only when it
+     appears free.
+   - Proxy mapping: use TTAS around each `VEMB` combiner board to reduce cache
+     line bouncing versus blind CAS loops.
+
+3. Adaptive direct versus batch behavior.
+   - Source pattern: one pending request uses a direct-style path; multiple
+     pending requests are combined.
+   - Proxy mapping: keep current VEMB adaptive direct/batch and use the new
+     observability counters to decide whether FC should replace or augment
+     bucket batching.
+
+4. CPU affinity and spin backoff.
+   - Source pattern: server/client threads are pinned and hot rings use spin
+     before sleeping.
+   - Proxy/supernode mapping: pin supernode workers, proxy result threads, and
+     benchmark clients to non-overlapping cores. Keep adaptive spin/backoff in
+     supernode workers and avoid syscalls on the hot receive path.
+
+5. Benchmark discipline.
+   - Source pattern: `tlc_v16_bench` allocates channels once, uses shared-memory
+     rings, pins client threads, and avoids spawning a client process per op.
+   - Current Go trigger tool is useful for correctness and end-to-end Redis
+     behavior, but it is not a pure proxy/supernode peak benchmark.
+   - Add a C benchmark later if we need to compare against TLC V16-style peak
+     numbers.
+
+### 7.2 Useful But Requires Architecture Changes
+
+1. SPSC rings per channel.
+   - TLC V16 gets much of its performance from single-producer/single-consumer
+     rings with no mutex, no MPSC reservation, and no data-path syscall.
+   - Current proxy has many Redis command threads writing the same worker ring,
+     so it still needs the bucket mutex around `ring_buffer_reserve()` /
+     `ring_buffer_commit_write()`.
+   - To remove the last ring-write mutex, choose one of:
+
+   ```text
+   A. producer/thread -> worker SPSC rings, supernode worker polls many rings
+   B. true MPSC reserve/commit API for the current worker ring
+   ```
+
+   Option A is closer to TLC V16 and has lower correctness risk.
+
+2. Compact VEMB response.
+   - TLC V16 returns a compact identifier for GET rather than copying the full
+     1200-byte value.
+   - For UB VEMB, an equivalent future path is:
+
+   ```text
+   supernode response: status + row_id / offset / warm_idx
+   proxy/client: read vector from shared memory when needed
+   ```
+
+   This can reduce response-ring bandwidth and result-thread copy cost, but it
+   changes the response contract and should come after the current direct/batch
+   path is stable.
+
+3. Result-thread sharding.
+   - TLC V16 has one response ring per channel.
+   - Current proxy has one result thread scanning all worker response rings.
+   - If `result_queue_avg_us` grows, shard result polling by worker range or
+     supernode id. Keep `RedisModule_UnblockClient()` API safety in mind.
+
+### 7.3 Do Not Borrow Directly
+
+1. Loser spin-wait until result.
+   TLC V16 channel threads spin until their slot reaches `DONE`. Redis command
+   threads must not spin waiting for UB completion.
+
+2. Replacing Redis blocked-client lifecycle.
+   TLC V16 owns the entire channel lifecycle. Proxy must keep Redis blocked
+   clients, completion registry, and unblock semantics.
+
+3. Applying top-k/compact response to current VSIM phase.
+   Current VSIM full-scan/full-result behavior is intentional for this phase and
+   remains a TODO rather than an active optimization item.
+
+### 7.4 Recommended Next Landing Order
+
+1. Supernode `VEMB` per-worker scratch buffers.
+   - Current supernode VEMB allocates temporary row/result buffers in the hot
+     path.
+   - Add reusable scratch buffers in `sve_worker_context_t`.
+   - This is the lowest-risk TLC-style cleanup because it does not change proxy
+     semantics or ring contracts.
+   - Status: implemented. Each supernode worker now owns reusable VEMB row and
+     vector scratch buffers and grows them only when a larger VEMB batch arrives.
+
+2. Proxy `VEMB` FC publication board MVP.
+   - Add per-worker publication slots and TTAS combiner.
+   - Keep the existing response path.
+   - Initially keep the bucket/ring mutex only around ring write to avoid an
+     unsafe MPSC rewrite.
+
+3. SPSC multi-input rings or MPSC ring reserve.
+   - Remove the last request-ring write mutex after FC behavior is validated.
+   - Prefer per-producer SPSC rings if memory and worker polling overhead are
+     acceptable.
+
+4. VEMB compact response.
+   - Return row/offset metadata instead of copying the full vector where the
+     caller can read from UB shared memory.
+   - This is a larger API/contract decision and should follow measurements that
+     show response copy or ring bandwidth is limiting throughput.
+
+5. Dedicated peak benchmark.
+   - Add a TLC-style C benchmark for proxy/supernode peak measurements.
+   - Keep the Go Redis trigger benchmark as the correctness and integration
+     benchmark.
+
+## 8. Test Plan
+
+### 8.1 Unit Tests
 
 Add focused tests for packet routing and packet generation:
 
@@ -449,7 +590,7 @@ Add focused tests for packet routing and packet generation:
    - op_type is `BATCH_PACKET_OP_VEMB`
    - num_requests is 1
 
-### 7.2 Integration Tests
+### 8.2 Integration Tests
 
 Use a local Redis instance with UB engine:
 
@@ -490,7 +631,7 @@ go run benchmark/trigger_proxy_aggregation.go \
   -c 64 -n 5000 -d 300 -p 1000
 ```
 
-### 7.3 Trace Acceptance
+### 8.3 Trace Acceptance
 
 For `VEMB` single-request traces:
 
@@ -515,7 +656,7 @@ wall qps should improve or stay flat
 failed should remain 0
 ```
 
-## 8. Current Landing Status
+## 9. Current Landing Status
 
 This section captures the current implementation state before server-side bench
 validation.
@@ -568,31 +709,116 @@ Completed:
    - Ring-buffer benchmark targets were adjusted to the current packet header
      layout.
 
+7. Initial server-side bench validation.
+   - VEMB with `proxy-vemb-adaptive yes` and
+     `proxy-vemb-direct-gap-us 50` reached about 24k wall QPS for
+     `-c 64 -n 5000 -d 300 -p 1000` with `failed=0`.
+   - Recent VEMB traces show `req=1`, `proxy_wait_avg_us` around 1-2 us,
+     confirming the direct singleton path is active.
+   - VSIM with `-c 64 -n 5000 -d 300 -p 1000` reached about 12.7k wall QPS
+     with `failed=0`.
+   - Recent VSIM traces show `req=1`, `proxy_wait_avg_us` around 1 us, and
+     `vector_load_ns` around 3.0-3.4 ms. The main VSIM cost is now the intended
+     full candidate vector load, not proxy waiting.
+
+8. Proxy observability.
+   - `batch-trace` now appends proxy path metadata:
+
+   ```text
+   path=direct|batch
+   flush_reason=direct|limit|timeout
+   flush_trigger=direct|background|capacity|append
+   bucket_depth=<n>
+   gap_us=<latest arrival gap>
+   ewma_gap_us=<arrival EWMA>
+   ```
+
+   - `INFO`/UB stats now expose direct and adaptive counters:
+
+   ```text
+   VEMB direct submits
+   VSIM direct submits
+   VEMB batch enqueues
+   VEMB adaptive checks
+   VEMB adaptive selected
+   VEMB adaptive bucket nonempty
+   VEMB adaptive gap selected
+   VEMB adaptive EWMA selected
+   VEMB direct fallbacks
+   Direct ring full
+   Batch size histogram
+   Average batch flush size
+   ```
+
+9. Supernode `VEMB` scratch buffers.
+   - `sve_worker_context_t` now owns reusable VEMB row-id and vector result
+     scratch buffers.
+   - `supernode_process_vemb_batch()` reuses those buffers instead of allocating
+     `emb_ids` and `results` for every batch.
+   - VSIM allocation behavior is intentionally unchanged because VSIM full-scan
+     optimization is a separate TODO.
+   - Supernode stats now expose:
+
+   ```text
+   VEMB scratch grows
+   VEMB scratch max rows
+   ```
+
+10. Phase 2 `VEMB` flat-combining MVP.
+   - `proxy-vemb-submit-mode fc` publishes VEMB work into per-worker FC boards
+     instead of appending every request to the bucket array.
+   - Each board has hashed publication slots and a TTAS combiner lock.
+   - The combiner claims `PENDING` slots, writes one VEMB packet to the existing
+     worker request ring, and returns immediately after publishing work.
+   - Redis blocked-client completion still flows through the response ring and
+     result thread; command threads do not spin for UB completion.
+   - The existing bucket mutex remains only around `ring_buffer_reserve()` /
+     `ring_buffer_commit_write()` because the request ring is not MPSC-safe yet.
+   - The flush thread also drains pending FC slots so a request published after
+     a combiner scan cannot remain stuck without another request arriving.
+   - Added tunables:
+
+   ```conf
+   proxy-vemb-submit-mode batch | direct | adaptive | fc
+   proxy-vemb-fc-slots 0       # 0 uses workers_per_node * 4, minimum 64
+   proxy-vemb-fc-max-scan 0    # 0 scans all slots
+   ```
+
+   - `INFO`/UB stats now expose FC counters:
+
+   ```text
+   VEMB FC published
+   VEMB FC combines
+   VEMB FC combined requests
+   VEMB FC slot busy
+   VEMB FC ring busy
+   VEMB FC fallbacks
+   Average VEMB FC batch size
+   ```
+
 Verified locally:
 
 ```bash
 make -C benchmark -B proxy_components_ut
 ./benchmark/proxy_components_ut
+make -C benchmark -B proxy_aggregator_ut
+./benchmark/proxy_aggregator_ut
 make -C src
 make -C benchmark ring_buffer_batch_bench
 make -C benchmark ring_buffer_compare_bench
 git diff --check
 ```
 
-Known local test gap:
-
-1. `proxy_aggregator_ut` is currently stale.
-   It includes `proxy_aggregator.c` directly, calls deprecated
-   `proxy_enqueue_request()`, and does not provide a complete RedisModule API
-   shim. It should be repaired separately before being used as a gate.
-
 Server bench checklist:
 
 1. Confirm config:
 
 ```bash
+CONFIG GET proxy-vemb-submit-mode
 CONFIG GET proxy-vemb-adaptive
 CONFIG GET proxy-vemb-direct-gap-us
+CONFIG GET proxy-vemb-fc-slots
+CONFIG GET proxy-vemb-fc-max-scan
 CONFIG GET proxy-batch-limit
 CONFIG GET proxy-time-limit-us
 CONFIG GET supernode-workers
@@ -645,6 +871,12 @@ proxy_flush_us
 queue_us
 result_queue_avg_us
 e2e_avg_us
+path
+flush_reason
+flush_trigger
+bucket_depth
+gap_us
+ewma_gap_us
 ```
 
 Interpretation:
@@ -652,25 +884,31 @@ Interpretation:
 1. Low-concurrency or sparse `VEMB` should show lower `proxy_wait_avg_us`.
 2. High-concurrency `VEMB` should keep a reasonable average batch size and avoid
    a throughput regression.
-3. If `result_queue_avg_us` grows after proxy wait drops, the next bottleneck is
+3. `path=direct` with `flush_reason=direct` confirms the singleton direct path.
+4. `path=batch` plus `flush_reason=limit|timeout` shows real bucket batching.
+5. `VEMB adaptive selected` should track direct-path decisions, while
+   `VEMB direct fallbacks` and `Direct ring full` should stay low.
+6. If `result_queue_avg_us` grows after proxy wait drops, the next bottleneck is
    likely the single result thread.
-4. If `queue_us` grows after request-id/row-id worker spreading, check whether
+7. If `queue_us` grows after request-id/row-id worker spreading, check whether
    supernode workers are saturated or whether UB bitmap/cache contention became
    visible.
+8. For FC mode, `VEMB FC published` should match submitted VEMB requests,
+   `VEMB FC combined requests` should advance, and `VEMB FC fallbacks` should
+   remain low.
 
-## 9. Remaining Work
+## 10. Remaining Work
 
 Still remaining after the current landing:
 
-1. Server-side benchmark validation.
-   - Validate correctness and performance against real UB/shared-memory setup.
-   - Compare adaptive on/off and threshold sweep.
+1. Broader server-side benchmark validation.
+   - Repeat VEMB/VSIM with larger `n`, different `c`, and larger `p`.
+   - Keep `failed=0` and compare wall QPS, `queue_us`, and `e2e_avg_us`.
 
-2. TLC V16 style `VEMB` flat-combining implementation.
-   - Add per-worker publication boards.
-   - Add TTAS combiner election.
-   - Let command threads publish work and return after blocking the Redis client.
-   - Keep result completion asynchronous through response rings.
+2. Server-side validation for `proxy-vemb-submit-mode fc`.
+   - Compare FC against `adaptive` and `batch` with VEMB raw output.
+   - Track wall QPS, FC average batch size, `queue_us`, `result_queue_avg_us`,
+     and fallback counters.
 
 3. Remove the last ring-write mutex.
    - Current direct and batch writes still serialize with the target bucket
@@ -682,13 +920,18 @@ Still remaining after the current landing:
    - Add multiple response-ring scanning threads if `result_queue_avg_us`
      becomes visible.
 
-5. `VSIM` top-k / compact response.
+5. TODO: `VSIM` top-k / compact response.
    - Current `VSIM` response still returns all candidates.
-   - Supernode should eventually return only `requested_count` best results.
+   - This is expected for the current phase because VSIM is intentionally doing
+     full candidate computation.
+   - Supernode can eventually return only `requested_count` best results, but
+     this is not an active optimization item right now.
 
-6. Completion registry sharding.
-   - The completion registry currently has a global lock.
-   - Shard by request id if result processing becomes concurrent or lock-bound.
+6. Completion registry sharding. `[completed locally in next-stage patch]`
+   - The completion registry now uses 64 request-id shards instead of one
+     global dict lock.
+   - Completion keys are stored as `uint64_t`, avoiding temporary `sds`
+     formatting/allocation on lookup, complete, and take.
 
 7. Config polish.
    - Potential future configs:
@@ -699,7 +942,7 @@ Still remaining after the current landing:
    proxy-result-threads 1..N
    ```
 
-## 10. Rollout Order
+## 11. Rollout Order
 
 Original recommended order:
 
@@ -720,10 +963,13 @@ Current order status:
 ```text
 1-7: implemented locally
 8: pending server bench
-9-10: pending benchmark evidence
+8: server bench partially validated for adaptive/direct
+9: completion registry sharding implemented locally; result-thread sharding still
+   pending benchmark evidence
+10: implemented locally; pending FC server bench validation
 ```
 
-## 11. Risks
+## 12. Risks
 
 1. Spreading `VSIM` by request id may increase UB bitmap/cache contention.
    Mitigation: make VSIM route policy configurable or keep VSIM key-routed until measured.
@@ -734,15 +980,16 @@ Current order status:
 3. More result threads can call `RedisModule_UnblockClient()` concurrently.
    Mitigation: verify Redis module API usage is safe from these threads in current code path; otherwise use result sharding only for packet processing and hand unblock to a safe executor.
 
-4. Completion registry global mutex may become visible after result sharding.
-   Mitigation: shard completion registry by request id in a later patch.
+4. Completion registry lock contention may become visible after result sharding.
+   Mitigation: completion registry is now sharded by request id; re-check only
+   if a shard-level lock shows up in profiling.
 
 5. Adaptive direct may reduce high-load batching if the gap threshold is too
    large.
    Mitigation: compare `proxy-vemb-adaptive yes/no` and sweep
    `proxy-vemb-direct-gap-us`.
 
-## 12. Definition of Done
+## 13. Definition of Done
 
 Phase 1 is complete when:
 

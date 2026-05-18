@@ -195,6 +195,8 @@ static void test_proxy_flush_executor_success(void) {
            PROXY_FLUSH_TRIGGER_IMMEDIATE_APPEND) == C_OK);
     assert(bucket.count == 0);
     assert(atomic_load_explicit(&executor.stats.total_flushes, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&executor.stats.batch_flush_requests, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&executor.stats.batch_size_hist_1, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&executor.stats.immediate_flush_attempts, memory_order_relaxed) == 1);
     assert(atomic_load_explicit(&executor.stats.immediate_flush_successes, memory_order_relaxed) == 1);
 
@@ -202,6 +204,38 @@ static void test_proxy_flush_executor_success(void) {
     assert(((batch_packet_t *)payload)->hdr.magic == BATCH_PACKET_MAGIC);
     assert(((batch_packet_t *)payload)->requests[0].row_id == 456);
 
+    proxy_batch_bucket_cleanup(&bucket);
+    test_rb_destroy(rb);
+}
+
+static void test_proxy_flush_executor_batch_histogram(void) {
+    proxy_flush_executor_t executor;
+    proxy_batch_bucket_t bucket = {0};
+    ring_buffer_t *rb = test_rb_create(1024);
+    proxy_vector_request_t *owners[3] = {0};
+
+    proxy_flush_executor_init(&executor);
+    assert(proxy_batch_bucket_init(&bucket, 4, 1, 2, 100) == C_OK);
+    for (int i = 0; i < 3; i++) {
+        owners[i] = calloc(1, sizeof(*owners[i]));
+        assert(owners[i]);
+        owners[i]->op_type = PROXY_VECTOR_OP_VEMB;
+        owners[i]->row_id = (uint64_t)(456 + i);
+        assert(proxy_batch_bucket_append(&bucket,
+               proxy_request_create((uint64_t)(1 + i), 123, 1, 2, 100 + (uint64_t)i, owners[i])) == C_OK);
+    }
+
+    assert(proxy_executor_flush_bucket_locked(&executor, &bucket, rb, 1, 200,
+           PROXY_FLUSH_TRIGGER_BACKGROUND) == C_OK);
+    assert(atomic_load_explicit(&executor.stats.batch_flush_requests, memory_order_relaxed) == 3);
+    assert(atomic_load_explicit(&executor.stats.batch_size_hist_1, memory_order_relaxed) == 0);
+    assert(atomic_load_explicit(&executor.stats.batch_size_hist_2_4, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&executor.stats.batch_full_flushes, memory_order_relaxed) == 1);
+    assert(atomic_load_explicit(&executor.stats.immediate_flush_attempts, memory_order_relaxed) == 0);
+
+    for (int i = 0; i < 3; i++) {
+        free(owners[i]);
+    }
     proxy_batch_bucket_cleanup(&bucket);
     test_rb_destroy(rb);
 }
@@ -279,6 +313,7 @@ int main(void) {
     test_proxy_batch_bucket_arrival_ewma();
     test_ring_buffer_cancel_write();
     test_proxy_flush_executor_success();
+    test_proxy_flush_executor_batch_histogram();
     test_proxy_flush_executor_failure_metrics();
     test_proxy_router();
     test_proxy_router_hot_key_distribution();

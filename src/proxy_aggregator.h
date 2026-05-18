@@ -18,7 +18,9 @@
 #include <stdint.h>
 
 typedef struct RedisModuleCtx RedisModuleCtx;
+#ifndef RedisModuleString
 typedef struct RedisModuleString RedisModuleString;
+#endif
 
 /* 聚合配置 */
 #define PROXY_BATCH_LIMIT 3000          /* 默认批量大小限制 */

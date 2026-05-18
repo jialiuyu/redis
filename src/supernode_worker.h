@@ -17,6 +17,7 @@
 #include "sve_operation.h"
 #include "ring_buffer.h"
 #include "monotonic.h"
+#include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -34,6 +35,11 @@ typedef struct sve_worker_context {
     /* 读取路径上下文 */
     sve_gather_ctx_t gather_ctx;
 
+    /* VEMB hot-path scratch buffers, owned by this worker thread. */
+    uint64_t *vemb_row_scratch;
+    float *vemb_vector_scratch;
+    size_t vemb_scratch_capacity;
+
     /* 统计信息 */
     atomic_uint_fast64_t total_batches;
     atomic_uint_fast64_t total_requests;
@@ -47,6 +53,8 @@ typedef struct sve_worker_context {
     atomic_uint_fast64_t max_compute_latency_us;
     atomic_uint_fast64_t total_response_latency_us;
     atomic_uint_fast64_t max_response_latency_us;
+    atomic_uint_fast64_t vemb_scratch_grows;
+    atomic_uint_fast64_t vemb_scratch_rows;
     sve_operation_stats_t op_stats;
 } sve_worker_context_t;
 
