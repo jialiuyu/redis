@@ -126,10 +126,22 @@ static int ub_engine_init(void) {
         return C_ERR;
     }
 
+    if (supernode_init(0, server.supernode_workers) != C_OK) {
+        serverLog(LL_WARNING, "UB Vector Engine: failed to initialize local SuperNode");
+        return C_ERR;
+    }
+    if (proxy_aggregator_init(1) != C_OK) {
+        serverLog(LL_WARNING, "UB Vector Engine: failed to initialize FC proxy");
+        supernode_shutdown();
+        return C_ERR;
+    }
+
     return C_OK;
 }
 
 static void ub_engine_cleanup(void) {
+    proxy_aggregator_shutdown();
+    supernode_shutdown();
     ub_cached_addr_space = NULL;  /* owned by ub_client, freed in ub_client_cleanup */
     ub_metadata_cleanup();
     ub_client_cleanup();

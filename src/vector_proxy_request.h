@@ -22,6 +22,7 @@ typedef struct proxy_vector_request {
     RedisModuleBlockedClient *bc;
     float *result_vector;
     size_t result_dim;
+    int completed;
     float *query_vector;
     size_t query_dim;
     uint64_t *candidate_rows;

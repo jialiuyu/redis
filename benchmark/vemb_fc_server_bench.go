@@ -183,6 +183,87 @@ func ensureOK(addr string, timeout time.Duration) error {
 	return nil
 }
 
+func configGet(addr string, timeout time.Duration, name string) (string, error) {
+	resp, err := redisCall(addr, timeout, "CONFIG", "GET", name)
+	if err != nil {
+		return "", err
+	}
+	if resp.kind != '*' || len(resp.array) < 2 {
+		return "", fmt.Errorf("unexpected CONFIG GET %s response: %s", name, resp.String())
+	}
+	return resp.array[1].String(), nil
+}
+
+func configGetInt(addr string, timeout time.Duration, name string) (int64, error) {
+	value, err := configGet(addr, timeout, name)
+	if err != nil {
+		return 0, err
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid CONFIG GET %s value %q: %w", name, value, err)
+	}
+	return parsed, nil
+}
+
+func preflight(addr string, timeout time.Duration, dim, prefillCount int, ubShmPath string) error {
+	serverDim, err := configGetInt(addr, timeout, "vector-dimension")
+	if err != nil {
+		return err
+	}
+	if serverDim != int64(dim) {
+		return fmt.Errorf("server vector-dimension=%d but bench -d=%d; restart Redis with matching config", serverDim, dim)
+	}
+
+	shmSize, err := configGetInt(addr, timeout, "ub-shm-size")
+	if err != nil {
+		return err
+	}
+	tableSize, err := configGetInt(addr, timeout, "ub-table-size")
+	if err != nil {
+		return err
+	}
+	tableOffset, err := configGetInt(addr, timeout, "ub-table-offset")
+	if err != nil {
+		return err
+	}
+	stride, err := configGetInt(addr, timeout, "ub-vector-stride-bytes")
+	if err != nil {
+		return err
+	}
+	if stride == 0 {
+		stride = int64(dim) * int64(4)
+	}
+	if stride < int64(dim)*4 {
+		return fmt.Errorf("ub-vector-stride-bytes=%d is smaller than dim*4=%d", stride, dim*4)
+	}
+	if ubShmPath == "" {
+		ubShmPath, err = configGet(addr, timeout, "ub-shm-path")
+		if err != nil {
+			return err
+		}
+	}
+	usableSize := tableSize
+	if usableSize == 0 {
+		usableSize = shmSize - tableOffset
+	}
+	requiredSize := int64(prefillCount) * stride
+	if usableSize < requiredSize {
+		return fmt.Errorf("UB table too small: usable=%d bytes required=%d bytes for prefill=%d dim=%d stride=%d",
+			usableSize, requiredSize, prefillCount, dim, stride)
+	}
+
+	stat, err := os.Stat(ubShmPath)
+	if err != nil {
+		return fmt.Errorf("stat %s failed: %w", ubShmPath, err)
+	}
+	if stat.Mode().IsRegular() && stat.Size() < shmSize {
+		return fmt.Errorf("%s is %d bytes but ub-shm-size=%d; run: truncate -s %d %s",
+			ubShmPath, stat.Size(), shmSize, shmSize, ubShmPath)
+	}
+	return nil
+}
+
 func writeFile(path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "write %s failed: %v\n", path, err)
@@ -474,12 +555,13 @@ func main() {
 	var skipPrefill bool
 	var flush bool
 	var timeout time.Duration
+	var ubShmPath string
 
 	flag.StringVar(&host, "host", "127.0.0.1", "Redis host")
 	flag.IntVar(&port, "port", 6391, "Redis port")
 	flag.StringVar(&key, "key", "myvectors", "Vector key")
-	flag.IntVar(&dim, "dim", 4, "Vector dimension")
-	flag.IntVar(&dim, "d", 4, "Vector dimension (short)")
+	flag.IntVar(&dim, "dim", 300, "Vector dimension")
+	flag.IntVar(&dim, "d", 300, "Vector dimension (short)")
 	flag.IntVar(&prefillCount, "prefill", 65536, "Number of vectors to prefill")
 	flag.IntVar(&prefillCount, "p", 65536, "Number of vectors to prefill (short)")
 	flag.IntVar(&requests, "requests", 200000, "Requests per concurrency point")
@@ -490,6 +572,7 @@ func main() {
 	flag.BoolVar(&skipPrefill, "skip-prefill", false, "Do not prefill; assume data already exists")
 	flag.BoolVar(&flush, "flush", true, "FLUSHALL before prefill")
 	flag.DurationVar(&timeout, "timeout", 10*time.Second, "Per-command timeout")
+	flag.StringVar(&ubShmPath, "ub-shm-path", "", "UB backing file path override for preflight size check; empty uses Redis config")
 	flag.Parse()
 
 	addr := fmt.Sprintf("%s:%d", host, port)
@@ -517,10 +600,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Start it with: ./src/redis-server benchmark/redis-vemb-fc-bench.conf")
 		os.Exit(1)
 	}
+	if err := preflight(addr, timeout, dim, prefillCount, ubShmPath); err != nil {
+		fmt.Fprintf(os.Stderr, "preflight failed: %v\n", err)
+		os.Exit(1)
+	}
 
 	config := fmt.Sprintf(
-		"addr=%s\nkey=%s\ndim=%d\nprefill=%d\nrequests=%d\nconcurrency=%s\nskip_prefill=%v\nflush=%v\ntimeout=%s\n",
-		addr, key, dim, prefillCount, requests, concurrencyList, skipPrefill, flush, timeout)
+		"addr=%s\nkey=%s\ndim=%d\nprefill=%d\nrequests=%d\nconcurrency=%s\nskip_prefill=%v\nflush=%v\ntimeout=%s\nub_shm_path=%s\n",
+		addr, key, dim, prefillCount, requests, concurrencyList, skipPrefill, flush, timeout, ubShmPath)
 	writeFile(filepath.Join(outDir, "config.txt"), config)
 
 	if !skipPrefill {

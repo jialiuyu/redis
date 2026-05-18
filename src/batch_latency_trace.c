@@ -74,7 +74,7 @@ static void batch_latency_trace_log_completed(const batch_latency_trace_t *trace
     double avg_e2e = trace->completed_requests > 0 ?
         (double)trace->request_e2e_total_us / (double)trace->completed_requests : 0.0;
 
-    serverLog(LL_NOTICE,
+    serverLog(LL_DEBUG,
               "batch-trace batch=%llu op=%u req=%u done=%u proxy_wait_avg_us=%.1f proxy_wait_max_us=%llu proxy_flush_us=%llu "
               "queue_us=%llu bitmap_lock_ns=%llu bitmap_ublock_ns=%llu vector_load_ns=%llu compute_ns=%llu response_ns=%llu result_queue_avg_us=%.1f "
               "result_queue_max_us=%llu e2e_avg_us=%.1f e2e_max_us=%llu "

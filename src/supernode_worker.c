@@ -13,6 +13,7 @@
 #include "ring_buffer_mgr.h"
 #include "sve_compute.h"
 #include "supernode_protocol.h"
+#include "vector_proxy_request.h"
 #include "server.h"
 #include "ub_client.h"
 
@@ -25,6 +26,8 @@
 #ifdef __linux__
 #include <sched.h>
 #endif
+
+int RM_UnblockClient(RedisModuleBlockedClient *bc, void *privdata);
 
 typedef struct supernode {
     int node_id;
@@ -325,6 +328,88 @@ static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
     return ret;
 }
 
+static int supernode_process_fc_vemb_batch(sve_worker_context_t *ctx,
+                                           fc_vemb_packet_t *packet,
+                                           supernode_batch_stage_times_t *times) {
+    RETURN_IF(!ctx || !packet, C_ERR);
+    RETURN_IF(packet->hdr.num_requests == 0, C_ERR);
+
+    uint64_t bitmap_lock_latency_ns = 0;
+    uint64_t bitmap_unlock_latency_ns = 0;
+    uint64_t vector_load_latency_ns = 0;
+    uint64_t response_latency_ns = 0;
+
+    if (supernode_vemb_ensure_scratch(ctx, packet->hdr.num_requests) != C_OK) {
+        return C_ERR;
+    }
+    uint64_t *emb_ids = ctx->vemb_row_scratch;
+    float *results = ctx->vemb_vector_scratch;
+
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++)
+        emb_ids[i] = packet->requests[i].row_id;
+
+    int ret = supernode_load_candidate_vectors_into(ctx,
+                                                    emb_ids,
+                                                    packet->hdr.num_requests,
+                                                    ctx->gather_ctx.vector_dim,
+                                                    results,
+                                                    &bitmap_lock_latency_ns,
+                                                    &bitmap_unlock_latency_ns,
+                                                    &vector_load_latency_ns);
+    monotime response_start;
+    elapsedStartNs(&response_start);
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++) {
+        proxy_vector_request_t *req = packet->requests[i].owner;
+        if (!req) continue;
+
+        if (ret == C_OK) {
+            size_t bytes = sizeof(float) * ctx->gather_ctx.vector_dim;
+            if (!req->result_vector)
+                req->result_vector = zmalloc(bytes);
+            if (req->result_vector) {
+                memcpy(req->result_vector,
+                       results + ((size_t)i * ctx->gather_ctx.vector_dim),
+                       bytes);
+                req->result_dim = ctx->gather_ctx.vector_dim;
+                req->error_code = C_OK;
+            } else {
+                req->result_dim = 0;
+                req->error_code = C_ERR;
+            }
+        } else {
+            req->result_dim = 0;
+            req->error_code = C_ERR;
+        }
+        req->completion_time_us = getMonotonicUs();
+        req->completed = 1;
+        if (req->batch_id != 0) {
+            uint64_t result_queue_us = req->completion_time_us > req->submit_time_us ?
+                (uint64_t)(req->completion_time_us - req->submit_time_us) : 0;
+            (void)batch_latency_trace_record_request_completion(req->batch_id,
+                                                                result_queue_us,
+                                                                result_queue_us);
+        }
+        if (req->bc) RM_UnblockClient(req->bc, req);
+    }
+    response_latency_ns = elapsedNs(response_start);
+
+    atomic_fetch_add_explicit(&ctx->total_gather_latency_us,
+                              vector_load_latency_ns / 1000ULL,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_response_latency_us,
+                              response_latency_ns / 1000ULL,
+                              memory_order_relaxed);
+    if (times) {
+        times->bitmap_lock_latency_ns = bitmap_lock_latency_ns;
+        times->bitmap_unlock_latency_ns = bitmap_unlock_latency_ns;
+        times->vector_load_latency_ns = vector_load_latency_ns;
+        times->compute_latency_ns = 0;
+        times->response_latency_ns = response_latency_ns;
+    }
+
+    return ret;
+}
+
 static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_request_header_t *hdr) {
     RETURN_IF(!ctx || !hdr, C_ERR);
 
@@ -343,10 +428,17 @@ static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_request_hea
               ctx->worker_id, hdr->num_requests,
               (unsigned long long)hdr->batch_id);
 
-    if (hdr->op_type == BATCH_PACKET_OP_VSIM) {
+    uint32_t base_op = hdr->op_type & ~BATCH_PACKET_FLAG_FC_POINTERS;
+    int is_fc_packet = (hdr->op_type & BATCH_PACKET_FLAG_FC_POINTERS) != 0;
+
+    if (base_op == BATCH_PACKET_OP_VSIM) {
         ret = supernode_process_vsim_batch(ctx, (batch_vsim_packet_t *)hdr, &times);
-    } else if (hdr->op_type == BATCH_PACKET_OP_VEMB) {
-        ret = supernode_process_vemb_batch(ctx, (batch_packet_t *)hdr, &times);
+    } else if (base_op == BATCH_PACKET_OP_VEMB) {
+        if (is_fc_packet) {
+            ret = supernode_process_fc_vemb_batch(ctx, (fc_vemb_packet_t *)hdr, &times);
+        } else {
+            ret = supernode_process_vemb_batch(ctx, (batch_packet_t *)hdr, &times);
+        }
     } else {
         serverLog(LL_WARNING, "Unsupported batch packet op_type: %u", hdr->op_type);
         return C_ERR;

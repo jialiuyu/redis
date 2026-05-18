@@ -369,18 +369,15 @@ publish work, and return. Completion remains:
 supernode response ring -> result_thread -> vector_proxy_completion -> RedisModule_UnblockClient
 ```
 
-Initial FC MVP can still use the existing bucket mutex only around
-`ring_buffer_reserve()` / `ring_buffer_commit_write()`. That removes the
-per-request bucket append and active-heap operations from the hot path while
-avoiding a risky MPSC ring-buffer rewrite. A later ring-buffer patch can replace
-that last mutex with an MPSC reservation API.
+The clean FC proxy does not use the historical bucket mutex, active bucket heap,
+or batch scheduler. The combiner writes directly to the worker request ring.
 
 Proposed config:
 
 ```conf
-proxy-vemb-submit-mode adaptive   # batch | direct | adaptive | fc
-proxy-vemb-fc-slots 1024
-proxy-vemb-fc-max-scan 1024
+proxy-vemb-submit-mode fc
+proxy-vemb-fc-slots 0            # 0 uses the v2 default: 256
+proxy-vemb-fc-max-scan 0         # 0 scans up to slot_count
 ```
 
 Proposed metrics:
@@ -764,36 +761,37 @@ Completed:
    VEMB scratch max rows
    ```
 
-10. Phase 2 `VEMB` flat-combining MVP.
+10. Phase 2 `VEMB` flat-combining clean proxy.
    - `proxy-vemb-submit-mode fc` publishes VEMB work into per-worker FC boards
-     instead of appending every request to the bucket array.
+     instead of appending every request to the old bucket array.
    - Each board has hashed publication slots and a TTAS combiner lock.
-   - The combiner claims `PENDING` slots, writes one VEMB packet to the existing
-     worker request ring, and returns immediately after publishing work.
-   - Redis blocked-client completion still flows through the response ring and
-     result thread; command threads do not spin for UB completion.
-   - The existing bucket mutex remains only around `ring_buffer_reserve()` /
-     `ring_buffer_commit_write()` because the request ring is not MPSC-safe yet.
-   - The flush thread also drains pending FC slots so a request published after
-     a combiner scan cannot remain stuck without another request arriving.
+   - The combiner claims `PENDING` slots and writes one pointer-carrying
+     `fc_vemb_packet_t` directly to the worker request ring.
+   - The supernode worker writes results directly into `proxy_vector_request_t`
+     and calls `RedisModule_UnblockClient()`.
+   - Runtime VEMB no longer uses active buckets, proxy batch buckets, flush
+     scheduler/executor, response result thread, or completion dict lookup.
    - Added tunables:
 
    ```conf
    proxy-vemb-submit-mode batch | direct | adaptive | fc
-   proxy-vemb-fc-slots 0       # 0 uses workers_per_node * 4, minimum 64
+   proxy-vemb-fc-slots 0       # 0 uses the v2 default: 256, minimum 64
    proxy-vemb-fc-max-scan 0    # 0 scans all slots
    ```
 
    - `INFO`/UB stats now expose FC counters:
 
    ```text
-   VEMB FC published
-   VEMB FC combines
-   VEMB FC combined requests
-   VEMB FC slot busy
-   VEMB FC ring busy
-   VEMB FC fallbacks
-   Average VEMB FC batch size
+   FC Proxy Stats
+   Published
+   Combine rounds
+   Combined requests
+   Direct rounds
+   Batch rounds
+   Slot busy
+   Ring busy
+   Submit failures
+   Average FC batch size
    ```
 
 Verified locally:

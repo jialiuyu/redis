@@ -4,6 +4,9 @@
 #include <stdint.h>
 
 #define BATCH_PACKET_MAGIC 0xCAC0BEEF
+#define BATCH_PACKET_FLAG_FC_POINTERS UINT32_C(0x80000000)
+
+typedef struct proxy_vector_request proxy_vector_request_t;
 
 typedef enum batchPacketOpType {
     BATCH_PACKET_OP_VEMB = 1,
@@ -57,6 +60,14 @@ typedef struct batch_packet {
         uint64_t row_id;                /* UB row id */
     } requests[];
 } __attribute__((packed)) batch_packet_t;
+
+typedef struct fc_vemb_packet {
+    batch_request_header_t hdr;
+    struct {
+        uint64_t row_id;
+        proxy_vector_request_t *owner;  /* In-process Redis blocked request */
+    } requests[];
+} __attribute__((packed)) fc_vemb_packet_t;
 
 typedef struct batch_vsim_packet {
     batch_request_header_t hdr;
