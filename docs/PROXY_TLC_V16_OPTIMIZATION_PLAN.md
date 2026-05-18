@@ -765,8 +765,11 @@ Completed:
    - `proxy-vemb-submit-mode fc` publishes VEMB work into per-worker FC boards
      instead of appending every request to the old bucket array.
    - Each board has hashed publication slots and a TTAS combiner lock.
-   - The combiner claims `PENDING` slots and writes one pointer-carrying
-     `fc_vemb_packet_t` directly to the worker request ring.
+   - Redis command threads only publish `PENDING` slots and return after
+     blocking the client.
+   - The supernode worker drains its own FC board when `proxy-batch-limit` or
+     `proxy-time-limit-us` fires, claims `PENDING` slots, and writes one
+     pointer-carrying `fc_vemb_packet_t` to its worker request ring.
    - The supernode worker writes results directly into `proxy_vector_request_t`
      and calls `RedisModule_UnblockClient()`.
    - Runtime VEMB no longer uses active buckets, proxy batch buckets, flush
@@ -775,6 +778,7 @@ Completed:
 
    ```conf
    proxy-vemb-submit-mode batch | direct | adaptive | fc
+   proxy-vemb-fc-workers 0     # 0 uses all supernode workers
    proxy-vemb-fc-slots 0       # 0 uses the v2 default: 256, minimum 64
    proxy-vemb-fc-max-scan 0    # 0 scans all slots
    ```
@@ -783,6 +787,7 @@ Completed:
 
    ```text
    FC Proxy Stats
+   Active FC workers
    Published
    Combine rounds
    Combined requests

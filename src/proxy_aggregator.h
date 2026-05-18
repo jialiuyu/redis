@@ -53,4 +53,7 @@ int proxy_submit_vsim(RedisModuleCtx *ctx,
 /* 统计信息 */
 sds proxy_aggregator_get_stats(void);
 
+/* Called by SuperNode worker threads to publish pending FC slots. */
+int proxy_aggregator_drain_worker(int worker_id, uint64_t now_us);
+
 #endif /* __PROXY_AGGREGATOR_H */

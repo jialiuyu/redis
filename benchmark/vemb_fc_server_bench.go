@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -88,8 +89,11 @@ func readRESP(br *bufio.Reader) (redisValue, error) {
 			return redisValue{kind: prefix, str: ""}, nil
 		}
 		buf := make([]byte, n+2)
-		if _, err := br.Read(buf); err != nil {
+		if _, err := io.ReadFull(br, buf); err != nil {
 			return redisValue{}, err
+		}
+		if buf[n] != '\r' || buf[n+1] != '\n' {
+			return redisValue{}, fmt.Errorf("invalid RESP bulk terminator")
 		}
 		return redisValue{kind: prefix, str: string(buf[:n])}, nil
 	case '*':
@@ -292,8 +296,30 @@ func captureStats(addr string, timeout time.Duration, outDir, tag string) {
 func keepStatsLine(line string) bool {
 	patterns := []string{
 		"Proxy Aggregator",
+		"FC Proxy Stats",
+		"Workers:",
+		"Active FC workers",
+		"FC slots per worker",
+		"FC batch limit",
+		"FC max scan",
+		"FC time limit us",
+		"Published",
+		"Combine rounds",
+		"Combined requests",
+		"Direct rounds",
+		"Batch rounds",
+		"Slot busy",
+		"Ring busy",
+		"Submit failures",
+		"Pending total",
+		"Pending max",
+		"Request ring bytes",
+		"Average FC batch size",
 		"SuperNode",
+		"Total batches",
 		"Total requests",
+		"Avg batch latency",
+		"Avg batch size",
 		"Active buckets",
 		"Active bucket peak",
 		"Total flushes",

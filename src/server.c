@@ -2337,6 +2337,7 @@ void initServerConfig(void) {
     server.proxy.vemb_submit_mode = PROXY_VEMB_SUBMIT_MODE_ADAPTIVE;
     server.proxy.vemb_adaptive = 1;
     server.proxy.vemb_direct_gap_us = 20;
+    server.proxy.vemb_fc_workers = 0;
     server.proxy.vemb_fc_slots = 0;
     server.proxy.vemb_fc_max_scan = 0;
     server.pause_cron = 0;

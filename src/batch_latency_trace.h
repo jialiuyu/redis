@@ -62,6 +62,7 @@ typedef struct batch_latency_trace {
 
 int batch_latency_trace_init(void);
 void batch_latency_trace_cleanup(void);
+int batch_latency_trace_enabled(void);
 
 int batch_latency_trace_begin(uint64_t batch_id,
                               uint32_t op_type,

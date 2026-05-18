@@ -182,6 +182,10 @@ int batch_latency_trace_init(void) {
 void batch_latency_trace_cleanup(void) {
 }
 
+int batch_latency_trace_enabled(void) {
+    return 0;
+}
+
 int batch_latency_trace_begin(uint64_t batch_id,
                               uint32_t op_type,
                               uint32_t num_requests,
@@ -260,6 +264,8 @@ static void setup_proxy(size_t workers, size_t batch_limit) {
     test_runtime_reset_server();
     server.supernode_workers = (int)workers;
     server.proxy.batch_limit = batch_limit;
+    server.proxy.time_limit_us = 1;
+    server.proxy.vemb_fc_workers = workers;
     server.proxy.vemb_fc_slots = 0;
     server.proxy.vemb_fc_max_scan = 0;
     assert(proxy_aggregator_init(1) == C_OK);
@@ -270,6 +276,10 @@ static void test_fc_single_submit(void) {
 
     proxy_vector_request_t req = make_vemb(1, 0);
     assert(proxy_enqueue_vector_request("key", &req) == C_OK);
+    assert(req.batch_id == 0);
+    assert(atomic_load_explicit(&proxy->boards[0].pending_count, memory_order_acquire) == 1);
+
+    assert(proxy_aggregator_drain_worker(0, getMonotonicUs() + 2) == C_OK);
     assert(req.batch_id != 0);
 
     size_t payload_len = 0;
@@ -290,8 +300,6 @@ static void test_fc_single_submit(void) {
 
 static void test_fc_drain_combines_two(void) {
     setup_proxy(1, 32);
-    proxy_fc_board_t *board = &proxy->boards[0];
-    atomic_store_explicit(&board->combiner_lock, 1, memory_order_release);
 
     proxy_vector_request_t req1 = make_vemb(1, 0);
     proxy_vector_request_t req2 = make_vemb(2, 0);
@@ -299,10 +307,10 @@ static void test_fc_drain_combines_two(void) {
     assert(proxy_enqueue_vector_request("key", &req2) == C_OK);
     assert(req1.batch_id == 0);
     assert(req2.batch_id == 0);
+    proxy_fc_board_t *board = &proxy->boards[0];
     assert(atomic_load_explicit(&board->pending_count, memory_order_acquire) == 2);
 
-    atomic_store_explicit(&board->combiner_lock, 0, memory_order_release);
-    assert(proxy_fc_try_combine(board, board->slot_count) == C_OK);
+    assert(proxy_aggregator_drain_worker(0, getMonotonicUs() + 2) == C_OK);
     assert(req1.batch_id != 0);
     assert(req2.batch_id == req1.batch_id);
 

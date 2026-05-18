@@ -26,10 +26,11 @@ Redis VEMB command
   -> metadata lookup row_id
   -> RedisModule_BlockClient
   -> publish req pointer into per-worker FC board
-  -> winning combiner writes one fc_vemb_packet to worker request ring
   -> command returns
 
 Supernode worker
+  -> drains its FC board when batch limit or time limit is reached
+  -> writes one fc_vemb_packet to its own request ring
   -> reads fc_vemb_packet from request ring
   -> gathers UB vectors for all rows in packet
   -> writes result directly into proxy_vector_request_t
@@ -40,8 +41,9 @@ Redis reply callback
   -> frees req
 ```
 
-There is no proxy background flush thread. The Redis command thread that wins
-the TTAS combiner election does the publish work immediately.
+There is no proxy background flush thread and Redis command threads do not
+combine. Supernode workers drain their own FC boards, so requests can accumulate
+while the worker is busy on the previous packet.
 
 ## Packet Contract
 
@@ -64,7 +66,7 @@ completion map lookup.
 
 ## FC Board
 
-Each worker owns one FC board and one SPSC request ring.
+Each active worker owns one FC board and one SPSC request ring.
 
 ```c
 typedef struct proxy_fc_board {
@@ -88,31 +90,36 @@ Rules:
 - scratch arrays are allocated once at board init
 - hot combine path has no malloc/free
 - cleanup touches only claimed slots
-- single pending request claims the caller slot and does not scan the board
+- Redis command threads only publish slots; they do not write request-ring packets
 
 ## Combine Algorithm
 
 1. Publish request into a hashed empty slot.
-2. Try TTAS combiner election:
+2. Supernode worker polls its FC board.
+3. Drain when either:
+   - pending count reaches `proxy-batch-limit`
+   - oldest pending slot waited at least `proxy-time-limit-us`
+4. Try TTAS combiner election:
    - relaxed read first
    - CAS only when the lock looks free
-3. Claim the caller slot first.
-4. If more pending requests exist, scan from `scan_cursor`.
-5. Write one `fc_vemb_packet_t` to the worker request ring.
-6. Clear only claimed slots.
+5. Scan from `scan_cursor` and claim up to `proxy-batch-limit` pending slots.
+6. Write one `fc_vemb_packet_t` to the worker request ring.
+7. Clear only claimed slots.
 
-If the request ring is full, the publisher fails fast and the Redis command
-returns an enqueue error instead of falling back to old proxy batching.
+If the request ring is full, the worker keeps claimed slots pending and retries
+on a later loop. The Redis command has already returned after publishing its
+slot.
 
 ## Routing
 
 Initial clean routing is local-supernode only:
 
 ```text
-worker = row_id % supernode_workers
+worker = row_id % active_fc_workers
 ```
 
-This matches the current UB benchmark setup and keeps the data path compact.
+`active_fc_workers` defaults to `supernode_workers` and can be reduced with
+`proxy-vemb-fc-workers` to concentrate load enough to form batches.
 Multi-supernode routing can be added later as a separate FC-board sharding layer,
 not by reintroducing `proxy_router`.
 
@@ -123,6 +130,8 @@ Recommended server bench config:
 ```text
 proxy-vemb-submit-mode fc
 proxy-batch-limit 32
+proxy-time-limit-us 20
+proxy-vemb-fc-workers 16
 proxy-vemb-fc-slots 0
 proxy-vemb-fc-max-scan 0
 ```
@@ -138,9 +147,11 @@ this phase.
 ```text
 FC Proxy Stats
 Workers
+Active FC workers
 FC slots per worker
 FC batch limit
 FC max scan
+FC time limit us
 Total requests
 Published
 Combine rounds

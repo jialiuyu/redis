@@ -3229,6 +3229,7 @@ standardConfig static_configs[] = {
     createSizeTConfig("proxy-max-supernodes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.max_supernodes, 0, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("proxy-vemb-adaptive", NULL, MODIFIABLE_CONFIG, server.proxy.vemb_adaptive, 1, NULL, NULL),
     createULongLongConfig("proxy-vemb-direct-gap-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.vemb_direct_gap_us, 20, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("proxy-vemb-fc-workers", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_workers, 0, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("proxy-vemb-fc-slots", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_slots, 0, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("proxy-vemb-fc-max-scan", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_max_scan, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, PREFETCH_BATCH_MAX_SIZE, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, NULL),

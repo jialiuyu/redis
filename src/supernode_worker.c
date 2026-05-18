@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 
 #include "batch_latency_trace.h"
+#include "proxy_aggregator.h"
 #include "supernode_worker.h"
 #include "macro.h"
 #include "ring_buffer_mgr.h"
@@ -511,6 +512,16 @@ void *sve_worker_thread(void *arg) {
                 ring_buffer_commit_read(ctx->input_rb, payload_len);
             }
         } else {
+            uint64_t now_us = getMonotonicUs();
+            if (proxy_aggregator_drain_worker(ctx->worker_id, now_us) == C_OK &&
+                ring_buffer_peek(ctx->input_rb, &payload, &payload_len) == C_OK &&
+                payload_len > 0) {
+                idle_iters = 0;
+                if (sve_worker_process_batch(ctx, (batch_request_header_t *)payload) == C_OK) {
+                    ring_buffer_commit_read(ctx->input_rb, payload_len);
+                }
+                continue;
+            }
             sve_worker_idle_wait(&idle_iters);
         }
     }
@@ -720,9 +731,13 @@ sds supernode_get_stats(void) {
         stats = sdscatprintf(stats, "  Avg batch size: %.1f\n", (double)tr / tb);
     }
 
-    sds traces = batch_latency_trace_dump_recent("  Recent batch traces", 16);
-    stats = sdscatsds(stats, traces);
-    sdsfree(traces);
+    if (batch_latency_trace_enabled()) {
+        sds traces = batch_latency_trace_dump_recent("  Recent batch traces", 16);
+        stats = sdscatsds(stats, traces);
+        sdsfree(traces);
+    } else {
+        stats = sdscat(stats, "  Recent batch traces: disabled unless loglevel debug\n");
+    }
 
     stats = sdscat(stats, "  Scatter/Gather:\n");
     stats = sdscatprintf(stats, "    Gather ops: %llu  elements: %llu\n",

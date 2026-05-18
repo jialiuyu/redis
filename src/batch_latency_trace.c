@@ -25,6 +25,10 @@ typedef struct batch_latency_trace_registry {
 
 static batch_latency_trace_registry_t g_batch_traces = {0};
 
+int batch_latency_trace_enabled(void) {
+    return server.verbosity <= LL_DEBUG;
+}
+
 static const char *batch_latency_trace_proxy_path_name(uint32_t path) {
     switch (path) {
     case BATCH_TRACE_PROXY_PATH_BATCH:
@@ -166,6 +170,7 @@ int batch_latency_trace_begin(uint64_t batch_id,
                               uint64_t proxy_flush_us,
                               const batch_latency_trace_proxy_meta_t *proxy_meta) {
     RETURN_IF(batch_id == 0 || num_requests == 0, C_ERR);
+    if (!batch_latency_trace_enabled()) return C_OK;
     if (!g_batch_traces.initialized && batch_latency_trace_init() != C_OK) return C_ERR;
 
     pthread_mutex_lock(&g_batch_traces.lock);
@@ -191,6 +196,7 @@ int batch_latency_trace_record_supernode(uint64_t batch_id,
                                          uint64_t supernode_vector_load_ns,
                                          uint64_t supernode_compute_ns,
                                          uint64_t supernode_response_ns) {
+    if (!batch_latency_trace_enabled()) return C_OK;
     if (!g_batch_traces.initialized) return C_ERR;
 
     pthread_mutex_lock(&g_batch_traces.lock);
@@ -212,6 +218,7 @@ int batch_latency_trace_record_supernode(uint64_t batch_id,
 int batch_latency_trace_record_request_completion(uint64_t batch_id,
                                                   uint64_t result_queue_us,
                                                   uint64_t request_e2e_us) {
+    if (!batch_latency_trace_enabled()) return C_OK;
     if (!g_batch_traces.initialized) return C_ERR;
 
     batch_latency_trace_t snapshot = {0};

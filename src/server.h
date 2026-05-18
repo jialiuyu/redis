@@ -1879,6 +1879,7 @@ typedef struct proxyConfig {
     int vemb_submit_mode;         /* batch | direct | adaptive | fc */
     int vemb_adaptive;            /* auto direct/batch for VEMB */
     uint64_t vemb_direct_gap_us;  /* direct VEMB when recent arrivals are sparse */
+    size_t vemb_fc_workers;       /* 0 means all supernode workers */
     size_t vemb_fc_slots;         /* 0 means default */
     size_t vemb_fc_max_scan;      /* 0 means scan all FC slots */
 } proxyConfig;

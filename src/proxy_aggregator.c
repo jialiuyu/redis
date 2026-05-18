@@ -63,9 +63,11 @@ typedef struct proxy_aggregator {
     proxy_fc_board_t *boards;
     size_t num_boards;
     size_t workers_per_node;
+    size_t active_workers;
     size_t batch_limit;
     size_t fc_slots;
     size_t fc_max_scan;
+    uint64_t time_limit_us;
     atomic_uint_fast64_t next_batch_id;
 
     atomic_uint_fast64_t total_requests;
@@ -98,6 +100,11 @@ static size_t proxy_fc_effective_batch_limit(size_t slots) {
     return limit;
 }
 
+static uint64_t proxy_fc_effective_time_limit_us(void) {
+    return server.proxy.time_limit_us > 0 ?
+        server.proxy.time_limit_us : PROXY_TIME_LIMIT_US;
+}
+
 static inline size_t proxy_fc_slot_index(uint64_t request_id, size_t slot_count) {
     uint64_t x = request_id;
     x ^= x >> 33;
@@ -109,8 +116,8 @@ static inline size_t proxy_fc_slot_index(uint64_t request_id, size_t slot_count)
 }
 
 static inline size_t proxy_fc_worker_for_row(uint64_t row_id) {
-    return proxy && proxy->workers_per_node > 0 ?
-        (size_t)(row_id % proxy->workers_per_node) : 0;
+    return proxy && proxy->active_workers > 0 ?
+        (size_t)(row_id % proxy->active_workers) : 0;
 }
 
 static int proxy_fc_board_init(proxy_fc_board_t *board,
@@ -252,11 +259,31 @@ static int proxy_fc_publish_packet(proxy_fc_board_t *board,
     return C_OK;
 }
 
-static int proxy_fc_try_combine(proxy_fc_board_t *board, size_t preferred_slot) {
+static int proxy_fc_try_combine(proxy_fc_board_t *board,
+                                size_t preferred_slot,
+                                uint64_t now_us,
+                                int force) {
     RETURN_IF(!proxy || !board || !board->slots || !board->request_ring, C_ERR);
 
-    if (atomic_load_explicit(&board->pending_count, memory_order_acquire) == 0)
+    size_t pending_snapshot =
+        atomic_load_explicit(&board->pending_count, memory_order_acquire);
+    if (pending_snapshot == 0)
         return C_OK;
+    if (!force && pending_snapshot < proxy->batch_limit) {
+        uint64_t oldest_us = UINT64_MAX;
+        for (size_t i = 0; i < board->slot_count; i++) {
+            int state = atomic_load_explicit(&board->slots[i].state,
+                                             memory_order_acquire);
+            if (state != PROXY_FC_SLOT_PENDING) continue;
+            uint64_t publish_us = board->slots[i].publish_time_us;
+            if (publish_us > 0 && publish_us < oldest_us) oldest_us = publish_us;
+        }
+        if (oldest_us == UINT64_MAX ||
+            now_us < oldest_us ||
+            now_us - oldest_us < proxy->time_limit_us) {
+            return C_OK;
+        }
+    }
 
     if (atomic_load_explicit(&board->combiner_lock, memory_order_relaxed) != 0)
         return C_OK;
@@ -268,8 +295,6 @@ static int proxy_fc_try_combine(proxy_fc_board_t *board, size_t preferred_slot) 
         return C_OK;
     }
 
-    size_t pending_snapshot =
-        atomic_load_explicit(&board->pending_count, memory_order_acquire);
     proxy_vector_request_t **owners = board->scratch_owners;
     size_t *indexes = board->scratch_indexes;
     size_t count = 0;
@@ -297,7 +322,7 @@ static int proxy_fc_try_combine(proxy_fc_board_t *board, size_t preferred_slot) 
 
     int ret = C_OK;
     if (count > 0) {
-        ret = proxy_fc_publish_packet(board, owners, count, getMonotonicUs());
+        ret = proxy_fc_publish_packet(board, owners, count, now_us);
         if (ret == C_OK) {
             atomic_fetch_add_explicit(&proxy->combine_rounds, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&proxy->combined_requests, count,
@@ -339,7 +364,6 @@ static int proxy_fc_submit_vemb(proxy_vector_request_t *owner) {
 
     size_t start = proxy_fc_slot_index(owner->request_id, board->slot_count);
     proxy_fc_slot_t *slot = NULL;
-    size_t slot_index = board->slot_count;
     for (size_t i = 0; i < board->slot_count; i++) {
         size_t idx = (start + i) % board->slot_count;
         proxy_fc_slot_t *candidate = &board->slots[idx];
@@ -349,7 +373,6 @@ static int proxy_fc_submit_vemb(proxy_vector_request_t *owner) {
                                                     memory_order_acq_rel,
                                                     memory_order_relaxed)) {
             slot = candidate;
-            slot_index = idx;
             break;
         }
     }
@@ -374,24 +397,14 @@ static int proxy_fc_submit_vemb(proxy_vector_request_t *owner) {
                                                   memory_order_relaxed)) {
     }
 
-    int ret = proxy_fc_try_combine(board, slot_index);
-    if (ret != C_OK) {
-        int pending_state = PROXY_FC_SLOT_PENDING;
-        if (atomic_compare_exchange_strong_explicit(&slot->state, &pending_state,
-                                                    PROXY_FC_SLOT_EMPTY,
-                                                    memory_order_acq_rel,
-                                                    memory_order_relaxed)) {
-            atomic_fetch_sub_explicit(&board->pending_count, 1, memory_order_acq_rel);
-            slot->owner = NULL;
-            slot->row_id = 0;
-            slot->publish_time_us = 0;
-        }
-        atomic_fetch_add_explicit(&proxy->submit_failures, 1, memory_order_relaxed);
-        return C_ERR;
-    }
-    if (atomic_load_explicit(&board->pending_count, memory_order_acquire) > 0)
-        (void)proxy_fc_try_combine(board, board->slot_count);
     return C_OK;
+}
+
+int proxy_aggregator_drain_worker(int worker_id, uint64_t now_us) {
+    RETURN_IF(!proxy || worker_id < 0, C_ERR);
+    RETURN_IF((size_t)worker_id >= proxy->active_workers, C_OK);
+    proxy_fc_board_t *board = &proxy->boards[worker_id];
+    return proxy_fc_try_combine(board, board->slot_count, now_us, 0);
 }
 
 int proxy_aggregator_init(int num_supernodes) {
@@ -402,9 +415,15 @@ int proxy_aggregator_init(int num_supernodes) {
     RETURN_IF(!proxy, C_ERR);
     proxy->workers_per_node = server.supernode_workers > 0 ?
         (size_t)server.supernode_workers : (size_t)max((int)sysconf(_SC_NPROCESSORS_ONLN), 1);
+    proxy->active_workers = server.proxy.vemb_fc_workers > 0 ?
+        server.proxy.vemb_fc_workers : proxy->workers_per_node;
+    if (proxy->active_workers > proxy->workers_per_node)
+        proxy->active_workers = proxy->workers_per_node;
+    if (proxy->active_workers == 0) proxy->active_workers = 1;
     proxy->fc_slots = proxy_fc_effective_slots();
     proxy->batch_limit = proxy_fc_effective_batch_limit(proxy->fc_slots);
     proxy->fc_max_scan = server.proxy.vemb_fc_max_scan;
+    proxy->time_limit_us = proxy_fc_effective_time_limit_us();
     proxy->num_boards = proxy->workers_per_node;
 
     if (ring_buffer_mgr_init(proxy->workers_per_node, RING_BUFFER_SIZE) != C_OK)
@@ -442,8 +461,12 @@ int proxy_aggregator_init(int num_supernodes) {
     atomic_init(&proxy->next_batch_id, 0);
 
     serverLog(LL_NOTICE,
-              "FC-only VEMB proxy initialized: workers=%zu slots=%zu batch_limit=%zu",
-              proxy->workers_per_node, proxy->fc_slots, proxy->batch_limit);
+              "FC-only VEMB proxy initialized: workers=%zu active_workers=%zu slots=%zu batch_limit=%zu time_limit_us=%llu",
+              proxy->workers_per_node,
+              proxy->active_workers,
+              proxy->fc_slots,
+              proxy->batch_limit,
+              (unsigned long long)proxy->time_limit_us);
     return C_OK;
 
 failed:
@@ -617,9 +640,12 @@ sds proxy_aggregator_get_stats(void) {
 
     stats = sdscatprintf(stats, "FC Proxy Stats:\n");
     stats = sdscatprintf(stats, "  Workers: %zu\n", proxy->workers_per_node);
+    stats = sdscatprintf(stats, "  Active FC workers: %zu\n", proxy->active_workers);
     stats = sdscatprintf(stats, "  FC slots per worker: %zu\n", proxy->fc_slots);
     stats = sdscatprintf(stats, "  FC batch limit: %zu\n", proxy->batch_limit);
     stats = sdscatprintf(stats, "  FC max scan: %zu\n", proxy->fc_max_scan);
+    stats = sdscatprintf(stats, "  FC time limit us: %llu\n",
+                         (unsigned long long)proxy->time_limit_us);
     stats = sdscatprintf(stats, "  Total requests: %llu\n",
                          (unsigned long long)atomic_load_explicit(&proxy->total_requests,
                                                                   memory_order_relaxed));
@@ -656,8 +682,12 @@ sds proxy_aggregator_get_stats(void) {
                              (double)combined_requests / (double)combine_rounds);
     }
 
-    sds traces = batch_latency_trace_dump_recent("  Recent FC traces", 16);
-    stats = sdscatsds(stats, traces);
-    sdsfree(traces);
+    if (batch_latency_trace_enabled()) {
+        sds traces = batch_latency_trace_dump_recent("  Recent FC traces", 16);
+        stats = sdscatsds(stats, traces);
+        sdsfree(traces);
+    } else {
+        stats = sdscat(stats, "  Recent FC traces: disabled unless loglevel debug\n");
+    }
     return stats;
 }

@@ -140,8 +140,8 @@ static int ub_engine_init(void) {
 }
 
 static void ub_engine_cleanup(void) {
-    proxy_aggregator_shutdown();
     supernode_shutdown();
+    proxy_aggregator_shutdown();
     ub_cached_addr_space = NULL;  /* owned by ub_client, freed in ub_client_cleanup */
     ub_metadata_cleanup();
     ub_client_cleanup();
