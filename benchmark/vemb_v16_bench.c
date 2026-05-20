@@ -31,6 +31,7 @@ typedef struct bench_cfg {
     int hot_key_enabled;
     uint32_t hot_key_id;
     uint32_t timeout_ms;
+    int pin_threads;
 } bench_cfg_t;
 
 typedef struct worker_arg {
@@ -296,10 +297,12 @@ static int prefill(const bench_cfg_t *cfg, const vemb_v16_channel_desc_t *desc,
 static void *worker_main(void *arg) {
     worker_arg_t *w = arg;
 #ifdef __linux__
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET((w->tid * 2 + 3) % 64, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (w->cfg.pin_threads) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET((w->tid * 2 + 3) % 64, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    }
 #endif
 
     vemb_v16_req_t req;
@@ -468,8 +471,9 @@ static int run_once(bench_cfg_t cfg) {
         fprintf(stderr, "failed to open prefill rings\n");
         return 1;
     }
-    printf("[setup] mode=%s dim=%u prefill=%u ops/thread=%u threads=%d\n",
-           mode_name(cfg.mode), cfg.dim, cfg.prefill, cfg.ops, cfg.threads);
+    printf("[setup] mode=%s dim=%u prefill=%u ops/thread=%u threads=%d pin=%s\n",
+           mode_name(cfg.mode), cfg.dim, cfg.prefill, cfg.ops, cfg.threads,
+           cfg.pin_threads ? "yes" : "no");
     if (cfg.prefill && cfg.mode != MODE_PING &&
         prefill(&cfg, &pre_desc, pre_req, pre_resp) != 0) {
         fprintf(stderr, "prefill failed\n");
@@ -619,9 +623,14 @@ int main(int argc, char **argv) {
             cfg.hot_key_enabled = 1;
             cfg.hot_key_id = (uint32_t)strtoul(argv[++i], NULL, 10);
         }
+        else if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
+            const char *v = argv[++i];
+            cfg.pin_threads = !strcmp(v, "yes") || !strcmp(v, "1") ||
+                              !strcmp(v, "true");
+        }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--threads N] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vadd-inline]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--threads N] [--pin yes|no] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vadd-inline]\n", argv[0]);
             return 0;
         }
     }
@@ -644,7 +653,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < thread_count; i++) {
         bench_cfg_t run_cfg = cfg;
         run_cfg.threads = thread_list[i];
-        ret |= run_once(run_cfg);
+        ret = run_once(run_cfg);
+        if (ret != 0) break;
     }
     return ret;
 }
