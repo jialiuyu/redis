@@ -45,6 +45,8 @@ typedef struct worker_arg {
     uint64_t ok;
     uint64_t fail;
     uint64_t read_bytes;
+    uint64_t vemb_sent;
+    uint64_t vadd_sent;
     uint64_t request_publish_spins;
     uint64_t response_empty_polls;
     uint64_t ns;
@@ -57,6 +59,7 @@ enum {
     MODE_VEMB_READ_VECTOR = 2,
     MODE_VADD_INLINE = 3,
     MODE_VEMB_SUPERNODE_READ = 4,
+    MODE_MIXED_80R20W = 5,
 };
 
 static uint32_t g_control_timeout_ms = 10000;
@@ -65,6 +68,8 @@ typedef struct pending_req {
     uint32_t op_index;
     uint32_t key_id;
 } pending_req_t;
+
+static const char *mode_name(int mode);
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -367,7 +372,10 @@ static void *worker_main(void *arg) {
             if (w->cfg.hot_key_enabled) key_id = w->cfg.hot_key_id;
             size_t req_len = vemb_v16_req_handle_len();
             int send_failed = 0;
-            uint8_t op = w->cfg.mode == MODE_VEMB_SUPERNODE_READ ?
+            int mixed_write = w->cfg.mode == MODE_MIXED_80R20W &&
+                              (i % 5u) == 0;
+            uint8_t op = (w->cfg.mode == MODE_VEMB_SUPERNODE_READ ||
+                          w->cfg.mode == MODE_MIXED_80R20W) ?
                 VEMB_V16_OP_VEMB_SUPERNODE_READ : VEMB_V16_OP_VEMB_HANDLE;
             if (w->cfg.mode == MODE_PING) {
                 memset(&req, 0, sizeof(req));
@@ -381,23 +389,26 @@ static void *worker_main(void *arg) {
                             w->tid, i);
                     send_failed = 1;
                 }
-            } else if (w->cfg.mode == MODE_VADD_INLINE) {
-                make_key(key, sizeof(key), global_id + 100000000u);
+            } else if (w->cfg.mode == MODE_VADD_INLINE || mixed_write) {
+                uint32_t write_key_id = mixed_write ? key_id : global_id + 100000000u;
+                make_key(key, sizeof(key), write_key_id);
                 prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1,
                             w->desc.channel_id, key, w->cfg.dim);
                 fill_vector(req.vector, w->cfg.dim, global_id);
                 req_len = vemb_v16_req_inline_len(req.vector_bytes);
+                w->vadd_sent++;
                 if (send_req(w->req_ring, &req, req_len,
                              &w->request_publish_spins,
                              w->cfg.timeout_ms) != 0) {
-                    fprintf(stderr, "worker %d request publish timeout at op=%u mode=vadd-inline\n",
-                            w->tid, i);
+                    fprintf(stderr, "worker %d request publish timeout at op=%u mode=%s\n",
+                            w->tid, i, mode_name(w->cfg.mode));
                     send_failed = 1;
                 }
             } else {
                 make_key(key, sizeof(key), key_id);
                 prepare_req(&req, op, i + 1, w->desc.channel_id, key,
                             w->cfg.dim);
+                w->vemb_sent++;
                 if (send_req(w->req_ring, &req, req_len,
                              &w->request_publish_spins,
                              w->cfg.timeout_ms) != 0) {
@@ -470,6 +481,7 @@ static int mode_from_string(const char *s) {
     if (!strcmp(s, "vemb-read-vector")) return MODE_VEMB_READ_VECTOR;
     if (!strcmp(s, "vemb-supernode-read")) return MODE_VEMB_SUPERNODE_READ;
     if (!strcmp(s, "vadd-inline")) return MODE_VADD_INLINE;
+    if (!strcmp(s, "mixed-80r20w")) return MODE_MIXED_80R20W;
     return -1;
 }
 
@@ -480,6 +492,7 @@ static const char *mode_name(int mode) {
     case MODE_VEMB_READ_VECTOR: return "vemb-read-vector";
     case MODE_VEMB_SUPERNODE_READ: return "vemb-supernode-read";
     case MODE_VADD_INLINE: return "vadd-inline";
+    case MODE_MIXED_80R20W: return "mixed-80r20w";
     default: return "unknown";
     }
 }
@@ -654,13 +667,15 @@ static int run_once(bench_cfg_t cfg) {
     }
     uint64_t wall = now_ns() - start;
 
-    uint64_t ok = 0, fail = 0, read_bytes = 0;
+    uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0, vadd_sent = 0;
     uint64_t request_publish_spins = 0, response_empty_polls = 0;
     uint64_t max_ns = 0;
     for (int i = 0; i < cfg.threads; i++) {
         ok += args[i].ok;
         fail += args[i].fail;
         read_bytes += args[i].read_bytes;
+        vemb_sent += args[i].vemb_sent;
+        vadd_sent += args[i].vadd_sent;
         request_publish_spins += args[i].request_publish_spins;
         response_empty_polls += args[i].response_empty_polls;
         if (args[i].ns > max_ns) max_ns = args[i].ns;
@@ -679,6 +694,12 @@ static int run_once(bench_cfg_t cfg) {
     printf("[client] request_publish_spins=%llu response_empty_polls=%llu\n",
            (unsigned long long)request_publish_spins,
            (unsigned long long)response_empty_polls);
+    if (vemb_sent || vadd_sent) {
+        printf("[client] sent_vemb=%llu sent_vadd=%llu write_ratio=%.2f%%\n",
+               (unsigned long long)vemb_sent,
+               (unsigned long long)vadd_sent,
+               (double)vadd_sent * 100.0 / (double)(vemb_sent + vadd_sent));
+    }
     for (int i = 0; i < cfg.threads; i++) {
         close_channel(cfg.socket_path, args[i].desc.channel_id);
         if (args[i].req_ring) {
@@ -736,14 +757,20 @@ int main(int argc, char **argv) {
             cfg.hot_key_enabled = 1;
             cfg.hot_key_id = (uint32_t)strtoul(argv[++i], NULL, 10);
         }
-        else if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
-            const char *v = argv[++i];
-            cfg.pin_threads = !strcmp(v, "yes") || !strcmp(v, "1") ||
-                              !strcmp(v, "true");
+        else if (!strcmp(argv[i], "--pin")) {
+            cfg.pin_threads = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                const char *v = argv[++i];
+                cfg.pin_threads = !strcmp(v, "yes") || !strcmp(v, "1") ||
+                                  !strcmp(v, "true") || !strcmp(v, "on");
+            }
+        }
+        else if (!strcmp(argv[i], "--no-pin")) {
+            cfg.pin_threads = 0;
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N] [--pin yes|no] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-supernode-read|vadd-inline]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
             return 0;
         }
     }
