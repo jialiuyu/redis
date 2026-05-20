@@ -23,7 +23,47 @@
 #include "three_layer_cache_ub.h"
 #include "hash_strategy.h"
 #include "eviction_strategy.h"
-#include "placement_strategy.h"
+/* === BASELINE placement (inline, was placement_strategy.h) === */
+static inline const char *placement_strategy_name(void) { return "BASELINE"; }
+
+static inline int placement_insert_hot(hot_index_t *table, uint64_t key, int32_t warm_idx, uint32_t mask) {
+    uint32_t slots[HASH_MAX_PROBES];
+    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++)
+        slots[i] = hash_probe(key, mask, (int)i);
+    for (int i = 0; i < HASH_MAX_PROBES; i++) {
+        hot_index_t cur = table[slots[i]];
+        if (cur.warm_idx < 0 || cur.key == key) {
+            if (cur.key == key) eviction_on_put_hit(slots[i]);
+            table[slots[i]] = (hot_index_t){key, warm_idx, 0};
+            return i;
+        }
+    }
+    uint32_t victim = eviction_select_victim_slots(slots, HASH_MAX_PROBES);
+    table[victim] = (hot_index_t){key, warm_idx, 0};
+    return HASH_MAX_PROBES;
+}
+
+static inline int32_t placement_lookup_hot(hot_index_t *table, uint64_t key, uint32_t mask,
+                                           int *out_probe_bucket, int *out_collided) {
+    int32_t warm_idx = -1;
+    int collided = 0;
+    for (int j = 0; j < HASH_MAX_PROBES; j++) {
+        uint32_t s = hash_probe(key, mask, j);
+        hot_index_t e = table[s];
+        if (e.warm_idx >= 0 && e.key == key) {
+            warm_idx = e.warm_idx;
+            eviction_on_get(s);
+            if (out_probe_bucket) *out_probe_bucket = j;
+            if (out_collided) *out_collided = collided;
+            return warm_idx;
+        }
+        if (e.warm_idx >= 0) collided = 1;
+        if (e.warm_idx < 0) break;
+    }
+    if (out_probe_bucket) *out_probe_bucket = HASH_MAX_PROBES;
+    if (out_collided) *out_collided = collided;
+    return -1;
+}
 
 /* Cache module — standalone, no SVE2/HA deps */
 extern int  fc_cache_init(three_layer_cache_t *c);
@@ -50,7 +90,6 @@ extern int  fc_cache_cold_append(cold_layer_t *c, uint64_t key, const void *val)
  * Lookup uses NEON (ARM) or SSE2 (x86) parallel compare for zero-memory
  * hit/miss determination.
  */
-#ifdef ENABLE_L0_CACHE
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #elif defined(__x86_64__)
@@ -58,7 +97,7 @@ extern int  fc_cache_cold_append(cold_layer_t *c, uint64_t key, const void *val)
 #endif
 
 #ifndef L0_CACHE_SIZE
-#define L0_CACHE_SIZE 8
+#define L0_CACHE_SIZE 64
 #endif
 
 static inline uint16_t hash_sig16(uint64_t key) {
@@ -207,10 +246,6 @@ static volatile uint64_t g_l0_misses;
 #define L0_HIT_INC()  ((void)0)
 #define L0_MISS_INC() ((void)0)
 #endif /* ENABLE_COLLISION_STATS */
-#else
-#define L0_HIT_INC()  ((void)0)
-#define L0_MISS_INC() ((void)0)
-#endif /* ENABLE_L0_CACHE */
 
 #define UDS_PATH       "/tmp/tlc_hash_bench.sock"
 #define MAX_SLOTS      64
@@ -425,7 +460,6 @@ static void *channel_poll(void *arg) {
     uint8_t req_buf[AERON_MSG_SIZE];
     uint8_t resp_buf[8];
 
-#ifdef ENABLE_L0_CACHE
     fprintf(stderr, "[ch%d] L0 cache init\n", ch->id);
     l0_warmup_cache_t warmup_cache;
     memset(&warmup_cache, 0, sizeof(warmup_cache));
@@ -434,7 +468,6 @@ static void *channel_poll(void *arg) {
     bool l0_frozen = false;
     uint64_t local_get_count = 0;
     uint64_t local_l0_hits = 0, local_l0_misses = 0;
-#endif
 
     while (g_running && ch->active) {
         int rlen = aeron_poll(ch->req, req_buf, sizeof(req_buf));
@@ -446,7 +479,6 @@ static void *channel_poll(void *arg) {
             uint64_t key; memcpy(&key, req_buf + 1, 8);
             int32_t warm_idx = -1;
 
-#ifdef ENABLE_L0_CACHE
             if (l0_frozen) {
                 warm_idx = l0_lookup_frozen(&frozen_cache, key);
             } else if (local_get_count < L0_WARMUP_OPS) {
@@ -468,13 +500,10 @@ static void *channel_poll(void *arg) {
             }
             L0_MISS_INC();
             local_l0_misses++;
-#endif
             warm_idx = fc_get(ch->id, key);
-#ifdef ENABLE_L0_CACHE
             if (!l0_frozen && warm_idx >= 0) {
                 l0_warmup_promote(&warmup_cache, key, warm_idx);
             }
-#endif
             if (warm_idx >= 0) {
                 resp_buf[0] = 0x00;
                 memcpy(resp_buf + 1, &warm_idx, 4);
@@ -501,11 +530,9 @@ static void *channel_poll(void *arg) {
                 __asm__ volatile("" ::: "memory");
         }
     }
-#ifdef ENABLE_L0_CACHE
     fprintf(stderr, "[ch%d] L0 local hits=%lu misses=%lu frozen_valid=%lu warmup_valid=%lu\n",
             ch->id, (unsigned long)local_l0_hits, (unsigned long)local_l0_misses,
             (unsigned long)frozen_cache.valid, (unsigned long)warmup_cache.count);
-#endif
     return NULL;
 }
 
@@ -574,10 +601,8 @@ static void *io_thread(void *arg) {
                 atomic_store(&g_total_warm_get, 0);
 #endif
 #ifdef ENABLE_COLLISION_STATS
-#ifdef ENABLE_L0_CACHE
                 g_l0_hits = 0;
                 g_l0_misses = 0;
-#endif
 #endif
                 uint8_t ok = 0; write_full(fd, &ok, 1); break;
             }
@@ -625,17 +650,11 @@ static void *io_thread(void *arg) {
                 uint64_t warm_occ = (uint64_t)atomic_load(&g_cache.warm.count);
                 if (warm_occ > g_cache.warm.capacity) warm_occ = g_cache.warm.capacity;
                 write_full(fd, &warm_occ, 8);
-#ifdef ENABLE_L0_CACHE
                 uint64_t l0_h = g_l0_hits;
                 uint64_t l0_m = g_l0_misses;
                 fprintf(stderr, "[DUMP] L0 hits=%lu misses=%lu\n", (unsigned long)l0_h, (unsigned long)l0_m);
                 write_full(fd, &l0_h, 8);
                 write_full(fd, &l0_m, 8);
-#else
-                uint64_t zero64 = 0;
-                write_full(fd, &zero64, 8);
-                write_full(fd, &zero64, 8);
-#endif
 #else
                 uint32_t sid = HASH_STRATEGY;
                 write_full(fd, &sid, 4);
@@ -675,11 +694,7 @@ int main(void) {
     printf("Strategy: %s (id=%d)  Probes: %d  Placement: %s  Eviction: %s\n",
         hash_strategy_name(), HASH_STRATEGY, HASH_MAX_PROBES,
         placement_strategy_name(), eviction_strategy_name());
-#ifdef ENABLE_L0_CACHE
     printf("L0 Cache: ENABLED  size=%d\n", L0_CACHE_SIZE);
-#else
-    printf("L0 Cache: DISABLED\n");
-#endif
 #ifdef ENABLE_COLLISION_STATS
     printf("Collision stats: ON\n");
 #else

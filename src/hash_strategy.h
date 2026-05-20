@@ -15,12 +15,9 @@
 #include <stdint.h>
 
 #define HASH_STRATEGY_V1_LINEAR    1
-#define HASH_STRATEGY_V2_ORIGINAL  2
-#define HASH_STRATEGY_V2_FIXED     3
-#define HASH_STRATEGY_V2_FULL64    4
-#define HASH_STRATEGY_V3_ODDEVEN   5
-#define HASH_STRATEGY_V4_CRC32     6
-#define HASH_STRATEGY_V5_CRC32FIB  7
+#define HASH_STRATEGY_V2_FIXED     2
+#define HASH_STRATEGY_V2_FULL64    3
+#define HASH_STRATEGY_V4_CRC32     4
 
 #ifndef HASH_STRATEGY
 #define HASH_STRATEGY HASH_STRATEGY_V1_LINEAR
@@ -77,37 +74,6 @@ static inline uint32_t hash_primary_alt(uint64_t key, uint32_t mask) {
 
 static inline uint32_t hash_probe_alt(uint64_t key, uint32_t mask, int probe_idx) {
     return (hash_primary_alt(key, mask) + (uint32_t)probe_idx) & mask;
-}
-
-/* ============================================================
- * Strategy: V2_ORIGINAL — Murmur3 on high-32 (BUGGY for small keys)
- * ============================================================ */
-#elif HASH_STRATEGY == HASH_STRATEGY_V2_ORIGINAL
-
-static inline const char *hash_strategy_name(void) { return "V2_ORIGINAL"; }
-
-static inline uint32_t hash_primary(uint64_t key, uint32_t mask) {
-    uint32_t hi = (uint32_t)(key >> 32);
-    return _hs_murmur3_mix32(hi) & mask;
-}
-
-static inline uint32_t hash_probe(uint64_t key, uint32_t mask, int probe_idx) {
-    uint32_t primary = hash_primary(key, mask);
-    uint32_t lo = (uint32_t)(key & 0xFFFFFFFF);
-    uint32_t stride = _hs_fib_stride(lo, mask);
-    return (primary + (uint32_t)probe_idx * stride) & mask;
-}
-
-static inline uint32_t hash_primary_alt(uint64_t key, uint32_t mask) {
-    uint32_t hi = (uint32_t)(key >> 32);
-    return _hs_murmur3_mix32_alt(hi) & mask;
-}
-
-static inline uint32_t hash_probe_alt(uint64_t key, uint32_t mask, int probe_idx) {
-    uint32_t primary = hash_primary_alt(key, mask);
-    uint32_t lo = (uint32_t)(key & 0xFFFFFFFF);
-    uint32_t stride = _hs_fib_stride(lo, mask);
-    return (primary + (uint32_t)probe_idx * stride) & mask;
 }
 
 /* ============================================================
@@ -171,42 +137,6 @@ static inline uint32_t hash_probe_alt(uint64_t key, uint32_t mask, int probe_idx
 }
 
 /* ============================================================
- * Strategy: V3_ODDEVEN — odd-bit primary, even-bit stride
- *
- * key = 64 bits, split by bit position:
- *   primary ← Murmur3(key & 0xAAAAAAAAAAAAAAAA)  (bits 1,3,5,...)
- *   stride  ← FibHash(key & 0x5555555555555555)  (bits 0,2,4,...)
- *
- * For small keys (< 2^32), both halves carry information from the
- * active bits, unlike V2_FIXED where hi32 = 0 kills the stride.
- * ============================================================ */
-#elif HASH_STRATEGY == HASH_STRATEGY_V3_ODDEVEN
-
-static inline const char *hash_strategy_name(void) { return "V3_ODDEVEN"; }
-
-static inline uint32_t hash_primary(uint64_t key, uint32_t mask) {
-    return _hs_murmur3_mix64(key & 0xAAAAAAAAAAAAAAAAULL) & mask;
-}
-
-static inline uint32_t hash_probe(uint64_t key, uint32_t mask, int probe_idx) {
-    uint32_t primary = hash_primary(key, mask);
-    uint32_t even = (uint32_t)(key & 0x5555555555555555ULL);
-    uint32_t stride = _hs_fib_stride(even, mask);
-    return (primary + (uint32_t)probe_idx * stride) & mask;
-}
-
-static inline uint32_t hash_primary_alt(uint64_t key, uint32_t mask) {
-    return _hs_murmur3_mix64_alt(key & 0xAAAAAAAAAAAAAAAAULL) & mask;
-}
-
-static inline uint32_t hash_probe_alt(uint64_t key, uint32_t mask, int probe_idx) {
-    uint32_t primary = hash_primary_alt(key, mask);
-    uint32_t even = (uint32_t)(key & 0x5555555555555555ULL);
-    uint32_t stride = _hs_fib_stride(even ^ 0x9e3779b9U, mask);
-    return (primary + (uint32_t)probe_idx * stride) & mask;
-}
-
-/* ============================================================
  * Strategy: V4_CRC32 — Hardware CRC32, stride=1
  *
  * Uses ARM CRC32 instruction (__crc32d) for single-cycle hashing.
@@ -251,59 +181,8 @@ static inline uint32_t hash_probe_alt(uint64_t key, uint32_t mask, int probe_idx
     return (hash_primary_alt(key, mask) + (uint32_t)probe_idx) & mask;
 }
 
-/* ============================================================
- * Strategy: V5_CRC32FIB — Hardware CRC32 primary, fib stride
- *
- * Same fast CRC32 hash as V4_CRC32, but uses Fibonacci hash for
- * secondary probe stride (from key low bits). Better distribution
- * for clock eviction multi-probe scenarios.
- * ============================================================ */
-#elif HASH_STRATEGY == HASH_STRATEGY_V5_CRC32FIB
-
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-#include <arm_acle.h>
-static inline uint32_t _hs_crc32fib_hash(uint64_t key) {
-    return __crc32d(0xFFFFFFFF, key);
-}
 #else
-static inline uint32_t _hs_crc32fib_hash(uint64_t key) {
-    uint64_t crc = 0xFFFFFFFF;
-    for (int i = 0; i < 8; i++) {
-        crc ^= (uint64_t)((key >> (i * 8)) & 0xFF) << 56;
-        for (int j = 0; j < 8; j++) {
-            crc = (crc << 1) ^ ((crc >> 63) ? 0x42F0E1EBA9EA3693ULL : 0);
-        }
-    }
-    return (uint32_t)(crc ^ 0xFFFFFFFF);
-}
-#endif
-
-static inline const char *hash_strategy_name(void) { return "V5_CRC32FIB"; }
-
-static inline uint32_t hash_primary(uint64_t key, uint32_t mask) {
-    return _hs_crc32fib_hash(key) & mask;
-}
-
-static inline uint32_t hash_probe(uint64_t key, uint32_t mask, int probe_idx) {
-    uint32_t primary = hash_primary(key, mask);
-    uint32_t lo = (uint32_t)(key & 0xFFFFFFFF);
-    uint32_t stride = _hs_fib_stride(lo, mask);
-    return (primary + (uint32_t)probe_idx * stride) & mask;
-}
-
-static inline uint32_t hash_primary_alt(uint64_t key, uint32_t mask) {
-    return _hs_crc32fib_hash(key ^ 0x9e3779b97f4a7c15ULL) & mask;
-}
-
-static inline uint32_t hash_probe_alt(uint64_t key, uint32_t mask, int probe_idx) {
-    uint32_t primary = hash_primary_alt(key, mask);
-    uint32_t lo = (uint32_t)(key & 0xFFFFFFFF);
-    uint32_t stride = _hs_fib_stride(lo ^ 0x9e3779b9U, mask);
-    return (primary + (uint32_t)probe_idx * stride) & mask;
-}
-
-#else
-#error "Unknown HASH_STRATEGY. Use 1..7"
+#error "Unknown HASH_STRATEGY. Use 1..4"
 #endif
 
 #endif /* __HASH_STRATEGY_H */

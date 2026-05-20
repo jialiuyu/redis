@@ -19,7 +19,6 @@
 
 #define EVICTION_BLIND  0
 #define EVICTION_CLOCK  1
-#define EVICTION_RR     2
 
 #ifndef EVICTION_STRATEGY
 #define EVICTION_STRATEGY EVICTION_BLIND
@@ -107,40 +106,8 @@ static inline void eviction_destroy(void) {
     _clock_ref_bits = NULL;
 }
 
-/* ============================================================
- * Strategy: RR — Round-Robin across probe positions
- * No per-slot state, just cycles 0→1→2→3→0...
- * ============================================================ */
-#elif EVICTION_STRATEGY == EVICTION_RR
-
-static uint32_t _rr_counter;
-
-static inline const char *eviction_strategy_name(void) { return "RR"; }
-
-static inline int eviction_init(size_t capacity) {
-    (void)capacity; _rr_counter = 0; return 0;
-}
-
-static inline void eviction_on_get(uint32_t slot) { (void)slot; }
-
-static inline void eviction_on_put_hit(uint32_t slot) { (void)slot; }
-
-static inline uint32_t eviction_select_victim_slots(const uint32_t *slots, uint32_t n) {
-    uint32_t probe_idx = (_rr_counter++) % n;
-    return slots[probe_idx];
-}
-
-static inline uint32_t eviction_select_victim(uint64_t key, uint32_t mask) {
-    uint32_t slots[HASH_MAX_PROBES];
-    for (uint32_t i = 0; i < HASH_MAX_PROBES; i++)
-        slots[i] = hash_probe(key, mask, (int)i);
-    return eviction_select_victim_slots(slots, HASH_MAX_PROBES);
-}
-
-static inline void eviction_destroy(void) {}
-
 #else
-#error "Unknown EVICTION_STRATEGY. Use 0 (BLIND), 1 (CLOCK), or 2 (RR)"
+#error "Unknown EVICTION_STRATEGY. Use 0 (BLIND) or 1 (CLOCK)"
 #endif
 
 #endif /* __EVICTION_STRATEGY_H */

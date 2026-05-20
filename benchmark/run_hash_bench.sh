@@ -22,23 +22,34 @@ if [ ! -x "$BENCH" ]; then
 fi
 fi
 # Timeout for each bench run (seconds)
-BENCH_TIMEOUT=300
+BENCH_TIMEOUT=600
 INCLUDE_V16=${INCLUDE_V16:-0}
 
-HASHES=(v1 v2fixed v2full64 crc32 crc32fib)
+HASHES=(v1 v2fixed v2full64 crc32)
 EVICTIONS=(blind clock)
-PLACEMENTS=("baseline:" "hopscotch:_hs")
+PLACEMENTS=("baseline:")
 
 declare -A HASH_SUFFIX=(
     [v1]="" [v2fixed]="" [v2full64]=""
-    [crc32]="_crc" [crc32fib]="_cf"
+    [crc32]="_crc"
 )
+
+# For compound suffixes: when placement has its own suffix (e.g. _hs),
+# the hash-specific baseline suffix (_crc) is omitted.
+build_label() {
+    local hash=$1 evict=$2 hsfx=$3 psfx=$4
+    if [ -n "$psfx" ]; then
+        echo "${hash}_${evict}${psfx}"
+    else
+        echo "${hash}_${evict}${hsfx}"
+    fi
+}
 
 mkdir -p benchmark/results
 
 echo "=== Hash Bench: ${OPS} ops, ${THREADS} threads, max-key ${MAX_KEY}, ${RW}R/${100-RW}W ==="
 echo "csv: ${CSV}"
-echo "hash,eviction,ops,threads,max_key,qps,mops,avg_ns,get_miss,hits_1probe,hits_2probe,hits_3probe,hits_4probe,misses,warm_1probe,warm_miss,hot_util%,warm_util%,l0_hits,l0_misses,l0_hit_pct" > "$CSV"
+echo "strategy,eviction,variant,ops,threads,max_key,qps,mops,avg_ns,get_miss,hits_1probe,hits_2probe,hits_3probe,hits_4probe,misses,warm_1probe,warm_miss,hot_util%,warm_util%,l0_hits,l0_misses,l0_hit_pct" > "$CSV"
 
 kill_bench() {
     ps -eo pid=,args= | awk '/tlc_hash_bench/ && $0 !~ /awk/ {print $1}' | xargs -r kill -9 2>/dev/null || true
@@ -60,18 +71,24 @@ cleanup() {
 
 trap cleanup EXIT INT TERM HUP
 
-run_combo() {
+run_variant() {
     local hash=$1
     local evict=$2
     local placement_name=$3
     local placement_suffix=$4
+    local variant=$5
     local hsfx="${HASH_SUFFIX[$hash]}"
-    local label="${hash}_${evict}${hsfx}${placement_suffix}"
+    local label=$(build_label "$hash" "$evict" "$hsfx" "$placement_suffix")
 
     echo ""
-    echo "=== ${hash}:${evict}:${placement_name} ==="
+    echo "=== ${hash}:${evict}:${placement_name}:${variant} ==="
 
-    local server="${SRC_DIR}/tlc_hash_fc_server_${label}_stats"
+    local server
+    if [ "$variant" = "stats" ]; then
+        server="${SRC_DIR}/tlc_hash_fc_server_${label}_stats_l0w_64"
+    else
+        server="${SRC_DIR}/tlc_hash_fc_server_${label}_l0w_64"
+    fi
     if [ ! -x "$server" ]; then
         echo "  SKIP (no binary: ${server})"
         return 0
@@ -88,7 +105,7 @@ run_combo() {
     fi
 
     echo "  Running bench (${OPS} ops, timeout=${BENCH_TIMEOUT}s)..."
-    timeout ${BENCH_TIMEOUT} ${BENCH} --ops ${OPS} --threads ${THREADS} --max-key ${MAX_KEY} --fill ${FILL} --rw ${RW} --zipf --eviction "${evict}" --csv "${CSV}" 2>&1
+    timeout ${BENCH_TIMEOUT} ${BENCH} --ops ${OPS} --threads ${THREADS} --max-key ${MAX_KEY} --fill ${FILL} --rw ${RW} --zipf --csv "${CSV}" --csv-tag "${variant}" 2>&1
     local rc=$?
     if [ $rc -eq 124 ]; then
         echo "  TIMEOUT after ${BENCH_TIMEOUT}s — killing"
@@ -96,8 +113,17 @@ run_combo() {
         echo "  BENCH exit code: $rc"
     fi
 
-    echo "  Done ${hash}:${evict}:${placement_name}"
+    echo "  Done ${hash}:${evict}:${placement_name}:${variant}"
     kill_server
+}
+
+run_combo() {
+    local hash=$1
+    local evict=$2
+    local placement_name=$3
+    local placement_suffix=$4
+    run_variant "$hash" "$evict" "$placement_name" "$placement_suffix" "plain"
+    run_variant "$hash" "$evict" "$placement_name" "$placement_suffix" "stats"
 }
 
 for hash in "${HASHES[@]}"; do
