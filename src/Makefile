@@ -576,9 +576,9 @@ ifeq ($(USE_SVE),yes)
 VEMB_V16_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
 endif
 
-vemb_v16_server: vemb_v16_server.c vemb_v16_proxy.c vemb_v16_supernode.c vemb_v16_table.c sve_operation.c zmalloc.c monotonic.c redisassert.c vemb_v16_proxy.h vemb_v16_protocol.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_supernode.h vemb_v16_table.h sve_operation.h aeron_ipc.h
+vemb_v16_server: vemb_v16_server.c vemb_v16_proxy.c vemb_v16_supernode.c vemb_v16_table.c vemb_v16_log.c sve_operation.c zmalloc.c monotonic.c redisassert.c vemb_v16_proxy.h vemb_v16_protocol.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_supernode.h vemb_v16_table.h vemb_v16_log.h sve_operation.h aeron_ipc.h
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
-	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c vemb_v16_proxy.c vemb_v16_supernode.c vemb_v16_table.c sve_operation.c zmalloc.c monotonic.c redisassert.c -pthread -lm
+	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c vemb_v16_proxy.c vemb_v16_supernode.c vemb_v16_table.c vemb_v16_log.c sve_operation.c zmalloc.c monotonic.c redisassert.c -pthread -lm
 
 ifdef TLC_VERSION
 tlc_single: tlc_$(TLC_VERSION)_server

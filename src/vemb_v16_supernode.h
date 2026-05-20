@@ -9,7 +9,7 @@
 
 typedef struct vemb_v16_supernode_ctx {
     uint32_t worker_id;
-    volatile int *channel_active;
+    atomic_int *channel_active;
     atomic_int *running;
     vemb_v16_aeron_ring_t *vemb_job_ring;
     vemb_v16_aeron_ring_t *vadd_job_ring;

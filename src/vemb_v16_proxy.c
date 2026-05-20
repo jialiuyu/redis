@@ -4,6 +4,7 @@
 #include "aeron_ipc.h"
 #include "vemb_v16_aeron_ring.h"
 #include "vemb_v16_dataplane.h"
+#include "vemb_v16_log.h"
 #include "vemb_v16_supernode.h"
 #include "vemb_v16_table.h"
 #include "zmalloc.h"
@@ -31,7 +32,7 @@
 typedef struct vemb_v16_channel {
     uint64_t channel_id;
     uint32_t index;
-    int active;
+    atomic_int active;
     char request_ring_name[64];
     char response_ring_name[64];
     aeron_ring_t *request_ring;
@@ -159,7 +160,8 @@ static void publish_response(vemb_v16_channel_t *ch,
         .dim = completion->dim,
     };
     while (aeron_publish(ch->response_ring, &resp, sizeof(resp)) != 0 &&
-           atomic_load_explicit(&ch->proxy->running, memory_order_relaxed)) {
+           atomic_load_explicit(&ch->proxy->running, memory_order_relaxed) &&
+           atomic_load_explicit(&ch->active, memory_order_acquire)) {
         atomic_fetch_add_explicit(&ch->proxy->proxy_response_ring_full, 1,
                                   memory_order_relaxed);
         vemb_v16_cpu_relax();
@@ -229,7 +231,8 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
         memcpy(job.base.key, req->key, key_len);
         memcpy(job.vector, req->vector, req->vector_bytes);
         while (vemb_v16_aeron_publish(&ch->vadd_job_ring, &job) != 0 &&
-               atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
+               atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
+               atomic_load_explicit(&ch->active, memory_order_acquire)) {
             atomic_fetch_add_explicit(&proxy->proxy_vadd_ring_full, 1,
                                       memory_order_relaxed);
             vemb_v16_cpu_relax();
@@ -252,7 +255,8 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
         };
         memcpy(job.base.key, req->key, key_len);
         while (vemb_v16_aeron_publish(&ch->vemb_job_ring, &job) != 0 &&
-               atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
+               atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
+               atomic_load_explicit(&ch->active, memory_order_acquire)) {
             atomic_fetch_add_explicit(&proxy->proxy_vemb_ring_full, 1,
                                       memory_order_relaxed);
             vemb_v16_cpu_relax();
@@ -269,7 +273,8 @@ static void drain_completions(vemb_v16_channel_t *ch) {
     while (vemb_v16_aeron_poll(&ch->completion_ring, &completion)) {
         atomic_fetch_add_explicit(&ch->proxy->proxy_completion_poll, 1,
                                   memory_order_relaxed);
-        if (completion.channel_id == ch->channel_id && ch->active) {
+        if (completion.channel_id == ch->channel_id &&
+            atomic_load_explicit(&ch->active, memory_order_acquire)) {
             publish_response(ch, &completion);
         }
     }
@@ -287,7 +292,10 @@ static void *channel_thread_main(void *arg) {
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #endif
 
-    while (atomic_load_explicit(&proxy->running, memory_order_relaxed) && ch->active) {
+    serverLog(LL_VERBOSE, "vemb_v16 proxy channel thread started: index=%u channel_id=%llu",
+              ch->index, (unsigned long long)ch->channel_id);
+    while (atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
+           atomic_load_explicit(&ch->active, memory_order_acquire)) {
         drain_completions(ch);
 
         int req_len = aeron_poll(ch->request_ring, req_buf, sizeof(req_buf));
@@ -302,6 +310,10 @@ static void *channel_thread_main(void *arg) {
             vemb_v16_cpu_relax();
         }
     }
+    serverLog(LL_VERBOSE, "vemb_v16 proxy channel thread stopped: index=%u channel_id=%llu ops=%llu",
+              ch->index,
+              (unsigned long long)ch->channel_id,
+              (unsigned long long)atomic_load_explicit(&ch->ops, memory_order_relaxed));
     return NULL;
 }
 
@@ -311,7 +323,8 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                                                memory_order_relaxed);
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         uint32_t candidate = (start + i) % VEMB_V16_MAX_CHANNELS;
-        if (!proxy->channels[candidate].active) {
+        if (!atomic_load_explicit(&proxy->channels[candidate].active,
+                                  memory_order_acquire)) {
             idx = candidate;
             break;
         }
@@ -324,7 +337,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
     ch->channel_id = atomic_fetch_add_explicit(&proxy->next_channel_id, 1,
                                                memory_order_relaxed);
     ch->proxy = proxy;
-    ch->active = 1;
+    atomic_store_explicit(&ch->active, 1, memory_order_release);
     atomic_init(&ch->ops, 0);
     if (posix_memalign(&ch->vemb_job_slots, 64,
                        sizeof(vemb_v16_vemb_job_t) *
@@ -335,9 +348,9 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
         posix_memalign(&ch->completion_slots, 64,
                        sizeof(vemb_v16_completion_t) *
                        VEMB_V16_COMPLETION_RING_SIZE) != 0) {
-        zfree(ch->vemb_job_slots);
-        zfree(ch->vadd_job_slots);
-        zfree(ch->completion_slots);
+        free(ch->vemb_job_slots);
+        free(ch->vadd_job_slots);
+        free(ch->completion_slots);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -353,9 +366,9 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                                  ch->completion_slots,
                                  sizeof(vemb_v16_completion_t),
                                  VEMB_V16_COMPLETION_RING_SIZE) != 0) {
-        zfree(ch->vemb_job_slots);
-        zfree(ch->vadd_job_slots);
-        zfree(ch->completion_slots);
+        free(ch->vemb_job_slots);
+        free(ch->vadd_job_slots);
+        free(ch->completion_slots);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -368,17 +381,17 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
              (unsigned long long)ch->channel_id);
 
     if (create_shared_ring(ch->request_ring_name, &ch->request_ring) != 0) {
-        zfree(ch->vemb_job_slots);
-        zfree(ch->vadd_job_slots);
-        zfree(ch->completion_slots);
+        free(ch->vemb_job_slots);
+        free(ch->vadd_job_slots);
+        free(ch->completion_slots);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
     if (create_shared_ring(ch->response_ring_name, &ch->response_ring) != 0) {
         destroy_shared_ring(ch->request_ring_name, ch->request_ring);
-        zfree(ch->vemb_job_slots);
-        zfree(ch->vadd_job_slots);
-        zfree(ch->completion_slots);
+        free(ch->vemb_job_slots);
+        free(ch->vadd_job_slots);
+        free(ch->completion_slots);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -411,7 +424,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                        vemb_v16_supernode_thread_main,
                        &ch->supernode_ctx) != 0 ||
         pthread_create(&ch->proxy_thread, NULL, channel_thread_main, ch) != 0) {
-        ch->active = 0;
+        atomic_store_explicit(&ch->active, 0, memory_order_release);
         destroy_shared_ring(ch->request_ring_name, ch->request_ring);
         destroy_shared_ring(ch->response_ring_name, ch->response_ring);
         free(ch->vemb_job_slots);
@@ -420,6 +433,12 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
+
+    serverLog(LL_VERBOSE, "vemb_v16 channel allocated: index=%u channel_id=%llu req=%s resp=%s",
+              ch->index,
+              (unsigned long long)ch->channel_id,
+              ch->request_ring_name,
+              ch->response_ring_name);
 
     memset(desc, 0, sizeof(*desc));
     desc->magic = VEMB_V16_MAGIC;
@@ -439,15 +458,17 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
 }
 
 static void close_channel(vemb_v16_channel_t *ch) {
-    if (!ch || !ch->active) return;
-    ch->active = 0;
+    if (!ch || !atomic_load_explicit(&ch->active, memory_order_acquire)) return;
+    serverLog(LL_VERBOSE, "vemb_v16 channel closing: index=%u channel_id=%llu",
+              ch->index, (unsigned long long)ch->channel_id);
+    atomic_store_explicit(&ch->active, 0, memory_order_release);
     pthread_join(ch->proxy_thread, NULL);
     pthread_join(ch->supernode_thread, NULL);
     destroy_shared_ring(ch->request_ring_name, ch->request_ring);
     destroy_shared_ring(ch->response_ring_name, ch->response_ring);
-    zfree(ch->vemb_job_slots);
-    zfree(ch->vadd_job_slots);
-    zfree(ch->completion_slots);
+    free(ch->vemb_job_slots);
+    free(ch->vadd_job_slots);
+    free(ch->completion_slots);
     memset(ch, 0, sizeof(*ch));
 }
 
@@ -455,7 +476,8 @@ static int close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
     if (!proxy || channel_id == 0) return -1;
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
-        if (ch->active && ch->channel_id == channel_id) {
+        if (atomic_load_explicit(&ch->active, memory_order_acquire) &&
+            ch->channel_id == channel_id) {
             close_channel(ch);
             return 0;
         }
@@ -475,6 +497,8 @@ static void handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
         if (read_full(fd, &req, sizeof(req)) != 0) goto close_fd;
         vemb_v16_channel_desc_t desc;
         uint8_t status = alloc_channel(proxy, &desc) == 0 ? VEMB_V16_STATUS_OK : VEMB_V16_STATUS_ERR;
+        if (status != VEMB_V16_STATUS_OK)
+            serverLog(LL_WARNING, "vemb_v16 alloc channel failed");
         write_full(fd, &status, sizeof(status));
         if (status == VEMB_V16_STATUS_OK)
             write_full(fd, &desc, sizeof(desc));
@@ -526,6 +550,10 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                                        O_CREAT | O_RDWR, 0666);
     if (proxy->vector_region_fd < 0 ||
         ftruncate(proxy->vector_region_fd, (off_t)proxy->vector_region_size) != 0) {
+        serverLog(LL_WARNING, "vemb_v16 vector region create failed: name=%s size=%zu error=%s",
+                  proxy->vector_region_name,
+                  proxy->vector_region_size,
+                  strerror(errno));
         vemb_v16_proxy_destroy(proxy);
         return -1;
     }
@@ -535,6 +563,10 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     close(proxy->vector_region_fd);
     proxy->vector_region_fd = -1;
     if (proxy->vector_region == MAP_FAILED) {
+        serverLog(LL_WARNING, "vemb_v16 vector region mmap failed: name=%s size=%zu error=%s",
+                  proxy->vector_region_name,
+                  proxy->vector_region_size,
+                  strerror(errno));
         proxy->vector_region = NULL;
         vemb_v16_proxy_destroy(proxy);
         return -1;
@@ -545,10 +577,18 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                               proxy->max_vectors,
                               proxy->vector_region,
                               proxy->vector_region_size) != 0) {
+        serverLog(LL_WARNING, "vemb_v16 table create failed: dim=%u max_vectors=%u",
+                  proxy->vector_dim, proxy->max_vectors);
         vemb_v16_proxy_destroy(proxy);
         return -1;
     }
 
+    serverLog(LL_NOTICE, "vemb_v16 proxy created: uds=%s dim=%u max_vectors=%u vector_region=%s size=%zu",
+              proxy->uds_path,
+              proxy->vector_dim,
+              proxy->max_vectors,
+              proxy->vector_region_name,
+              proxy->vector_region_size);
     *out = proxy;
     return 0;
 }
@@ -583,9 +623,9 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
     }
     fcntl(proxy->uds_fd, F_SETFL, fcntl(proxy->uds_fd, F_GETFL, 0) | O_NONBLOCK);
 
-    printf("vemb_v16 server ready: uds=%s dim=%u max_vectors=%u vector_region=%s\n",
-           proxy->uds_path, proxy->vector_dim, proxy->max_vectors,
-           proxy->vector_region_name);
+    serverLog(LL_NOTICE, "vemb_v16 server ready: uds=%s dim=%u max_vectors=%u vector_region=%s",
+              proxy->uds_path, proxy->vector_dim, proxy->max_vectors,
+              proxy->vector_region_name);
 
     while (atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
         int cfd = accept(proxy->uds_fd, NULL, NULL);
@@ -596,6 +636,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
                 continue;
             }
             if (errno == EINTR) continue;
+            serverLog(LL_WARNING, "vemb_v16 accept failed: %s", strerror(errno));
             return -1;
         }
         handle_control_fd(proxy, cfd);
@@ -664,6 +705,7 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
             atomic_load_explicit(&sve_stats->lock_failure, memory_order_relaxed);
     }
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
-        if (proxy->channels[i].active) stats->active_channels++;
+        if (atomic_load_explicit(&proxy->channels[i].active, memory_order_acquire))
+            stats->active_channels++;
     }
 }

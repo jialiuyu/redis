@@ -2,6 +2,7 @@
 
 #include "vemb_v16_supernode.h"
 #include "vemb_v16_dataplane.h"
+#include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
 #include "zmalloc.h"
 
@@ -42,8 +43,10 @@ void *vemb_v16_supernode_thread_main(void *arg) {
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #endif
 
+    serverLog(LL_VERBOSE, "vemb_v16 supernode worker started: worker_id=%u",
+              ctx->worker_id);
     while (atomic_load_explicit(ctx->running, memory_order_relaxed) &&
-           *ctx->channel_active) {
+           atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
         if (vemb_v16_aeron_poll(ctx->vemb_job_ring, &vemb_job)) {
             vemb_v16_job_base_t *job = &vemb_job.base;
             atomic_fetch_add_explicit(ctx->supernode_vemb_poll, 1,
@@ -125,7 +128,8 @@ void *vemb_v16_supernode_thread_main(void *arg) {
             atomic_fetch_add_explicit(ctx->vemb_requests, 1, memory_order_relaxed);
             uint64_t completion_start = sample ? monotonic_ns() : 0;
             while (vemb_v16_aeron_publish(ctx->completion_ring, &completion) != 0 &&
-                   atomic_load_explicit(ctx->running, memory_order_relaxed)) {
+                   atomic_load_explicit(ctx->running, memory_order_relaxed) &&
+                   atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
                 atomic_fetch_add_explicit(ctx->supernode_completion_ring_full, 1,
                                           memory_order_relaxed);
                 vemb_v16_supernode_relax();
@@ -179,7 +183,8 @@ void *vemb_v16_supernode_thread_main(void *arg) {
         }
 
         while (vemb_v16_aeron_publish(ctx->completion_ring, &completion) != 0 &&
-               atomic_load_explicit(ctx->running, memory_order_relaxed)) {
+               atomic_load_explicit(ctx->running, memory_order_relaxed) &&
+               atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
             atomic_fetch_add_explicit(ctx->supernode_completion_ring_full, 1,
                                       memory_order_relaxed);
             vemb_v16_supernode_relax();
@@ -189,5 +194,7 @@ void *vemb_v16_supernode_thread_main(void *arg) {
         atomic_fetch_add_explicit(ctx->completed_jobs, 1, memory_order_relaxed);
     }
     zfree(vemb_vector_scratch);
+    serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
+              ctx->worker_id);
     return NULL;
 }

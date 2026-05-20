@@ -121,6 +121,10 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
 	@echo "✅ Built: $@"
 
+vemb_v16_bench: vemb_v16_bench.c ../src/aeron_ipc.h ../src/vemb_v16_protocol.h ../src/vemb_v16_dataplane.h ../src/vemb_v16_aeron_ring.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< -pthread -lm
+	@echo "✅ Built: $@"
+
 # Ring buffer unit test
 ring_buffer_ut: ring_buffer_ut.c test_runtime_shim.c ../src/ring_buffer.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \

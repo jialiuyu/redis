@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,6 +29,7 @@ typedef struct bench_cfg {
     int mode;
     int hot_key_enabled;
     uint32_t hot_key_id;
+    uint32_t timeout_ms;
 } bench_cfg_t;
 
 typedef struct worker_arg {
@@ -52,10 +54,27 @@ enum {
     MODE_VADD_INLINE = 3,
 };
 
+static uint32_t g_control_timeout_ms = 10000;
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int wait_timed_out(uint64_t start_ns, uint32_t timeout_ms) {
+    if (timeout_ms == 0) return 0;
+    return now_ns() - start_ns >= (uint64_t)timeout_ms * 1000000ULL;
+}
+
+static void set_fd_timeout(int fd) {
+    if (g_control_timeout_ms == 0) return;
+    struct timeval tv = {
+        .tv_sec = (time_t)(g_control_timeout_ms / 1000),
+        .tv_usec = (suseconds_t)((g_control_timeout_ms % 1000) * 1000),
+    };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 static int read_full(int fd, void *buf, size_t n) {
@@ -81,6 +100,7 @@ static int write_full(int fd, const void *buf, size_t n) {
 static int connect_uds(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    set_fd_timeout(fd);
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -189,10 +209,15 @@ static void prepare_req(vemb_v16_req_t *req,
 }
 
 static int send_req(aeron_ring_t *ring, const vemb_v16_req_t *req, size_t len,
-                    uint64_t *publish_spins) {
+                    uint64_t *publish_spins, uint32_t timeout_ms) {
     uint64_t spins = 0;
+    uint64_t start = now_ns();
     while (aeron_publish(ring, req, (uint32_t)len) != 0) {
         spins++;
+        if ((spins & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
+            if (publish_spins) *publish_spins += spins;
+            return -1;
+        }
         __asm__ volatile("" ::: "memory");
     }
     if (publish_spins) *publish_spins += spins;
@@ -200,11 +225,16 @@ static int send_req(aeron_ring_t *ring, const vemb_v16_req_t *req, size_t len,
 }
 
 static int recv_resp(aeron_ring_t *ring, vemb_v16_resp_t *resp,
-                     uint64_t *empty_polls) {
+                     uint64_t *empty_polls, uint32_t timeout_ms) {
     int got;
     uint64_t polls = 0;
+    uint64_t start = now_ns();
     while ((got = aeron_poll(ring, resp, sizeof(*resp))) <= 0) {
         polls++;
+        if ((polls & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
+            if (empty_polls) *empty_polls += polls;
+            return -1;
+        }
         __asm__ volatile("" ::: "memory");
     }
     if (empty_polls) *empty_polls += polls;
@@ -222,9 +252,17 @@ static int prefill(const bench_cfg_t *cfg, const vemb_v16_channel_desc_t *desc,
         prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1, desc->channel_id,
                     key, cfg->dim);
         fill_vector(req.vector, cfg->dim, i);
-        send_req(req_ring, &req, vemb_v16_req_inline_len(req.vector_bytes), NULL);
-        if (recv_resp(resp_ring, &resp, NULL) != 0 || resp.status != VEMB_V16_STATUS_OK)
+        if (send_req(req_ring, &req, vemb_v16_req_inline_len(req.vector_bytes),
+                     NULL, cfg->timeout_ms) != 0) {
+            fprintf(stderr, "prefill send timeout at item=%u\n", i);
             return -1;
+        }
+        if (recv_resp(resp_ring, &resp, NULL, cfg->timeout_ms) != 0 ||
+            resp.status != VEMB_V16_STATUS_OK) {
+            fprintf(stderr, "prefill response timeout/error at item=%u status=%u\n",
+                    i, resp.status);
+            return -1;
+        }
         if ((i + 1) % 10000 == 0)
             printf("[prefill] inserted=%u elapsed=%.3fs\n",
                    i + 1, (double)(now_ns() - start) / 1e9);
@@ -258,26 +296,44 @@ static void *worker_main(void *arg) {
             req.op = VEMB_V16_OP_PING;
             req.req_id = i + 1;
             req.channel_id = w->desc.channel_id;
-            send_req(w->req_ring, &req, vemb_v16_req_handle_len(),
-                     &w->request_publish_spins);
+            if (send_req(w->req_ring, &req, vemb_v16_req_handle_len(),
+                         &w->request_publish_spins, w->cfg.timeout_ms) != 0) {
+                fprintf(stderr, "worker %d request publish timeout at op=%u mode=ping\n",
+                        w->tid, i);
+                w->fail += w->cfg.ops - i;
+                break;
+            }
         } else if (w->cfg.mode == MODE_VADD_INLINE) {
             make_key(key, sizeof(key), global_id + 100000000u);
             prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1, w->desc.channel_id,
                         key, w->cfg.dim);
             fill_vector(req.vector, w->cfg.dim, global_id);
-            send_req(w->req_ring, &req, vemb_v16_req_inline_len(req.vector_bytes),
-                     &w->request_publish_spins);
+            if (send_req(w->req_ring, &req, vemb_v16_req_inline_len(req.vector_bytes),
+                         &w->request_publish_spins, w->cfg.timeout_ms) != 0) {
+                fprintf(stderr, "worker %d request publish timeout at op=%u mode=vadd-inline\n",
+                        w->tid, i);
+                w->fail += w->cfg.ops - i;
+                break;
+            }
         } else {
             make_key(key, sizeof(key), key_id);
             prepare_req(&req, op, i + 1, w->desc.channel_id, key, w->cfg.dim);
-            send_req(w->req_ring, &req, vemb_v16_req_handle_len(),
-                     &w->request_publish_spins);
+            if (send_req(w->req_ring, &req, vemb_v16_req_handle_len(),
+                         &w->request_publish_spins, w->cfg.timeout_ms) != 0) {
+                fprintf(stderr, "worker %d request publish timeout at op=%u key_id=%u\n",
+                        w->tid, i, key_id);
+                w->fail += w->cfg.ops - i;
+                break;
+            }
         }
 
-        if (recv_resp(w->resp_ring, &resp, &w->response_empty_polls) != 0 ||
+        if (recv_resp(w->resp_ring, &resp, &w->response_empty_polls,
+                      w->cfg.timeout_ms) != 0 ||
             resp.status != VEMB_V16_STATUS_OK) {
-            w->fail++;
-            continue;
+            fprintf(stderr, "worker %d response timeout/error at op=%u status=%u key_id=%u\n",
+                    w->tid, i, resp.status, key_id);
+            w->fail += w->cfg.ops - i;
+            break;
         }
 
         if (w->cfg.mode == MODE_VEMB_READ_VECTOR) {
@@ -391,10 +447,14 @@ static int run_once(bench_cfg_t cfg) {
         fprintf(stderr, "prefill failed\n");
         return 1;
     }
+    printf("[run] preparing mode=%s threads=%d ops/thread=%u timeout_ms=%u\n",
+           mode_name(cfg.mode), cfg.threads, cfg.ops, cfg.timeout_ms);
+    fflush(stdout);
 
     vemb_v16_stats_t before = {0};
     vemb_v16_stats_t after = {0};
-    fetch_stats(cfg.socket_path, &before);
+    if (fetch_stats(cfg.socket_path, &before) != 0)
+        fprintf(stderr, "warning: fetch stats before run failed\n");
 
     worker_arg_t *args = calloc((size_t)cfg.threads, sizeof(*args));
     pthread_t *threads = calloc((size_t)cfg.threads, sizeof(*threads));
@@ -419,6 +479,10 @@ static int run_once(bench_cfg_t cfg) {
     }
 
     uint64_t start = now_ns();
+    printf("[run] mode=%s threads=%d requests=%llu\n",
+           mode_name(cfg.mode), cfg.threads,
+           (unsigned long long)cfg.ops * (unsigned long long)cfg.threads);
+    fflush(stdout);
     for (int i = 0; i < cfg.threads; i++)
         pthread_create(&threads[i], NULL, worker_main, &args[i]);
     for (int i = 0; i < cfg.threads; i++)
@@ -464,6 +528,8 @@ static int run_once(bench_cfg_t cfg) {
     munmap(pre_resp, sizeof(aeron_ring_t));
     if (fetch_stats(cfg.socket_path, &after) == 0)
         print_stats_delta(&before, &after);
+    else
+        fprintf(stderr, "warning: fetch stats after run failed\n");
     free(args);
     free(threads);
     return fail == 0 ? 0 : 1;
@@ -477,6 +543,7 @@ int main(int argc, char **argv) {
         .ops = 200000,
         .threads = 8,
         .mode = MODE_VEMB_HANDLE,
+        .timeout_ms = 10000,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -484,6 +551,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dim") && i + 1 < argc) cfg.dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ops") && i + 1 < argc) cfg.ops = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) cfg.timeout_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *arg = argv[++i];
             if (strchr(arg, ',')) {
@@ -498,10 +566,11 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--threads N] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vadd-inline]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--threads N] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vadd-inline]\n", argv[0]);
             return 0;
         }
     }
+    g_control_timeout_ms = cfg.timeout_ms;
     if (cfg.mode < 0 || cfg.threads <= 0 || cfg.threads > VEMB_V16_MAX_CHANNELS) {
         fprintf(stderr, "invalid arguments\n");
         return 1;
