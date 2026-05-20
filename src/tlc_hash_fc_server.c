@@ -61,114 +61,10 @@ extern int  fc_cache_cold_append(cold_layer_t *c, uint64_t key, const void *val)
 #define L0_CACHE_SIZE 8
 #endif
 
-typedef struct {
-    uint16_t sig[L0_CACHE_SIZE];
-    int32_t  widx[L0_CACHE_SIZE];
-    uint64_t key[L0_CACHE_SIZE];
-    uint32_t lru_age[L0_CACHE_SIZE];  /* timestamp: larger = more recently used */
-    uint64_t lru_counter;             /* monotonic timestamp counter */
-    uint64_t valid;                   /* bit i = slot i valid (up to 64 entries) */
-} l0_sig_cache_t;
-
 static inline uint16_t hash_sig16(uint64_t key) {
     /* Re-use murmur3 finalizer, keep high 16 bits */
     uint32_t h = _hs_murmur3_mix64(key);
     return (uint16_t)(h >> 16);
-}
-
-static inline int32_t l0_lookup(l0_sig_cache_t *l0, uint64_t key) {
-    uint16_t sig = hash_sig16(key);
-    uint64_t valid = l0->valid;
-    if (!valid) return -1;
-
-    int idx = -1;
-
-#if defined(__aarch64__)
-    uint16x8_t v_sig = vdupq_n_u16(sig);
-    int match_idx = -1;
-    for (int base = 0; base < L0_CACHE_SIZE; base += 8) {
-        uint16x8_t v_cache = vld1q_u16(l0->sig + base);
-        uint16x8_t v_eq = vceqq_u16(v_sig, v_cache);
-        uint8x8_t  v_narrow = vmovn_u16(v_eq);
-        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(v_narrow), 0);
-        while (mask) {
-            int lane = __builtin_ctzll(mask) >> 3; /* 8 bits per lane -> /8 */
-            int i = base + lane;
-            if ((valid & (1ULL << i)) && l0->key[i] == key) {
-                match_idx = i;
-                goto l0_found;
-            }
-            mask &= ~(0xFFULL << (lane * 8));
-        }
-    }
-l0_found:
-    if (match_idx >= 0) {
-        idx = l0->widx[match_idx];
-        l0->lru_age[match_idx] = (uint32_t)l0->lru_counter++;
-    }
-#elif defined(__x86_64__)
-    __m128i v_sig = _mm_set1_epi16((short)sig);
-    int match_idx = -1;
-    for (int base = 0; base < L0_CACHE_SIZE; base += 8) {
-        __m128i v_cache = _mm_loadu_si128((__m128i const*)(l0->sig + base));
-        __m128i v_eq = _mm_cmpeq_epi16(v_sig, v_cache);
-        int mask = _mm_movemask_epi8(v_eq);
-        while (mask) {
-            int lane = __builtin_ctz(mask) >> 1; /* 2 bytes per lane -> /2 */
-            int i = base + lane;
-            if ((valid & (1ULL << i)) && l0->key[i] == key) {
-                match_idx = i;
-                goto l0_found;
-            }
-            mask &= ~(3 << (lane * 2));
-        }
-    }
-l0_found:
-    if (match_idx >= 0) {
-        idx = l0->widx[match_idx];
-        l0->lru_age[match_idx] = (uint32_t)l0->lru_counter++;
-    }
-#else
-    for (int i = 0; i < L0_CACHE_SIZE; i++) {
-        if ((valid & (1ULL << i)) && l0->sig[i] == sig && l0->key[i] == key) {
-            idx = l0->widx[i];
-            l0->lru_age[i] = (uint32_t)l0->lru_counter++;
-            break;
-        }
-    }
-#endif
-    return idx;
-}
-
-static inline void l0_promote(l0_sig_cache_t *l0, uint64_t key, int32_t widx) {
-    uint64_t valid = l0->valid;
-    uint32_t idx;
-
-#if L0_CACHE_SIZE >= 64
-    uint64_t full_mask = 0xFFFFFFFFFFFFFFFFULL;
-#else
-    uint64_t full_mask = (1ULL << L0_CACHE_SIZE) - 1;
-#endif
-    if ((valid & full_mask) != full_mask) {
-        /* find first empty slot */
-        idx = (uint32_t)__builtin_ctzll(~valid & full_mask);
-    } else {
-        /* find LRU entry (minimum age) */
-        idx = 0;
-        uint32_t min_age = l0->lru_age[0];
-        for (int i = 1; i < L0_CACHE_SIZE; i++) {
-            if (l0->lru_age[i] < min_age) {
-                min_age = l0->lru_age[i];
-                idx = (uint32_t)i;
-            }
-        }
-    }
-
-    l0->sig[idx] = hash_sig16(key);
-    l0->widx[idx] = widx;
-    l0->key[idx] = key;
-    l0->valid |= (1ULL << idx);
-    l0->lru_age[idx] = (uint32_t)l0->lru_counter++;
 }
 
 /* ---- Frozen L0 cache: read-only snapshot after warmup ---- */
@@ -531,18 +427,12 @@ static void *channel_poll(void *arg) {
 
 #ifdef ENABLE_L0_CACHE
     fprintf(stderr, "[ch%d] L0 cache init\n", ch->id);
-#ifdef ENABLE_L0_WARMUP
     l0_warmup_cache_t warmup_cache;
     memset(&warmup_cache, 0, sizeof(warmup_cache));
     l0_frozen_cache_t frozen_cache;
     memset(&frozen_cache, 0, sizeof(frozen_cache));
     bool l0_frozen = false;
     uint64_t local_get_count = 0;
-#else
-    l0_sig_cache_t l0_cache_local;
-    memset(&l0_cache_local, 0, sizeof(l0_cache_local));
-    l0_sig_cache_t *l0_cache = &l0_cache_local;
-#endif
     uint64_t local_l0_hits = 0, local_l0_misses = 0;
 #endif
 
@@ -557,7 +447,6 @@ static void *channel_poll(void *arg) {
             int32_t warm_idx = -1;
 
 #ifdef ENABLE_L0_CACHE
-#ifdef ENABLE_L0_WARMUP
             if (l0_frozen) {
                 warm_idx = l0_lookup_frozen(&frozen_cache, key);
             } else if (local_get_count < L0_WARMUP_OPS) {
@@ -568,9 +457,6 @@ static void *channel_poll(void *arg) {
                 l0_frozen = true;
                 warm_idx = l0_lookup_frozen(&frozen_cache, key);
             }
-#else
-            warm_idx = l0_lookup(l0_cache, key);
-#endif
             if (warm_idx >= 0) {
                 L0_HIT_INC();
                 local_l0_hits++;
@@ -585,15 +471,9 @@ static void *channel_poll(void *arg) {
 #endif
             warm_idx = fc_get(ch->id, key);
 #ifdef ENABLE_L0_CACHE
-#ifdef ENABLE_L0_WARMUP
             if (!l0_frozen && warm_idx >= 0) {
                 l0_warmup_promote(&warmup_cache, key, warm_idx);
             }
-#else
-            if (warm_idx >= 0) {
-                l0_promote(l0_cache, key, warm_idx);
-            }
-#endif
 #endif
             if (warm_idx >= 0) {
                 resp_buf[0] = 0x00;
@@ -622,14 +502,9 @@ static void *channel_poll(void *arg) {
         }
     }
 #ifdef ENABLE_L0_CACHE
-#ifdef ENABLE_L0_WARMUP
     fprintf(stderr, "[ch%d] L0 local hits=%lu misses=%lu frozen_valid=%lu warmup_valid=%lu\n",
             ch->id, (unsigned long)local_l0_hits, (unsigned long)local_l0_misses,
             (unsigned long)frozen_cache.valid, (unsigned long)warmup_cache.count);
-#else
-    fprintf(stderr, "[ch%d] L0 local hits=%lu misses=%lu valid=%d\n",
-            ch->id, (unsigned long)local_l0_hits, (unsigned long)local_l0_misses, l0_cache->valid);
-#endif
 #endif
     return NULL;
 }
