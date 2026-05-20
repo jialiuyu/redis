@@ -33,6 +33,7 @@ enum vemb_v16_data_op {
     VEMB_V16_OP_PING = 0x01,
     VEMB_V16_OP_VADD_INLINE = 0x10,
     VEMB_V16_OP_VEMB_HANDLE = 0x20,
+    VEMB_V16_OP_VEMB_SUPERNODE_READ = 0x21,
 };
 
 typedef struct vemb_v16_alloc_req {

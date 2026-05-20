@@ -55,6 +55,7 @@ enum {
     MODE_VEMB_HANDLE = 1,
     MODE_VEMB_READ_VECTOR = 2,
     MODE_VADD_INLINE = 3,
+    MODE_VEMB_SUPERNODE_READ = 4,
 };
 
 static uint32_t g_control_timeout_ms = 10000;
@@ -311,7 +312,8 @@ static void *worker_main(void *arg) {
     uint64_t start = now_ns();
     for (uint32_t i = 0; i < w->cfg.ops; i++) {
         uint32_t global_id = (uint32_t)(i + (uint32_t)w->tid * w->cfg.ops);
-        uint8_t op = VEMB_V16_OP_VEMB_HANDLE;
+        uint8_t op = w->cfg.mode == MODE_VEMB_SUPERNODE_READ ?
+            VEMB_V16_OP_VEMB_SUPERNODE_READ : VEMB_V16_OP_VEMB_HANDLE;
         uint32_t key_id = w->cfg.prefill ? global_id % w->cfg.prefill : global_id;
         if (w->cfg.hot_key_enabled) key_id = w->cfg.hot_key_id;
         if (w->cfg.mode == MODE_PING) {
@@ -377,6 +379,7 @@ static int mode_from_string(const char *s) {
     if (!strcmp(s, "ping")) return MODE_PING;
     if (!strcmp(s, "vemb-handle")) return MODE_VEMB_HANDLE;
     if (!strcmp(s, "vemb-read-vector")) return MODE_VEMB_READ_VECTOR;
+    if (!strcmp(s, "vemb-supernode-read")) return MODE_VEMB_SUPERNODE_READ;
     if (!strcmp(s, "vadd-inline")) return MODE_VADD_INLINE;
     return -1;
 }
@@ -386,6 +389,7 @@ static const char *mode_name(int mode) {
     case MODE_PING: return "ping";
     case MODE_VEMB_HANDLE: return "vemb-handle";
     case MODE_VEMB_READ_VECTOR: return "vemb-read-vector";
+    case MODE_VEMB_SUPERNODE_READ: return "vemb-supernode-read";
     case MODE_VADD_INLINE: return "vadd-inline";
     default: return "unknown";
     }
@@ -630,7 +634,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--threads N] [--pin yes|no] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vadd-inline]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--threads N] [--pin yes|no] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-supernode-read|vadd-inline]\n", argv[0]);
             return 0;
         }
     }

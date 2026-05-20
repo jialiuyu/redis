@@ -239,7 +239,8 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
         }
         atomic_fetch_add_explicit(&proxy->proxy_vadd_publish, 1,
                                   memory_order_relaxed);
-    } else {
+    } else if (req->op == VEMB_V16_OP_VEMB_HANDLE ||
+               req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
         vemb_v16_vemb_job_t job = {
             .base = {
                 .op = req->op,
@@ -263,6 +264,16 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
         }
         atomic_fetch_add_explicit(&proxy->proxy_vemb_publish, 1,
                                   memory_order_relaxed);
+    } else {
+        vemb_v16_completion_t completion = {
+            .status = VEMB_V16_STATUS_ERR,
+            .op = req->op,
+            .req_id = req->req_id,
+            .channel_index = ch->index,
+            .channel_id = ch->channel_id,
+        };
+        publish_response(ch, &completion);
+        return;
     }
     atomic_fetch_add_explicit(&proxy->published_jobs, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&proxy->total_requests, 1, memory_order_relaxed);

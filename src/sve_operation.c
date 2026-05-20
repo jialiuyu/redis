@@ -265,6 +265,82 @@ int sve_serial_contiguous_read_traced(sve_gather_ctx_t *ctx,
     return 0;
 }
 
+int sve_serial_contiguous_read_blocking_traced(sve_gather_ctx_t *ctx,
+                                               uint64_t *emb_ids,
+                                               size_t num_ids,
+                                               float *results,
+                                               uint64_t *bitmap_lock_latency_ns,
+                                               uint64_t *bitmap_unlock_latency_ns,
+                                               uint64_t *vector_load_latency_ns) {
+    RETURN_IF(!ctx || !ctx->ubas || !ctx->bitmap || !ctx->stats ||
+              !ctx->ubas->mapped_addr || !emb_ids || !results || num_ids == 0 ||
+              ctx->vector_dim == 0 || !bitmap_lock_latency_ns ||
+              !bitmap_unlock_latency_ns || !vector_load_latency_ns, -1);
+
+    const size_t dim = ctx->vector_dim;
+    const size_t row_bytes = dim * sizeof(float);
+
+    *bitmap_lock_latency_ns = 0;
+    *bitmap_unlock_latency_ns = 0;
+    *vector_load_latency_ns = 0;
+
+    for (size_t i = 0; i < num_ids; i++) {
+        if (emb_ids[i] >= ctx->table_row_capacity) {
+            memset(&results[i * dim], 0, row_bytes);
+            return -1;
+        }
+
+        monotime lock_start;
+        elapsedStartNs(&lock_start);
+        while (bitmap_try_acquire(ctx->bitmap, emb_ids[i]) != 0) {
+            atomic_fetch_add_explicit(&ctx->stats->lock_failure, 1,
+                                      memory_order_relaxed);
+            __asm__ __volatile__("yield" ::: "memory");
+        }
+        atomic_fetch_add_explicit(&ctx->stats->lock_success, 1,
+                                  memory_order_relaxed);
+        *bitmap_lock_latency_ns += elapsedNs(lock_start);
+
+        const float *src = (const float *)((const char *)ctx->ubas->mapped_addr +
+                                           emb_ids[i] * ctx->vector_stride_bytes);
+        monotime load_start;
+        elapsedStartNs(&load_start);
+#ifdef USE_ARM_SVE
+        {
+            const size_t vl = svcntw();
+            size_t rem = dim;
+            const float *srcp = src;
+            float *dstp = &results[i * dim];
+
+            while (rem >= vl) {
+                svbool_t pg = svptrue_b32();
+                svfloat32_t v = svld1_f32(pg, srcp);
+                svst1_f32(pg, dstp, v);
+                srcp += vl;
+                dstp += vl;
+                rem -= vl;
+            }
+
+            if (rem > 0) {
+                svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+                svfloat32_t v = svld1_f32(pg, srcp);
+                svst1_f32(pg, dstp, v);
+            }
+        }
+#else
+        memcpy(&results[i * dim], src, row_bytes);
+#endif
+        *vector_load_latency_ns += elapsedNs(load_start);
+
+        monotime release_start;
+        elapsedStartNs(&release_start);
+        bitmap_release(ctx->bitmap, emb_ids[i]);
+        *bitmap_unlock_latency_ns += elapsedNs(release_start);
+    }
+
+    return 0;
+}
+
 /* ============================================================
  * Streaming Load / Store（非临时内存访问）
  * ============================================================ */

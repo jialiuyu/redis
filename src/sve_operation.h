@@ -89,6 +89,15 @@ int sve_serial_contiguous_read_traced(sve_gather_ctx_t *ctx,
                                       uint64_t *bitmap_unlock_latency_ns,
                                       uint64_t *vector_load_latency_ns);
 
+/* blocking traced 版本：bitmap busy 时等待，确保返回的数据来自已加锁 row */
+int sve_serial_contiguous_read_blocking_traced(sve_gather_ctx_t *ctx,
+                                               uint64_t *emb_ids,
+                                               size_t num_ids,
+                                               float *results,
+                                               uint64_t *bitmap_lock_latency_ns,
+                                               uint64_t *bitmap_unlock_latency_ns,
+                                               uint64_t *vector_load_latency_ns);
+
 /* 跨 embedding SVE gather 并行读取 */
 int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,
                                uint64_t *emb_ids,

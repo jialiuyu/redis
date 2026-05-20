@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <time.h>
 
 #define VEMB_V16_SAMPLE_MASK 1023u
@@ -32,6 +33,8 @@ void *vemb_v16_supernode_thread_main(void *arg) {
     vemb_v16_supernode_ctx_t *ctx = arg;
     vemb_v16_vemb_job_t vemb_job;
     vemb_v16_vadd_job_t vadd_job;
+    float *read_result = NULL;
+    size_t read_result_bytes = 0;
 
 #ifdef __linux__
     cpu_set_t cpuset;
@@ -62,11 +65,13 @@ void *vemb_v16_supernode_thread_main(void *arg) {
             uint32_t row_id = 0;
             int sample = ((job->req_id & VEMB_V16_SAMPLE_MASK) == 0);
             uint64_t lookup_start = sample ? monotonic_ns() : 0;
+            uint64_t lookup_ns = 0;
             if (vemb_v16_table_lookup(ctx->table, job->key, job->key_len,
                                       job->key_hash, &row_id) != 0) {
                 completion.status = VEMB_V16_STATUS_NOT_FOUND;
                 atomic_fetch_add_explicit(ctx->not_found, 1, memory_order_relaxed);
             } else {
+                if (sample) lookup_ns = monotonic_ns() - lookup_start;
                 if (job->dim != vemb_v16_table_dim(ctx->table) ||
                     job->vector_bytes != vemb_v16_table_stride(ctx->table)) {
                     completion.status = VEMB_V16_STATUS_ERR;
@@ -74,13 +79,52 @@ void *vemb_v16_supernode_thread_main(void *arg) {
                     completion.vector_offset =
                         (uint64_t)row_id * vemb_v16_table_stride(ctx->table);
                     completion.vector_bytes = vemb_v16_table_stride(ctx->table);
+                    if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
+                        if (read_result_bytes < job->vector_bytes) {
+                            float *next = realloc(read_result, job->vector_bytes);
+                            if (!next) {
+                                completion.status = VEMB_V16_STATUS_ERR;
+                                goto vemb_read_done;
+                            }
+                            read_result = next;
+                            read_result_bytes = job->vector_bytes;
+                        }
+
+                        uint64_t emb_id = row_id;
+                        uint64_t bitmap_lock_ns = 0;
+                        uint64_t bitmap_unlock_ns = 0;
+                        uint64_t vector_load_ns = 0;
+                        if (sve_serial_contiguous_read_blocking_traced(
+                                vemb_v16_table_gather_ctx(ctx->table),
+                                &emb_id,
+                                1,
+                                read_result,
+                                &bitmap_lock_ns,
+                                &bitmap_unlock_ns,
+                                &vector_load_ns) != 0) {
+                            completion.status = VEMB_V16_STATUS_ERR;
+                        }
+                        if (sample) {
+                            atomic_fetch_add_explicit(ctx->sample_bitmap_lock_ns,
+                                                      bitmap_lock_ns,
+                                                      memory_order_relaxed);
+                            atomic_fetch_add_explicit(ctx->sample_bitmap_unlock_ns,
+                                                      bitmap_unlock_ns,
+                                                      memory_order_relaxed);
+                            atomic_fetch_add_explicit(ctx->sample_vector_load_ns,
+                                                      vector_load_ns,
+                                                      memory_order_relaxed);
+                        }
+                    }
                 }
             }
+vemb_read_done:
             if (sample) {
+                if (!lookup_ns) lookup_ns = monotonic_ns() - lookup_start;
                 atomic_fetch_add_explicit(ctx->sample_count, 1,
                                           memory_order_relaxed);
                 atomic_fetch_add_explicit(ctx->sample_table_lookup_ns,
-                                          monotonic_ns() - lookup_start,
+                                          lookup_ns,
                                           memory_order_relaxed);
             }
             atomic_fetch_add_explicit(ctx->vemb_requests, 1, memory_order_relaxed);
@@ -153,5 +197,6 @@ void *vemb_v16_supernode_thread_main(void *arg) {
     }
     serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
               ctx->worker_id);
+    free(read_result);
     return NULL;
 }
