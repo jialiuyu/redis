@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 
-#include "../src/aeron_ipc.h"
+#include "../src/vemb_v16_client_ring.h"
 #include "../src/vemb_v16_protocol.h"
 
 #include <errno.h>
@@ -38,8 +38,8 @@ typedef struct worker_arg {
     int tid;
     bench_cfg_t cfg;
     vemb_v16_channel_desc_t desc;
-    aeron_ring_t *req_ring;
-    aeron_ring_t *resp_ring;
+    vemb_v16_client_ring_t *req_ring;
+    vemb_v16_client_ring_t *resp_ring;
     uint8_t *vector_region;
     uint64_t ok;
     uint64_t fail;
@@ -183,10 +183,13 @@ static int close_all_channels(const char *socket_path, uint64_t *closed) {
     return 0;
 }
 
-static int open_ring(const char *name, aeron_ring_t **ring) {
+static int open_ring(const char *name,
+                     uint32_t slot_size,
+                     vemb_v16_client_ring_t **ring) {
     int fd = shm_open(name, O_RDWR, 0666);
     if (fd < 0) return -1;
-    void *ptr = mmap(NULL, sizeof(aeron_ring_t), PROT_READ | PROT_WRITE,
+    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
+    void *ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
                      MAP_SHARED, fd, 0);
     close(fd);
     if (ptr == MAP_FAILED) return -1;
@@ -230,11 +233,11 @@ static void prepare_req(vemb_v16_req_t *req,
     memcpy(req->key, key, req->key_len);
 }
 
-static int send_req(aeron_ring_t *ring, const vemb_v16_req_t *req, size_t len,
+static int send_req(vemb_v16_client_ring_t *ring, const vemb_v16_req_t *req, size_t len,
                     uint64_t *publish_spins, uint32_t timeout_ms) {
     uint64_t spins = 0;
     uint64_t start = now_ns();
-    while (aeron_publish(ring, req, (uint32_t)len) != 0) {
+    while (vemb_v16_client_publish(ring, req, (uint32_t)len) != 0) {
         spins++;
         if ((spins & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
             if (publish_spins) *publish_spins += spins;
@@ -246,12 +249,12 @@ static int send_req(aeron_ring_t *ring, const vemb_v16_req_t *req, size_t len,
     return 0;
 }
 
-static int recv_resp(aeron_ring_t *ring, vemb_v16_resp_t *resp,
+static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
                      uint64_t *empty_polls, uint32_t timeout_ms) {
     int got;
     uint64_t polls = 0;
     uint64_t start = now_ns();
-    while ((got = aeron_poll(ring, resp, sizeof(*resp))) <= 0) {
+    while ((got = vemb_v16_client_poll(ring, resp, sizeof(*resp))) <= 0) {
         polls++;
         if ((polls & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
             if (empty_polls) *empty_polls += polls;
@@ -264,7 +267,8 @@ static int recv_resp(aeron_ring_t *ring, vemb_v16_resp_t *resp,
 }
 
 static int prefill(const bench_cfg_t *cfg, const vemb_v16_channel_desc_t *desc,
-                   aeron_ring_t *req_ring, aeron_ring_t *resp_ring) {
+                   vemb_v16_client_ring_t *req_ring,
+                   vemb_v16_client_ring_t *resp_ring) {
     vemb_v16_req_t req;
     vemb_v16_resp_t resp;
     char key[VEMB_V16_MAX_KEY_LEN];
@@ -469,9 +473,13 @@ static int run_once(bench_cfg_t cfg) {
         fprintf(stderr, "failed to allocate prefill channel\n");
         return 1;
     }
-    aeron_ring_t *pre_req = NULL, *pre_resp = NULL;
-    if (open_ring(pre_desc.request_ring_name, &pre_req) != 0 ||
-        open_ring(pre_desc.response_ring_name, &pre_resp) != 0) {
+    vemb_v16_client_ring_t *pre_req = NULL, *pre_resp = NULL;
+    if (open_ring(pre_desc.request_ring_name,
+                  pre_desc.request_ring_slot_size,
+                  &pre_req) != 0 ||
+        open_ring(pre_desc.response_ring_name,
+                  pre_desc.response_ring_slot_size,
+                  &pre_resp) != 0) {
         fprintf(stderr, "failed to open prefill rings\n");
         return 1;
     }
@@ -484,8 +492,10 @@ static int run_once(bench_cfg_t cfg) {
         return 1;
     }
     close_channel(cfg.socket_path, pre_desc.channel_id);
-    munmap(pre_req, sizeof(aeron_ring_t));
-    munmap(pre_resp, sizeof(aeron_ring_t));
+    munmap(pre_req,
+           vemb_v16_client_ring_bytes(pre_desc.request_ring_slot_size));
+    munmap(pre_resp,
+           vemb_v16_client_ring_bytes(pre_desc.response_ring_slot_size));
     pre_req = NULL;
     pre_resp = NULL;
     printf("[run] preparing mode=%s threads=%d ops/thread=%u timeout_ms=%u\n",
@@ -506,8 +516,12 @@ static int run_once(bench_cfg_t cfg) {
         args[i].cfg = cfg;
         atomic_init(&args[i].done, 0);
         if (alloc_channel(&cfg, &args[i].desc) != 0 ||
-            open_ring(args[i].desc.request_ring_name, &args[i].req_ring) != 0 ||
-            open_ring(args[i].desc.response_ring_name, &args[i].resp_ring) != 0) {
+            open_ring(args[i].desc.request_ring_name,
+                      args[i].desc.request_ring_slot_size,
+                      &args[i].req_ring) != 0 ||
+            open_ring(args[i].desc.response_ring_name,
+                      args[i].desc.response_ring_slot_size,
+                      &args[i].resp_ring) != 0) {
             fprintf(stderr, "worker %d channel setup failed\n", i);
             return 1;
         }
@@ -582,8 +596,16 @@ static int run_once(bench_cfg_t cfg) {
            (unsigned long long)response_empty_polls);
     for (int i = 0; i < cfg.threads; i++) {
         close_channel(cfg.socket_path, args[i].desc.channel_id);
-        if (args[i].req_ring) munmap(args[i].req_ring, sizeof(aeron_ring_t));
-        if (args[i].resp_ring) munmap(args[i].resp_ring, sizeof(aeron_ring_t));
+        if (args[i].req_ring) {
+            munmap(args[i].req_ring,
+                   vemb_v16_client_ring_bytes(
+                       args[i].desc.request_ring_slot_size));
+        }
+        if (args[i].resp_ring) {
+            munmap(args[i].resp_ring,
+                   vemb_v16_client_ring_bytes(
+                       args[i].desc.response_ring_slot_size));
+        }
         if (args[i].vector_region) {
             munmap(args[i].vector_region,
                    (size_t)args[i].desc.vector_stride * args[i].desc.max_vectors);

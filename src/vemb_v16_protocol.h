@@ -49,6 +49,8 @@ typedef struct vemb_v16_channel_desc {
     uint32_t vector_dim;
     uint32_t vector_stride;
     uint32_t max_vectors;
+    uint32_t request_ring_slot_size;
+    uint32_t response_ring_slot_size;
     char request_ring_name[64];
     char response_ring_name[64];
     char vector_region_name[64];

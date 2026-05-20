@@ -49,7 +49,7 @@ void *vemb_v16_supernode_thread_main(void *arg) {
            atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
         if (vemb_v16_aeron_poll(ctx->vemb_job_ring, &vemb_job)) {
             vemb_v16_job_base_t *job = &vemb_job.base;
-            atomic_fetch_add_explicit(ctx->supernode_vemb_poll, 1,
+            atomic_fetch_add_explicit(&ctx->stats->supernode_vemb_poll, 1,
                                       memory_order_relaxed);
             vemb_v16_completion_t completion = {
                 .status = VEMB_V16_STATUS_OK,
@@ -69,7 +69,8 @@ void *vemb_v16_supernode_thread_main(void *arg) {
             if (vemb_v16_table_lookup(ctx->table, job->key, job->key_len,
                                       job->key_hash, &row_id) != 0) {
                 completion.status = VEMB_V16_STATUS_NOT_FOUND;
-                atomic_fetch_add_explicit(ctx->not_found, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
+                                          memory_order_relaxed);
             } else {
                 if (sample) lookup_ns = monotonic_ns() - lookup_start;
                 if (job->dim != vemb_v16_table_dim(ctx->table) ||
@@ -105,13 +106,13 @@ void *vemb_v16_supernode_thread_main(void *arg) {
                             completion.status = VEMB_V16_STATUS_ERR;
                         }
                         if (sample) {
-                            atomic_fetch_add_explicit(ctx->sample_bitmap_lock_ns,
+                            atomic_fetch_add_explicit(&ctx->stats->sample_bitmap_lock_ns,
                                                       bitmap_lock_ns,
                                                       memory_order_relaxed);
-                            atomic_fetch_add_explicit(ctx->sample_bitmap_unlock_ns,
+                            atomic_fetch_add_explicit(&ctx->stats->sample_bitmap_unlock_ns,
                                                       bitmap_unlock_ns,
                                                       memory_order_relaxed);
-                            atomic_fetch_add_explicit(ctx->sample_vector_load_ns,
+                            atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
                                                       vector_load_ns,
                                                       memory_order_relaxed);
                         }
@@ -121,29 +122,31 @@ void *vemb_v16_supernode_thread_main(void *arg) {
 vemb_read_done:
             if (sample) {
                 if (!lookup_ns) lookup_ns = monotonic_ns() - lookup_start;
-                atomic_fetch_add_explicit(ctx->sample_count, 1,
+                atomic_fetch_add_explicit(&ctx->stats->sample_count, 1,
                                           memory_order_relaxed);
-                atomic_fetch_add_explicit(ctx->sample_table_lookup_ns,
+                atomic_fetch_add_explicit(&ctx->stats->sample_table_lookup_ns,
                                           lookup_ns,
                                           memory_order_relaxed);
             }
-            atomic_fetch_add_explicit(ctx->vemb_requests, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&ctx->stats->vemb_requests, 1,
+                                      memory_order_relaxed);
             uint64_t completion_start = sample ? monotonic_ns() : 0;
             while (vemb_v16_aeron_publish(ctx->completion_ring, &completion) != 0 &&
                    atomic_load_explicit(ctx->running, memory_order_relaxed) &&
                    atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
-                atomic_fetch_add_explicit(ctx->supernode_completion_ring_full, 1,
+                atomic_fetch_add_explicit(&ctx->stats->supernode_completion_ring_full, 1,
                                           memory_order_relaxed);
                 vemb_v16_supernode_relax();
             }
             if (sample) {
-                atomic_fetch_add_explicit(ctx->sample_completion_publish_ns,
+                atomic_fetch_add_explicit(&ctx->stats->sample_completion_publish_ns,
                                           monotonic_ns() - completion_start,
                                           memory_order_relaxed);
             }
-            atomic_fetch_add_explicit(ctx->supernode_completion_publish, 1,
+            atomic_fetch_add_explicit(&ctx->stats->supernode_completion_publish, 1,
                                       memory_order_relaxed);
-            atomic_fetch_add_explicit(ctx->completed_jobs, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&ctx->stats->completed_jobs, 1,
+                                      memory_order_relaxed);
             continue;
         }
 
@@ -151,7 +154,7 @@ vemb_read_done:
             vemb_v16_supernode_relax();
             continue;
         }
-        atomic_fetch_add_explicit(ctx->supernode_vadd_poll, 1,
+        atomic_fetch_add_explicit(&ctx->stats->supernode_vadd_poll, 1,
                                   memory_order_relaxed);
         vemb_v16_job_base_t *job = &vadd_job.base;
 
@@ -179,7 +182,8 @@ vemb_read_done:
                 completion.vector_offset =
                     (uint64_t)row_id * vemb_v16_table_stride(ctx->table);
             }
-            atomic_fetch_add_explicit(ctx->vadd_requests, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&ctx->stats->vadd_requests, 1,
+                                      memory_order_relaxed);
         } else {
             completion.status = VEMB_V16_STATUS_ERR;
         }
@@ -187,13 +191,14 @@ vemb_read_done:
         while (vemb_v16_aeron_publish(ctx->completion_ring, &completion) != 0 &&
                atomic_load_explicit(ctx->running, memory_order_relaxed) &&
                atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
-            atomic_fetch_add_explicit(ctx->supernode_completion_ring_full, 1,
+            atomic_fetch_add_explicit(&ctx->stats->supernode_completion_ring_full, 1,
                                       memory_order_relaxed);
             vemb_v16_supernode_relax();
         }
-        atomic_fetch_add_explicit(ctx->supernode_completion_publish, 1,
+        atomic_fetch_add_explicit(&ctx->stats->supernode_completion_publish, 1,
                                   memory_order_relaxed);
-        atomic_fetch_add_explicit(ctx->completed_jobs, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ctx->stats->completed_jobs, 1,
+                                  memory_order_relaxed);
     }
     serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
               ctx->worker_id);
