@@ -107,6 +107,12 @@ typedef struct vemb_v16_stats {
     uint64_t sample_completion_publish_ns;
     uint64_t bitmap_lock_success;
     uint64_t bitmap_lock_failure;
+    uint64_t request_ring_depth;
+    uint64_t response_ring_depth;
+    uint64_t vemb_job_ring_depth;
+    uint64_t vadd_job_ring_depth;
+    uint64_t completion_ring_depth;
+    uint64_t channel_ops;
 } vemb_v16_stats_t;
 
 static inline uint32_t vemb_v16_murmur3(const char *key, size_t len) {

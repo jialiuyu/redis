@@ -4,7 +4,6 @@
 #include "vemb_v16_dataplane.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
-#include "zmalloc.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -33,8 +32,6 @@ void *vemb_v16_supernode_thread_main(void *arg) {
     vemb_v16_supernode_ctx_t *ctx = arg;
     vemb_v16_vemb_job_t vemb_job;
     vemb_v16_vadd_job_t vadd_job;
-    float *vemb_vector_scratch = NULL;
-    size_t vemb_vector_scratch_floats = 0;
 
 #ifdef __linux__
     cpu_set_t cpuset;
@@ -70,52 +67,13 @@ void *vemb_v16_supernode_thread_main(void *arg) {
                 completion.status = VEMB_V16_STATUS_NOT_FOUND;
                 atomic_fetch_add_explicit(ctx->not_found, 1, memory_order_relaxed);
             } else {
-                uint32_t table_dim = vemb_v16_table_dim(ctx->table);
-                if (job->dim != table_dim ||
+                if (job->dim != vemb_v16_table_dim(ctx->table) ||
                     job->vector_bytes != vemb_v16_table_stride(ctx->table)) {
                     completion.status = VEMB_V16_STATUS_ERR;
-                }
-                if (completion.status == VEMB_V16_STATUS_OK &&
-                    vemb_vector_scratch_floats < table_dim) {
-                    float *next = zrealloc(vemb_vector_scratch,
-                                           sizeof(float) * table_dim);
-                    if (!next) {
-                        completion.status = VEMB_V16_STATUS_ERR;
-                    } else {
-                        vemb_vector_scratch = next;
-                        vemb_vector_scratch_floats = table_dim;
-                    }
-                }
-                if (completion.status == VEMB_V16_STATUS_OK) {
-                    uint64_t emb_id = row_id;
-                    uint64_t bitmap_lock_ns = 0;
-                    uint64_t bitmap_unlock_ns = 0;
-                    uint64_t vector_load_ns = 0;
-                    if (sve_serial_contiguous_read_traced(
-                            vemb_v16_table_gather_ctx(ctx->table),
-                            &emb_id,
-                            1,
-                            vemb_vector_scratch,
-                            &bitmap_lock_ns,
-                            &bitmap_unlock_ns,
-                            &vector_load_ns) != 0) {
-                        completion.status = VEMB_V16_STATUS_ERR;
-                    } else {
-                        completion.vector_offset =
-                            (uint64_t)row_id * vemb_v16_table_stride(ctx->table);
-                        completion.vector_bytes = vemb_v16_table_stride(ctx->table);
-                    }
-                    if (sample) {
-                        atomic_fetch_add_explicit(ctx->sample_bitmap_lock_ns,
-                                                  bitmap_lock_ns,
-                                                  memory_order_relaxed);
-                        atomic_fetch_add_explicit(ctx->sample_bitmap_unlock_ns,
-                                                  bitmap_unlock_ns,
-                                                  memory_order_relaxed);
-                        atomic_fetch_add_explicit(ctx->sample_vector_load_ns,
-                                                  vector_load_ns,
-                                                  memory_order_relaxed);
-                    }
+                } else {
+                    completion.vector_offset =
+                        (uint64_t)row_id * vemb_v16_table_stride(ctx->table);
+                    completion.vector_bytes = vemb_v16_table_stride(ctx->table);
                 }
             }
             if (sample) {
@@ -193,7 +151,6 @@ void *vemb_v16_supernode_thread_main(void *arg) {
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(ctx->completed_jobs, 1, memory_order_relaxed);
     }
-    zfree(vemb_vector_scratch);
     serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
               ctx->worker_id);
     return NULL;

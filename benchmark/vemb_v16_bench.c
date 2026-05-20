@@ -8,6 +8,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,7 @@ typedef struct worker_arg {
     uint64_t request_publish_spins;
     uint64_t response_empty_polls;
     uint64_t ns;
+    atomic_int done;
 } worker_arg_t;
 
 enum {
@@ -346,6 +348,7 @@ static void *worker_main(void *arg) {
         w->ok++;
     }
     w->ns = now_ns() - start;
+    atomic_store_explicit(&w->done, 1, memory_order_release);
     return NULL;
 }
 
@@ -410,6 +413,13 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(supernode_completion_publish));
     printf("[stats] bitmap lock_success=%llu lock_failure=%llu\n",
            D(bitmap_lock_success), D(bitmap_lock_failure));
+    printf("[stats] depth request=%llu response=%llu vemb_job=%llu vadd_job=%llu completion=%llu channel_ops=%llu\n",
+           (unsigned long long)after->request_ring_depth,
+           (unsigned long long)after->response_ring_depth,
+           (unsigned long long)after->vemb_job_ring_depth,
+           (unsigned long long)after->vadd_job_ring_depth,
+           (unsigned long long)after->completion_ring_depth,
+           (unsigned long long)after->channel_ops);
     uint64_t samples = after->sample_count - before->sample_count;
     if (samples) {
         printf("[stats] samples=%llu table_lookup_avg_ns=%.1f bitmap_lock_avg_ns=%.1f bitmap_unlock_avg_ns=%.1f vector_load_avg_ns=%.1f completion_publish_avg_ns=%.1f\n",
@@ -463,6 +473,7 @@ static int run_once(bench_cfg_t cfg) {
     for (int i = 0; i < cfg.threads; i++) {
         args[i].tid = i;
         args[i].cfg = cfg;
+        atomic_init(&args[i].done, 0);
         if (alloc_channel(&cfg, &args[i].desc) != 0 ||
             open_ring(args[i].desc.request_ring_name, &args[i].req_ring) != 0 ||
             open_ring(args[i].desc.response_ring_name, &args[i].resp_ring) != 0) {
@@ -485,8 +496,33 @@ static int run_once(bench_cfg_t cfg) {
     fflush(stdout);
     for (int i = 0; i < cfg.threads; i++)
         pthread_create(&threads[i], NULL, worker_main, &args[i]);
-    for (int i = 0; i < cfg.threads; i++)
-        pthread_join(threads[i], NULL);
+    uint64_t join_start = now_ns();
+    int timed_out = 0;
+    for (;;) {
+        int done = 0;
+        for (int i = 0; i < cfg.threads; i++)
+            done += atomic_load_explicit(&args[i].done, memory_order_acquire);
+        if (done == cfg.threads) break;
+        if (wait_timed_out(join_start, cfg.timeout_ms ? cfg.timeout_ms : 0)) {
+            fprintf(stderr, "run timeout: done_workers=%d/%d timeout_ms=%u\n",
+                    done, cfg.threads, cfg.timeout_ms);
+            if (fetch_stats(cfg.socket_path, &after) == 0)
+                print_stats_delta(&before, &after);
+            timed_out = 1;
+            break;
+        }
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+    }
+    if (!timed_out) {
+        for (int i = 0; i < cfg.threads; i++)
+            pthread_join(threads[i], NULL);
+    } else {
+        for (int i = 0; i < cfg.threads; i++)
+            close_channel(cfg.socket_path, args[i].desc.channel_id);
+        close_channel(cfg.socket_path, pre_desc.channel_id);
+        return 1;
+    }
     uint64_t wall = now_ns() - start;
 
     uint64_t ok = 0, fail = 0, read_bytes = 0;

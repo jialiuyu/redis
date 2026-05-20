@@ -573,7 +573,7 @@ tlc_urma_server: tlc_urma_server.c liburma.so $(TLC_COMMON_DEPS)
 
 VEMB_V16_CFLAGS = -O3 -Wall -Wextra -pthread -std=gnu11 -I.
 ifeq ($(USE_SVE),yes)
-VEMB_V16_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+VEMB_V16_CFLAGS += -DUSE_SVE -DUSE_ARM_SVE -march=armv8.2-a+sve
 endif
 
 vemb_v16_server: vemb_v16_server.c vemb_v16_proxy.c vemb_v16_supernode.c vemb_v16_table.c vemb_v16_log.c sve_operation.c localtime.c zmalloc.c monotonic.c redisassert.c vemb_v16_proxy.h vemb_v16_protocol.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_supernode.h vemb_v16_table.h vemb_v16_log.h sve_operation.h aeron_ipc.h

@@ -70,6 +70,13 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.bitmap_lock_success,
            (unsigned long long)stats.bitmap_lock_failure,
            (unsigned long long)stats.sample_vector_load_ns);
+    serverLog(LL_NOTICE, "vemb_v16 stats: depth request=%llu response=%llu vemb_job=%llu vadd_job=%llu completion=%llu channel_ops=%llu",
+           (unsigned long long)stats.request_ring_depth,
+           (unsigned long long)stats.response_ring_depth,
+           (unsigned long long)stats.vemb_job_ring_depth,
+           (unsigned long long)stats.vadd_job_ring_depth,
+           (unsigned long long)stats.completion_ring_depth,
+           (unsigned long long)stats.channel_ops);
 
     vemb_v16_proxy_destroy(g_proxy);
     g_proxy = NULL;

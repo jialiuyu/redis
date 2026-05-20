@@ -705,7 +705,27 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
             atomic_load_explicit(&sve_stats->lock_failure, memory_order_relaxed);
     }
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
-        if (atomic_load_explicit(&proxy->channels[i].active, memory_order_acquire))
+        vemb_v16_channel_t *ch = &proxy->channels[i];
+        if (atomic_load_explicit(&ch->active, memory_order_acquire)) {
             stats->active_channels++;
+            if (ch->request_ring) {
+                uint64_t req_head = __atomic_load_n(&ch->request_ring->head,
+                                                    __ATOMIC_ACQUIRE);
+                uint64_t req_tail = __atomic_load_n(&ch->request_ring->tail,
+                                                    __ATOMIC_ACQUIRE);
+                stats->request_ring_depth += req_tail - req_head;
+            }
+            if (ch->response_ring) {
+                uint64_t resp_head = __atomic_load_n(&ch->response_ring->head,
+                                                     __ATOMIC_ACQUIRE);
+                uint64_t resp_tail = __atomic_load_n(&ch->response_ring->tail,
+                                                     __ATOMIC_ACQUIRE);
+                stats->response_ring_depth += resp_tail - resp_head;
+            }
+            stats->vemb_job_ring_depth += vemb_v16_aeron_available(&ch->vemb_job_ring);
+            stats->vadd_job_ring_depth += vemb_v16_aeron_available(&ch->vadd_job_ring);
+            stats->completion_ring_depth += vemb_v16_aeron_available(&ch->completion_ring);
+            stats->channel_ops += atomic_load_explicit(&ch->ops, memory_order_relaxed);
+        }
     }
 }
