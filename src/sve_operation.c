@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#ifdef USE_ARM_SVE
+#include <arm_sve.h>
+#endif
+
 #ifdef SVE_OP_STANDALONE
 static inline void *zcalloc(size_t n) { return calloc(1, n); }
 static inline void  zfree(void *p)    { free(p); }
