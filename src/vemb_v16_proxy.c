@@ -28,6 +28,7 @@
 #define VEMB_V16_VEMB_JOB_RING_SIZE VEMB_V16_AERON_RING_SIZE
 #define VEMB_V16_VADD_JOB_RING_SIZE 256u
 #define VEMB_V16_COMPLETION_RING_SIZE VEMB_V16_AERON_RING_SIZE
+#define VEMB_V16_PROXY_BATCH 32u
 
 typedef struct vemb_v16_channel {
     uint64_t channel_id;
@@ -329,13 +330,18 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
 }
 
 static void drain_completions(vemb_v16_channel_t *ch) {
-    vemb_v16_completion_t completion;
-    while (vemb_v16_aeron_poll(&ch->completion_ring, &completion)) {
-        atomic_fetch_add_explicit(&ch->stats.proxy_completion_poll, 1,
+    vemb_v16_completion_t completions[VEMB_V16_PROXY_BATCH];
+    uint32_t n;
+    while ((n = vemb_v16_aeron_poll_batch(&ch->completion_ring,
+                                          completions,
+                                          VEMB_V16_PROXY_BATCH)) != 0) {
+        atomic_fetch_add_explicit(&ch->stats.proxy_completion_poll, n,
                                   memory_order_relaxed);
-        if (completion.channel_id == ch->channel_id &&
-            atomic_load_explicit(&ch->active, memory_order_acquire)) {
-            publish_response(ch, &completion);
+        for (uint32_t i = 0; i < n; i++) {
+            if (completions[i].channel_id == ch->channel_id &&
+                atomic_load_explicit(&ch->active, memory_order_acquire)) {
+                publish_response(ch, &completions[i]);
+            }
         }
     }
 }
@@ -343,7 +349,8 @@ static void drain_completions(vemb_v16_channel_t *ch) {
 static void *channel_thread_main(void *arg) {
     vemb_v16_channel_t *ch = arg;
     vemb_v16_proxy_t *proxy = ch->proxy;
-    vemb_v16_req_t req_buf;
+    vemb_v16_req_t *req_buf = malloc(sizeof(*req_buf) * VEMB_V16_PROXY_BATCH);
+    if (!req_buf) return NULL;
 
 #ifdef __linux__
     cpu_set_t cpuset;
@@ -358,14 +365,17 @@ static void *channel_thread_main(void *arg) {
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
         drain_completions(ch);
 
-        int req_len = vemb_v16_client_poll(ch->request_ring, &req_buf, sizeof(req_buf));
-        if (req_len > 0) {
-            atomic_fetch_add_explicit(&ch->stats.proxy_request_poll, 1,
+        uint32_t req_count = vemb_v16_client_poll_batch(ch->request_ring,
+                                                        req_buf,
+                                                        sizeof(req_buf[0]),
+                                                        VEMB_V16_PROXY_BATCH);
+        if (req_count > 0) {
+            atomic_fetch_add_explicit(&ch->stats.proxy_request_poll, req_count,
                                       memory_order_relaxed);
-            if ((size_t)req_len >= vemb_v16_req_handle_len()) {
-                handle_request(ch, &req_buf, req_len);
+            for (uint32_t i = 0; i < req_count; i++) {
+                handle_request(ch, &req_buf[i], (int)ch->request_ring->slot_size);
             }
-            atomic_fetch_add_explicit(&ch->stats.channel_ops, 1,
+            atomic_fetch_add_explicit(&ch->stats.channel_ops, req_count,
                                       memory_order_relaxed);
         } else {
             vemb_v16_cpu_relax();
@@ -376,6 +386,7 @@ static void *channel_thread_main(void *arg) {
               (unsigned long long)ch->channel_id,
               (unsigned long long)atomic_load_explicit(&ch->stats.channel_ops,
                                                        memory_order_relaxed));
+    free(req_buf);
     return NULL;
 }
 
@@ -723,7 +734,8 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
                 continue;
             }
             if (errno == EINTR) continue;
-            serverLog(LL_WARNING, "vemb_v16 accept failed: %s", strerror(errno));
+            serverLog(LL_WARNING, "vemb_v16 accept failed: fd=%d errno=%d error=%s",
+                      proxy->uds_fd, errno, strerror(errno));
             return -1;
         }
         handle_control_fd(proxy, cfd);

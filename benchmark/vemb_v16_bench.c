@@ -32,6 +32,7 @@ typedef struct bench_cfg {
     uint32_t hot_key_id;
     uint32_t timeout_ms;
     int pin_threads;
+    uint32_t pipeline;
 } bench_cfg_t;
 
 typedef struct worker_arg {
@@ -59,6 +60,11 @@ enum {
 };
 
 static uint32_t g_control_timeout_ms = 10000;
+
+typedef struct pending_req {
+    uint32_t op_index;
+    uint32_t key_id;
+} pending_req_t;
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -266,6 +272,31 @@ static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
     return got == (int)sizeof(*resp) ? 0 : -1;
 }
 
+static int recv_resp_batch(vemb_v16_client_ring_t *ring,
+                           vemb_v16_resp_t *responses,
+                           uint32_t max_count,
+                           uint32_t *received,
+                           uint64_t *empty_polls,
+                           uint32_t timeout_ms) {
+    uint64_t polls = 0;
+    uint64_t start = now_ns();
+    uint32_t got = 0;
+    while ((got = vemb_v16_client_poll_batch(ring,
+                                             responses,
+                                             sizeof(*responses),
+                                             max_count)) == 0) {
+        polls++;
+        if ((polls & 0xfffu) == 0 && wait_timed_out(start, timeout_ms)) {
+            if (empty_polls) *empty_polls += polls;
+            return -1;
+        }
+        __asm__ volatile("" ::: "memory");
+    }
+    if (empty_polls) *empty_polls += polls;
+    *received = got;
+    return 0;
+}
+
 static int prefill(const bench_cfg_t *cfg, const vemb_v16_channel_desc_t *desc,
                    vemb_v16_client_ring_t *req_ring,
                    vemb_v16_client_ring_t *resp_ring) {
@@ -310,71 +341,125 @@ static void *worker_main(void *arg) {
     }
 #endif
 
+    uint32_t pipeline = w->cfg.pipeline ? w->cfg.pipeline : 1;
     vemb_v16_req_t req;
-    vemb_v16_resp_t resp;
+    vemb_v16_resp_t *responses = calloc(pipeline, sizeof(*responses));
+    pending_req_t *pending = calloc(pipeline, sizeof(*pending));
+    if (!responses || !pending) {
+        free(responses);
+        free(pending);
+        w->fail = w->cfg.ops;
+        atomic_store_explicit(&w->done, 1, memory_order_release);
+        return NULL;
+    }
     char key[VEMB_V16_MAX_KEY_LEN];
     uint64_t start = now_ns();
-    for (uint32_t i = 0; i < w->cfg.ops; i++) {
-        uint32_t global_id = (uint32_t)(i + (uint32_t)w->tid * w->cfg.ops);
-        uint8_t op = w->cfg.mode == MODE_VEMB_SUPERNODE_READ ?
-            VEMB_V16_OP_VEMB_SUPERNODE_READ : VEMB_V16_OP_VEMB_HANDLE;
-        uint32_t key_id = w->cfg.prefill ? global_id % w->cfg.prefill : global_id;
-        if (w->cfg.hot_key_enabled) key_id = w->cfg.hot_key_id;
-        if (w->cfg.mode == MODE_PING) {
-            memset(&req, 0, sizeof(req));
-            req.op = VEMB_V16_OP_PING;
-            req.req_id = i + 1;
-            req.channel_id = w->desc.channel_id;
-            if (send_req(w->req_ring, &req, vemb_v16_req_handle_len(),
-                         &w->request_publish_spins, w->cfg.timeout_ms) != 0) {
-                fprintf(stderr, "worker %d request publish timeout at op=%u mode=ping\n",
-                        w->tid, i);
-                w->fail += w->cfg.ops - i;
-                break;
+    uint32_t sent = 0;
+    uint32_t completed = 0;
+    uint32_t pending_head = 0;
+    uint32_t pending_tail = 0;
+    uint32_t pending_count = 0;
+    while (completed < w->cfg.ops) {
+        while (sent < w->cfg.ops && pending_count < pipeline) {
+            uint32_t i = sent;
+            uint32_t global_id = (uint32_t)(i + (uint32_t)w->tid * w->cfg.ops);
+            uint32_t key_id = w->cfg.prefill ? global_id % w->cfg.prefill : global_id;
+            if (w->cfg.hot_key_enabled) key_id = w->cfg.hot_key_id;
+            size_t req_len = vemb_v16_req_handle_len();
+            int send_failed = 0;
+            uint8_t op = w->cfg.mode == MODE_VEMB_SUPERNODE_READ ?
+                VEMB_V16_OP_VEMB_SUPERNODE_READ : VEMB_V16_OP_VEMB_HANDLE;
+            if (w->cfg.mode == MODE_PING) {
+                memset(&req, 0, sizeof(req));
+                req.op = VEMB_V16_OP_PING;
+                req.req_id = i + 1;
+                req.channel_id = w->desc.channel_id;
+                if (send_req(w->req_ring, &req, req_len,
+                             &w->request_publish_spins,
+                             w->cfg.timeout_ms) != 0) {
+                    fprintf(stderr, "worker %d request publish timeout at op=%u mode=ping\n",
+                            w->tid, i);
+                    send_failed = 1;
+                }
+            } else if (w->cfg.mode == MODE_VADD_INLINE) {
+                make_key(key, sizeof(key), global_id + 100000000u);
+                prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1,
+                            w->desc.channel_id, key, w->cfg.dim);
+                fill_vector(req.vector, w->cfg.dim, global_id);
+                req_len = vemb_v16_req_inline_len(req.vector_bytes);
+                if (send_req(w->req_ring, &req, req_len,
+                             &w->request_publish_spins,
+                             w->cfg.timeout_ms) != 0) {
+                    fprintf(stderr, "worker %d request publish timeout at op=%u mode=vadd-inline\n",
+                            w->tid, i);
+                    send_failed = 1;
+                }
+            } else {
+                make_key(key, sizeof(key), key_id);
+                prepare_req(&req, op, i + 1, w->desc.channel_id, key,
+                            w->cfg.dim);
+                if (send_req(w->req_ring, &req, req_len,
+                             &w->request_publish_spins,
+                             w->cfg.timeout_ms) != 0) {
+                    fprintf(stderr, "worker %d request publish timeout at op=%u key_id=%u\n",
+                            w->tid, i, key_id);
+                    send_failed = 1;
+                }
             }
-        } else if (w->cfg.mode == MODE_VADD_INLINE) {
-            make_key(key, sizeof(key), global_id + 100000000u);
-            prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1, w->desc.channel_id,
-                        key, w->cfg.dim);
-            fill_vector(req.vector, w->cfg.dim, global_id);
-            if (send_req(w->req_ring, &req, vemb_v16_req_inline_len(req.vector_bytes),
-                         &w->request_publish_spins, w->cfg.timeout_ms) != 0) {
-                fprintf(stderr, "worker %d request publish timeout at op=%u mode=vadd-inline\n",
-                        w->tid, i);
-                w->fail += w->cfg.ops - i;
-                break;
+            if (send_failed) {
+                w->fail += w->cfg.ops - completed;
+                goto worker_done;
             }
-        } else {
-            make_key(key, sizeof(key), key_id);
-            prepare_req(&req, op, i + 1, w->desc.channel_id, key, w->cfg.dim);
-            if (send_req(w->req_ring, &req, vemb_v16_req_handle_len(),
-                         &w->request_publish_spins, w->cfg.timeout_ms) != 0) {
-                fprintf(stderr, "worker %d request publish timeout at op=%u key_id=%u\n",
-                        w->tid, i, key_id);
-                w->fail += w->cfg.ops - i;
-                break;
-            }
+            pending[pending_tail] = (pending_req_t){
+                .op_index = i,
+                .key_id = key_id,
+            };
+            pending_tail = (pending_tail + 1) % pipeline;
+            pending_count++;
+            sent++;
         }
 
-        if (recv_resp(w->resp_ring, &resp, &w->response_empty_polls,
-                      w->cfg.timeout_ms) != 0 ||
-            resp.status != VEMB_V16_STATUS_OK) {
-            fprintf(stderr, "worker %d response timeout/error at op=%u status=%u key_id=%u\n",
-                    w->tid, i, resp.status, key_id);
-            w->fail += w->cfg.ops - i;
-            break;
+        uint32_t got = 0;
+        if (recv_resp_batch(w->resp_ring,
+                            responses,
+                            pipeline < pending_count ? pipeline : pending_count,
+                            &got,
+                            &w->response_empty_polls,
+                            w->cfg.timeout_ms) != 0) {
+            uint32_t key_id = pending_count ? pending[pending_head].key_id : 0;
+            uint32_t op_index = pending_count ? pending[pending_head].op_index : completed;
+            fprintf(stderr, "worker %d response timeout at op=%u key_id=%u\n",
+                    w->tid, op_index, key_id);
+            w->fail += w->cfg.ops - completed;
+            goto worker_done;
         }
 
-        if (w->cfg.mode == MODE_VEMB_READ_VECTOR) {
-            volatile const uint8_t *p = w->vector_region + resp.vector_offset;
-            uint8_t checksum = 0;
-            for (uint32_t j = 0; j < resp.vector_bytes; j += 64)
-                checksum ^= p[j];
-            w->read_bytes += resp.vector_bytes + checksum * 0u;
+        for (uint32_t r = 0; r < got; r++) {
+            pending_req_t done_req = pending[pending_head];
+            pending_head = (pending_head + 1) % pipeline;
+            pending_count--;
+            vemb_v16_resp_t *resp = &responses[r];
+            if (resp->status != VEMB_V16_STATUS_OK) {
+                fprintf(stderr, "worker %d response error at op=%u status=%u key_id=%u\n",
+                        w->tid, done_req.op_index, resp->status, done_req.key_id);
+                w->fail += w->cfg.ops - completed;
+                goto worker_done;
+            }
+            if (w->cfg.mode == MODE_VEMB_READ_VECTOR) {
+                volatile const uint8_t *p = w->vector_region + resp->vector_offset;
+                uint8_t checksum = 0;
+                for (uint32_t j = 0; j < resp->vector_bytes; j += 64)
+                    checksum ^= p[j];
+                w->read_bytes += resp->vector_bytes + checksum * 0u;
+            }
+            w->ok++;
+            completed++;
         }
-        w->ok++;
     }
+worker_done:
     w->ns = now_ns() - start;
+    free(responses);
+    free(pending);
     atomic_store_explicit(&w->done, 1, memory_order_release);
     return NULL;
 }
@@ -483,9 +568,9 @@ static int run_once(bench_cfg_t cfg) {
         fprintf(stderr, "failed to open prefill rings\n");
         return 1;
     }
-    printf("[setup] mode=%s dim=%u prefill=%u ops/thread=%u threads=%d pin=%s\n",
+    printf("[setup] mode=%s dim=%u prefill=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
            mode_name(cfg.mode), cfg.dim, cfg.prefill, cfg.ops, cfg.threads,
-           cfg.pin_threads ? "yes" : "no");
+           cfg.pipeline, cfg.pin_threads ? "yes" : "no");
     if (cfg.prefill && cfg.mode != MODE_PING &&
         prefill(&cfg, &pre_desc, pre_req, pre_resp) != 0) {
         fprintf(stderr, "prefill failed\n");
@@ -629,6 +714,7 @@ int main(int argc, char **argv) {
         .threads = 8,
         .mode = MODE_VEMB_HANDLE,
         .timeout_ms = 10000,
+        .pipeline = 1,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -637,6 +723,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ops") && i + 1 < argc) cfg.ops = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) cfg.timeout_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--pipeline") && i + 1 < argc) cfg.pipeline = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *arg = argv[++i];
             if (strchr(arg, ',')) {
@@ -656,7 +743,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--threads N] [--pin yes|no] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-supernode-read|vadd-inline]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N] [--pin yes|no] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-supernode-read|vadd-inline]\n", argv[0]);
             return 0;
         }
     }
@@ -664,7 +751,8 @@ int main(int argc, char **argv) {
     uint64_t closed = 0;
     if (close_all_channels(cfg.socket_path, &closed) == 0 && closed)
         printf("[setup] closed stale channels=%llu\n", (unsigned long long)closed);
-    if (cfg.mode < 0 || cfg.threads <= 0 || cfg.threads > VEMB_V16_MAX_CHANNELS) {
+    if (cfg.mode < 0 || cfg.threads <= 0 || cfg.threads > VEMB_V16_MAX_CHANNELS ||
+        cfg.pipeline == 0 || cfg.pipeline > VEMB_V16_CLIENT_RING_SIZE) {
         fprintf(stderr, "invalid arguments\n");
         return 1;
     }

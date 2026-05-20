@@ -64,6 +64,27 @@ static inline int vemb_v16_client_poll(vemb_v16_client_ring_t *ring,
     return (int)len;
 }
 
+static inline uint32_t vemb_v16_client_poll_batch(vemb_v16_client_ring_t *ring,
+                                                  void *slots,
+                                                  uint32_t max_len,
+                                                  uint32_t max_count) {
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
+    uint64_t available = tail - head;
+    if (available == 0 || max_count == 0) return 0;
+    if (available > max_count) available = max_count;
+    uint32_t len = ring->slot_size;
+    if (len > max_len) len = max_len;
+    uint8_t *dst = slots;
+    for (uint32_t i = 0; i < (uint32_t)available; i++) {
+        memcpy(dst + (size_t)i * max_len,
+               ring->slots + ((head + i) & ring->slot_mask) * ring->slot_size,
+               len);
+    }
+    atomic_store_explicit(&ring->head, head + available, memory_order_release);
+    return (uint32_t)available;
+}
+
 static inline uint64_t vemb_v16_client_available(vemb_v16_client_ring_t *ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
