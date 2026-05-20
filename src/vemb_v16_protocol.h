@@ -26,6 +26,7 @@ enum vemb_v16_ctrl_op {
     VEMB_V16_CTRL_ALLOC_CHANNEL = 0x20,
     VEMB_V16_CTRL_CLOSE_CHANNEL = 0x21,
     VEMB_V16_CTRL_STATS = 0x22,
+    VEMB_V16_CTRL_CLOSE_ALL_CHANNELS = 0x23,
 };
 
 enum vemb_v16_data_op {

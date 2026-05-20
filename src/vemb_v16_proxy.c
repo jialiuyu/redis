@@ -485,6 +485,19 @@ static int close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
     return -1;
 }
 
+static uint64_t close_all_channels(vemb_v16_proxy_t *proxy) {
+    if (!proxy) return 0;
+    uint64_t closed = 0;
+    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
+        vemb_v16_channel_t *ch = &proxy->channels[i];
+        if (atomic_load_explicit(&ch->active, memory_order_acquire)) {
+            close_channel(ch);
+            closed++;
+        }
+    }
+    return closed;
+}
+
 static void handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
     uint8_t op = 0;
     if (read(fd, &op, 1) != 1) goto close_fd;
@@ -514,6 +527,11 @@ static void handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
         uint8_t status = close_channel_by_id(proxy, channel_id) == 0 ?
             VEMB_V16_STATUS_OK : VEMB_V16_STATUS_ERR;
         write_full(fd, &status, sizeof(status));
+    } else if (op == VEMB_V16_CTRL_CLOSE_ALL_CHANNELS) {
+        uint64_t closed = close_all_channels(proxy);
+        uint8_t status = VEMB_V16_STATUS_OK;
+        write_full(fd, &status, sizeof(status));
+        write_full(fd, &closed, sizeof(closed));
     }
 
 close_fd:

@@ -163,6 +163,24 @@ static int close_channel(const char *socket_path, uint64_t channel_id) {
     return status == VEMB_V16_STATUS_OK ? 0 : -1;
 }
 
+static int close_all_channels(const char *socket_path, uint64_t *closed) {
+    int fd = connect_uds(socket_path);
+    if (fd < 0) return -1;
+    uint8_t op = VEMB_V16_CTRL_CLOSE_ALL_CHANNELS;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    uint64_t n = 0;
+    if (write_full(fd, &op, sizeof(op)) != 0 ||
+        read_full(fd, &status, sizeof(status)) != 0 ||
+        status != VEMB_V16_STATUS_OK ||
+        read_full(fd, &n, sizeof(n)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    if (closed) *closed = n;
+    return 0;
+}
+
 static int open_ring(const char *name, aeron_ring_t **ring) {
     int fd = shm_open(name, O_RDWR, 0666);
     if (fd < 0) return -1;
@@ -457,6 +475,11 @@ static int run_once(bench_cfg_t cfg) {
         fprintf(stderr, "prefill failed\n");
         return 1;
     }
+    close_channel(cfg.socket_path, pre_desc.channel_id);
+    munmap(pre_req, sizeof(aeron_ring_t));
+    munmap(pre_resp, sizeof(aeron_ring_t));
+    pre_req = NULL;
+    pre_resp = NULL;
     printf("[run] preparing mode=%s threads=%d ops/thread=%u timeout_ms=%u\n",
            mode_name(cfg.mode), cfg.threads, cfg.ops, cfg.timeout_ms);
     fflush(stdout);
@@ -520,7 +543,6 @@ static int run_once(bench_cfg_t cfg) {
     } else {
         for (int i = 0; i < cfg.threads; i++)
             close_channel(cfg.socket_path, args[i].desc.channel_id);
-        close_channel(cfg.socket_path, pre_desc.channel_id);
         return 1;
     }
     uint64_t wall = now_ns() - start;
@@ -559,9 +581,6 @@ static int run_once(bench_cfg_t cfg) {
                    (size_t)args[i].desc.vector_stride * args[i].desc.max_vectors);
         }
     }
-    close_channel(cfg.socket_path, pre_desc.channel_id);
-    munmap(pre_req, sizeof(aeron_ring_t));
-    munmap(pre_resp, sizeof(aeron_ring_t));
     if (fetch_stats(cfg.socket_path, &after) == 0)
         print_stats_delta(&before, &after);
     else
@@ -607,6 +626,9 @@ int main(int argc, char **argv) {
         }
     }
     g_control_timeout_ms = cfg.timeout_ms;
+    uint64_t closed = 0;
+    if (close_all_channels(cfg.socket_path, &closed) == 0 && closed)
+        printf("[setup] closed stale channels=%llu\n", (unsigned long long)closed);
     if (cfg.mode < 0 || cfg.threads <= 0 || cfg.threads > VEMB_V16_MAX_CHANNELS) {
         fprintf(stderr, "invalid arguments\n");
         return 1;
