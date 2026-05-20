@@ -45,6 +45,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
     monotonicInit();
+    vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
     serverLog(LL_NOTICE, "vemb_v16 server starting: uds=%s dim=%u max_vectors=%u",
               uds_path, dim, max_vectors);
