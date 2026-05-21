@@ -5,9 +5,12 @@
 
 set -e
 
-REDIS_SERVER="./src/redis-server"
-REDIS_CLI="./src/redis-cli"
-TEST_PROGRAM="./batch_embedding_test"
+BENCHMARK_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$BENCHMARK_DIR/.." && pwd)"
+
+REDIS_SERVER="$REPO_ROOT/src/redis-server"
+REDIS_CLI="$REPO_ROOT/src/redis-cli"
+TEST_PROGRAM="$BENCHMARK_DIR/batch_embedding_test"
 TEST_CONFIG="/tmp/redis_ub_test.conf"
 TEST_PORT=6381
 
@@ -31,7 +34,11 @@ REDIS_PID=$!
 sleep 3
 
 echo "2. Compiling test program..."
-gcc -I./deps/hiredis -I./src -o "$TEST_PROGRAM" simple_ub_test.c ./deps/hiredis/libhiredis.a -lm
+gcc -I"$REPO_ROOT/deps/hiredis" -I"$REPO_ROOT/src" \
+    -o "$TEST_PROGRAM" \
+    "$BENCHMARK_DIR/simple_ub_test.c" \
+    "$REPO_ROOT/deps/hiredis/libhiredis.a" \
+    -lm
 
 echo "3. Running simple UB test..."
 $TEST_PROGRAM

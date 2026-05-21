@@ -5,7 +5,7 @@
 
 set -e
 
-REDIS_DIR="$(cd "$(dirname "$0")" && pwd)"
+BENCHMARK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "========================================="
 echo "Bitmap CAS Optimization Test"
@@ -42,8 +42,8 @@ echo "-------------------------------------------"
 gcc -O3 $ARCH_FLAGS -pthread \
     -std=c11 \
     -Wall -Wextra \
-    "$REDIS_DIR/test_bitmap_cas_optimized.c" \
-    -o "$REDIS_DIR/test_bitmap_cas_optimized"
+    "$BENCHMARK_DIR/test_bitmap_cas_optimized.c" \
+    -o "$BENCHMARK_DIR/test_bitmap_cas_optimized"
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✅ Compilation successful${NC}"
@@ -58,7 +58,7 @@ echo ""
 echo "Running tests..."
 echo "-------------------------------------------"
 
-"$REDIS_DIR/test_bitmap_cas_optimized"
+"$BENCHMARK_DIR/test_bitmap_cas_optimized"
 
 TEST_RESULT=$?
 
@@ -86,7 +86,7 @@ fi
 
 echo ""
 echo "Next steps:"
-echo "  1. Review BITMAP_CAS_OPTIMIZATION.md for details"
+    echo "  1. Review docs/BITMAP_CAS_OPTIMIZATION.md for details"
 echo "  2. Integrate optimized code into Redis"
 echo "  3. Run full system tests"
 echo "  4. Measure real-world performance"
