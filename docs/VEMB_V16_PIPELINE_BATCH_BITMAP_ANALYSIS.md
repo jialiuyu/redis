@@ -23,57 +23,119 @@ client -> proxy -> SuperNode -> completion -> proxy -> client
 
 ```mermaid
 flowchart LR
-    C[Benchmark Client<br/>pipeline requests] --> RQ[Client Request Ring]
-    RQ --> P[Proxy<br/>batch poll / route]
-    P --> J[SuperNode Job Ring]
-    J --> S[SuperNode Worker<br/>VEMB / VADD execution]
-    S --> CP[Completion Ring]
-    CP --> P
-    P --> RS[Client Response Ring]
-    RS --> C
+    subgraph ClientSide["Client / benchmark"]
+        C["worker threads<br/>pipeline window"]
+        RQ["request ring<br/>per channel"]
+        RS["response ring<br/>per channel"]
+    end
+
+    subgraph ProxySide["Proxy"]
+        PI["channel thread<br/>request batch poll"]
+        PO["completion batch poll<br/>response publish"]
+    end
+
+    subgraph SuperNodeSide["SuperNode"]
+        J["job ring"]
+        S["worker<br/>VEMB / VADD"]
+        T["table + vector region"]
+        B["bitmap"]
+        CP["completion ring"]
+    end
+
+    C -->|"VEMB / VADD"| RQ
+    RQ -->|"poll batch"| PI
+    PI -->|"publish job"| J
+    J -->|"poll batch"| S
+    S -->|"lookup / load"| T
+    S -->|"claim / release"| B
+    S -->|"publish completion"| CP
+    CP -->|"poll batch"| PO
+    PO -->|"status / handle"| RS
+    RS -->|"batch poll"| C
+
+    classDef client fill:#e8f4ff,stroke:#2563eb,stroke-width:1px,color:#0f172a;
+    classDef proxy fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#0f172a;
+    classDef supernode fill:#ecfdf5,stroke:#16a34a,stroke-width:1px,color:#0f172a;
+    classDef ring fill:#f8fafc,stroke:#64748b,stroke-width:1px,color:#0f172a;
+
+    class C client;
+    class PI,PO proxy;
+    class S,T,B supernode;
+    class RQ,RS,J,CP ring;
 ```
 
 ## VEMB 细化时序图
 
 ```mermaid
 sequenceDiagram
-    participant C as Client Worker
-    participant Req as Client Request Ring
-    participant P as Proxy Channel Thread
-    participant Job as SuperNode VEMB Job Ring
-    participant S as SuperNode Worker
-    participant T as Vector Table
+    autonumber
+    participant C as Client worker
+    participant Req as Request ring
+    participant P as Proxy channel thread
+    participant Job as Job ring
+    participant S as SuperNode worker
+    participant T as Table / vector region
     participant B as Bitmap
-    participant Comp as Completion Ring
-    participant Resp as Client Response Ring
+    participant Comp as Completion ring
+    participant Resp as Response ring
 
-    C->>C: maintain pipeline window, up to N outstanding requests
-    loop fill pipeline window
-        C->>Req: publish VEMB(key, req_id, channel_id)
+    loop keep pipeline window
+        C->>Req: publish VEMB(key, req_id)
     end
 
-    P->>Req: batch poll client requests
+    P->>Req: poll request batch
     loop each request
         P->>Job: publish VEMB job
     end
 
-    S->>Job: batch poll VEMB jobs
+    S->>Job: poll job batch
     loop each VEMB job
-        S->>T: lookup key -> row_id / vector offset
-        S->>B: bitmap read claim / lock row
-        S->>T: load vector row / execute SuperNode read path
-        S->>B: bitmap release / unlock row
-        S->>Comp: publish completion(req_id, status, handle/offset)
+        S->>T: lookup key -> row_id
+        S->>B: claim row
+        S->>T: load 300-dim vector
+        S->>B: release row
+        S->>Comp: publish completion(status, handle)
     end
 
-    P->>Comp: batch poll completions
+    P->>Comp: poll completion batch
     loop each completion
         P->>Resp: publish response(req_id, status)
     end
 
-    C->>Resp: batch poll responses
-    C->>C: retire completed req_id, refill pipeline window
+    C->>Resp: poll response batch
+    C->>C: retire completed req_id and refill window
 ```
+
+## 当前架构限制 / 适用边界
+
+本报告中的 QPS 结果只代表当前 standalone vemb_v16 数据面，不等同于完整 multi-SuperNode 生产架构。
+
+当前实现的主要限制如下：
+
+- 当前是单进程内的 local dataplane：client channel 进入 proxy channel thread 后，转发到本地 SuperNode worker；不是独立 proxy 进程面对多个独立 SuperNode 进程。
+- 当前没有引入 `consistent hash ring`，因此没有 `vector_key -> SuperNode shard` 的分片路由。
+- 当前没有多 SuperNode shard 的 table/region 隔离；所有 worker 共享同一个本地 table 和同一个 vector region。
+- 当前没有实现多 SuperNode 下的 request fan-out、completion fan-in、completion demux 和跨 SuperNode ring 扫描。
+- 当前没有 hash ring 变更、SuperNode 增删、rebalance、route snapshot 或只读路由快照等生产控制面。
+- 当前没有跨 SuperNode 的故障处理、超时重试、背压迁移和降级路由。
+- 当前 VADD/VEMB 在同一个本地表中完成，尚未验证同一个 `vector_key` 在多 SuperNode 分片下的写读一致路由。
+- 当前 vector region 是 POSIX shm mmap 出来的本地共享内存，不是真实 `/dev/obmm_shmdev*` UB region。
+- 当前 bench 使用 vemb_v16 专用 channel 协议，不经过 Redis RESP/TCP、Redis command framework、module callback 或 blocked-client/unblock 路径。
+- 当前 response 是 status/handle/offset，不返回完整 1200B vector payload；这与 tlc_v16 zero-copy GET 的轻量 response 对齐，但不是完整 payload 回包测试。
+
+因此，本报告更适合回答：
+
+```text
+在去掉 Redis 路径后，client -> proxy -> local SuperNode -> completion -> proxy -> client 这条数据面能达到什么吞吐。
+```
+
+它还不能回答完整生产问题：
+
+```text
+client -> proxy -> consistent hash ring -> 多 SuperNode shard -> completion fan-in -> proxy -> client
+```
+
+后续如果加入 multi-SuperNode，需要单独重测 hash lookup、跨 SuperNode ring 扫描、completion demux、shard table 访问和 route snapshot 的额外成本。
 
 ## 压测数据结论
 
@@ -121,6 +183,59 @@ sequenceDiagram
 | 32 | 8,477,727 | 8,614,195 | +1.6% |
 
 结论：`pipeline=16` 已经基本覆盖 client 等待开销，继续加深 pipeline 不是主要优化方向。默认建议继续使用 `pipeline=16`。
+
+### mixed-80r20w 对标 tlc_v16
+
+`mixed-80r20w` 模式在同一个 worker、同一个 channel、同一个 pipeline 内按 `4:1` 发送请求：
+
+```text
+80% VEMB_SUPERNODE_READ
+20% VADD_INLINE
+```
+
+VADD 更新已有 `prefill` key，不持续插入新 key。这个语义更接近 tlc_v16 的 `80R/20W`，也避免表容量成为干扰项。
+
+`prefill=65536, ops/thread=200000, pipeline=16`：
+
+| threads | QPS | avg/op | sent_vemb | sent_vadd | write_ratio |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 5,459,548 | 181.3ns | 640,000 | 160,000 | 20.00% |
+| 8 | 6,358,668 | 156.6ns | 1,280,000 | 320,000 | 20.00% |
+| 16 | 8,709,330 | 114.4ns | 2,560,000 | 640,000 | 20.00% |
+| 32 | 9,731,370 | 102.5ns | 5,120,000 | 1,280,000 | 20.00% |
+
+服务端计数完全对齐：
+
+| threads | total | vemb | vadd | not_found | completed |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 800,000 | 640,000 | 160,000 | 0 | 800,000 |
+| 8 | 1,600,000 | 1,280,000 | 320,000 | 0 | 1,600,000 |
+| 16 | 3,200,000 | 2,560,000 | 640,000 | 0 | 3,200,000 |
+| 32 | 6,400,000 | 5,120,000 | 1,280,000 | 0 | 6,400,000 |
+
+对比 tlc_v16 之前的 `80R/20W = 3.99M QPS`，当前最高 `9.73M QPS`：
+
+```text
+9.73M / 3.99M = 2.44x
+```
+
+结论：
+
+- 如果目标是 tlc_v16 80R/20W 级别的 key/value IPC 调度吞吐，当前已经达标。
+- 当前 `client -> proxy -> SuperNode -> completion -> proxy -> client` 多一层 proxy，仍超过 tlc_v16 80R/20W 基准。
+- 当前 response 是 status/handle，不返回完整 1200B payload；这与 tlc_v16 zero-copy GET 的轻量 response 对齐。
+- 后续重点不再是证明吞吐是否能达到 tlc_v16，而是优化高并发下 SuperNode bitmap 与 batch execute 的效率。
+
+mixed 模式下的瓶颈信号仍然集中在 bitmap：
+
+| threads | bitmap_lock_avg_ns | bitmap_unlock_avg_ns | vector_load_avg_ns | completion_publish_avg_ns |
+|---:|---:|---:|---:|---:|
+| 4 | 110.9 | 42.1 | 57.9 | 90.6 |
+| 8 | 214.6 | 110.4 | 66.9 | 114.4 |
+| 16 | 329.0 | 206.1 | 63.6 | 123.6 |
+| 32 | 734.3 | 371.1 | 63.6 | 115.3 |
+
+`vector_load_avg_ns` 和 `completion_publish_avg_ns` 相对稳定，`bitmap_lock_avg_ns` / `bitmap_unlock_avg_ns` 随并发明显升高。
 
 ### pin=yes 对比
 
@@ -228,9 +343,24 @@ VEMB 是读，VADD 是写。bitmap 不能直接删除，因为它承担 VADD/VEM
 
 ## 建议默认压测命令
 
+纯 VEMB read 基准：
+
 ```bash
 ./benchmark/vemb_v16_bench \
   --mode vemb-supernode-read \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 4,8,16,32 \
+  --pipeline 16 \
+  --timeout-ms 30000
+```
+
+tlc_v16 80R/20W 对标基准：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --mode mixed-80r20w \
   --dim 300 \
   --prefill 65536 \
   --ops 200000 \
