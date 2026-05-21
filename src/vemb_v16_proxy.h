@@ -8,7 +8,8 @@ typedef struct vemb_v16_proxy vemb_v16_proxy_t;
 int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
                           uint32_t vector_dim,
-                          uint32_t max_vectors);
+                          uint32_t max_vectors,
+                          const char *vector_region_name);
 void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy);
 void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy);

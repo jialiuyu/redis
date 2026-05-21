@@ -4,11 +4,11 @@
 #include "vemb_v16_dataplane.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
+#include "zmalloc.h"
 
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
-#include <stdlib.h>
 #include <time.h>
 
 #define VEMB_V16_SAMPLE_MASK 1023u
@@ -89,7 +89,7 @@ static void vemb_v16_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
             completion.vector_bytes = vemb_v16_table_stride(ctx->table);
             if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
                 if (*read_result_bytes < job->vector_bytes) {
-                    float *next = realloc(*read_result, job->vector_bytes);
+                    float *next = zrealloc(*read_result, job->vector_bytes);
                     if (!next) {
                         completion.status = VEMB_V16_STATUS_ERR;
                         goto vemb_read_done;
@@ -183,14 +183,14 @@ static void vemb_v16_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
 void *vemb_v16_supernode_thread_main(void *arg) {
     vemb_v16_supernode_ctx_t *ctx = arg;
     vemb_v16_vemb_job_t *vemb_jobs =
-        malloc(sizeof(*vemb_jobs) * VEMB_V16_SUPERNODE_BATCH);
+        zmalloc(sizeof(*vemb_jobs) * VEMB_V16_SUPERNODE_BATCH);
     vemb_v16_vadd_job_t *vadd_jobs =
-        malloc(sizeof(*vadd_jobs) * VEMB_V16_SUPERNODE_BATCH);
+        zmalloc(sizeof(*vadd_jobs) * VEMB_V16_SUPERNODE_BATCH);
     float *read_result = NULL;
     size_t read_result_bytes = 0;
     if (!vemb_jobs || !vadd_jobs) {
-        free(vemb_jobs);
-        free(vadd_jobs);
+        zfree(vemb_jobs);
+        zfree(vadd_jobs);
         return NULL;
     }
 
@@ -235,8 +235,8 @@ void *vemb_v16_supernode_thread_main(void *arg) {
     }
     serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
               ctx->worker_id);
-    free(read_result);
-    free(vemb_jobs);
-    free(vadd_jobs);
+    zfree(read_result);
+    zfree(vemb_jobs);
+    zfree(vadd_jobs);
     return NULL;
 }

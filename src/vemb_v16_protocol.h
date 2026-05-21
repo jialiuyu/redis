@@ -10,6 +10,7 @@
 
 #define VEMB_V16_UDS_PATH "/tmp/vemb_v16.sock"
 #define VEMB_V16_SHM_PREFIX "vemb_v16"
+#define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
 #define VEMB_V16_MAX_CHANNELS 64
 #define VEMB_V16_MAX_KEY_LEN 128

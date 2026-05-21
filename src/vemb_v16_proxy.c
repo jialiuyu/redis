@@ -197,6 +197,16 @@ static void stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->sample_completion_publish_ns += src->sample_completion_publish_ns;
 }
 
+static void vemb_v16_channel_free_slots(vemb_v16_channel_t *ch) {
+    if (!ch) return;
+    free(ch->vemb_job_slots);
+    free(ch->vadd_job_slots);
+    free(ch->completion_slots);
+    ch->vemb_job_slots = NULL;
+    ch->vadd_job_slots = NULL;
+    ch->completion_slots = NULL;
+}
+
 static void publish_response(vemb_v16_channel_t *ch,
                              const vemb_v16_completion_t *completion) {
     vemb_v16_resp_t resp = {
@@ -349,7 +359,7 @@ static void drain_completions(vemb_v16_channel_t *ch) {
 static void *channel_thread_main(void *arg) {
     vemb_v16_channel_t *ch = arg;
     vemb_v16_proxy_t *proxy = ch->proxy;
-    vemb_v16_req_t *req_buf = malloc(sizeof(*req_buf) * VEMB_V16_PROXY_BATCH);
+    vemb_v16_req_t *req_buf = zmalloc(sizeof(*req_buf) * VEMB_V16_PROXY_BATCH);
     if (!req_buf) return NULL;
 
 #ifdef __linux__
@@ -386,7 +396,7 @@ static void *channel_thread_main(void *arg) {
               (unsigned long long)ch->channel_id,
               (unsigned long long)atomic_load_explicit(&ch->stats.channel_ops,
                                                        memory_order_relaxed));
-    free(req_buf);
+    zfree(req_buf);
     return NULL;
 }
 
@@ -420,9 +430,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
         posix_memalign(&ch->completion_slots, 64,
                        sizeof(vemb_v16_completion_t) *
                        VEMB_V16_COMPLETION_RING_SIZE) != 0) {
-        free(ch->vemb_job_slots);
-        free(ch->vadd_job_slots);
-        free(ch->completion_slots);
+        vemb_v16_channel_free_slots(ch);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -438,9 +446,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                                  ch->completion_slots,
                                  sizeof(vemb_v16_completion_t),
                                  VEMB_V16_COMPLETION_RING_SIZE) != 0) {
-        free(ch->vemb_job_slots);
-        free(ch->vadd_job_slots);
-        free(ch->completion_slots);
+        vemb_v16_channel_free_slots(ch);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -456,9 +462,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                            proxy->request_ring_slot_size,
                            &ch->request_ring,
                            &ch->request_ring_bytes) != 0) {
-        free(ch->vemb_job_slots);
-        free(ch->vadd_job_slots);
-        free(ch->completion_slots);
+        vemb_v16_channel_free_slots(ch);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -468,9 +472,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                            &ch->response_ring_bytes) != 0) {
         destroy_shared_ring(ch->request_ring_name, ch->request_ring,
                             ch->request_ring_bytes);
-        free(ch->vemb_job_slots);
-        free(ch->vadd_job_slots);
-        free(ch->completion_slots);
+        vemb_v16_channel_free_slots(ch);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -495,9 +497,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
                             ch->request_ring_bytes);
         destroy_shared_ring(ch->response_ring_name, ch->response_ring,
                             ch->response_ring_bytes);
-        free(ch->vemb_job_slots);
-        free(ch->vadd_job_slots);
-        free(ch->completion_slots);
+        vemb_v16_channel_free_slots(ch);
         memset(ch, 0, sizeof(*ch));
         return -1;
     }
@@ -541,9 +541,7 @@ static void close_channel(vemb_v16_channel_t *ch) {
                         ch->request_ring_bytes);
     destroy_shared_ring(ch->response_ring_name, ch->response_ring,
                         ch->response_ring_bytes);
-    free(ch->vemb_job_slots);
-    free(ch->vadd_job_slots);
-    free(ch->completion_slots);
+    vemb_v16_channel_free_slots(ch);
     memset(ch, 0, sizeof(*ch));
 }
 
@@ -616,7 +614,8 @@ close_fd:
 int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
                           uint32_t vector_dim,
-                          uint32_t max_vectors) {
+                          uint32_t max_vectors,
+                          const char *vector_region_name) {
     if (!out) return -1;
     if (vector_dim == 0 || vector_dim > VEMB_V16_MAX_DIM)
         vector_dim = VEMB_V16_DEFAULT_DIM;
@@ -640,8 +639,18 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     pthread_mutex_init(&proxy->stats_lock, NULL);
 
     proxy->vector_region_size = (size_t)proxy->vector_stride * proxy->max_vectors;
-    snprintf(proxy->vector_region_name, sizeof(proxy->vector_region_name),
-             "/%s_vectors", VEMB_V16_SHM_PREFIX);
+    if (!vector_region_name || !vector_region_name[0])
+        vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
+    if (vector_region_name[0] != '/' ||
+        strlen(vector_region_name) >= sizeof(proxy->vector_region_name)) {
+        serverLog(LL_WARNING, "invalid vemb_v16 vector region name: %s",
+                  vector_region_name);
+        vemb_v16_proxy_destroy(proxy);
+        return -1;
+    }
+    strncpy(proxy->vector_region_name,
+            vector_region_name,
+            sizeof(proxy->vector_region_name) - 1);
     shm_unlink(proxy->vector_region_name);
     proxy->vector_region_fd = shm_open(proxy->vector_region_name,
                                        O_CREAT | O_RDWR, 0666);

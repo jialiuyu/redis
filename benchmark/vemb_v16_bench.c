@@ -2,6 +2,7 @@
 
 #include "../src/vemb_v16_client_ring.h"
 #include "../src/vemb_v16_protocol.h"
+#include "../src/zmalloc.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -348,11 +349,11 @@ static void *worker_main(void *arg) {
 
     uint32_t pipeline = w->cfg.pipeline ? w->cfg.pipeline : 1;
     vemb_v16_req_t req;
-    vemb_v16_resp_t *responses = calloc(pipeline, sizeof(*responses));
-    pending_req_t *pending = calloc(pipeline, sizeof(*pending));
+    vemb_v16_resp_t *responses = zcalloc_num(pipeline, sizeof(*responses));
+    pending_req_t *pending = zcalloc_num(pipeline, sizeof(*pending));
     if (!responses || !pending) {
-        free(responses);
-        free(pending);
+        zfree(responses);
+        zfree(pending);
         w->fail = w->cfg.ops;
         atomic_store_explicit(&w->done, 1, memory_order_release);
         return NULL;
@@ -469,8 +470,8 @@ static void *worker_main(void *arg) {
     }
 worker_done:
     w->ns = now_ns() - start;
-    free(responses);
-    free(pending);
+    zfree(responses);
+    zfree(pending);
     atomic_store_explicit(&w->done, 1, memory_order_release);
     return NULL;
 }
@@ -605,8 +606,8 @@ static int run_once(bench_cfg_t cfg) {
     if (fetch_stats(cfg.socket_path, &before) != 0)
         fprintf(stderr, "warning: fetch stats before run failed\n");
 
-    worker_arg_t *args = calloc((size_t)cfg.threads, sizeof(*args));
-    pthread_t *threads = calloc((size_t)cfg.threads, sizeof(*threads));
+    worker_arg_t *args = zcalloc_num((size_t)cfg.threads, sizeof(*args));
+    pthread_t *threads = zcalloc_num((size_t)cfg.threads, sizeof(*threads));
     if (!args || !threads) return 1;
 
     for (int i = 0; i < cfg.threads; i++) {
@@ -721,8 +722,8 @@ static int run_once(bench_cfg_t cfg) {
         print_stats_delta(&before, &after);
     else
         fprintf(stderr, "warning: fetch stats after run failed\n");
-    free(args);
-    free(threads);
+    zfree(args);
+    zfree(threads);
     return fail == 0 ? 0 : 1;
 }
 

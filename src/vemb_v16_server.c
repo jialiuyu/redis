@@ -19,6 +19,7 @@ static void on_signal(int sig) {
 
 int main(int argc, char **argv) {
     const char *uds_path = VEMB_V16_UDS_PATH;
+    const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     uint32_t dim = VEMB_V16_DEFAULT_DIM;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
     int loglevel = LL_NOTICE;
@@ -26,6 +27,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
             uds_path = argv[++i];
+        } else if (!strcmp(argv[i], "--vector-region") && i + 1 < argc) {
+            vector_region_name = argv[++i];
         } else if (!strcmp(argv[i], "--dim") && i + 1 < argc) {
             dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--max-vectors") && i + 1 < argc) {
@@ -36,7 +39,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--vector-region SHM_NAME] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             return 0;
         }
     }
@@ -47,10 +50,14 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: uds=%s dim=%u max_vectors=%u",
-              uds_path, dim, max_vectors);
+    serverLog(LL_NOTICE, "vemb_v16 server starting: uds=%s dim=%u max_vectors=%u vector_region=%s",
+              uds_path, dim, max_vectors, vector_region_name);
 
-    if (vemb_v16_proxy_create(&g_proxy, uds_path, dim, max_vectors) != 0) {
+    if (vemb_v16_proxy_create(&g_proxy,
+                              uds_path,
+                              dim,
+                              max_vectors,
+                              vector_region_name) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
         return 1;
     }
