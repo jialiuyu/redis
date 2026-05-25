@@ -221,3 +221,6 @@ benchmark/*_ut
 benchmark/*_bench
 /deps/lua/src/lua
 /deps/lua/src/luac
+.agents/
+skills/
+output/

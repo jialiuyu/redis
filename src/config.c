@@ -3194,6 +3194,13 @@ standardConfig static_configs[] = {
     createStringConfig("ub-table-name", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ub.table_name, NULL, NULL, NULL),
     createStringConfig("ub-shm-path", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ub.shm_path, NULL, NULL, NULL),
 
+    /* VEMB V16 Dataplane */
+    createBoolConfig("vemb-v16-enabled", NULL, IMMUTABLE_CONFIG, server.vemb_v16_enabled, 0, NULL, NULL),
+    createStringConfig("vemb-v16-uds-path", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_uds_path, "/tmp/redis_vemb.sock", NULL, NULL),
+    createIntConfig("vemb-v16-dim", NULL, IMMUTABLE_CONFIG, 1, 4096, server.vemb_v16_dim, 300, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-max-vectors", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.vemb_v16_max_vectors, 131072, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("vemb-v16-vector-region", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_vector_region, "/redis_vemb_vectors", NULL, NULL),
+
     /* SDS Configs */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
     createSDSConfig("requirepass", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.requirepass, NULL, NULL, updateRequirePass),

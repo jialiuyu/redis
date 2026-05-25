@@ -47,6 +47,14 @@
 #include "cli_commands.h"
 #include "hdr_histogram.h"
 
+#include "vemb_v16_protocol.h"
+#include "vemb_v16_client_ring.h"
+
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sched.h>
+
 #define UNUSED(V) ((void) V)
 
 #define OUTPUT_STANDARD 0
@@ -273,12 +281,150 @@ static struct config {
     char *client_name;
     int prefer_ipv4; /* Prefer IPv4 over IPv6 on DNS lookup. */
     int prefer_ipv6; /* Prefer IPv6 over IPv4 on DNS lookup. */
+    /* VEMB V16 dataplane */
+    int vemb_v16_enabled;
+    char *vemb_v16_uds_path;
+    int vemb_v16_dim;
 } config;
 
 /* User preferences. */
 static struct pref {
     int hints;
 } pref;
+
+/* VEMB V16 vector dataplane context */
+typedef struct cliVectorContext {
+    int enabled;
+    int control_fd;
+    vemb_v16_channel_desc_t ch_desc;
+    vemb_v16_client_ring_t *req_ring;
+    vemb_v16_client_ring_t *resp_ring;
+    size_t req_ring_bytes;
+    size_t resp_ring_bytes;
+    uint8_t *vector_region;
+    size_t vector_region_size;
+} cliVectorContext_t;
+
+static cliVectorContext_t g_vector_ctx = {0};
+
+static int vemb_connect_uds(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int vemb_read_full(int fd, void *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = read(fd, (char *)buf + done, n - done);
+        if (r <= 0) return -1;
+        done += (size_t)r;
+    }
+    return 0;
+}
+
+static int vemb_write_full(int fd, const void *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = write(fd, (const char *)buf + done, n - done);
+        if (r <= 0) return -1;
+        done += (size_t)r;
+    }
+    return 0;
+}
+
+static int cliVectorContextInit(const char *uds_path, uint32_t dim) {
+    memset(&g_vector_ctx, 0, sizeof(g_vector_ctx));
+
+    int fd = vemb_connect_uds(uds_path);
+    if (fd < 0) return -1;
+
+    uint8_t op = VEMB_V16_CTRL_ALLOC_CHANNEL;
+    vemb_v16_alloc_req_t req = {.vector_dim = dim, .flags = 0};
+    uint8_t status = VEMB_V16_STATUS_ERR;
+
+    if (vemb_write_full(fd, &op, sizeof(op)) != 0 ||
+        vemb_write_full(fd, &req, sizeof(req)) != 0 ||
+        vemb_read_full(fd, &status, sizeof(status)) != 0 ||
+        status != VEMB_V16_STATUS_OK ||
+        vemb_read_full(fd, &g_vector_ctx.ch_desc, sizeof(g_vector_ctx.ch_desc)) != 0) {
+        close(fd);
+        return -1;
+    }
+    g_vector_ctx.control_fd = fd;
+
+    size_t req_bytes = vemb_v16_client_ring_bytes(g_vector_ctx.ch_desc.request_ring_slot_size);
+    int req_fd = shm_open(g_vector_ctx.ch_desc.request_ring_name, O_RDWR, 0666);
+    if (req_fd < 0) goto fail;
+    g_vector_ctx.req_ring = mmap(NULL, req_bytes, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, req_fd, 0);
+    close(req_fd);
+    if (g_vector_ctx.req_ring == MAP_FAILED) goto fail;
+    g_vector_ctx.req_ring_bytes = req_bytes;
+
+    size_t resp_bytes = vemb_v16_client_ring_bytes(g_vector_ctx.ch_desc.response_ring_slot_size);
+    int resp_fd = shm_open(g_vector_ctx.ch_desc.response_ring_name, O_RDWR, 0666);
+    if (resp_fd < 0) goto fail_req;
+    g_vector_ctx.resp_ring = mmap(NULL, resp_bytes, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED, resp_fd, 0);
+    close(resp_fd);
+    if (g_vector_ctx.resp_ring == MAP_FAILED) goto fail_req;
+    g_vector_ctx.resp_ring_bytes = resp_bytes;
+
+    int vec_fd = shm_open(g_vector_ctx.ch_desc.vector_region_name, O_RDONLY, 0666);
+    if (vec_fd < 0) goto fail_resp;
+    off_t vec_size = lseek(vec_fd, 0, SEEK_END);
+    if (vec_size <= 0) {
+        close(vec_fd);
+        goto fail_resp;
+    }
+    g_vector_ctx.vector_region = mmap(NULL, (size_t)vec_size, PROT_READ,
+                                      MAP_SHARED, vec_fd, 0);
+    close(vec_fd);
+    if (g_vector_ctx.vector_region == MAP_FAILED) goto fail_resp;
+    g_vector_ctx.vector_region_size = (size_t)vec_size;
+
+    g_vector_ctx.enabled = 1;
+    return 0;
+
+fail_resp:
+    if (g_vector_ctx.resp_ring) munmap(g_vector_ctx.resp_ring, g_vector_ctx.resp_ring_bytes);
+    g_vector_ctx.resp_ring = NULL;
+fail_req:
+    if (g_vector_ctx.req_ring) munmap(g_vector_ctx.req_ring, g_vector_ctx.req_ring_bytes);
+    g_vector_ctx.req_ring = NULL;
+fail:
+    close(g_vector_ctx.control_fd);
+    g_vector_ctx.control_fd = -1;
+    memset(&g_vector_ctx, 0, sizeof(g_vector_ctx));
+    return -1;
+}
+
+static void cliVectorContextCleanup(void) {
+    if (!g_vector_ctx.enabled) return;
+
+    if (g_vector_ctx.control_fd >= 0) {
+        uint8_t op = VEMB_V16_CTRL_CLOSE_CHANNEL;
+        uint64_t channel_id = g_vector_ctx.ch_desc.channel_id;
+        uint8_t status;
+        (void)vemb_write_full(g_vector_ctx.control_fd, &op, sizeof(op));
+        (void)vemb_write_full(g_vector_ctx.control_fd, &channel_id, sizeof(channel_id));
+        (void)vemb_read_full(g_vector_ctx.control_fd, &status, sizeof(status));
+        close(g_vector_ctx.control_fd);
+    }
+    if (g_vector_ctx.req_ring) munmap(g_vector_ctx.req_ring, g_vector_ctx.req_ring_bytes);
+    if (g_vector_ctx.resp_ring) munmap(g_vector_ctx.resp_ring, g_vector_ctx.resp_ring_bytes);
+    if (g_vector_ctx.vector_region) munmap(g_vector_ctx.vector_region, g_vector_ctx.vector_region_size);
+    memset(&g_vector_ctx, 0, sizeof(g_vector_ctx));
+}
 
 static volatile sig_atomic_t force_cancel_loop = 0;
 static void usage(int err);
@@ -1697,6 +1843,7 @@ static int cliConnect(int flags) {
     if (context == NULL || flags & CC_FORCE) {
         if (context != NULL) {
             redisFree(context);
+            cliVectorContextCleanup();
             config.dbnum = 0;
             config.in_multi = 0;
             config.pubsub_mode = 0;
@@ -1759,6 +1906,20 @@ static int cliConnect(int flags) {
             return REDIS_ERR;
         if (cliSetName() != REDIS_OK)
             return REDIS_ERR;
+
+        /* Initialize VEMB V16 dataplane channel */
+        cliVectorContextCleanup();
+        if (config.vemb_v16_enabled) {
+            if (cliVectorContextInit(config.vemb_v16_uds_path,
+                                      (uint32_t)config.vemb_v16_dim) == 0) {
+                fprintf(stderr, "VEMB V16 dataplane connected: channel=%llu\n",
+                        (unsigned long long)g_vector_ctx.ch_desc.channel_id);
+                atexit(cliVectorContextCleanup);
+            } else {
+                fprintf(stderr, "Warning: failed to connect VEMB V16 dataplane, "
+                        "vector commands will use TCP\n");
+            }
+        }
     }
 
     /* Set a PUSH handler if configured to do so. */
@@ -2434,12 +2595,126 @@ static void cliWaitForMessagesOrStdin(void) {
     cliRestoreTTY();
 }
 
+static int cliSendCommandVector(int argc, char **argv, long repeat) {
+    (void)repeat;
+    if (argc < 2) {
+        fprintf(stderr, "Vector command requires at least a key argument\n");
+        return REDIS_ERR;
+    }
+
+    const char *cmd = argv[0];
+    vemb_v16_req_t req = {0};
+    req.channel_id = g_vector_ctx.ch_desc.channel_id;
+    req.req_id = 1;
+
+    if (argc < 3) {
+        fprintf(stderr, "Vector command requires <key> and <element> arguments\n");
+        return REDIS_ERR;
+    }
+    req.key_len = strlen(argv[2]);
+    if (req.key_len >= VEMB_V16_MAX_KEY_LEN) req.key_len = VEMB_V16_MAX_KEY_LEN - 1;
+    memcpy(req.key, argv[2], req.key_len);
+    req.key[req.key_len] = '\0';
+    req.key_hash = vemb_v16_murmur3(req.key, req.key_len);
+
+    if (!strcasecmp(cmd, "VADD")) {
+        if (argc < 4) {
+            fprintf(stderr, "VADD requires: VADD <key> <element> <vector...>\n");
+            return REDIS_ERR;
+        }
+        req.op = VEMB_V16_OP_VADD_INLINE;
+        req.dim = (uint32_t)g_vector_ctx.ch_desc.vector_dim;
+        size_t vec_count = (size_t)(argc - 3);
+        if (vec_count != req.dim) {
+            fprintf(stderr, "VADD vector dimension mismatch: expected %u, got %zu\n",
+                    req.dim, vec_count);
+            return REDIS_ERR;
+        }
+        for (size_t i = 0; i < vec_count; i++) {
+            req.vector[i] = strtof(argv[3 + i], NULL);
+        }
+        req.vector_bytes = req.dim * sizeof(float);
+    } else if (!strcasecmp(cmd, "VEMB")) {
+        if (argc < 3) {
+            fprintf(stderr, "VEMB requires: VEMB <key> <element>\n");
+            return REDIS_ERR;
+        }
+        req.op = VEMB_V16_OP_VEMB_HANDLE;
+        req.dim = (uint32_t)g_vector_ctx.ch_desc.vector_dim;
+        req.vector_bytes = req.dim * sizeof(float);
+    } else {
+        return REDIS_ERR;
+    }
+
+    size_t req_len = (req.op == VEMB_V16_OP_VADD_INLINE)
+                         ? vemb_v16_req_inline_len(req.vector_bytes)
+                         : vemb_v16_req_handle_len();
+
+    while (vemb_v16_client_publish(g_vector_ctx.req_ring, &req, (uint32_t)req_len) != 0) {
+        sched_yield();
+    }
+
+    vemb_v16_resp_t resp;
+    while (vemb_v16_client_poll(g_vector_ctx.resp_ring, &resp, sizeof(resp)) == 0) {
+        sched_yield();
+    }
+
+    if (resp.status == VEMB_V16_STATUS_NOT_FOUND) {
+        printf("(nil)\n");
+    } else if (resp.status == VEMB_V16_STATUS_OK) {
+        if (resp.op == VEMB_V16_OP_VADD_INLINE) {
+            printf("OK\n");
+        } else if (resp.op == VEMB_V16_OP_VEMB_HANDLE) {
+            float *vec = (float *)(g_vector_ctx.vector_region + resp.vector_offset);
+            for (uint32_t i = 0; i < resp.dim; i++) {
+                printf("%f\n", vec[i]);
+            }
+        }
+    } else {
+        printf("(error) VEMB V16 status=%u\n", resp.status);
+    }
+
+    return REDIS_OK;
+}
+
 static int cliSendCommand(int argc, char **argv, long repeat) {
     char *command = argv[0];
     size_t *argvlen;
     int j, output_raw;
+    sds *vadd_argv = NULL;
+    int vadd_converted = 0;
 
-    if (context == NULL) return REDIS_ERR;
+    /* VADD TCP fallback: convert to vector-sets compatible format */
+    if (!g_vector_ctx.enabled && !strcasecmp(command, "VADD") && argc >= 4) {
+        int dim = argc - 3;
+        vadd_argv = zmalloc((5 + dim) * sizeof(sds));
+        vadd_argv[0] = (sds)argv[0];
+        vadd_argv[1] = (sds)argv[1];
+        vadd_argv[2] = sdsnew("VALUES");
+        vadd_argv[3] = sdsfromlonglong(dim);
+        for (int i = 0; i < dim; i++) {
+            vadd_argv[4 + i] = (sds)argv[3 + i];
+        }
+        vadd_argv[4 + dim] = (sds)argv[2];
+        argv = (char **)vadd_argv;
+        argc = 5 + dim;
+        vadd_converted = 1;
+    }
+
+    if (context == NULL) {
+        if (vadd_converted) {
+            sdsfree(vadd_argv[2]);
+            sdsfree(vadd_argv[3]);
+            zfree(vadd_argv);
+        }
+        return REDIS_ERR;
+    }
+
+    /* Route VADD/VEMB through SHM dataplane if available */
+    if (g_vector_ctx.enabled &&
+        (!strcasecmp(command, "VADD") || !strcasecmp(command, "VEMB"))) {
+        return cliSendCommandVector(argc, argv, repeat);
+    }
 
     output_raw = 0;
     if (!strcasecmp(command,"info") ||
@@ -2522,6 +2797,11 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
                 if (config.last_cmd_type == REDIS_REPLY_ERROR)
                     config.monitor_mode = 0;
             } while(config.monitor_mode);
+            if (vadd_converted) {
+                sdsfree(vadd_argv[2]);
+                sdsfree(vadd_argv[3]);
+                zfree(vadd_argv);
+            }
             zfree(argvlen);
             return REDIS_OK;
         }
@@ -2541,6 +2821,11 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
             printf("Entering replica output mode...  (press Ctrl-C to quit)\n");
             slaveMode(0);
             config.slave_mode = 0;
+            if (vadd_converted) {
+                sdsfree(vadd_argv[2]);
+                sdsfree(vadd_argv[3]);
+                zfree(vadd_argv);
+            }
             zfree(argvlen);
             return REDIS_ERR;  /* Error = slaveMode lost connection to master */
         }
@@ -2548,6 +2833,11 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
         /* Read response, possibly skipping pubsub/push messages. */
         while (1) {
             if (cliReadReply(output_raw) != REDIS_OK) {
+                if (vadd_converted) {
+                    sdsfree(vadd_argv[2]);
+                    sdsfree(vadd_argv[3]);
+                    zfree(vadd_argv);
+                }
                 zfree(argvlen);
                 return REDIS_ERR;
             }
@@ -2636,6 +2926,11 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
         fflush(stdout); /* Make it grep friendly */
     }
 
+    if (vadd_converted) {
+        sdsfree(vadd_argv[2]);
+        sdsfree(vadd_argv[3]);
+        zfree(vadd_argv);
+    }
     zfree(argvlen);
     return REDIS_OK;
 }
@@ -2848,6 +3143,11 @@ static int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--keystats")) {
             config.keystats = 1;
             config.memkeys_samples = -1; /* use redis default */
+        } else if (!strcmp(argv[i],"--vemb-v16") && !lastarg) {
+            config.vemb_v16_enabled = 1;
+            config.vemb_v16_uds_path = argv[++i];
+        } else if (!strcmp(argv[i],"--vemb-v16-dim") && !lastarg) {
+            config.vemb_v16_dim = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"--keystats-samples") && !lastarg) {
             char *endptr;
             config.keystats = 1;
@@ -10954,6 +11254,9 @@ int main(int argc, char **argv) {
     config.server_version = NULL;
     config.prefer_ipv4 = 0;
     config.prefer_ipv6 = 0;
+    config.vemb_v16_enabled = 0;
+    config.vemb_v16_uds_path = NULL;
+    config.vemb_v16_dim = 300;
     config.cluster_manager_command.name = NULL;
     config.cluster_manager_command.argc = 0;
     config.cluster_manager_command.argv = NULL;
@@ -11120,10 +11423,11 @@ int main(int argc, char **argv) {
         testHintSuite(config.test_hint_file);
     }
 
+    /* Ignore SIGPIPE to prevent termination on broken UDS/TCP connections */
+    signal(SIGPIPE, SIG_IGN);
+
     /* Start interactive mode when no command is provided */
     if (argc == 0 && !config.eval) {
-        /* Ignore SIGPIPE in interactive mode to force a reconnect */
-        signal(SIGPIPE, SIG_IGN);
         signal(SIGINT, sigIntHandler);
 
         /* Note that in repl mode we don't abort on connection error.

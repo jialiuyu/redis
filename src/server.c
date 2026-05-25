@@ -5006,6 +5006,18 @@ int finishShutdown(void) {
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
 
+    /* Shutdown VEMB V16 dataplane */
+    if (server.vemb_v16_enabled && server.vemb_v16_proxy) {
+        serverLog(LL_NOTICE, "Shutting down VEMB V16 dataplane...");
+        vemb_v16_proxy_stop(server.vemb_v16_proxy);
+        if (server.vemb_v16_proxy_thread_result) {
+            vemb_v16_proxy_thread_wait(server.vemb_v16_proxy_thread_result);
+        }
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        server.vemb_v16_enabled = 0;
+    }
+
 #if !defined(__sun)
     /* Unlock the cluster config file before shutdown */
     if (server.cluster_enabled && server.cluster_config_file_lock_fd != -1) {
@@ -7911,6 +7923,31 @@ int main(int argc, char **argv) {
     /* Warning the user about suspicious maxmemory setting. */
     if (server.maxmemory > 0 && server.maxmemory < 1024*1024) {
         serverLog(LL_WARNING,"WARNING: You specified a maxmemory value that is less than 1MB (current value is %llu bytes). Are you sure this is what you really want?", server.maxmemory);
+    }
+
+    /* Initialize VEMB V16 dataplane */
+    if (server.vemb_v16_enabled) {
+        serverLog(LL_NOTICE, "Initializing VEMB V16 dataplane...");
+        if (vemb_v16_proxy_create(&server.vemb_v16_proxy,
+                                  server.vemb_v16_uds_path,
+                                  (uint32_t)server.vemb_v16_dim,
+                                  (uint32_t)server.vemb_v16_max_vectors,
+                                  server.vemb_v16_vector_region) != 0) {
+            serverLog(LL_WARNING, "Failed to create VEMB V16 proxy, disabling dataplane");
+            server.vemb_v16_enabled = 0;
+            server.vemb_v16_proxy = NULL;
+        } else {
+            if (vemb_v16_proxy_run_in_thread(server.vemb_v16_proxy,
+                                              &server.vemb_v16_proxy_thread_result) != 0) {
+                serverLog(LL_WARNING, "Failed to start VEMB V16 proxy thread, disabling dataplane");
+                vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+                server.vemb_v16_proxy = NULL;
+                server.vemb_v16_enabled = 0;
+            } else {
+                serverLog(LL_NOTICE, "VEMB V16 dataplane ready: uds=%s",
+                          server.vemb_v16_uds_path);
+            }
+        }
     }
 
     redisSetCpuAffinity(server.server_cpulist);

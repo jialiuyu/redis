@@ -50,6 +50,8 @@ typedef long long ustime_t; /* microsecond time type. */
 #include "vector_engine_types.h"
 
 #include "ub_client.h"
+#include "vemb_v16_proxy.h"
+#include "vemb_v16_proxy_thread.h"
 
 #include "ae.h"      /* Event driven programming library */
 #include "sds.h"     /* Dynamic safe strings */
@@ -1943,6 +1945,14 @@ struct redisServer {
     int supernode_workers;       /* SuperNode worker count, 0 means auto-detect */
     proxyConfig proxy;           /* Proxy aggregator configuration */
     ub_mem_config_t ub;          /* UB data-plane configuration */
+    /* VEMB V16 Dataplane */
+    int vemb_v16_enabled;
+    char *vemb_v16_uds_path;
+    int vemb_v16_dim;
+    int vemb_v16_max_vectors;
+    char *vemb_v16_vector_region;
+    vemb_v16_proxy_t *vemb_v16_proxy;
+    vemb_v16_proxy_thread_result_t *vemb_v16_proxy_thread_result;
     /* Networking */
     int port;                   /* TCP listening port */
     int tls_port;               /* TLS listening port */

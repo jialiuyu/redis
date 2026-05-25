@@ -40,7 +40,7 @@ int vemb_v16_table_create(vemb_v16_table_t **out,
     vemb_v16_table_t *table = zcalloc(sizeof(*table));
     if (!table) return -1;
     table->vector_dim = vector_dim;
-    table->vector_stride = vector_dim * sizeof(float);
+    table->vector_stride = (vector_dim * sizeof(float) + 63) & ~63;
     table->max_vectors = max_vectors;
     table->vector_region = vector_region;
     table->vector_region_size = vector_region_size;
