@@ -2,7 +2,7 @@
 #define __VEMB_V16_SUPERNODE_H
 
 #include "vemb_v16_aeron_ring.h"
-#include "vemb_v16_table.h"
+#include "vemb_v16_tlc.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -42,7 +42,7 @@ typedef struct vemb_v16_supernode_ctx {
     vemb_v16_aeron_ring_t *vemb_job_ring;
     vemb_v16_aeron_ring_t *vadd_job_ring;
     vemb_v16_aeron_ring_t *completion_ring;
-    vemb_v16_table_t *table;
+    vemb_v16_tlc_t *tlc;
     vemb_v16_channel_counters_t *stats;
     sve_operation_stats_t *sve_stats;
 } vemb_v16_supernode_ctx_t;

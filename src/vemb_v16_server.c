@@ -22,6 +22,9 @@ int main(int argc, char **argv) {
     const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     uint32_t dim = VEMB_V16_DEFAULT_DIM;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
+    uint32_t warm_region_id = 0;
+    uint32_t warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
 
     for (int i = 1; i < argc; i++) {
@@ -33,13 +36,27 @@ int main(int argc, char **argv) {
             dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--max-vectors") && i + 1 < argc) {
             max_vectors = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--region-id") && i + 1 < argc) {
+            warm_region_id = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--warm-backend") && i + 1 < argc) {
+            const char *backend = argv[++i];
+            if (!strcmp(backend, "shm")) {
+                warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
+            } else if (!strcmp(backend, "ub")) {
+                warm_backend_type = VEMB_V16_REGION_UB;
+            } else {
+                fprintf(stderr, "invalid warm backend\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[i], "--warm-mmap-offset") && i + 1 < argc) {
+            warm_mmap_offset = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--loglevel") && i + 1 < argc) {
             if (vemb_v16_parse_log_level(argv[++i], &loglevel) != 0) {
                 fprintf(stderr, "invalid loglevel\n");
                 return 1;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--vector-region SHM_NAME] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--socket PATH] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             return 0;
         }
     }
@@ -57,7 +74,10 @@ int main(int argc, char **argv) {
                               uds_path,
                               dim,
                               max_vectors,
-                              vector_region_name) != 0) {
+                              vector_region_name,
+                              warm_region_id,
+                              warm_backend_type,
+                              warm_mmap_offset) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
         return 1;
     }

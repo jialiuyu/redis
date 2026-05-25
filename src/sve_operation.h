@@ -10,6 +10,7 @@
 #ifndef __SVE_OPERATION_H
 #define __SVE_OPERATION_H
 
+#include "sve_config.h"
 #include "ub_client.h"
 #include <stdint.h>
 #include <stddef.h>

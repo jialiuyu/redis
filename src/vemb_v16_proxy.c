@@ -1,12 +1,14 @@
 #define _GNU_SOURCE
 
+#include "cpu_relax.h"
 #include "vemb_v16_proxy.h"
 #include "vemb_v16_aeron_ring.h"
 #include "vemb_v16_client_ring.h"
 #include "vemb_v16_dataplane.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_supernode.h"
-#include "vemb_v16_table.h"
+#include "vemb_v16_tlc.h"
+#include "vemb_v16_warm_provider.h"
 #include "zmalloc.h"
 
 #include <errno.h>
@@ -60,11 +62,14 @@ struct vemb_v16_proxy {
     uint32_t request_ring_slot_size;
     uint32_t response_ring_slot_size;
     uint32_t max_vectors;
+    uint32_t warm_region_id;
+    uint32_t warm_backend_type;
     uint8_t *vector_region;
     size_t vector_region_size;
-    int vector_region_fd;
-    char vector_region_name[64];
-    vemb_v16_table_t *table;
+    char vector_region_name[256];
+    uint64_t warm_mmap_offset;
+    vemb_v16_warm_provider_t warm_provider;
+    vemb_v16_tlc_t *tlc;
     vemb_v16_channel_t channels[VEMB_V16_MAX_CHANNELS];
     atomic_uint_fast64_t next_channel_id;
     atomic_uint_fast32_t next_channel_index;
@@ -73,16 +78,6 @@ struct vemb_v16_proxy {
     pthread_mutex_t stats_lock;
     vemb_v16_stats_t closed_stats;
 };
-
-static inline void vemb_v16_cpu_relax(void) {
-#if defined(__x86_64__)
-    __asm__ volatile("pause" ::: "memory");
-#elif defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
-#else
-    __asm__ volatile("" ::: "memory");
-#endif
-}
 
 static int read_full(int fd, void *buf, size_t n) {
     size_t done = 0;
@@ -218,13 +213,14 @@ static void publish_response(vemb_v16_channel_t *ch,
         .vector_offset = completion->vector_offset,
         .vector_bytes = completion->vector_bytes,
         .dim = completion->dim,
+        .region_id = completion->region_id,
     };
     while (vemb_v16_client_publish(ch->response_ring, &resp, sizeof(resp)) != 0 &&
            atomic_load_explicit(&ch->proxy->running, memory_order_relaxed) &&
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
         atomic_fetch_add_explicit(&ch->stats.proxy_response_ring_full, 1,
                                   memory_order_relaxed);
-        vemb_v16_cpu_relax();
+        cpu_relax();
     }
     atomic_fetch_add_explicit(&ch->stats.proxy_response_publish, 1,
                               memory_order_relaxed);
@@ -295,7 +291,7 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
                atomic_load_explicit(&ch->active, memory_order_acquire)) {
             atomic_fetch_add_explicit(&ch->stats.proxy_vadd_ring_full, 1,
                                       memory_order_relaxed);
-            vemb_v16_cpu_relax();
+            cpu_relax();
         }
         atomic_fetch_add_explicit(&ch->stats.proxy_vadd_publish, 1,
                                   memory_order_relaxed);
@@ -320,7 +316,7 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
                atomic_load_explicit(&ch->active, memory_order_acquire)) {
             atomic_fetch_add_explicit(&ch->stats.proxy_vemb_ring_full, 1,
                                       memory_order_relaxed);
-            vemb_v16_cpu_relax();
+            cpu_relax();
         }
         atomic_fetch_add_explicit(&ch->stats.proxy_vemb_publish, 1,
                                   memory_order_relaxed);
@@ -388,7 +384,7 @@ static void *channel_thread_main(void *arg) {
             atomic_fetch_add_explicit(&ch->stats.channel_ops, req_count,
                                       memory_order_relaxed);
         } else {
-            vemb_v16_cpu_relax();
+            cpu_relax();
         }
     }
     serverLog(LL_VERBOSE, "vemb_v16 proxy channel thread stopped: index=%u channel_id=%llu ops=%llu",
@@ -484,7 +480,7 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
         .vemb_job_ring = &ch->vemb_job_ring,
         .vadd_job_ring = &ch->vadd_job_ring,
         .completion_ring = &ch->completion_ring,
-        .table = proxy->table,
+        .tlc = proxy->tlc,
         .stats = &ch->stats,
     };
 
@@ -518,6 +514,10 @@ static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc)
     desc->max_vectors = proxy->max_vectors;
     desc->request_ring_slot_size = proxy->request_ring_slot_size;
     desc->response_ring_slot_size = proxy->response_ring_slot_size;
+    desc->warm_region_id = proxy->warm_region_id;
+    desc->warm_backend_type = proxy->warm_backend_type;
+    desc->warm_region_bytes = proxy->warm_provider.region.region_bytes;
+    desc->warm_mmap_offset = proxy->warm_provider.region.mmap_offset;
     strncpy(desc->request_ring_name, ch->request_ring_name,
             sizeof(desc->request_ring_name) - 1);
     strncpy(desc->response_ring_name, ch->response_ring_name,
@@ -615,7 +615,10 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
-                          const char *vector_region_name) {
+                          const char *vector_region_name,
+                          uint32_t warm_region_id,
+                          uint32_t warm_backend_type,
+                          uint64_t warm_mmap_offset) {
     if (!out) return -1;
     if (vector_dim == 0 || vector_dim > VEMB_V16_MAX_DIM)
         vector_dim = VEMB_V16_DEFAULT_DIM;
@@ -631,8 +634,11 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
         (uint32_t)vemb_v16_req_inline_len(proxy->vector_stride);
     proxy->response_ring_slot_size = sizeof(vemb_v16_resp_t);
     proxy->max_vectors = max_vectors;
+    proxy->warm_region_id = warm_region_id;
+    proxy->warm_backend_type = warm_backend_type ? warm_backend_type :
+        VEMB_V16_REGION_LOCAL_SHM;
+    proxy->warm_mmap_offset = warm_mmap_offset;
     proxy->uds_fd = -1;
-    proxy->vector_region_fd = -1;
     atomic_init(&proxy->running, 0);
     atomic_init(&proxy->next_channel_id, 1);
     atomic_init(&proxy->next_channel_index, 0);
@@ -651,39 +657,25 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     strncpy(proxy->vector_region_name,
             vector_region_name,
             sizeof(proxy->vector_region_name) - 1);
-    shm_unlink(proxy->vector_region_name);
-    proxy->vector_region_fd = shm_open(proxy->vector_region_name,
-                                       O_CREAT | O_RDWR, 0666);
-    if (proxy->vector_region_fd < 0 ||
-        ftruncate(proxy->vector_region_fd, (off_t)proxy->vector_region_size) != 0) {
-        serverLog(LL_WARNING, "vemb_v16 vector region create failed: name=%s size=%zu error=%s",
-                  proxy->vector_region_name,
-                  proxy->vector_region_size,
-                  strerror(errno));
+    /* TODO: move warm provider/TLC ownership to supernode; supernode owns storage. */
+    if (vemb_v16_warm_provider_open(&proxy->warm_provider,
+                                    proxy->warm_region_id,
+                                    proxy->warm_backend_type,
+                                    proxy->vector_region_name,
+                                    proxy->warm_mmap_offset,
+                                    proxy->vector_stride,
+                                    proxy->max_vectors) != 0) {
         vemb_v16_proxy_destroy(proxy);
         return -1;
     }
-    proxy->vector_region = mmap(NULL, proxy->vector_region_size,
-                                PROT_READ | PROT_WRITE, MAP_SHARED,
-                                proxy->vector_region_fd, 0);
-    close(proxy->vector_region_fd);
-    proxy->vector_region_fd = -1;
-    if (proxy->vector_region == MAP_FAILED) {
-        serverLog(LL_WARNING, "vemb_v16 vector region mmap failed: name=%s size=%zu error=%s",
-                  proxy->vector_region_name,
-                  proxy->vector_region_size,
-                  strerror(errno));
-        proxy->vector_region = NULL;
-        vemb_v16_proxy_destroy(proxy);
-        return -1;
-    }
+    proxy->vector_region = proxy->warm_provider.region.mapped_addr;
+    proxy->vector_region_size = proxy->warm_provider.region.region_bytes;
 
-    if (vemb_v16_table_create(&proxy->table,
-                              proxy->vector_dim,
-                              proxy->max_vectors,
-                              proxy->vector_region,
-                              proxy->vector_region_size) != 0) {
-        serverLog(LL_WARNING, "vemb_v16 table create failed: dim=%u max_vectors=%u",
+    if (vemb_v16_tlc_create(&proxy->tlc,
+                            proxy->vector_dim,
+                            proxy->max_vectors,
+                            &proxy->warm_provider.region) != 0) {
+        serverLog(LL_WARNING, "vemb_v16 tlc create failed: dim=%u max_vectors=%u",
                   proxy->vector_dim, proxy->max_vectors);
         vemb_v16_proxy_destroy(proxy);
         return -1;
@@ -706,9 +698,8 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
         close_channel(&proxy->channels[i]);
     if (proxy->uds_fd >= 0) close(proxy->uds_fd);
     if (proxy->uds_path[0]) unlink(proxy->uds_path);
-    vemb_v16_table_destroy(proxy->table);
-    if (proxy->vector_region) munmap(proxy->vector_region, proxy->vector_region_size);
-    if (proxy->vector_region_name[0]) shm_unlink(proxy->vector_region_name);
+    vemb_v16_tlc_destroy(proxy->tlc);
+    vemb_v16_warm_provider_close(&proxy->warm_provider);
     pthread_mutex_destroy(&proxy->stats_lock);
     zfree(proxy);
 }
@@ -766,7 +757,7 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
     pthread_mutex_lock(&proxy->stats_lock);
     stats_add(stats, &proxy->closed_stats);
     pthread_mutex_unlock(&proxy->stats_lock);
-    sve_operation_stats_t *sve_stats = vemb_v16_table_sve_stats(proxy->table);
+    sve_operation_stats_t *sve_stats = &proxy->tlc->sve_stats;
     if (sve_stats) {
         stats->bitmap_lock_success =
             atomic_load_explicit(&sve_stats->lock_success, memory_order_relaxed);

@@ -40,7 +40,7 @@ typedef struct vemb_v16_completion {
     uint64_t key_hash;
     uint64_t vector_offset;
     uint32_t vector_bytes;
-    uint32_t reserved;
+    uint32_t region_id;
 } vemb_v16_completion_t;
 
 #endif

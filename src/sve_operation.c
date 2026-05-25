@@ -471,8 +471,8 @@ void sve_streaming_load(const void *src, void *dst, size_t size) {
     const uint8_t *s = (const uint8_t *)src;
     uint8_t *d = (uint8_t *)dst;
     size_t off = 0;
-    svbool_t pg = svptrue_b8();
     while (off < size) {
+        svbool_t pg = svwhilelt_b8_u64((uint64_t)off, (uint64_t)size);
         svuint8_t v = svld1_u8(pg, &s[off]);
         svst1_u8(pg, &d[off], v);
         off += svcntb();

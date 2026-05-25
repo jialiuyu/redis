@@ -42,6 +42,17 @@ VSIM
 TLC HOT/WARM/COLD
 ```
 
+交付版本备注：
+
+```text
+交付版本会率先使用 TCP/IP 方式完成 CLI 与 SuperNode 之间的交互。
+CLI 仍在本地执行 consistent_hash(vector_key)，选择目标 supernode_id。
+选中目标后，CLI 直接通过 TCP/IP 向对应 SuperNode 发送 VADD/VEMB/VSIM 请求。
+proxy/channel/shared-memory ring/WARM mmap read-by-handle 作为后续高性能数据面形态继续演进。
+```
+
+因此，交付版的功能语义先按“CLI hash route -> TCP/IP -> SuperNode -> TLC”闭环，先保证多 SuperNode 路由、请求语义和 TLC 存储语义正确；后续再把传输层替换为 proxy-managed channel 与共享内存/UB 读路径。
+
 ## Multi-SuperNode 架构
 
 ```mermaid

@@ -22,6 +22,9 @@
 #define VEMB_V16_STATUS_NOT_FOUND 1u
 #define VEMB_V16_STATUS_ERR 2u
 
+#define VEMB_V16_REGION_LOCAL_SHM 1u
+#define VEMB_V16_REGION_UB 2u
+
 enum vemb_v16_ctrl_op {
     VEMB_V16_CTRL_PING = 0x01,
     VEMB_V16_CTRL_ALLOC_CHANNEL = 0x20,
@@ -52,9 +55,13 @@ typedef struct vemb_v16_channel_desc {
     uint32_t max_vectors;
     uint32_t request_ring_slot_size;
     uint32_t response_ring_slot_size;
+    uint32_t warm_region_id;
+    uint32_t warm_backend_type;
+    uint64_t warm_region_bytes;
+    uint64_t warm_mmap_offset;
     char request_ring_name[64];
     char response_ring_name[64];
-    char vector_region_name[64];
+    char vector_region_name[256];
 } vemb_v16_channel_desc_t;
 
 typedef struct vemb_v16_req {
@@ -81,7 +88,8 @@ typedef struct vemb_v16_resp {
     uint64_t vector_offset;
     uint32_t vector_bytes;
     uint32_t dim;
-    uint64_t reserved;
+    uint32_t region_id;
+    uint32_t reserved;
 } vemb_v16_resp_t;
 
 typedef struct vemb_v16_stats {

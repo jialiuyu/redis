@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "cpu_relax.h"
 #include "vemb_v16_supernode.h"
 #include "vemb_v16_dataplane.h"
 #include "vemb_v16_log.h"
@@ -20,16 +21,6 @@ static uint64_t monotonic_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static inline void vemb_v16_supernode_relax(void) {
-#if defined(__x86_64__)
-    __asm__ volatile("pause" ::: "memory");
-#elif defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
-#else
-    __asm__ volatile("" ::: "memory");
-#endif
-}
-
 static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
                                         const vemb_v16_completion_t *completion,
                                         uint64_t completion_start,
@@ -39,7 +30,7 @@ static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
            atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
         atomic_fetch_add_explicit(&ctx->stats->supernode_completion_ring_full, 1,
                                   memory_order_relaxed);
-        vemb_v16_supernode_relax();
+        cpu_relax();
     }
     if (sample) {
         atomic_fetch_add_explicit(&ctx->stats->sample_completion_publish_ns,
@@ -68,25 +59,26 @@ static void vemb_v16_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
         .dim = job->dim,
         .vector_bytes = job->vector_bytes,
     };
-    uint32_t row_id = 0;
+    uint32_t warm_slot = 0;
+    vemb_v16_vector_handle_t handle = {0};
     int sample = ((job->req_id & VEMB_V16_SAMPLE_MASK) == 0);
     uint64_t lookup_start = sample ? monotonic_ns() : 0;
     uint64_t lookup_ns = 0;
 
-    if (vemb_v16_table_lookup(ctx->table, job->key, job->key_len,
-                              job->key_hash, &row_id) != 0) {
+    if (vemb_v16_tlc_get_handle(ctx->tlc, job->key, job->key_len,
+                                job->key_hash, &handle, &warm_slot) != 0) {
         completion.status = VEMB_V16_STATUS_NOT_FOUND;
         atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
                                   memory_order_relaxed);
     } else {
         if (sample) lookup_ns = monotonic_ns() - lookup_start;
-        if (job->dim != vemb_v16_table_dim(ctx->table) ||
-            job->vector_bytes != vemb_v16_table_stride(ctx->table)) {
+        if (job->dim != ctx->tlc->vector_dim ||
+            job->vector_bytes != ctx->tlc->value_size) {
             completion.status = VEMB_V16_STATUS_ERR;
         } else {
-            completion.vector_offset =
-                (uint64_t)row_id * vemb_v16_table_stride(ctx->table);
-            completion.vector_bytes = vemb_v16_table_stride(ctx->table);
+            completion.vector_offset = handle.offset;
+            completion.vector_bytes = handle.bytes;
+            completion.region_id = handle.region_id;
             if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
                 if (*read_result_bytes < job->vector_bytes) {
                     float *next = zrealloc(*read_result, job->vector_bytes);
@@ -98,12 +90,12 @@ static void vemb_v16_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                     *read_result_bytes = job->vector_bytes;
                 }
 
-                uint64_t emb_id = row_id;
+                uint64_t emb_id = warm_slot;
                 uint64_t bitmap_lock_ns = 0;
                 uint64_t bitmap_unlock_ns = 0;
                 uint64_t vector_load_ns = 0;
                 if (sve_serial_contiguous_read_blocking_traced(
-                        vemb_v16_table_gather_ctx(ctx->table),
+                        &ctx->tlc->gather_ctx,
                         &emb_id,
                         1,
                         *read_result,
@@ -160,16 +152,18 @@ static void vemb_v16_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
     };
 
     if (job->op == VEMB_V16_OP_VADD_INLINE) {
-        uint32_t row_id = 0;
-        if (job->dim != vemb_v16_table_dim(ctx->table) ||
-            job->vector_bytes != vemb_v16_table_stride(ctx->table) ||
-            vemb_v16_table_upsert(ctx->table, job->key, job->key_len,
-                                  job->key_hash, vadd_job->vector,
-                                  job->vector_bytes, &row_id) != 0) {
+        uint32_t warm_slot = 0;
+        vemb_v16_vector_handle_t handle = {0};
+        if (job->dim != ctx->tlc->vector_dim ||
+            job->vector_bytes != ctx->tlc->value_size ||
+            vemb_v16_tlc_put(ctx->tlc, job->key, job->key_len,
+                             job->key_hash, vadd_job->vector,
+                             job->vector_bytes, &handle, &warm_slot) != 0) {
             completion.status = VEMB_V16_STATUS_ERR;
         } else {
-            completion.vector_offset =
-                (uint64_t)row_id * vemb_v16_table_stride(ctx->table);
+            completion.vector_offset = handle.offset;
+            completion.vector_bytes = handle.bytes;
+            completion.region_id = handle.region_id;
         }
         atomic_fetch_add_explicit(&ctx->stats->vadd_requests, 1,
                                   memory_order_relaxed);
@@ -224,7 +218,7 @@ void *vemb_v16_supernode_thread_main(void *arg) {
                                       vadd_jobs,
                                       VEMB_V16_SUPERNODE_BATCH);
         if (!n) {
-            vemb_v16_supernode_relax();
+            cpu_relax();
             continue;
         }
         atomic_fetch_add_explicit(&ctx->stats->supernode_vadd_poll, n,
