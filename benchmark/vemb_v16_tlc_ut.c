@@ -11,6 +11,10 @@ static void fill_vector(float *vector, uint32_t dim, uint32_t seed) {
         vector[i] = (float)(seed + i);
 }
 
+static void make_key(char *buf, size_t len, uint32_t id) {
+    snprintf(buf, len, "item:%u", id);
+}
+
 static void test_put_get_handle(void) {
     enum { dim = 4, max_vectors = 8 };
     float region[dim * max_vectors];
@@ -160,6 +164,54 @@ static void test_hot_is_cache_only(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+static void test_prefill_distribution_stays_warm(void) {
+    enum { dim = 1, max_vectors = 131072, prefill = 65536 };
+    float *region = calloc((size_t)dim * max_vectors, sizeof(*region));
+    float vector[dim];
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 19,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .mapped_addr = region,
+        .region_bytes = (uint64_t)sizeof(*region) * dim * max_vectors,
+        .value_size = dim * sizeof(float),
+    };
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    uint32_t cold_only_writes = 0;
+    char key[32];
+
+    assert(region);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    for (uint32_t i = 0; i < prefill; i++) {
+        make_key(key, sizeof(key), i);
+        fill_vector(vector, dim, i);
+        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        memset(&handle, 0, sizeof(handle));
+        warm_slot = UINT32_MAX;
+        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                                vector, sizeof(vector),
+                                &handle, &warm_slot) == 0);
+        if (warm_slot == UINT32_MAX)
+            cold_only_writes++;
+    }
+    assert(cold_only_writes == 0);
+
+    for (uint32_t i = 0; i < prefill; i++) {
+        make_key(key, sizeof(key), i);
+        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        memset(&handle, 0, sizeof(handle));
+        warm_slot = UINT32_MAX;
+        assert(vemb_v16_tlc_get_handle(tlc, key, (uint32_t)strlen(key),
+                                       key_hash, &handle, &warm_slot) == 0);
+        assert(handle.region_id == 19);
+        assert(handle.bytes == sizeof(vector));
+        assert(warm_slot < max_vectors);
+    }
+    vemb_v16_tlc_destroy(tlc);
+    free(region);
+}
+
 typedef struct concurrent_arg {
     vemb_v16_tlc_t *tlc;
     int tid;
@@ -232,6 +284,7 @@ int main(void) {
     test_overwrite_and_capacity();
     test_cold_read_through_promotes_warm_handle();
     test_hot_is_cache_only();
+    test_prefill_distribution_stays_warm();
     test_concurrent_distinct_keys();
     printf("vemb_v16_tlc_ut: all tests passed\n");
     return 0;

@@ -580,8 +580,9 @@ static void *worker_main(void *arg) {
         if (resp.status != VEMB_V16_STATUS_OK) {
             fprintf(stderr, "worker %d response error at op=%u status=%u key_id=%u\n",
                     w->tid, done_req.op_index, resp.status, done_req.key_id);
-            w->fail += w->cfg.ops - completed;
-            goto worker_done;
+            w->fail++;
+            completed++;
+            continue;
         }
         if (w->cfg.mode == MODE_VEMB_READ_VECTOR) {
             bench_region_map_t *warm_region = find_warm_region(w, resp.region_id);

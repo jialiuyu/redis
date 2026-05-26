@@ -9,8 +9,14 @@
 #include <string.h>
 
 #define TLC_CORE_HOT_PROBES 4u
-#define TLC_CORE_WARM_PROBES 6u
-#define TLC_CORE_COLD_PROBES 6u
+/*
+ * The warm/cold hash tables stay intentionally sparse, but realistic bench
+ * keysets can still create 10+ entry linear-probe runs. A slightly larger
+ * probe window avoids spilling valid warm keys into the cold path and later
+ * surfacing them as false NOT_FOUND responses.
+ */
+#define TLC_CORE_WARM_PROBES 16u
+#define TLC_CORE_COLD_PROBES 16u
 #define TLC_CORE_INVALID_OFFSET UINT64_MAX
 
 typedef enum tlc_core_entry_state {
