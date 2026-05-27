@@ -86,6 +86,47 @@ vemb_v16_bench / future redis-cli-vemb
 
 ## 后续
 
+## TODO：proxy/SuperNode 线程池化
+
+当前 `vemb_v16_bench` / `vemb_v16_server` 的线程模型是 channel 绑定线程：
+
+```text
+bench worker N
+-> channel N
+-> server proxy channel thread N
+-> server SuperNode thread N
+```
+
+也就是说，bench `--threads 64` 时，server 侧会随 channel 数线性创建约 `64 proxy channel threads + 64 SuperNode threads`。这个模型实现简单、channel 隔离好，但连接数和线程数强绑定，不适合后续跨机 TCP、多 client、长连接生产形态。
+
+目标模型是把 channel 降级为连接/session，把执行资源改为固定线程池：
+
+```text
+many bench workers / TCP connections / SHM channels
+-> proxy I/O worker pool
+-> bounded job queues or shard queues
+-> SuperNode worker pool
+-> completion / response dispatch
+```
+
+预期收益：
+
+- 线程数不再随 bench/client/channel 数线性增长，server 侧可以固定为 `proxy_io_threads=N`、`supernode_workers=M`。
+- 减少线程栈、调度、上下文切换和 cache footprint，压测线程数超过物理 core 后更稳定。
+- 更容易做跨 channel 负载均衡，避免某个热 channel 独占一个 SuperNode thread 而其他 thread 空闲。
+- 更适合 TCP 跨机长连接：大量 TCP connection 由少量 I/O worker 管理，计算由固定 SuperNode worker 执行。
+- 内部 ring/queue 数量可以从 per-channel ring 逐步收敛为 per-worker/per-shard queue，降低内存和 cache 压力。
+- 可以做全局 backpressure：global inflight、per-channel inflight、per-worker queue depth、超时/拒绝策略。
+
+第一版约束：
+
+- 同一 channel 内先保持请求/响应有序，不立即引入乱序 response。
+- `bench` 当前 pipeline 按发送顺序等待 response；如果后续允许同一 channel 并行执行，需要 client 侧按 `req_id` 匹配，或者 server 侧做 per-channel reorder buffer。
+- 优先实现折中方案：`accept/control main thread + proxy_io_threads + supernode_workers`，其中 `channel_id` 或 `key_hash` 路由到固定 worker/shard，先拿到线程数受控和跨 channel 均衡收益。
+- SHM transport 需要 proxy I/O worker 轮询多个 request ring，并把 completion 写回对应 response ring。
+- TCP transport 需要 proxy I/O worker 管理多个 persistent fd，后续可从 `poll` 演进到 `epoll` / `kqueue`。
+- stats 需要同时保留 per-channel 可观测性和 per-worker 聚合指标，避免线程池化后定位瓶颈变困难。
+
 ## Phase 2：Aeron Ring 化
 
 设计文档：`docs/VEMB_V16_PHASE2_AERON_RING_DESIGN.md`

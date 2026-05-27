@@ -117,6 +117,179 @@ channel_id -> response ring lifecycle + completion return target
 channel_id -> uint64_t monotonic id, never reused in process lifetime
 ```
 
+### Network Transport 第一阶段
+
+`vemb_v16_bench` 与 `vemb_v16_server` 之间新增网络 transport 时，第一阶段选择 TCP persistent connection，不使用 `aeron_ipc`。
+
+选择顺序：
+
+```text
+1. TCP persistent connection + binary fixed frame
+2. DPDK / userspace NIC transport, only after TCP profiling proves kernel network stack is the bottleneck
+3. KCP/UDP, only for lossy or high-jitter network experiments
+```
+
+原因：
+
+- TCP 语义可靠，跨主机可用，部署与调试成本最低。
+- V16 当前请求形态是 request/response，且 payload 主要是小型 `VEMB_HANDLE` 与约 1200B 的 `VADD_INLINE`，TCP 长连接加 pipeline 可以先把功能和 benchmark 口径跑准。
+- DPDK 性能上限最高，但需要 hugepage、NIC binding、queue/core/NUMA 管理和专用部署权限，不应阻塞第一阶段。
+- KCP 适合弱网、丢包和高 jitter 场景；在低丢包机房内网里，它会把可靠性和重传逻辑搬到用户态，复杂度通常不值得作为主路径。
+
+TCP 第一阶段的数据路径：
+
+```text
+bench worker
+-> persistent TCP connection
+-> binary frame carrying vemb_v16_req_t
+-> proxy network channel
+-> existing proxy -> SuperNode SPSC job ring
+-> SuperNode/TLC
+-> existing completion ring
+-> binary frame carrying vemb_v16_resp_t
+-> bench worker
+```
+
+TCP 路径架构：
+
+```mermaid
+flowchart LR
+    subgraph Bench[benchmark/vemb_v16_bench]
+        T[worker threads]
+        C[TCP data fd per channel]
+        CTL[TCP control short fd]
+    end
+
+    subgraph NET[TCP transport]
+        H[HELLO / WELCOME]
+        RQ[REQUEST frame]
+        RS[RESPONSE frame]
+        CC[STATS / CLOSE_* frame]
+    end
+
+    subgraph Server[src/vemb_v16_server]
+        L[tcp listen<br/>--tcp-host / --tcp-port]
+        P[vemb_v16_proxy]
+        CH[vemb_v16_channel<br/>transport=TCP]
+        WK[channel thread]
+        HP[handle_request]
+        WARM[warm provider<br/>SHM or UB vector region]
+    end
+
+    T --> C
+    C --> H --> L
+    L --> P
+    P --> CH
+    CH --> H --> C
+
+    C --> RQ --> CH
+    CH --> WK --> HP
+    HP --> WARM
+    HP --> RS --> C
+
+    CTL --> CC --> L
+    L --> P
+    P --> CC --> CTL
+```
+
+TCP 数据长连接时序：
+
+```mermaid
+sequenceDiagram
+    participant B as bench worker
+    participant TCP as TCP socket
+    participant S as vemb_v16_server
+    participant CH as TCP channel
+    participant W as warm backend<br/>SHM/UB
+
+    B->>TCP: connect(host, port)
+    B->>S: VEMB_V16_NET_HELLO + alloc_req
+    S->>CH: alloc_tcp_channel()
+    S->>B: VEMB_V16_NET_WELCOME + channel_desc
+
+    loop each op
+        B->>S: VEMB_V16_NET_REQUEST + vemb_v16_req_t
+        S->>CH: channel_poll_tcp_request()
+        CH->>W: read/write vector metadata or vector bytes
+        W-->>CH: handle / offset / vector slice
+        CH->>B: VEMB_V16_NET_RESPONSE + vemb_v16_resp_t
+    end
+```
+
+TCP control 使用短连接，不依赖本机 UDS：
+
+```mermaid
+sequenceDiagram
+    participant B as bench
+    participant S as server tcp listener
+    participant P as proxy
+
+    B->>S: connect()
+    B->>P: STATS / CLOSE_CHANNEL / CLOSE_ALL_CHANNELS
+    P-->>B: STATS or CONTROL_STATUS
+    B->>S: close()
+```
+
+TCP 第一阶段只替换 client/bench 与 proxy 之间的外侧 channel。Proxy 与 SuperNode 之间仍保留进程内 `vemb_v16_aeron_ring.h` typed SPSC ring；这不是 `aeron_ipc`，也不承担跨进程/跨主机通信。
+
+TCP frame 采用固定 header 加 payload：
+
+```c
+typedef struct vemb_v16_net_hdr {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t flags;
+    uint32_t payload_len;
+    uint64_t channel_id;
+    uint32_t req_id;
+    uint32_t reserved;
+} vemb_v16_net_hdr_t;
+```
+
+第一阶段 frame 类型：
+
+```text
+HELLO     bench -> server, payload = vemb_v16_alloc_req_t
+WELCOME   server -> bench, payload = vemb_v16_channel_desc_t
+REQUEST   bench -> server, payload = vemb_v16_req_t prefix
+RESPONSE  server -> bench, payload = vemb_v16_resp_t
+CLOSE     either side, payload empty
+STATS     bench -> server, payload empty; server -> bench, payload = vemb_v16_stats_t
+CLOSE_CHANNEL bench -> server, channel_id in header, payload empty
+CLOSE_ALL_CHANNELS bench -> server, payload empty
+CONTROL_STATUS server -> bench, payload = vemb_v16_net_status_t
+```
+
+第一阶段支持：
+
+- `ping`
+- `vadd-inline`
+- `vemb-handle`
+- `vemb-supernode-read`
+- `vemb-inline-vector`
+- `mixed-80r20w`
+
+`vemb-inline-vector` 是 TCP transport 的跨主机完整 vector 语义。请求使用 `VEMB_V16_OP_VEMB_HANDLE` 并设置 `VEMB_V16_REQ_F_INLINE_VECTOR`；SuperNode 仍然返回 `{region_id, offset, bytes}` completion，proxy 在 TCP `RESPONSE` frame 中写入：
+
+```text
+payload = vemb_v16_resp_t + vector_bytes
+```
+
+其中 `vemb_v16_resp_t` 保留 handle 字段，追加 payload 是从 server 本地 WARM/vector region 按 offset 拷贝出的 vector 内容。第一阶段 `vemb-inline-vector` 只承诺 TCP transport；shared-memory transport 继续使用 `vemb-read-vector` 由客户端 mmap region 后本地读取。
+
+`vemb-read-vector` 暂不作为跨主机语义，因为当前该模式依赖客户端 mmap WARM/vector region 后按 `{region_id, offset, bytes}` 本地读取。后续如果要进一步优化跨主机完整 vector 返回，应引入 RDMA/URMA/DPDK zero-copy read path，减少 TCP 追加 1200B payload 的内核拷贝。
+
+TCP 实现要求：
+
+- 每个 bench worker 使用一条长连接。
+- 连接建立后先执行 `HELLO/WELCOME`，server 为该连接创建一个 channel。
+- 同一连接内 request 可以 pipeline；response 按连接内 completion 顺序返回。
+- `--transport tcp` 的 stats、close-channel、close-all-channel 必须全部走 TCP control frame，不依赖本机 UDS。
+- TCP 连接 EOF、`CLOSE` 或 socket error 后，server 标记 channel inactive，由 proxy 主循环 reap channel、join worker、合并 counters 到 `closed_stats`。
+- socket 使用 `TCP_NODELAY`，并保留后续 `SO_REUSEPORT`、per-core accept、`readv/writev`、batch parse 优化空间。
+- 现有 shared-memory ring transport 保留，默认行为不回退。
+
 ### VADD / PUT
 
 ```mermaid
@@ -955,7 +1128,7 @@ handle-only VEMB 达到 800k+ QPS，并量化 SPSC job ring 和 completion ring 
 | 项 | 当前 Redis FC Proxy | 新 VEMB V16 数据面 |
 |---|---|---|
 | 命令入口 | Redis RESP command | CLI 兼容解析 + binary request |
-| 请求传输 | TCP RESP | shared-memory ring |
+| 请求传输 | TCP RESP | shared-memory ring；第一阶段新增 TCP binary frame |
 | VEMB 回复 | RESP array + 1200B bulk | status + handle |
 | payload 读取 | Redis socket 返回 | client 读 vector region |
 | 阻塞模型 | RedisModule_BlockClient | spin/poll ring |

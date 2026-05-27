@@ -621,6 +621,67 @@ make -C benchmark vemb_v16_bench
   --mode mixed-80r20w
 ```
 
+TCP 模式启动 server。默认 TCP 端口是 `6391`，这里显式写出便于跨机器或多实例调试：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --vector-region /vemb_v16_vectors \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072 \
+  --loglevel notice
+```
+
+如需同时保留本机 UDS 控制面和 TCP transport，可将 `--transport tcp` 改为 `--transport both`。
+
+TCP 模式 benchmark 连通性测试：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 0 \
+  --ops 100000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode ping
+```
+
+TCP 模式只返回 WARM handle 的 VEMB benchmark：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode vemb-handle
+```
+
+TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。`vemb-read-vector` 依赖 client 本地 mmap WARM/vector region，不作为 TCP 跨主机读 vector 语义：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode vemb-inline-vector
+```
+
 UB 模式启动 server。`--vector-region` 必须是 Linux server 上可 `open(O_RDWR)` 且可 `mmap(MAP_SHARED)` 的 UB 设备或文件路径；`--warm-mmap-offset` 传 UB warm 区域起始偏移。
 
 ```bash

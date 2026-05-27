@@ -26,10 +26,25 @@ int main(int argc, char **argv) {
     uint32_t warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
     uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
+    const char *transport = "shm";
+    const char *tcp_host = VEMB_V16_TCP_HOST;
+    uint16_t tcp_port = VEMB_V16_TCP_PORT;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
             uds_path = argv[++i];
+        } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
+            transport = argv[++i];
+            if (strcmp(transport, "shm") &&
+                strcmp(transport, "tcp") &&
+                strcmp(transport, "both")) {
+                fprintf(stderr, "invalid transport\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[i], "--tcp-host") && i + 1 < argc) {
+            tcp_host = argv[++i];
+        } else if (!strcmp(argv[i], "--tcp-port") && i + 1 < argc) {
+            tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--vector-region") && i + 1 < argc) {
             vector_region_name = argv[++i];
         } else if (!strcmp(argv[i], "--dim") && i + 1 < argc) {
@@ -56,7 +71,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport shm|tcp|both] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             return 0;
         }
     }
@@ -67,8 +82,9 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: uds=%s dim=%u max_vectors=%u vector_region=%s",
-              uds_path, dim, max_vectors, vector_region_name);
+    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u dim=%u max_vectors=%u vector_region=%s",
+              transport, uds_path, tcp_host, tcp_port, dim, max_vectors,
+              vector_region_name);
 
     if (vemb_v16_proxy_create(&g_proxy,
                               uds_path,
@@ -80,6 +96,14 @@ int main(int argc, char **argv) {
                               warm_mmap_offset) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
         return 1;
+    }
+    if (!strcmp(transport, "tcp") || !strcmp(transport, "both")) {
+        if (vemb_v16_proxy_enable_tcp(g_proxy, tcp_host, tcp_port) != 0) {
+            serverLog(LL_WARNING, "failed to enable vemb_v16 tcp transport");
+            vemb_v16_proxy_destroy(g_proxy);
+            g_proxy = NULL;
+            return 1;
+        }
     }
 
     int ret = vemb_v16_proxy_run(g_proxy);

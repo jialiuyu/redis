@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "../src/vemb_v16_client_ring.h"
+#include "../src/vemb_v16_net.h"
 #include "../src/vemb_v16_protocol.h"
 #include "../src/zmalloc.h"
 
@@ -32,6 +33,7 @@ typedef struct bench_hash_node {
 
 typedef struct bench_cfg {
     const char *socket_path;
+    const char *tcp_host;
     char socket_paths[VEMB_V16_BENCH_MAX_NODES][VEMB_V16_BENCH_PATH_MAX];
     uint32_t node_count;
     bench_hash_node_t hash_nodes[
@@ -48,6 +50,8 @@ typedef struct bench_cfg {
     uint32_t timeout_ms;
     int pin_threads;
     uint32_t pipeline;
+    uint32_t transport_type;
+    uint16_t tcp_port;
 } bench_cfg_t;
 
 typedef struct bench_region_map {
@@ -66,6 +70,11 @@ typedef struct bench_node_channel {
     vemb_v16_channel_desc_t desc;
     vemb_v16_client_ring_t *req_ring;
     vemb_v16_client_ring_t *resp_ring;
+    int net_fd;
+    uint32_t transport_type;
+    const char *tcp_host;
+    uint16_t tcp_port;
+    uint32_t timeout_ms;
     bench_region_map_t warm_region;
 } bench_node_channel_t;
 
@@ -92,6 +101,7 @@ enum {
     MODE_VADD_INLINE = 3,
     MODE_VEMB_SUPERNODE_READ = 4,
     MODE_MIXED_80R20W = 5,
+    MODE_VEMB_INLINE_VECTOR = 6,
 };
 
 static uint32_t g_control_timeout_ms = 10000;
@@ -184,6 +194,119 @@ static int alloc_channel_path(const char *socket_path,
     bench_cfg_t node_cfg = *cfg;
     node_cfg.socket_path = socket_path;
     return alloc_channel(&node_cfg, desc);
+}
+
+static int alloc_tcp_channel(const bench_cfg_t *cfg,
+                             vemb_v16_channel_desc_t *desc,
+                             int *net_fd) {
+    int fd = vemb_v16_net_connect(cfg->tcp_host,
+                                  cfg->tcp_port,
+                                  cfg->timeout_ms);
+    if (fd < 0) return -1;
+    vemb_v16_alloc_req_t req = {.vector_dim = cfg->dim};
+    if (vemb_v16_net_write_frame(fd,
+                                 VEMB_V16_NET_HELLO,
+                                 0,
+                                 0,
+                                 0,
+                                 &req,
+                                 sizeof(req)) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_WELCOME ||
+        hdr.payload_len != sizeof(*desc) ||
+        vemb_v16_net_read_full(fd, desc, sizeof(*desc)) != 0 ||
+        desc->magic != VEMB_V16_MAGIC ||
+        desc->version != VEMB_V16_VERSION) {
+        close(fd);
+        return -1;
+    }
+    *net_fd = fd;
+    return 0;
+}
+
+static int tcp_control_request(const char *host,
+                               uint16_t port,
+                               uint32_t timeout_ms,
+                               uint16_t type,
+                               uint64_t channel_id,
+                               uint16_t expect_type,
+                               void *payload,
+                               uint32_t payload_len) {
+    int fd = vemb_v16_net_connect(host, port, timeout_ms);
+    if (fd < 0) return -1;
+    if (vemb_v16_net_write_frame(fd,
+                                 type,
+                                 0,
+                                 channel_id,
+                                 0,
+                                 NULL,
+                                 0) != 0) {
+        close(fd);
+        return -1;
+    }
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != expect_type ||
+        hdr.payload_len != payload_len ||
+        (payload_len &&
+         vemb_v16_net_read_full(fd, payload, payload_len) != 0)) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int fetch_stats_tcp(const bench_cfg_t *cfg, vemb_v16_stats_t *stats) {
+    return tcp_control_request(cfg->tcp_host,
+                               cfg->tcp_port,
+                               cfg->timeout_ms,
+                               VEMB_V16_NET_STATS,
+                               0,
+                               VEMB_V16_NET_STATS,
+                               stats,
+                               sizeof(*stats));
+}
+
+static int close_channel_tcp(const char *host,
+                             uint16_t port,
+                             uint32_t timeout_ms,
+                             uint64_t channel_id) {
+    vemb_v16_net_status_t status;
+    if (tcp_control_request(host,
+                            port,
+                            timeout_ms,
+                            VEMB_V16_NET_CLOSE_CHANNEL,
+                            channel_id,
+                            VEMB_V16_NET_CONTROL_STATUS,
+                            &status,
+                            sizeof(status)) != 0) {
+        return -1;
+    }
+    return status.status == VEMB_V16_STATUS_OK ? 0 : -1;
+}
+
+static int close_all_channels_tcp(const bench_cfg_t *cfg, uint64_t *closed) {
+    vemb_v16_net_status_t status;
+    if (tcp_control_request(cfg->tcp_host,
+                            cfg->tcp_port,
+                            cfg->timeout_ms,
+                            VEMB_V16_NET_CLOSE_ALL_CHANNELS,
+                            0,
+                            VEMB_V16_NET_CONTROL_STATUS,
+                            &status,
+                            sizeof(status)) != 0) {
+        return -1;
+    }
+    if (status.status != VEMB_V16_STATUS_OK)
+        return -1;
+    if (closed) *closed = status.value;
+    return 0;
 }
 
 static int fetch_stats(const char *socket_path, vemb_v16_stats_t *stats) {
@@ -422,6 +545,61 @@ static int recv_resp(vemb_v16_client_ring_t *ring, vemb_v16_resp_t *resp,
     return got == (int)sizeof(*resp) ? 0 : -1;
 }
 
+static int send_channel_req(bench_node_channel_t *node,
+                            const vemb_v16_req_t *req,
+                            size_t len,
+                            uint64_t *publish_spins,
+                            uint32_t timeout_ms) {
+    if (node->transport_type == VEMB_V16_TRANSPORT_TCP) {
+        (void)publish_spins;
+        (void)timeout_ms;
+        if (node->net_fd < 0) return -1;
+        return vemb_v16_net_write_frame(node->net_fd,
+                                        VEMB_V16_NET_REQUEST,
+                                        0,
+                                        node->desc.channel_id,
+                                        req->req_id,
+                                        req,
+                                        (uint32_t)len);
+    }
+    return send_req(node->req_ring, req, len, publish_spins, timeout_ms);
+}
+
+static int recv_channel_resp(bench_node_channel_t *node,
+                             vemb_v16_resp_t *resp,
+                             uint8_t *inline_vector,
+                             uint32_t inline_vector_cap,
+                             uint32_t *inline_vector_bytes,
+                             uint64_t *empty_polls,
+                             uint32_t timeout_ms) {
+    if (inline_vector_bytes) *inline_vector_bytes = 0;
+    if (node->transport_type == VEMB_V16_TRANSPORT_TCP) {
+        (void)empty_polls;
+        (void)timeout_ms;
+        if (node->net_fd < 0) return -1;
+        vemb_v16_net_hdr_t hdr;
+        if (vemb_v16_net_read_header(node->net_fd, &hdr) != 0 ||
+            hdr.type != VEMB_V16_NET_RESPONSE ||
+            hdr.channel_id != node->desc.channel_id ||
+            hdr.payload_len < sizeof(*resp) ||
+            vemb_v16_net_read_full(node->net_fd, resp, sizeof(*resp)) != 0) {
+            return -1;
+        }
+        uint32_t extra = hdr.payload_len - (uint32_t)sizeof(*resp);
+        if (extra) {
+            if (!inline_vector || extra > inline_vector_cap)
+                return -1;
+            if (vemb_v16_net_read_full(node->net_fd, inline_vector, extra) != 0)
+                return -1;
+            if (inline_vector_bytes) *inline_vector_bytes = extra;
+        }
+        return 0;
+    }
+    (void)inline_vector;
+    (void)inline_vector_cap;
+    return recv_resp(node->resp_ring, resp, empty_polls, timeout_ms);
+}
+
 static int prefill_multi(const bench_cfg_t *cfg,
                          bench_node_channel_t *nodes,
                          uint32_t node_count) {
@@ -438,14 +616,14 @@ static int prefill_multi(const bench_cfg_t *cfg,
         prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1,
                     node->desc.channel_id, key, cfg->dim);
         fill_vector(req.vector, cfg->dim, i);
-        if (send_req(node->req_ring, &req,
-                     vemb_v16_req_inline_len(req.vector_bytes),
-                     NULL, cfg->timeout_ms) != 0) {
+        if (send_channel_req(node, &req,
+                             vemb_v16_req_inline_len(req.vector_bytes),
+                             NULL, cfg->timeout_ms) != 0) {
             fprintf(stderr, "prefill send timeout at item=%u node=%u\n",
                     i, node_index);
             return -1;
         }
-        if (recv_resp(node->resp_ring, &resp, NULL, cfg->timeout_ms) != 0 ||
+        if (recv_channel_resp(node, &resp, NULL, 0, NULL, NULL, cfg->timeout_ms) != 0 ||
             resp.status != VEMB_V16_STATUS_OK) {
             fprintf(stderr, "prefill response timeout/error at item=%u node=%u status=%u\n",
                     i, node_index, resp.status);
@@ -481,6 +659,17 @@ static void *worker_main(void *arg) {
         atomic_store_explicit(&w->done, 1, memory_order_release);
         return NULL;
     }
+    uint32_t inline_vector_cap = w->cfg.dim * sizeof(float);
+    uint8_t *inline_vector = NULL;
+    if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR) {
+        inline_vector = zmalloc(inline_vector_cap);
+        if (!inline_vector) {
+            zfree(pending);
+            w->fail = w->cfg.ops;
+            atomic_store_explicit(&w->done, 1, memory_order_release);
+            return NULL;
+        }
+    }
     char key[VEMB_V16_MAX_KEY_LEN];
     uint64_t start = now_ns();
     uint32_t sent = 0;
@@ -507,9 +696,9 @@ static void *worker_main(void *arg) {
                 req.op = VEMB_V16_OP_PING;
                 req.req_id = i + 1;
                 req.channel_id = node->desc.channel_id;
-                if (send_req(node->req_ring, &req, req_len,
-                             &w->request_publish_spins,
-                             w->cfg.timeout_ms) != 0) {
+                if (send_channel_req(node, &req, req_len,
+                                     &w->request_publish_spins,
+                                     w->cfg.timeout_ms) != 0) {
                     fprintf(stderr, "worker %d request publish timeout at op=%u mode=ping\n",
                             w->tid, i);
                     send_failed = 1;
@@ -524,9 +713,9 @@ static void *worker_main(void *arg) {
                 fill_vector(req.vector, w->cfg.dim, global_id);
                 req_len = vemb_v16_req_inline_len(req.vector_bytes);
                 w->vadd_sent++;
-                if (send_req(node->req_ring, &req, req_len,
-                             &w->request_publish_spins,
-                             w->cfg.timeout_ms) != 0) {
+                if (send_channel_req(node, &req, req_len,
+                                     &w->request_publish_spins,
+                                     w->cfg.timeout_ms) != 0) {
                     fprintf(stderr, "worker %d request publish timeout at op=%u mode=%s\n",
                             w->tid, i, mode_name(w->cfg.mode));
                     send_failed = 1;
@@ -538,10 +727,12 @@ static void *worker_main(void *arg) {
                 bench_node_channel_t *node = &w->nodes[node_index];
                 prepare_req(&req, op, i + 1, node->desc.channel_id, key,
                             w->cfg.dim);
+                if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR)
+                    req.flags |= VEMB_V16_REQ_F_INLINE_VECTOR;
                 w->vemb_sent++;
-                if (send_req(node->req_ring, &req, req_len,
-                             &w->request_publish_spins,
-                             w->cfg.timeout_ms) != 0) {
+                if (send_channel_req(node, &req, req_len,
+                                     &w->request_publish_spins,
+                                     w->cfg.timeout_ms) != 0) {
                     fprintf(stderr, "worker %d request publish timeout at op=%u key_id=%u\n",
                             w->tid, i, key_id);
                     send_failed = 1;
@@ -560,12 +751,16 @@ static void *worker_main(void *arg) {
         }
 
         vemb_v16_resp_t resp;
+        uint32_t inline_vector_bytes = 0;
         uint32_t recv_node_index = pending[pending_head].node_index;
         bench_node_channel_t *recv_node = &w->nodes[recv_node_index];
-        if (recv_resp(recv_node->resp_ring,
-                      &resp,
-                      &w->response_empty_polls,
-                      w->cfg.timeout_ms) != 0) {
+        if (recv_channel_resp(recv_node,
+                              &resp,
+                              inline_vector,
+                              inline_vector_cap,
+                              &inline_vector_bytes,
+                              &w->response_empty_polls,
+                              w->cfg.timeout_ms) != 0) {
             uint32_t key_id = pending_count ? pending[pending_head].key_id : 0;
             uint32_t op_index = pending_count ? pending[pending_head].op_index : completed;
             fprintf(stderr, "worker %d response timeout at op=%u key_id=%u\n",
@@ -605,12 +800,29 @@ static void *worker_main(void *arg) {
             for (uint32_t j = 0; j < resp.vector_bytes; j += 64)
                 checksum ^= p[j];
             w->read_bytes += resp.vector_bytes + checksum * 0u;
+        } else if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR) {
+            if (inline_vector_bytes != resp.vector_bytes ||
+                resp.vector_bytes != inline_vector_cap) {
+                fprintf(stderr, "worker %d invalid inline vector at op=%u bytes=%u expected=%u resp_bytes=%u\n",
+                        w->tid,
+                        done_req.op_index,
+                        inline_vector_bytes,
+                        inline_vector_cap,
+                        resp.vector_bytes);
+                w->fail += w->cfg.ops - completed;
+                goto worker_done;
+            }
+            uint8_t checksum = 0;
+            for (uint32_t j = 0; j < inline_vector_bytes; j += 64)
+                checksum ^= inline_vector[j];
+            w->read_bytes += inline_vector_bytes + checksum * 0u;
         }
         w->ok++;
         completed++;
     }
 worker_done:
     w->ns = now_ns() - start;
+    zfree(inline_vector);
     zfree(pending);
     atomic_store_explicit(&w->done, 1, memory_order_release);
     return NULL;
@@ -620,6 +832,7 @@ static int mode_from_string(const char *s) {
     if (!strcmp(s, "ping")) return MODE_PING;
     if (!strcmp(s, "vemb-handle")) return MODE_VEMB_HANDLE;
     if (!strcmp(s, "vemb-read-vector")) return MODE_VEMB_READ_VECTOR;
+    if (!strcmp(s, "vemb-inline-vector")) return MODE_VEMB_INLINE_VECTOR;
     if (!strcmp(s, "vemb-supernode-read")) return MODE_VEMB_SUPERNODE_READ;
     if (!strcmp(s, "vadd-inline")) return MODE_VADD_INLINE;
     if (!strcmp(s, "mixed-80r20w")) return MODE_MIXED_80R20W;
@@ -631,6 +844,7 @@ static const char *mode_name(int mode) {
     case MODE_PING: return "ping";
     case MODE_VEMB_HANDLE: return "vemb-handle";
     case MODE_VEMB_READ_VECTOR: return "vemb-read-vector";
+    case MODE_VEMB_INLINE_VECTOR: return "vemb-inline-vector";
     case MODE_VEMB_SUPERNODE_READ: return "vemb-supernode-read";
     case MODE_VADD_INLINE: return "vadd-inline";
     case MODE_MIXED_80R20W: return "mixed-80r20w";
@@ -737,11 +951,44 @@ static void print_stats_delta_node(uint32_t node_index,
     print_stats_delta(before, after);
 }
 
+static int fetch_stats_for_node(const bench_cfg_t *cfg,
+                                uint32_t node_index,
+                                vemb_v16_stats_t *stats) {
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP)
+        return fetch_stats_tcp(cfg, stats);
+    return fetch_stats(cfg->socket_paths[node_index], stats);
+}
+
+static int close_all_for_node(const bench_cfg_t *cfg,
+                              uint32_t node_index,
+                              uint64_t *closed) {
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP)
+        return close_all_channels_tcp(cfg, closed);
+    return close_all_channels(cfg->socket_paths[node_index], closed);
+}
+
 static void close_node_channel(const char *socket_path,
                                bench_node_channel_t *node) {
     if (!node) return;
-    if (node->desc.channel_id)
+    if (node->transport_type == VEMB_V16_TRANSPORT_TCP) {
+        if (node->net_fd >= 0) {
+            vemb_v16_net_write_frame(node->net_fd,
+                                     VEMB_V16_NET_CLOSE,
+                                     0,
+                                     node->desc.channel_id,
+                                     0,
+                                     NULL,
+                                     0);
+            close(node->net_fd);
+        }
+        if (node->desc.channel_id)
+            close_channel_tcp(node->tcp_host,
+                              node->tcp_port,
+                              node->timeout_ms,
+                              node->desc.channel_id);
+    } else if (node->desc.channel_id) {
         close_channel_path(socket_path, node->desc.channel_id);
+    }
     if (node->req_ring) {
         munmap(node->req_ring,
                vemb_v16_client_ring_bytes(node->desc.request_ring_slot_size));
@@ -752,6 +999,7 @@ static void close_node_channel(const char *socket_path,
     }
     close_warm_region(&node->warm_region);
     memset(node, 0, sizeof(*node));
+    node->net_fd = -1;
 }
 
 static int setup_node_channel(const bench_cfg_t *cfg,
@@ -760,6 +1008,19 @@ static int setup_node_channel(const bench_cfg_t *cfg,
                               bench_node_channel_t *node) {
     if (node_index >= cfg->node_count)
         return -1;
+    memset(node, 0, sizeof(*node));
+    node->net_fd = -1;
+    node->transport_type = cfg->transport_type;
+    node->tcp_host = cfg->tcp_host;
+    node->tcp_port = cfg->tcp_port;
+    node->timeout_ms = cfg->timeout_ms;
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
+        if (alloc_tcp_channel(cfg, &node->desc, &node->net_fd) != 0) {
+            close_node_channel(cfg->socket_paths[node_index], node);
+            return -1;
+        }
+        return 0;
+    }
     const char *socket_path = cfg->socket_paths[node_index];
     if (alloc_channel_path(socket_path, cfg, &node->desc) != 0 ||
         open_ring(node->desc.request_ring_name,
@@ -781,7 +1042,18 @@ static int setup_node_channel(const bench_cfg_t *cfg,
 static int run_once(bench_cfg_t cfg) {
     bench_node_channel_t pre_nodes[VEMB_V16_BENCH_MAX_NODES];
     memset(pre_nodes, 0, sizeof(pre_nodes));
-    printf("[setup] mode=%s dim=%u prefill=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
+    if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
+        cfg.mode == MODE_VEMB_READ_VECTOR) {
+        fprintf(stderr, "vemb-read-vector requires shm vector-region mmap; use vemb-handle or vemb-supernode-read with --transport tcp\n");
+        return 1;
+    }
+    if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
+        cfg.mode == MODE_VEMB_INLINE_VECTOR) {
+        fprintf(stderr, "vemb-inline-vector requires --transport tcp\n");
+        return 1;
+    }
+    printf("[setup] transport=%s mode=%s dim=%u prefill=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
+           vemb_v16_transport_name(cfg.transport_type),
            mode_name(cfg.mode), cfg.dim, cfg.prefill, cfg.ops, cfg.threads,
            cfg.pipeline, cfg.pin_threads ? "yes" : "no");
     if (cfg.prefill && cfg.mode != MODE_PING) {
@@ -811,7 +1083,7 @@ static int run_once(bench_cfg_t cfg) {
     memset(before, 0, sizeof(before));
     memset(after, 0, sizeof(after));
     for (uint32_t n = 0; n < cfg.node_count; n++) {
-        if (fetch_stats(cfg.socket_paths[n], &before[n]) != 0)
+        if (fetch_stats_for_node(&cfg, n, &before[n]) != 0)
             fprintf(stderr, "warning: fetch stats before run failed for node=%u\n", n);
     }
 
@@ -853,7 +1125,7 @@ static int run_once(bench_cfg_t cfg) {
             fprintf(stderr, "run timeout: done_workers=%d/%d timeout_ms=%u\n",
                     done, cfg.threads, cfg.timeout_ms);
             for (uint32_t n = 0; n < cfg.node_count; n++) {
-                if (fetch_stats(cfg.socket_paths[n], &after[n]) == 0)
+                if (fetch_stats_for_node(&cfg, n, &after[n]) == 0)
                     print_stats_delta_node(n, &before[n], &after[n]);
             }
             timed_out = 1;
@@ -912,7 +1184,7 @@ static int run_once(bench_cfg_t cfg) {
             close_node_channel(cfg.socket_paths[n], &args[i].nodes[n]);
     }
     for (uint32_t n = 0; n < cfg.node_count; n++) {
-        if (fetch_stats(cfg.socket_paths[n], &after[n]) == 0)
+        if (fetch_stats_for_node(&cfg, n, &after[n]) == 0)
             print_stats_delta_node(n, &before[n], &after[n]);
         else
             fprintf(stderr, "warning: fetch stats after run failed for node=%u\n", n);
@@ -925,6 +1197,7 @@ static int run_once(bench_cfg_t cfg) {
 int main(int argc, char **argv) {
     bench_cfg_t cfg = {
         .socket_path = VEMB_V16_UDS_PATH,
+        .tcp_host = VEMB_V16_TCP_HOST,
         .dim = VEMB_V16_DEFAULT_DIM,
         .prefill = 65536,
         .ops = 200000,
@@ -932,6 +1205,8 @@ int main(int argc, char **argv) {
         .mode = MODE_VEMB_HANDLE,
         .timeout_ms = 10000,
         .pipeline = 1,
+        .transport_type = VEMB_V16_TRANSPORT_SHM,
+        .tcp_port = VEMB_V16_TCP_PORT,
     };
     cfg.node_count = 1;
     strncpy(cfg.socket_paths[0], cfg.socket_path, sizeof(cfg.socket_paths[0]) - 1);
@@ -951,6 +1226,26 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "invalid socket list\n");
                 return 1;
             }
+        }
+        else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
+            const char *transport = argv[++i];
+            if (!strcmp(transport, "shm")) {
+                cfg.transport_type = VEMB_V16_TRANSPORT_SHM;
+            } else if (!strcmp(transport, "tcp")) {
+                cfg.transport_type = VEMB_V16_TRANSPORT_TCP;
+                cfg.node_count = 1;
+            } else {
+                fprintf(stderr, "invalid transport: %s\n", transport);
+                return 1;
+            }
+        }
+        else if ((!strcmp(argv[i], "--host") ||
+                  !strcmp(argv[i], "--tcp-host")) && i + 1 < argc) {
+            cfg.tcp_host = argv[++i];
+        }
+        else if ((!strcmp(argv[i], "--port") ||
+                  !strcmp(argv[i], "--tcp-port")) && i + 1 < argc) {
+            cfg.tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
         }
         else if (!strcmp(argv[i], "--dim") && i + 1 < argc) cfg.dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -982,14 +1277,16 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--socket PATH | --sockets PATH[,PATH...]] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
+            printf("usage: %s [--transport shm|tcp] [--socket PATH | --sockets PATH[,PATH...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
             return 0;
         }
     }
+    if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP)
+        cfg.node_count = 1;
     g_control_timeout_ms = cfg.timeout_ms;
     for (uint32_t n = 0; n < cfg.node_count; n++) {
         uint64_t closed = 0;
-        if (close_all_channels(cfg.socket_paths[n], &closed) == 0 && closed)
+        if (close_all_for_node(&cfg, n, &closed) == 0 && closed)
             printf("[setup] node=%u closed stale channels=%llu\n",
                    n, (unsigned long long)closed);
     }

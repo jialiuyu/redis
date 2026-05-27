@@ -9,6 +9,8 @@
 #define VEMB_V16_VERSION 1u
 
 #define VEMB_V16_UDS_PATH "/tmp/vemb_v16.sock"
+#define VEMB_V16_TCP_HOST "127.0.0.1"
+#define VEMB_V16_TCP_PORT 6391
 #define VEMB_V16_SHM_PREFIX "vemb_v16"
 #define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
@@ -25,12 +27,30 @@
 #define VEMB_V16_REGION_LOCAL_SHM 1u
 #define VEMB_V16_REGION_UB 2u
 
+#define VEMB_V16_TRANSPORT_SHM 1u
+#define VEMB_V16_TRANSPORT_TCP 2u
+
+#define VEMB_V16_REQ_F_INLINE_VECTOR 0x01u
+#define VEMB_V16_NET_F_INLINE_VECTOR 0x01u
+
 enum vemb_v16_ctrl_op {
     VEMB_V16_CTRL_PING = 0x01,
     VEMB_V16_CTRL_ALLOC_CHANNEL = 0x20,
     VEMB_V16_CTRL_CLOSE_CHANNEL = 0x21,
     VEMB_V16_CTRL_STATS = 0x22,
     VEMB_V16_CTRL_CLOSE_ALL_CHANNELS = 0x23,
+};
+
+enum vemb_v16_net_frame_type {
+    VEMB_V16_NET_HELLO = 0x01,
+    VEMB_V16_NET_WELCOME = 0x02,
+    VEMB_V16_NET_REQUEST = 0x03,
+    VEMB_V16_NET_RESPONSE = 0x04,
+    VEMB_V16_NET_CLOSE = 0x05,
+    VEMB_V16_NET_STATS = 0x06,
+    VEMB_V16_NET_CLOSE_CHANNEL = 0x07,
+    VEMB_V16_NET_CLOSE_ALL_CHANNELS = 0x08,
+    VEMB_V16_NET_CONTROL_STATUS = 0x09,
 };
 
 enum vemb_v16_data_op {
@@ -63,6 +83,23 @@ typedef struct vemb_v16_channel_desc {
     char response_ring_name[64];
     char vector_region_name[256];
 } vemb_v16_channel_desc_t;
+
+typedef struct vemb_v16_net_hdr {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t flags;
+    uint32_t payload_len;
+    uint64_t channel_id;
+    uint32_t req_id;
+    uint32_t reserved;
+} vemb_v16_net_hdr_t;
+
+typedef struct vemb_v16_net_status {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint64_t value;
+} vemb_v16_net_status_t;
 
 typedef struct vemb_v16_req {
     uint8_t op;

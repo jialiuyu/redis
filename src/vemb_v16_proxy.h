@@ -13,6 +13,9 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           uint32_t warm_region_id,
                           uint32_t warm_backend_type,
                           uint64_t warm_mmap_offset);
+int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
+                              const char *host,
+                              uint16_t port);
 void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy);
 void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy);

@@ -53,6 +53,77 @@ proxy/channel/shared-memory ring/WARM mmap read-by-handle 作为后续高性能�
 
 因此，交付版的功能语义先按“CLI hash route -> TCP/IP -> SuperNode -> TLC”闭环，先保证多 SuperNode 路由、请求语义和 TLC 存储语义正确；后续再把传输层替换为 proxy-managed channel 与共享内存/UB 读路径。
 
+## Network Transport 选型
+
+多 SuperNode 的第一阶段网络路径选择 TCP persistent connection + binary frame，不使用 `aeron_ipc`。
+
+优先级：
+
+```text
+1. TCP: first implementation and default cross-node transport
+2. DPDK: later high-end transport after TCP profiling identifies kernel stack bottleneck
+3. KCP/UDP: experimental transport for lossy or high-jitter networks
+```
+
+取舍：
+
+- TCP 最适合先交付：可靠、有序、跨机可用，部署与排障成本低。
+- DPDK 只有在可以独占 CPU/NIC 队列、配置 hugepage、绑定 NUMA/core，并且 TCP 已被证明是瓶颈时才值得进入主线。
+- KCP 更适合弱网，不适合作为机房内低丢包网络的默认高性能数据面。
+
+第一阶段连接模型：
+
+```text
+bench/CLI worker
+-> route vector_key by local consistent hash
+-> connect target supernode TCP endpoint
+-> HELLO/WELCOME creates per-connection channel
+-> REQUEST frames carry vemb_v16_req_t
+-> RESPONSE frames carry vemb_v16_resp_t
+```
+
+跨 SuperNode TCP 路由架构：
+
+```mermaid
+flowchart LR
+    CLI[bench/CLI worker]
+    HR[local consistent hash]
+
+    subgraph N0[Node 0]
+        EP0[TCP endpoint<br/>host0:port]
+        P0[vemb_v16_proxy]
+        CH0[TCP channel]
+        SN0[SuperNode 0<br/>TLC]
+        W0[WARM/UB region 0]
+        EP0 --> P0 --> CH0 --> SN0 --> W0
+    end
+
+    subgraph N1[Node 1]
+        EP1[TCP endpoint<br/>host1:port]
+        P1[vemb_v16_proxy]
+        CH1[TCP channel]
+        SN1[SuperNode 1<br/>TLC]
+        W1[WARM/UB region 1]
+        EP1 --> P1 --> CH1 --> SN1 --> W1
+    end
+
+    CLI --> HR
+    HR -->|vector_key -> SN0| EP0
+    HR -->|vector_key -> SN1| EP1
+```
+
+每个 TCP 连接在 server 内部仍绑定一个 channel worker 和一个 SuperNode worker；server 内部继续使用进程内 typed SPSC ring，保持现有 `proxy -> SuperNode -> completion -> proxy` 执行边界。
+
+TCP control 也走同一个 TCP endpoint：
+
+```text
+STATS
+CLOSE_CHANNEL
+CLOSE_ALL_CHANNELS
+```
+
+因此 `--transport tcp` 的 bench/CLI 可以在跨主机场景下完成 stats 与 channel cleanup，不需要访问目标机器上的 UDS control socket。TCP data connection 断开后，server 负责 reap inactive channel、join worker，并把 counters 合并进 closed stats。
+
 ## Multi-SuperNode 架构
 
 ```mermaid
