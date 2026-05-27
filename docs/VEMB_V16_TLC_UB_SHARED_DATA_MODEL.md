@@ -682,6 +682,22 @@ TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。`
   --mode vemb-inline-vector
 ```
 
+TCP 模式线程扫描可用逗号列表；bench 会按顺序分别执行每个线程数：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,48 \
+  --pipeline 32 \
+  --mode vemb-inline-vector \
+  --timeout-ms 120000
+```
+
 UB 模式启动 server。`--vector-region` 必须是 Linux server 上可 `open(O_RDWR)` 且可 `mmap(MAP_SHARED)` 的 UB 设备或文件路径；`--warm-mmap-offset` 传 UB warm 区域起始偏移。
 
 ```bash

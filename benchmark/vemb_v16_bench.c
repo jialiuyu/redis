@@ -1259,11 +1259,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pipeline") && i + 1 < argc) cfg.pipeline = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *arg = argv[++i];
-            if (strchr(arg, ',')) {
-                strncpy(cfg.threads_arg, arg, sizeof(cfg.threads_arg) - 1);
-            } else {
-                cfg.threads = atoi(arg);
+            if (strlen(arg) >= sizeof(cfg.threads_arg)) {
+                fprintf(stderr, "invalid thread list\n");
+                return 1;
             }
+            strncpy(cfg.threads_arg, arg, sizeof(cfg.threads_arg) - 1);
+            cfg.threads_arg[sizeof(cfg.threads_arg) - 1] = '\0';
+            if (!strchr(arg, ','))
+                cfg.threads = atoi(arg);
         }
         else if (!strcmp(argv[i], "--hot-key-id") && i + 1 < argc) {
             cfg.hot_key_enabled = 1;
@@ -1282,7 +1285,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport shm|tcp] [--socket PATH | --sockets PATH[,PATH...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
+            printf("usage: %s [--transport shm|tcp] [--socket PATH | --sockets PATH[,PATH...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
             return 0;
         }
     }
@@ -1295,7 +1298,7 @@ int main(int argc, char **argv) {
             printf("[setup] node=%u closed stale channels=%llu\n",
                    n, (unsigned long long)closed);
     }
-    if (cfg.mode < 0 || cfg.threads <= 0 || cfg.threads > VEMB_V16_MAX_CHANNELS ||
+    if (cfg.mode < 0 ||
         cfg.pipeline == 0 || cfg.pipeline > VEMB_V16_CLIENT_RING_SIZE ||
         cfg.node_count == 0 || cfg.node_count > VEMB_V16_BENCH_MAX_NODES) {
         fprintf(stderr, "invalid arguments\n");
