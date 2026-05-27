@@ -6,7 +6,7 @@ CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
 # 目标文件
-TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench ring_buffer_ut ring_buffer_batch_bench ring_buffer_compare_bench proxy_components_ut proxy_scheduler_ut proxy_aggregator_ut vector_proxy_completion_ut monotonic_clock_bench
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench ring_buffer_ut ring_buffer_batch_bench ring_buffer_compare_bench proxy_components_ut proxy_scheduler_ut proxy_aggregator_ut vector_proxy_completion_ut monotonic_clock_bench vemb_v16_slow_client_bench
 
 # 所有目标
 all: $(TARGETS)
@@ -122,6 +122,10 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	@echo "✅ Built: $@"
 
 vemb_v16_bench: vemb_v16_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_client_ring.h ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_slow_client_bench: vemb_v16_slow_client_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"
 
@@ -352,6 +356,7 @@ help:
 	@echo "  ./tlc_aeron_bench / tlc_fc_bench / tlc_kcp_bench / tlc_raw_bench"
 	@echo "  ./tlc_transport_bench / tlc_all_transport_bench / tlc_client_bench"
 	@echo "  ./tlc_v10_bench / tlc_v13_bench / tlc_v14_bench"
+	@echo "  ./vemb_v16_bench / ./vemb_v16_slow_client_bench"
 	@echo ""
 	@echo "UB cross-node validation:"
 	@echo "  make ub_client_ut [USE_CC_MODE=yes] [USE_SVE=yes]"

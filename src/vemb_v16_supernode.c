@@ -10,7 +10,11 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <string.h>
 #include <time.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #define VEMB_V16_SAMPLE_MASK 1023u
 #define VEMB_V16_SUPERNODE_BATCH 32u
@@ -19,6 +23,29 @@ static uint64_t monotonic_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void vemb_v16_notify_completion_consumer(vemb_v16_supernode_ctx_t *ctx) {
+#ifdef __linux__
+    if (!ctx || !ctx->completion_notify_armed || !ctx->completion_notify_fd)
+        return;
+    int expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(ctx->completion_notify_armed,
+                                                 &expected,
+                                                 0,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed)) {
+        return;
+    }
+
+    int notify_fd = *ctx->completion_notify_fd;
+    if (notify_fd >= 0) {
+        uint64_t one = 1;
+        (void)write(notify_fd, &one, sizeof(one));
+    }
+#else
+    (void)ctx;
+#endif
 }
 
 static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
@@ -41,12 +68,13 @@ static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
                               memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->stats->completed_jobs, 1,
                               memory_order_relaxed);
+    vemb_v16_notify_completion_consumer(ctx);
 }
 
-static void vemb_v16_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
-                                     vemb_v16_vemb_job_t *vemb_job,
-                                     float **read_result,
-                                     size_t *read_result_bytes) {
+void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
+                                        vemb_v16_vemb_job_t *vemb_job,
+                                        float **read_result,
+                                        size_t *read_result_bytes) {
     vemb_v16_job_base_t *job = &vemb_job->base;
     vemb_v16_completion_t completion = {
         .status = VEMB_V16_STATUS_OK,
@@ -136,8 +164,8 @@ vemb_read_done:
                                 sample);
 }
 
-static void vemb_v16_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
-                                     vemb_v16_vadd_job_t *vadd_job) {
+void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
+                                        vemb_v16_vadd_job_t *vadd_job) {
     vemb_v16_job_base_t *job = &vadd_job->base;
     vemb_v16_completion_t completion = {
         .status = VEMB_V16_STATUS_OK,
@@ -174,19 +202,69 @@ static void vemb_v16_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
     vemb_v16_publish_completion(ctx, &completion, 0, 0);
 }
 
+int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch) {
+    if (!scratch) return -1;
+    memset(scratch, 0, sizeof(*scratch));
+    scratch->vemb_jobs =
+        zmalloc(sizeof(*scratch->vemb_jobs) * VEMB_V16_SUPERNODE_BATCH);
+    scratch->vadd_jobs =
+        zmalloc(sizeof(*scratch->vadd_jobs) * VEMB_V16_SUPERNODE_BATCH);
+    if (!scratch->vemb_jobs || !scratch->vadd_jobs) {
+        vemb_v16_supernode_scratch_cleanup(scratch);
+        return -1;
+    }
+    return 0;
+}
+
+void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch) {
+    if (!scratch) return;
+    zfree(scratch->read_result);
+    zfree(scratch->vemb_jobs);
+    zfree(scratch->vadd_jobs);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+int vemb_v16_supernode_drain(vemb_v16_supernode_ctx_t *ctx,
+                             vemb_v16_supernode_scratch_t *scratch) {
+    if (!ctx || !scratch || !scratch->vemb_jobs || !scratch->vadd_jobs)
+        return -1;
+    if (!atomic_load_explicit(ctx->running, memory_order_relaxed) ||
+        !atomic_load_explicit(ctx->channel_active, memory_order_acquire))
+        return 0;
+
+    uint32_t n = vemb_v16_aeron_poll_batch(ctx->vemb_job_ring,
+                                           scratch->vemb_jobs,
+                                           VEMB_V16_SUPERNODE_BATCH);
+    if (n) {
+        atomic_fetch_add_explicit(&ctx->stats->supernode_vemb_poll, n,
+                                  memory_order_relaxed);
+        for (uint32_t i = 0; i < n; i++) {
+            vemb_v16_supernode_handle_vemb_job(ctx,
+                                               &scratch->vemb_jobs[i],
+                                               &scratch->read_result,
+                                               &scratch->read_result_bytes);
+        }
+        return (int)n;
+    }
+
+    n = vemb_v16_aeron_poll_batch(ctx->vadd_job_ring,
+                                  scratch->vadd_jobs,
+                                  VEMB_V16_SUPERNODE_BATCH);
+    if (!n)
+        return 0;
+    atomic_fetch_add_explicit(&ctx->stats->supernode_vadd_poll, n,
+                              memory_order_relaxed);
+    for (uint32_t i = 0; i < n; i++) {
+        vemb_v16_supernode_handle_vadd_job(ctx, &scratch->vadd_jobs[i]);
+    }
+    return (int)n;
+}
+
 void *vemb_v16_supernode_thread_main(void *arg) {
     vemb_v16_supernode_ctx_t *ctx = arg;
-    vemb_v16_vemb_job_t *vemb_jobs =
-        zmalloc(sizeof(*vemb_jobs) * VEMB_V16_SUPERNODE_BATCH);
-    vemb_v16_vadd_job_t *vadd_jobs =
-        zmalloc(sizeof(*vadd_jobs) * VEMB_V16_SUPERNODE_BATCH);
-    float *read_result = NULL;
-    size_t read_result_bytes = 0;
-    if (!vemb_jobs || !vadd_jobs) {
-        zfree(vemb_jobs);
-        zfree(vadd_jobs);
+    vemb_v16_supernode_scratch_t scratch;
+    if (vemb_v16_supernode_scratch_init(&scratch) != 0)
         return NULL;
-    }
 
 #ifdef __linux__
     cpu_set_t cpuset;
@@ -199,38 +277,14 @@ void *vemb_v16_supernode_thread_main(void *arg) {
               ctx->worker_id);
     while (atomic_load_explicit(ctx->running, memory_order_relaxed) &&
            atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
-        uint32_t n = vemb_v16_aeron_poll_batch(ctx->vemb_job_ring,
-                                               vemb_jobs,
-                                               VEMB_V16_SUPERNODE_BATCH);
-        if (n) {
-            atomic_fetch_add_explicit(&ctx->stats->supernode_vemb_poll, n,
-                                      memory_order_relaxed);
-            for (uint32_t i = 0; i < n; i++) {
-                vemb_v16_handle_vemb_job(ctx,
-                                         &vemb_jobs[i],
-                                         &read_result,
-                                         &read_result_bytes);
-            }
-            continue;
-        }
-
-        n = vemb_v16_aeron_poll_batch(ctx->vadd_job_ring,
-                                      vadd_jobs,
-                                      VEMB_V16_SUPERNODE_BATCH);
-        if (!n) {
+        int n = vemb_v16_supernode_drain(ctx, &scratch);
+        if (n <= 0) {
             cpu_relax();
             continue;
-        }
-        atomic_fetch_add_explicit(&ctx->stats->supernode_vadd_poll, n,
-                                  memory_order_relaxed);
-        for (uint32_t i = 0; i < n; i++) {
-            vemb_v16_handle_vadd_job(ctx, &vadd_jobs[i]);
         }
     }
     serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
               ctx->worker_id);
-    zfree(read_result);
-    zfree(vemb_jobs);
-    zfree(vadd_jobs);
+    vemb_v16_supernode_scratch_cleanup(&scratch);
     return NULL;
 }

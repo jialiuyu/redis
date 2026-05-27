@@ -2,8 +2,10 @@
 #define __VEMB_V16_SUPERNODE_H
 
 #include "vemb_v16_aeron_ring.h"
+#include "vemb_v16_dataplane.h"
 #include "vemb_v16_tlc.h"
 
+#include <stddef.h>
 #include <stdatomic.h>
 #include <stdint.h>
 
@@ -39,6 +41,8 @@ typedef struct vemb_v16_supernode_ctx {
     uint32_t worker_id;
     atomic_int *channel_active;
     atomic_int *running;
+    atomic_int *completion_notify_armed;
+    int *completion_notify_fd;
     vemb_v16_aeron_ring_t *vemb_job_ring;
     vemb_v16_aeron_ring_t *vadd_job_ring;
     vemb_v16_aeron_ring_t *completion_ring;
@@ -47,6 +51,23 @@ typedef struct vemb_v16_supernode_ctx {
     sve_operation_stats_t *sve_stats;
 } vemb_v16_supernode_ctx_t;
 
+typedef struct vemb_v16_supernode_scratch {
+    vemb_v16_vemb_job_t *vemb_jobs;
+    vemb_v16_vadd_job_t *vadd_jobs;
+    float *read_result;
+    size_t read_result_bytes;
+} vemb_v16_supernode_scratch_t;
+
+int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch);
+void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch);
+void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
+                                        vemb_v16_vemb_job_t *vemb_job,
+                                        float **read_result,
+                                        size_t *read_result_bytes);
+void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
+                                        vemb_v16_vadd_job_t *vadd_job);
+int vemb_v16_supernode_drain(vemb_v16_supernode_ctx_t *ctx,
+                             vemb_v16_supernode_scratch_t *scratch);
 void *vemb_v16_supernode_thread_main(void *arg);
 
 #endif

@@ -628,6 +628,8 @@ TCP 模式启动 server。默认 TCP 端口是 `6391`，这里显式写出便于
   --transport tcp \
   --tcp-host 127.0.0.1 \
   --tcp-port 6391 \
+  --proxy-io-threads 8 \
+  --supernode-workers 16 \
   --vector-region /vemb_v16_vectors \
   --warm-backend shm \
   --dim 300 \
@@ -635,7 +637,7 @@ TCP 模式启动 server。默认 TCP 端口是 `6391`，这里显式写出便于
   --loglevel notice
 ```
 
-如需同时保留本机 UDS 控制面和 TCP transport，可将 `--transport tcp` 改为 `--transport both`。
+如需同时保留本机 UDS 控制面和 TCP transport，可将 `--transport tcp` 改为 `--transport both`。`--proxy-io-threads 0` 或不传时保持旧的 per-channel proxy thread 模型；传入非零值会启用固定 TCP I/O worker 池，Linux 下 worker 内部使用 `epoll`，非 Linux fallback 到 `poll`。`--supernode-workers 0` 或不传时保持旧的 per-channel SuperNode thread 模型；传入非零值会启用固定 SuperNode worker 池。二者同时启用时，TCP VEMB job 会走 `proxy_io_worker -> supernode_worker` SPSC shard queue，用于降低高连接数压测时的线程膨胀和 per-channel job ring 扫描成本。
 
 TCP 模式 benchmark 连通性测试：
 

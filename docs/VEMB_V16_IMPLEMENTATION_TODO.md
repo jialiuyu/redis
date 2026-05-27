@@ -127,6 +127,63 @@ many bench workers / TCP connections / SHM channels
 - TCP transport 需要 proxy I/O worker 管理多个 persistent fd，后续可从 `poll` 演进到 `epoll` / `kqueue`。
 - stats 需要同时保留 per-channel 可观测性和 per-worker 聚合指标，避免线程池化后定位瓶颈变困难。
 
+落地 TODO：
+
+1. P0：已完成。新增 `--supernode-workers N`，保留现有 per-channel proxy thread，但 SuperNode 执行从 per-channel thread 改为固定 worker 池。
+   - channel 仍保留自己的 SPSC `vemb_job_ring` / `vadd_job_ring` / `completion_ring`。
+   - 固定 worker 按 `channel_index % supernode_workers` 扫描自己的 channel 集合。
+   - 同一 channel 只被一个 SuperNode worker 消费，避免 MPSC 队列和 response reorder。
+   - `N=0` 保留旧 per-channel SuperNode thread，便于 A/B 对照。
+2. P1：已完成。新增 `--proxy-io-threads N`，把 TCP channel thread 收敛为固定 I/O worker。
+   - accept/control main thread 只负责 accept、HELLO/WELCOME、channel lifecycle。
+   - `proxy_io_worker[k]` 管理多个 TCP fd，处理 frame parse、job dispatch、completion drain、response write。
+   - 第一版使用 `poll` 验证多 fd 生命周期；不传或传 `0` 时保持旧 per-channel proxy thread。
+3. P2：已完成第一版 Linux epoll 化。
+   - Linux 下每个 proxy I/O worker 拥有一个 `epoll_fd`，非 Linux 继续 fallback 到 `poll`。
+   - TCP fd 注册 `EPOLLIN | EPOLLERR | EPOLLHUP`，fd 注册状态由 worker 维护。
+   - channel close 会等待 worker 从 epoll 中摘除 fd，避免 fd close/reuse 与 epoll 注册表交叉。
+   - 已完成第一版慢 client backpressure：Linux pooled proxy I/O channel 在 response 写不动时转入 per-channel backlog，并通过 `EPOLLOUT` 继续 flush，避免同步写长期占住 worker。
+   - 已完成第一版 completion 唤醒：Linux proxy I/O worker 使用 worker-local `eventfd`，SuperNode 在 completion 发布后按 arm/disarm 语义通知对应 worker，减少 idle scan；后续再评估是否扩展到 job queue 唤醒。
+4. P3：已完成第一版。队列收敛。
+   - TCP VEMB / VADD 已从 per-channel `vemb_job_ring` / `vadd_job_ring` 收敛到 `proxy_io_worker -> supernode_worker` SPSC shard queue。
+   - shard queue 仅在同时启用 `--proxy-io-threads N` 和 `--supernode-workers M` 时生效。
+   - 当前 VADD 仍走 full-vector payload shard queue，先拿到 pooled 线程模型收益，后续再评估 staged payload 或小 descriptor 化以继续压缩内存/复制成本。
+   - Linux pooled SuperNode worker 已完成第一版 job queue 唤醒：publisher 按目标 `supernode_worker_id` 唤醒 worker-local `eventfd`，worker idle 时按 arm/disarm 语义等待，减少 shard/per-channel job ring 空转扫描。
+5. P4：跨 worker 并行与 response reorder。
+   - 从 `channel_index` 路由升级为 `key_hash` / shard 路由。
+   - 单 channel 可并行打到多个 SuperNode worker。
+   - client 或 server 引入 `req_id` 匹配 / reorder buffer，保持 pipeline response 语义。
+
+当前第一步命令示例：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 8 \
+  --supernode-workers 16 \
+  --vector-region /vemb_v16_vectors \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072
+```
+
+慢 client / backlog 验证可使用：
+
+```bash
+./benchmark/vemb_v16_slow_client_bench \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --proxy-io-threads 1 \
+  --prefill 1024 \
+  --slow-ops 8192 \
+  --probe-ops 1000 \
+  --stall-ms 2000
+```
+
+建议配合 `--proxy-io-threads 1` 或在空闲 server 上运行，便于让 slow/probe channel 更稳定地落到同一 proxy I/O worker。
+
 ## Phase 2：Aeron Ring 化
 
 设计文档：`docs/VEMB_V16_PHASE2_AERON_RING_DESIGN.md`

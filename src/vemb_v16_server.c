@@ -29,6 +29,8 @@ int main(int argc, char **argv) {
     const char *transport = "shm";
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
+    uint32_t proxy_io_threads = 0;
+    uint32_t supernode_workers = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
@@ -45,6 +47,10 @@ int main(int argc, char **argv) {
             tcp_host = argv[++i];
         } else if (!strcmp(argv[i], "--tcp-port") && i + 1 < argc) {
             tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--proxy-io-threads") && i + 1 < argc) {
+            proxy_io_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--supernode-workers") && i + 1 < argc) {
+            supernode_workers = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--vector-region") && i + 1 < argc) {
             vector_region_name = argv[++i];
         } else if (!strcmp(argv[i], "--dim") && i + 1 < argc) {
@@ -71,7 +77,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport shm|tcp|both] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport shm|tcp|both] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             return 0;
         }
     }
@@ -82,9 +88,9 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u dim=%u max_vectors=%u vector_region=%s",
-              transport, uds_path, tcp_host, tcp_port, dim, max_vectors,
-              vector_region_name);
+    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s",
+              transport, uds_path, tcp_host, tcp_port, proxy_io_threads,
+              supernode_workers, dim, max_vectors, vector_region_name);
 
     if (vemb_v16_proxy_create(&g_proxy,
                               uds_path,
@@ -95,6 +101,20 @@ int main(int argc, char **argv) {
                               warm_backend_type,
                               warm_mmap_offset) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
+        return 1;
+    }
+    if (supernode_workers &&
+        vemb_v16_proxy_set_supernode_workers(g_proxy, supernode_workers) != 0) {
+        serverLog(LL_WARNING, "failed to configure vemb_v16 supernode workers");
+        vemb_v16_proxy_destroy(g_proxy);
+        g_proxy = NULL;
+        return 1;
+    }
+    if (proxy_io_threads &&
+        vemb_v16_proxy_set_proxy_io_threads(g_proxy, proxy_io_threads) != 0) {
+        serverLog(LL_WARNING, "failed to configure vemb_v16 proxy io threads");
+        vemb_v16_proxy_destroy(g_proxy);
+        g_proxy = NULL;
         return 1;
     }
     if (!strcmp(transport, "tcp") || !strcmp(transport, "both")) {
