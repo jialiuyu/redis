@@ -242,29 +242,20 @@ static int publish_tcp_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp) {
     uint32_t vector_bytes = 0;
     tcp_response_vector_slice(ch, resp, &vector, &vector_bytes);
 
-    vemb_v16_net_hdr_t hdr = {
-        .magic = VEMB_V16_MAGIC,
-        .version = VEMB_V16_VERSION,
-        .type = VEMB_V16_NET_RESPONSE,
-        .flags = vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
-        .payload_len = (uint32_t)sizeof(*resp) + vector_bytes,
-        .channel_id = ch->channel_id,
-        .req_id = resp->req_id,
-    };
-    if (vemb_v16_net_write_full(ch->net_fd, &hdr, sizeof(hdr)) != 0 ||
-        vemb_v16_net_write_full(ch->net_fd, resp, sizeof(*resp)) != 0) {
-        return -1;
-    }
-    if (vector_bytes &&
-        vemb_v16_net_write_full(ch->net_fd, vector, vector_bytes) != 0) {
-        return -1;
-    }
-    return 0;
+    return vemb_v16_net_write_frame2(ch->net_fd,
+                                     VEMB_V16_NET_RESPONSE,
+                                     vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+                                     ch->channel_id,
+                                     resp->req_id,
+                                     resp,
+                                     (uint32_t)sizeof(*resp),
+                                     vector,
+                                     vector_bytes);
 }
 
-static void publish_response(vemb_v16_channel_t *ch,
-                             const vemb_v16_completion_t *completion) {
-    vemb_v16_resp_t resp = {
+static void fill_response_from_completion(vemb_v16_resp_t *resp,
+                                          const vemb_v16_completion_t *completion) {
+    *resp = (vemb_v16_resp_t){
         .status = completion->status,
         .op = completion->op,
         .flags = completion->flags,
@@ -275,6 +266,65 @@ static void publish_response(vemb_v16_channel_t *ch,
         .dim = completion->dim,
         .region_id = completion->region_id,
     };
+}
+
+static int publish_tcp_response_batch(vemb_v16_channel_t *ch,
+                                      const vemb_v16_completion_t *completions,
+                                      uint32_t n,
+                                      uint32_t *published) {
+    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
+    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+    struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
+    int iovcnt = 0;
+    uint32_t out = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (completions[i].channel_id != ch->channel_id ||
+            !atomic_load_explicit(&ch->active, memory_order_acquire)) {
+            continue;
+        }
+
+        fill_response_from_completion(&responses[out], &completions[i]);
+        const uint8_t *vector = NULL;
+        uint32_t vector_bytes = 0;
+        tcp_response_vector_slice(ch, &responses[out], &vector, &vector_bytes);
+
+        headers[out] = (vemb_v16_net_hdr_t){
+            .magic = VEMB_V16_MAGIC,
+            .version = VEMB_V16_VERSION,
+            .type = VEMB_V16_NET_RESPONSE,
+            .flags = vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+            .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes,
+            .channel_id = ch->channel_id,
+            .req_id = responses[out].req_id,
+        };
+        iov[iovcnt++] = (struct iovec){
+            .iov_base = &headers[out],
+            .iov_len = sizeof(headers[out]),
+        };
+        iov[iovcnt++] = (struct iovec){
+            .iov_base = &responses[out],
+            .iov_len = sizeof(responses[out]),
+        };
+        if (vector_bytes) {
+            iov[iovcnt++] = (struct iovec){
+                .iov_base = (void *)vector,
+                .iov_len = vector_bytes,
+            };
+        }
+        out++;
+    }
+
+    if (published) *published = out;
+    if (out == 0)
+        return 0;
+    return vemb_v16_net_writev_full(ch->net_fd, iov, iovcnt);
+}
+
+static void publish_response(vemb_v16_channel_t *ch,
+                             const vemb_v16_completion_t *completion) {
+    vemb_v16_resp_t resp;
+    fill_response_from_completion(&resp, completion);
     if (ch->transport_type == VEMB_V16_TRANSPORT_TCP) {
         if (ch->net_fd < 0 ||
             publish_tcp_response(ch, &resp) != 0) {
@@ -309,6 +359,8 @@ static void handle_request(vemb_v16_channel_t *ch, const vemb_v16_req_t *req, in
             .channel_index = ch->index,
             .channel_id = ch->channel_id,
         };
+        atomic_fetch_add_explicit(&ch->stats.total_requests, 1,
+                                  memory_order_relaxed);
         publish_response(ch, &completion);
         return;
     }
@@ -415,6 +467,22 @@ static void drain_completions(vemb_v16_channel_t *ch) {
                                           VEMB_V16_PROXY_BATCH)) != 0) {
         atomic_fetch_add_explicit(&ch->stats.proxy_completion_poll, n,
                                   memory_order_relaxed);
+        if (ch->transport_type == VEMB_V16_TRANSPORT_TCP) {
+            uint32_t published = 0;
+            if (ch->net_fd < 0 ||
+                publish_tcp_response_batch(ch, completions, n, &published) != 0) {
+                if (ch->net_fd >= 0) {
+                    shutdown(ch->net_fd, SHUT_RDWR);
+                    close(ch->net_fd);
+                    ch->net_fd = -1;
+                }
+                return;
+            }
+            atomic_fetch_add_explicit(&ch->stats.proxy_response_publish,
+                                      published,
+                                      memory_order_relaxed);
+            continue;
+        }
         for (uint32_t i = 0; i < n; i++) {
             if (completions[i].channel_id == ch->channel_id &&
                 atomic_load_explicit(&ch->active, memory_order_acquire)) {
@@ -424,20 +492,25 @@ static void drain_completions(vemb_v16_channel_t *ch) {
     }
 }
 
-static int channel_poll_tcp_request(vemb_v16_channel_t *ch) {
-    if (ch->net_fd < 0) return -1;
+static int tcp_poll_input(int fd) {
+    if (fd < 0) return -1;
     struct pollfd pfd = {
-        .fd = ch->net_fd,
+        .fd = fd,
         .events = POLLIN,
     };
     int pr = poll(&pfd, 1, 0);
     if (pr < 0) return errno == EINTR ? 0 : -1;
     if (pr == 0) return 0;
-    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+    if (pfd.revents & (POLLERR | POLLNVAL))
         return -1;
-    if (!(pfd.revents & POLLIN))
-        return 0;
+    if (pfd.revents & POLLIN)
+        return 1;
+    if (pfd.revents & POLLHUP)
+        return -1;
+    return 0;
+}
 
+static int channel_read_tcp_request(vemb_v16_channel_t *ch) {
     vemb_v16_net_hdr_t hdr;
     if (vemb_v16_net_read_header(ch->net_fd, &hdr) != 0)
         return -1;
@@ -455,11 +528,35 @@ static int channel_poll_tcp_request(vemb_v16_channel_t *ch) {
     if (vemb_v16_net_read_full(ch->net_fd, &req, hdr.payload_len) != 0)
         return -1;
     handle_request(ch, &req, (int)hdr.payload_len);
-    atomic_fetch_add_explicit(&ch->stats.proxy_request_poll, 1,
-                              memory_order_relaxed);
-    atomic_fetch_add_explicit(&ch->stats.channel_ops, 1,
-                              memory_order_relaxed);
+    if (ch->net_fd < 0)
+        return -1;
     return 1;
+}
+
+static int channel_poll_tcp_requests(vemb_v16_channel_t *ch) {
+    int ready = tcp_poll_input(ch->net_fd);
+    if (ready <= 0)
+        return ready;
+
+    uint32_t count = 0;
+    while (count < VEMB_V16_PROXY_BATCH) {
+        if (channel_read_tcp_request(ch) < 0)
+            return -1;
+        count++;
+        if (count >= VEMB_V16_PROXY_BATCH)
+            break;
+        ready = tcp_poll_input(ch->net_fd);
+        if (ready < 0)
+            return -1;
+        if (ready == 0)
+            break;
+    }
+
+    atomic_fetch_add_explicit(&ch->stats.proxy_request_poll, count,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&ch->stats.channel_ops, count,
+                              memory_order_relaxed);
+    return (int)count;
 }
 
 static void *channel_thread_main(void *arg) {
@@ -485,7 +582,7 @@ static void *channel_thread_main(void *arg) {
         drain_completions(ch);
 
         if (ch->transport_type == VEMB_V16_TRANSPORT_TCP) {
-            int rc = channel_poll_tcp_request(ch);
+            int rc = channel_poll_tcp_requests(ch);
             if (rc < 0)
                 break;
             if (rc == 0)

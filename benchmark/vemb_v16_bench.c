@@ -581,17 +581,22 @@ static int recv_channel_resp(bench_node_channel_t *node,
         if (vemb_v16_net_read_header(node->net_fd, &hdr) != 0 ||
             hdr.type != VEMB_V16_NET_RESPONSE ||
             hdr.channel_id != node->desc.channel_id ||
-            hdr.payload_len < sizeof(*resp) ||
-            vemb_v16_net_read_full(node->net_fd, resp, sizeof(*resp)) != 0) {
+            hdr.payload_len < sizeof(*resp)) {
             return -1;
         }
         uint32_t extra = hdr.payload_len - (uint32_t)sizeof(*resp);
         if (extra) {
             if (!inline_vector || extra > inline_vector_cap)
                 return -1;
-            if (vemb_v16_net_read_full(node->net_fd, inline_vector, extra) != 0)
+            struct iovec iov[2] = {
+                {.iov_base = resp, .iov_len = sizeof(*resp)},
+                {.iov_base = inline_vector, .iov_len = extra},
+            };
+            if (vemb_v16_net_readv_full(node->net_fd, iov, 2) != 0)
                 return -1;
             if (inline_vector_bytes) *inline_vector_bytes = extra;
+        } else if (vemb_v16_net_read_full(node->net_fd, resp, sizeof(*resp)) != 0) {
+            return -1;
         }
         return 0;
     }
@@ -925,7 +930,7 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            (unsigned long long)after->vemb_job_ring_depth,
            (unsigned long long)after->vadd_job_ring_depth,
            (unsigned long long)after->completion_ring_depth,
-           (unsigned long long)after->channel_ops);
+           D(channel_ops));
     uint64_t samples = after->sample_count - before->sample_count;
     if (samples) {
         printf("[stats] samples=%llu table_lookup_avg_ns=%.1f bitmap_lock_avg_ns=%.1f bitmap_unlock_avg_ns=%.1f vector_load_avg_ns=%.1f completion_publish_avg_ns=%.1f\n",

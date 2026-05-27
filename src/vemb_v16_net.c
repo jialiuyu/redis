@@ -9,7 +9,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <unistd.h>
+
+#define VEMB_V16_NET_MAX_IOV 128
 
 int vemb_v16_net_set_timeouts(int fd, uint32_t timeout_ms) {
     if (fd < 0 || timeout_ms == 0) return 0;
@@ -100,6 +103,62 @@ int vemb_v16_net_write_full(int fd, const void *buf, size_t n) {
     return 0;
 }
 
+static int iov_copy(struct iovec *dst, const struct iovec *src, int iovcnt) {
+    if (!dst || !src || iovcnt <= 0 || iovcnt > VEMB_V16_NET_MAX_IOV)
+        return -1;
+    int out = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (src[i].iov_len == 0) continue;
+        if (!src[i].iov_base) return -1;
+        dst[out++] = src[i];
+    }
+    return out > 0 ? out : -1;
+}
+
+static void iov_advance(struct iovec **iov, int *iovcnt, size_t bytes) {
+    while (*iovcnt > 0 && bytes >= (*iov)->iov_len) {
+        bytes -= (*iov)->iov_len;
+        (*iov)++;
+        (*iovcnt)--;
+    }
+    if (*iovcnt > 0 && bytes > 0) {
+        (*iov)->iov_base = (char *)(*iov)->iov_base + bytes;
+        (*iov)->iov_len -= bytes;
+    }
+}
+
+int vemb_v16_net_readv_full(int fd, const struct iovec *iov, int iovcnt) {
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = iov_copy(local, iov, iovcnt);
+    if (nlocal < 0) return -1;
+
+    struct iovec *cur = local;
+    int curcnt = nlocal;
+    while (curcnt > 0) {
+        ssize_t r = readv(fd, cur, curcnt);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        iov_advance(&cur, &curcnt, (size_t)r);
+    }
+    return 0;
+}
+
+int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = iov_copy(local, iov, iovcnt);
+    if (nlocal < 0) return -1;
+
+    struct iovec *cur = local;
+    int curcnt = nlocal;
+    while (curcnt > 0) {
+        ssize_t r = writev(fd, cur, curcnt);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        iov_advance(&cur, &curcnt, (size_t)r);
+    }
+    return 0;
+}
+
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr) {
     if (!hdr) return -1;
     if (vemb_v16_net_read_full(fd, hdr, sizeof(*hdr)) != 0)
@@ -116,21 +175,49 @@ int vemb_v16_net_write_frame(int fd,
                              uint32_t req_id,
                              const void *payload,
                              uint32_t payload_len) {
+    return vemb_v16_net_write_frame2(fd,
+                                     type,
+                                     flags,
+                                     channel_id,
+                                     req_id,
+                                     payload,
+                                     payload_len,
+                                     NULL,
+                                     0);
+}
+
+int vemb_v16_net_write_frame2(int fd,
+                              uint16_t type,
+                              uint32_t flags,
+                              uint64_t channel_id,
+                              uint32_t req_id,
+                              const void *payload1,
+                              uint32_t payload1_len,
+                              const void *payload2,
+                              uint32_t payload2_len) {
     vemb_v16_net_hdr_t hdr = {
         .magic = VEMB_V16_MAGIC,
         .version = VEMB_V16_VERSION,
         .type = type,
         .flags = flags,
-        .payload_len = payload_len,
+        .payload_len = payload1_len + payload2_len,
         .channel_id = channel_id,
         .req_id = req_id,
     };
-    if (vemb_v16_net_write_full(fd, &hdr, sizeof(hdr)) != 0)
-        return -1;
-    if (payload_len && payload &&
-        vemb_v16_net_write_full(fd, payload, payload_len) != 0)
-        return -1;
-    return 0;
+    struct iovec iov[3];
+    int iovcnt = 0;
+    iov[iovcnt++] = (struct iovec){.iov_base = &hdr, .iov_len = sizeof(hdr)};
+    if (payload1_len)
+        iov[iovcnt++] = (struct iovec){
+            .iov_base = (void *)payload1,
+            .iov_len = payload1_len,
+        };
+    if (payload2_len)
+        iov[iovcnt++] = (struct iovec){
+            .iov_base = (void *)payload2,
+            .iov_len = payload2_len,
+        };
+    return vemb_v16_net_writev_full(fd, iov, iovcnt);
 }
 
 const char *vemb_v16_transport_name(uint32_t transport) {
