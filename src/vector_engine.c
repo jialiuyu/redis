@@ -88,8 +88,13 @@ int vector_engine_init_from_config(vector_engine_config_t *config) {
     }
 
     current_engine = engine;
-    serverLog(LL_NOTICE, "Vector engine initialized: %s",
-              type == VECTOR_ENGINE_UB ? "UB" : "Redis");
+    const char *engine_name;
+    switch (type) {
+        case VECTOR_ENGINE_UB:       engine_name = "UB"; break;
+        case VECTOR_ENGINE_VEMB_V16: engine_name = "VEMB V16"; break;
+        default:                     engine_name = "Redis"; break;
+    }
+    serverLog(LL_NOTICE, "Vector engine initialized: %s", engine_name);
     return C_OK;
 }
 
@@ -141,8 +146,13 @@ int vector_engine_switch(vector_engine_type_t type) {
     }
 
     current_engine = engine;
-    serverLog(LL_NOTICE, "Vector engine switched to: %s",
-              type == VECTOR_ENGINE_UB ? "UB" : "Redis");
+    const char *switch_name;
+    switch (type) {
+        case VECTOR_ENGINE_UB:       switch_name = "UB"; break;
+        case VECTOR_ENGINE_VEMB_V16: switch_name = "VEMB V16"; break;
+        default:                     switch_name = "Redis"; break;
+    }
+    serverLog(LL_NOTICE, "Vector engine switched to: %s", switch_name);
     return C_OK;
 }
 

@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "vemb_v16_server_integration.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -5003,6 +5004,11 @@ int finishShutdown(void) {
      * send them pending writes. */
     flushSlavesOutputBuffers();
 
+    /* Shutdown VEMB V16 dataplane */
+    if (server.vemb_v16_enabled) {
+        vemb_v16_server_integration_shutdown();
+    }
+
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
 
@@ -7857,6 +7863,16 @@ int main(int argc, char **argv) {
         clusterInit();
     }
     if (!server.sentinel_mode) {
+        /* Initialize VEMB V16 dataplane before module loading so that
+         * vector engine init (triggered by module load) can connect. */
+        if (server.vemb_v16_enabled) {
+            if (vemb_v16_server_integration_init() != 0) {
+                serverLog(LL_WARNING,
+                          "VEMB V16 integration init failed, disabling dataplane");
+                server.vemb_v16_enabled = 0;
+            }
+        }
+
         moduleInitModulesSystemLast();
         moduleLoadInternalModules();
         moduleLoadFromQueue();
