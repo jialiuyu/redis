@@ -91,6 +91,7 @@ typedef struct worker_arg {
     uint64_t request_publish_spins;
     uint64_t response_empty_polls;
     uint64_t ns;
+    atomic_int stop;
     atomic_int done;
 } worker_arg_t;
 
@@ -682,8 +683,11 @@ static void *worker_main(void *arg) {
     uint32_t pending_head = 0;
     uint32_t pending_tail = 0;
     uint32_t pending_count = 0;
-    while (completed < w->cfg.ops) {
+    while (completed < w->cfg.ops &&
+           !atomic_load_explicit(&w->stop, memory_order_acquire)) {
         while (sent < w->cfg.ops && pending_count < pipeline) {
+            if (atomic_load_explicit(&w->stop, memory_order_acquire))
+                break;
             uint32_t i = sent;
             uint32_t global_id = (uint32_t)(i + (uint32_t)w->tid * w->cfg.ops);
             uint32_t key_id = w->cfg.prefill ? global_id % w->cfg.prefill : global_id;
@@ -745,6 +749,8 @@ static void *worker_main(void *arg) {
                 pending[pending_tail].node_index = node_index;
             }
             if (send_failed) {
+                if (atomic_load_explicit(&w->stop, memory_order_acquire))
+                    goto worker_done;
                 w->fail += w->cfg.ops - completed;
                 goto worker_done;
             }
@@ -766,6 +772,8 @@ static void *worker_main(void *arg) {
                               &inline_vector_bytes,
                               &w->response_empty_polls,
                               w->cfg.timeout_ms) != 0) {
+            if (atomic_load_explicit(&w->stop, memory_order_acquire))
+                goto worker_done;
             uint32_t key_id = pending_count ? pending[pending_head].key_id : 0;
             uint32_t op_index = pending_count ? pending[pending_head].op_index : completed;
             fprintf(stderr, "worker %d response timeout at op=%u key_id=%u\n",
@@ -1100,6 +1108,7 @@ static int run_once(bench_cfg_t cfg) {
         args[i].tid = i;
         args[i].cfg = cfg;
         args[i].node_count = cfg.node_count;
+        atomic_init(&args[i].stop, 0);
         atomic_init(&args[i].done, 0);
         for (uint32_t n = 0; n < cfg.node_count; n++) {
             if (setup_node_channel(&cfg,
@@ -1134,21 +1143,15 @@ static int run_once(bench_cfg_t cfg) {
                     print_stats_delta_node(n, &before[n], &after[n]);
             }
             timed_out = 1;
+            for (int i = 0; i < cfg.threads; i++)
+                atomic_store_explicit(&args[i].stop, 1, memory_order_release);
             break;
         }
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
     }
-    if (!timed_out) {
-        for (int i = 0; i < cfg.threads; i++)
-            pthread_join(threads[i], NULL);
-    } else {
-        for (int i = 0; i < cfg.threads; i++) {
-            for (uint32_t n = 0; n < cfg.node_count; n++)
-                close_node_channel(cfg.socket_paths[n], &args[i].nodes[n]);
-        }
-        return 1;
-    }
+    for (int i = 0; i < cfg.threads; i++)
+        pthread_join(threads[i], NULL);
     uint64_t wall = now_ns() - start;
 
     uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0, vadd_sent = 0;
@@ -1184,19 +1187,19 @@ static int run_once(bench_cfg_t cfg) {
                (unsigned long long)vadd_sent,
                (double)vadd_sent * 100.0 / (double)(vemb_sent + vadd_sent));
     }
-    for (int i = 0; i < cfg.threads; i++) {
-        for (uint32_t n = 0; n < cfg.node_count; n++)
-            close_node_channel(cfg.socket_paths[n], &args[i].nodes[n]);
-    }
     for (uint32_t n = 0; n < cfg.node_count; n++) {
         if (fetch_stats_for_node(&cfg, n, &after[n]) == 0)
             print_stats_delta_node(n, &before[n], &after[n]);
         else
             fprintf(stderr, "warning: fetch stats after run failed for node=%u\n", n);
     }
+    for (int i = 0; i < cfg.threads; i++) {
+        for (uint32_t n = 0; n < cfg.node_count; n++)
+            close_node_channel(cfg.socket_paths[n], &args[i].nodes[n]);
+    }
     zfree(args);
     zfree(threads);
-    return fail == 0 ? 0 : 1;
+    return fail == 0 && !timed_out ? 0 : 1;
 }
 
 int main(int argc, char **argv) {

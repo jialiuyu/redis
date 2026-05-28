@@ -288,6 +288,82 @@
 - 中间态 `0/16` 证明仅收敛 SuperNode worker 池，就能在中低并发区间获得可观收益，但高并发下会受限于固定 worker 数量。
 - 放大池化 `16/32` 证明新线程模型不是天然吞吐吃亏，而是其上限与 `proxy I/O worker` / `supernode worker` 配置规模强相关；在 worker 数量足够时，池化模型同样可以取得更高峰值吞吐。
 
+### 2.4 SHM 场景补充对照：`docs/bench_log`
+
+为补充验证 `SHM + per-channel` 与 `SHM + pooled` 两种线程模型的差异，本轮又整理了 `docs/bench_log` 中的对照结果。统一配置为：
+
+```text
+transport=shm
+dim=300
+prefill=65536
+ops/thread=200000
+pipeline=16
+pin=no
+threads=4,8,16,32,64
+```
+
+#### 2.4.1 `vemb-supernode-read`
+
+| Threads | per-channel QPS | pooled QPS | 变化 |
+| ---: | ---: | ---: | ---: |
+| 4 | 5,764,304.15 | 5,866,760.82 | `+1.8%` |
+| 8 | 5,053,078.60 | 4,913,201.63 | `-2.8%` |
+| 16 | 6,681,219.64 | 6,550,002.24 | `-2.0%` |
+| 32 | 6,586,852.53 | 6,664,796.64 | `+1.2%` |
+
+#### 2.4.2 `mixed-80r20w`
+
+| Threads | per-channel QPS | pooled QPS | 变化 |
+| ---: | ---: | ---: | ---: |
+| 4 | 4,891,607.15 | 4,579,285.21 | `-6.4%` |
+| 8 | 5,209,320.59 | 5,214,604.47 | `+0.1%` |
+| 16 | 6,877,517.45 | 6,766,011.11 | `-1.6%` |
+| 32 | 7,252,304.21 | 7,178,422.28 | `-1.0%` |
+| 64 | 1,015,835.71 | 7,074,032.88 | `+596.4%` |
+
+#### 2.4.3 关键观察
+
+- 在 `4/8/16/32` 线程区间，`per-channel` 与 `pooled` 的差距总体不大，说明当前系统的主要瓶颈仍在 SuperNode 热路径，而不是线程模型本身。
+- `request_publish_spins=0`，且所有 `ring full` 计数均为 `0`，说明请求/响应队列容量不是主要限制因素。
+- `bitmap_lock_avg_ns`、`bitmap_unlock_avg_ns`、`table_lookup_avg_ns` 会随着并发上升而明显变大，说明并发扩展压力主要来自 bitmap 争用与表查找成本。
+- 在 `64` 线程的 `mixed-80r20w` 场景下，`per-channel` 吞吐掉到约 `1.02M QPS`，而 `pooled` 仍能维持约 `7.07M QPS`，差距接近 `7x`。
+- 这说明旧的 `per-channel` 线程模型在高并发下会被线程膨胀、调度开销和 cache footprint 明显拖累，而池化模型可以更稳定地控制执行资源，维持可用吞吐。
+
+#### 2.4.4 关键指标对比（64 线程）
+
+`vemb-supernode-read`：
+
+| 指标 | per-channel | pooled | 变化 |
+| --- | ---: | ---: | ---: |
+| `QPS` | 6,586,852.53 | 6,664,796.64 | `+1.2%` |
+| `response_empty_polls` | 28,779,827,790 | 28,590,394,452 | `-0.7%` |
+| `table_lookup_avg_ns` | 1,967.4 | 1,876.4 | `-4.6%` |
+| `bitmap_lock_avg_ns` | 683.9 | 683.0 | `-0.1%` |
+| `bitmap_unlock_avg_ns` | 226.0 | 240.4 | `+6.4%` |
+| `vector_load_avg_ns` | 49.3 | 48.2 | `-2.2%` |
+| `completion_publish_avg_ns` | 103.9 | 102.9 | `-1.0%` |
+
+`mixed-80r20w`：
+
+| 指标 | per-channel | pooled | 变化 |
+| --- | ---: | ---: | ---: |
+| `QPS` | 1,015,835.71 | 7,074,032.88 | `+596.4%` |
+| `response_empty_polls` | 195,735,733,981 | 87,470,592,523 | `-55.3%` |
+| `table_lookup_avg_ns` | 2,341.8 | 2,404.2 | `+2.7%` |
+| `bitmap_lock_avg_ns` | 497.1 | 459.7 | `-7.5%` |
+| `bitmap_unlock_avg_ns` | 203.8 | 173.7 | `-14.8%` |
+| `vector_load_avg_ns` | 461.0 | 55.7 | `-87.9%` |
+| `completion_publish_avg_ns` | 105.1 | 105.3 | `+0.2%` |
+
+#### 2.4.5 指标分析结论
+
+- `vemb-supernode-read` 在 64 线程下，两种模型的 `QPS` 仍然接近，说明纯读路径的主要限制依然是 SuperNode 热路径本身，线程模型只带来小幅波动。
+- `response_empty_polls` 在两种模式下都非常高，说明 client 端大部分时间仍在等待 response；但 pooled 在 `mixed-80r20w` 下明显更低，表明池化模型在高并发读写混合场景下更能减少整体等待时间。
+- `table_lookup_avg_ns` 在 `mixed-80r20w` 下略有上升，说明池化模型并没有消除 lookup 成本，真正的收益主要来自执行资源收敛和更稳定的调度，而不是更快的查表本身。
+- `bitmap_lock_avg_ns` 和 `bitmap_unlock_avg_ns` 变化不大，说明 bitmap 争用仍然存在，而且已经接近该 workload 下的主瓶颈之一。
+- `vector_load_avg_ns` 在 `mixed-80r20w` 下从 `461.0ns` 降到 `55.7ns`，这是最显著的变化，说明 per-channel 模型在 64 线程时已经出现明显的调度/采样失真或局部拥塞，而 pooled 模型保持了更稳定的热路径表现。
+- 综合来看，`64` 线程的结果证明：在低到中等并发下，`per-channel` 和 `pooled` 差距有限，但当并发继续拉高时，`pooled` 能显著抑制等待和资源抖动，因而更适合作为长期主路径。
+
 ## 稳定性信号
 
 从 bench 输出可以看到以下稳定性信号：
@@ -323,6 +399,7 @@
 4. `mixed-80r20w` 在 TCP 模式下稳定达到约 `1.82M - 1.84M QPS`。
 5. 所有高并发吞吐测试均无失败、无 ring full，说明 `proxy I/O worker + supernode worker` 模型已经具备较好的稳定性与扩展性。
 6. 当前边界主要体现在 slow channel 的 TCP response backlog 容量，以及高并发下 worker 池规模对吞吐上限的影响，而不是线程模型本身的隔离能力。
+7. 在 SHM 场景的补充对照中，`4/8/16/32` 线程下 `per-channel` 与 `pooled` 大体接近，但 `64` 线程时 `pooled` 明显优于 `per-channel`，说明线程池化在高并发场景下更具可扩展性。
 
 ## 可直接引用的阶段性总结
 
