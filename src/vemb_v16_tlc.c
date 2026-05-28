@@ -66,10 +66,17 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
             .shared_allocator = warm_regions[i].shared_allocator,
         };
     }
+    /* The hot table is open-addressed with a small fixed probe count.
+     * Keep the load factor well below 0.5 so that all vectors up to
+     * max_vectors remain hot and lookups do not degrade into collisions. */
+    uint32_t hot_capacity = max_vectors * 4u;
+    if (hot_capacity < TLC_CORE_DEFAULT_HOT_CAPACITY)
+        hot_capacity = TLC_CORE_DEFAULT_HOT_CAPACITY;
+
     tlc_core_config_t core_config = {
         .value_size = tlc->value_size,
         .warm_capacity = max_vectors,
-        .hot_capacity = TLC_CORE_DEFAULT_HOT_CAPACITY,
+        .hot_capacity = hot_capacity,
         .cold_max_segments = TLC_CORE_DEFAULT_COLD_MAX_SEGMENTS,
         .cold_segment_records = TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS,
         .warm_regions = core_regions,

@@ -22,6 +22,7 @@
 #include "cluster_asm.h"
 #include "memory_prefetch.h"
 #include "connection.h"
+#include "vemb_v16_server_integration.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <math.h>
@@ -1581,6 +1582,16 @@ void acceptCommonHandler(connection *conn, int flags, char *ip) {
                   "Accepted client connection in error state: %s (addr=%s laddr=%s)",
                   connGetLastError(conn), addr, laddr);
         connClose(conn);
+        return;
+    }
+
+    /* VEMB V16 protocol sniffing: if the first 4 bytes match VEMB magic,
+     * hand the fd to the VEMB proxy thread instead of creating a Redis client. */
+    if (vemb_v16_sniff_and_handoff(conn)) {
+        /* fd has been stolen (conn->fd == -1).  Free the connection struct
+         * without closing the fd — the proxy now owns it. */
+        conn->state = CONN_STATE_CLOSED;
+        zfree(conn);
         return;
     }
 

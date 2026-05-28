@@ -157,7 +157,8 @@ int vemb_v16_shared_allocator_open(vemb_v16_shared_allocator_mapping_t *mapping,
                                    const char *path,
                                    uint64_t mmap_offset,
                                    uint32_t region_id,
-                                   uint32_t capacity_slots) {
+                                   uint32_t capacity_slots,
+                                   uint32_t is_local) {
     RETURN_IF(!mapping || !path || !path[0] || capacity_slots == 0, -1);
     if (backend_type == VEMB_V16_REGION_UB &&
         (mmap_offset % VEMB_V16_SHARED_ALLOCATOR_ALIGNMENT) != 0) {
@@ -175,7 +176,8 @@ int vemb_v16_shared_allocator_open(vemb_v16_shared_allocator_mapping_t *mapping,
                                     backend_type,
                                     path,
                                     mmap_offset,
-                                    sizeof(vemb_v16_shared_region_allocator_t)) != 0) {
+                                    sizeof(vemb_v16_shared_region_allocator_t),
+                                    is_local) != 0) {
         serverLog(LL_WARNING,
                   "vemb_v16 shared allocator open failed: backend=%u path=%s offset=%llu region_id=%u capacity=%u",
                   backend_type,
@@ -209,7 +211,8 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
                                     const char *path,
                                     uint64_t mmap_offset,
                                     uint32_t region_id,
-                                    uint32_t capacity_slots) {
+                                    uint32_t capacity_slots,
+                                    uint32_t is_local) {
     RETURN_IF(!path || !path[0] || capacity_slots == 0, -1);
     backend_type = backend_type ? backend_type : VEMB_V16_REGION_LOCAL_SHM;
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM)
@@ -220,7 +223,8 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
                                     backend_type,
                                     path,
                                     mmap_offset,
-                                    sizeof(vemb_v16_shared_region_allocator_t)) != 0) {
+                                    sizeof(vemb_v16_shared_region_allocator_t),
+                                    is_local) != 0) {
         serverLog(LL_WARNING,
                   "vemb_v16 shared allocator reset open failed: backend=%u path=%s offset=%llu region_id=%u capacity=%u",
                   backend_type,

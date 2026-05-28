@@ -129,11 +129,9 @@ static void iov_advance(struct iovec **iov, int *iovcnt, size_t bytes) {
 }
 
 int vemb_v16_net_readv_full(int fd, const struct iovec *iov, int iovcnt) {
-    struct iovec *local = malloc(sizeof(*local) * VEMB_V16_NET_MAX_IOV);
-    if (!local) return -1;
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
     int nlocal = iov_copy(local, iov, iovcnt);
     if (nlocal < 0) {
-        free(local);
         return -1;
     }
 
@@ -143,21 +141,17 @@ int vemb_v16_net_readv_full(int fd, const struct iovec *iov, int iovcnt) {
         ssize_t r = readv(fd, cur, curcnt);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) {
-            free(local);
             return -1;
         }
         iov_advance(&cur, &curcnt, (size_t)r);
     }
-    free(local);
     return 0;
 }
 
 int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
-    struct iovec *local = malloc(sizeof(*local) * VEMB_V16_NET_MAX_IOV);
-    if (!local) return -1;
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
     int nlocal = iov_copy(local, iov, iovcnt);
     if (nlocal < 0) {
-        free(local);
         return -1;
     }
 
@@ -167,13 +161,29 @@ int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
         ssize_t r = writev(fd, cur, curcnt);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) {
-            free(local);
             return -1;
         }
         iov_advance(&cur, &curcnt, (size_t)r);
     }
-    free(local);
     return 0;
+}
+
+ssize_t vemb_v16_net_writev_nonblocking(int fd, const struct iovec *iov, int iovcnt) {
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = iov_copy(local, iov, iovcnt);
+    if (nlocal < 0) {
+        return -1;
+    }
+
+    struct msghdr msg = {
+        .msg_iov = local,
+        .msg_iovlen = nlocal,
+    };
+    ssize_t r = sendmsg(fd, &msg, MSG_DONTWAIT);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+    return r;
 }
 
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr) {
@@ -239,7 +249,6 @@ int vemb_v16_net_write_frame2(int fd,
 
 const char *vemb_v16_transport_name(uint32_t transport) {
     switch (transport) {
-    case VEMB_V16_TRANSPORT_AERON: return "aeron";
     case VEMB_V16_TRANSPORT_TCP: return "tcp";
     default: return "unknown";
     }

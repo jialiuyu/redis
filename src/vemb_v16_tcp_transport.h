@@ -4,9 +4,6 @@
 #include "vemb_v16_proxy_internal.h"
 
 int vemb_v16_tcp_flush_response_backlog(vemb_v16_channel_t *ch);
-int vemb_v16_tcp_listen(vemb_v16_proxy_t *proxy,
-                        int backlog,
-                        vemb_v16_transport_listener_t *listener);
 int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch,
                                   vemb_v16_resp_t *resp);
 int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,

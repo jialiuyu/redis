@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 static vemb_v16_proxy_t *g_proxy;
@@ -49,16 +48,14 @@ static void on_signal(int sig) {
 int main(int argc, char **argv) {
     int ret = 1;
     vemb_v16_storage_ctx_t *storage = NULL;
-    const char *uds_path = VEMB_V16_UDS_PATH;
     const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     const char *warm_regions_manifest = NULL;
     uint32_t dim = VEMB_V16_DEFAULT_DIM;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
     uint32_t warm_region_id = 0;
-    uint32_t warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    uint32_t warm_backend_type = VEMB_V16_REGION_UB;
     uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
-    const char *transport = "aeron";
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
     uint32_t proxy_io_threads = default_proxy_io_threads();
@@ -66,16 +63,7 @@ int main(int argc, char **argv) {
     int reset_warm_regions = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
-            uds_path = argv[++i];
-        } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
-            transport = argv[++i];
-            if (strcmp(transport, "aeron") &&
-                strcmp(transport, "tcp")) {
-                fprintf(stderr, "invalid transport\n");
-                goto cleanup;
-            }
-        } else if (!strcmp(argv[i], "--tcp-host") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--tcp-host") && i + 1 < argc) {
             tcp_host = argv[++i];
         } else if (!strcmp(argv[i], "--tcp-port") && i + 1 < argc) {
             tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
@@ -125,12 +113,6 @@ int main(int argc, char **argv) {
     }
     if (supernode_workers == 0) {
         fprintf(stderr, "--supernode-workers must be >= 1\n");
-        goto cleanup;
-    }
-    if (!uds_path || uds_path[0] == '\0' ||
-        strlen(uds_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        fprintf(stderr, "--socket path must be non-empty and shorter than %zu bytes\n",
-                sizeof(((struct sockaddr_un *)0)->sun_path));
         goto cleanup;
     }
     if (dim == 0 || dim > VEMB_V16_MAX_DIM) {
@@ -203,7 +185,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (vemb_v16_proxy_create(&g_proxy,
-                              uds_path,
                               dim,
                               max_vectors,
                               storage) != 0) {
@@ -218,16 +199,9 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 proxy io threads");
         goto cleanup;
     }
-    if (!strcmp(transport, "aeron")) {
-        if (vemb_v16_proxy_enable_uds(g_proxy) != 0) {
-            serverLog(LL_WARNING, "failed to enable vemb_v16 uds transport");
-            goto cleanup;
-        }
-    } else {
-        if (vemb_v16_proxy_enable_tcp(g_proxy, tcp_host, tcp_port) != 0) {
-            serverLog(LL_WARNING, "failed to enable vemb_v16 tcp transport");
-            goto cleanup;
-        }
+    if (vemb_v16_proxy_enable_tcp(g_proxy, tcp_host, tcp_port) != 0) {
+        serverLog(LL_WARNING, "failed to enable vemb_v16 tcp transport");
+        goto cleanup;
     }
 
     ret = vemb_v16_proxy_run(g_proxy);

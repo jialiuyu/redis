@@ -100,7 +100,8 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 uint32_t backend_type,
                                 const char *path,
                                 uint64_t mmap_offset,
-                                size_t requested_size) {
+                                size_t requested_size,
+                                uint32_t is_local) {
     RETURN_IF(!region || !path || !path[0] || requested_size == 0, -1);
     RETURN_IF(strlen(path) >= sizeof(region->path), -1);
     memset(region, 0, sizeof(*region));
@@ -121,7 +122,12 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
         if (open_or_attach_local_shm(region, path, required_size, &created) != 0)
             return -1;
     } else {
-        region->fd = open(path, O_RDWR);
+        /* OBMM import devices (remote memory) reject cacheable mmap with EPERM.
+         * The kernel requires O_SYNC on open() to select noncacheable mapping. */
+        int open_flags = O_RDWR;
+        if (!is_local)
+            open_flags |= O_SYNC;
+        region->fd = open(path, open_flags);
         if (region->fd < 0) {
             serverLog(LL_WARNING,
                       "vemb_v16 mapped region ub open failed: path=%s request_size=%zu offset=%llu error=%s",
