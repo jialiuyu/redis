@@ -799,7 +799,9 @@ int VADD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     /* UB engine dispatch — after parameter parsing and key open/create,
      * before CAS branch. UB path does not support CAS threaded insert. */
     vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vadd) {
+    if (vector_engine_enabled && ve &&
+        (ve->type == VECTOR_ENGINE_UB || ve->type == VECTOR_ENGINE_VEMB_V16) &&
+        ve->vadd) {
         if (attrib) {
             RedisModule_Free(vec);
             return RedisModule_ReplyWithError(ctx,
@@ -1443,6 +1445,36 @@ int VEMB_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         ve->type == VECTOR_ENGINE_UB &&
         ve->vemb) {
         return proxy_submit_vemb(ctx, key, element, raw_output);
+    }
+
+    /* Check if VEMB V16 engine is active */
+    if (vector_engine_enabled &&
+        ve &&
+        ve->type == VECTOR_ENGINE_VEMB_V16 &&
+        ve->vemb) {
+        vector_data_t *result = vector_data_create(NULL, 0, 0);
+        if (!result) return RedisModule_ReplyWithError(ctx, "ERR OOM");
+        if (ve->vemb(ctx, key, element, result) == C_OK) {
+            if (result->data == NULL || result->dim == 0) {
+                vector_data_destroy(result);
+                return RedisModule_ReplyWithNull(ctx);
+            }
+            if (raw_output) {
+                RedisModule_ReplyWithArray(ctx, 2);
+                RedisModule_ReplyWithSimpleString(ctx, "FP32");
+                RedisModule_ReplyWithStringBuffer(ctx, (const char *)result->data,
+                                                  result->dim * sizeof(float));
+            } else {
+                RedisModule_ReplyWithArray(ctx, result->dim);
+                for (size_t i = 0; i < result->dim; i++) {
+                    RedisModule_ReplyWithDouble(ctx, result->data[i]);
+                }
+            }
+            vector_data_destroy(result);
+            return REDISMODULE_OK;
+        }
+        vector_data_destroy(result);
+        return RedisModule_ReplyWithError(ctx, "ERR VEMB V16 query failed");
     }
 
     /* Traditional Redis implementation */
@@ -2400,8 +2432,13 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (vector_engine_init_from_config(NULL) == C_OK) {
         current_engine_type = vector_engine_get_current_type();
         vector_engine_enabled = 1;
-        RedisModule_Log(ctx, "notice", "Vector engine initialized: %s",
-                       current_engine_type == VECTOR_ENGINE_UB ? "UB Engine" : "Redis Engine");
+        const char *engine_name;
+        switch (current_engine_type) {
+            case VECTOR_ENGINE_UB:       engine_name = "UB Engine"; break;
+            case VECTOR_ENGINE_VEMB_V16: engine_name = "VEMB V16 Engine"; break;
+            default:                     engine_name = "Redis Engine"; break;
+        }
+        RedisModule_Log(ctx, "notice", "Vector engine initialized: %s", engine_name);
 
         /* Initialize batch processor for high-throughput operations */
         if (batch_processor_init() == C_OK) {
@@ -2410,7 +2447,8 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
             RedisModule_Log(ctx, "warning", "Failed to initialize batch processor");
         }
 
-        if (current_engine_type == VECTOR_ENGINE_UB) {
+        if (current_engine_type == VECTOR_ENGINE_UB ||
+            current_engine_type == VECTOR_ENGINE_VEMB_V16) {
             if (vector_proxy_completion_init() != C_OK) {
                 RedisModule_Log(ctx, "warning", "Failed to initialize vector proxy completion");
             }
@@ -2798,8 +2836,13 @@ int VENGINE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
         vector_engine_type_t active_type = vector_engine_get_current_type();
         RedisModule_ReplyWithArray(ctx, 2);
         RedisModule_ReplyWithSimpleString(ctx, "engine");
-        RedisModule_ReplyWithSimpleString(ctx,
-            active_type == VECTOR_ENGINE_UB ? "UB" : "REDIS");
+        const char *engine_name;
+        switch (active_type) {
+            case VECTOR_ENGINE_UB:       engine_name = "UB"; break;
+            case VECTOR_ENGINE_VEMB_V16: engine_name = "VEMB_V16"; break;
+            default:                     engine_name = "REDIS"; break;
+        }
+        RedisModule_ReplyWithSimpleString(ctx, engine_name);
         return REDISMODULE_OK;
 
     } else if (!strcasecmp(subcmd, "STATS")) {

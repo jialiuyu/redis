@@ -407,10 +407,13 @@ endif
 
 REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
 REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
-REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o vector_engine.o vector_engine_redis_impl.o vector_engine_ub_impl.o ub_client.o ub_metadata.o sve_compute.o sve_similarity.o batch_processor.o vector_proxy_request.o vector_proxy_completion.o batch_latency_trace.o
+REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o vector_engine.o vector_engine_redis_impl.o vector_engine_ub_impl.o ub_client.o ub_metadata.o sve_compute.o sve_similarity.o batch_processor.o vector_proxy_request.o vector_proxy_completion.o batch_latency_trace.o proxy_aggregator.o supernode_worker.o ring_buffer_mgr.o ring_buffer.o sve_operation.o \
+                    vemb_v16_server_integration.o vector_engine_vemb_v16_impl.o vemb_v16_server_tcp_client.o \
+                    vemb_v16_proxy.o vemb_v16_supernode.o vemb_v16_tlc.o tlc_core.o \
+                    vemb_v16_net.o vemb_v16_storage.o vemb_v16_warm_provider.o vemb_v16_tcp_transport.o vemb_v16_aeron_transport.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
-REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
+REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o vemb_v16_cli_tcp.o vemb_v16_cli_shm.o vemb_v16_client_sdk.o vemb_v16_net.o 
 REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
 REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
@@ -503,6 +506,9 @@ $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
 DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_VEC_SETS_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
+
+vemb_v16_client_sdk.o: ../clients/c/vemb_v16_client_sdk.c .make-prerequisites
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
 -include $(DEP)
 
 # Because the jemalloc.h header is generated as a part of the jemalloc build,

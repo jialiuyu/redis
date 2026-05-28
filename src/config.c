@@ -111,6 +111,7 @@ configEnum tls_auth_clients_enum[] = {
 configEnum vector_engine_enum[] = {
     {"redis", 0},
     {"ub", 1},
+    {"vemb-v16", 2},
     {NULL, 0}
 };
 
@@ -3354,6 +3355,19 @@ standardConfig static_configs[] = {
     createStringConfig("tls-protocols", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.protocols, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, applyTlsCfg),
+
+    /* VEMB V16 configs */
+    createBoolConfig("vemb-v16-enabled", NULL, MODIFIABLE_CONFIG, server.vemb_v16_enabled, 0, NULL, NULL),
+    createStringConfig("vemb-v16-uds-path", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_uds_path, NULL, NULL, NULL),
+    createStringConfig("vemb-v16-tcp-host", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_tcp_host, NULL, NULL, NULL),
+    createIntConfig("vemb-v16-tcp-port", NULL, MODIFIABLE_CONFIG, 1, 65535, server.vemb_v16_tcp_port, 6391, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-dim", NULL, MODIFIABLE_CONFIG, 1, 4096, server.vemb_v16_dim, 300, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-max-vectors", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.vemb_v16_max_vectors, 131072, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("vemb-v16-vector-region", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_vector_region, NULL, NULL, NULL),
+    createStringConfig("vemb-v16-warm-backend", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_warm_backend, NULL, NULL, NULL),
+    createSizeTConfig("vemb-v16-warm-mmap-offset", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.vemb_v16_warm_mmap_offset, 0, MEMORY_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-proxy-io-threads", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_proxy_io_threads, 0, INTEGER_CONFIG, NULL, NULL),
 
     /* Special configs */
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),

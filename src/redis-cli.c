@@ -9,6 +9,8 @@
  */
 
 #include "fmacros.h"
+#include "vemb_v16_cli_tcp.h"
+#include "vemb_v16_cli_shm.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -273,6 +275,14 @@ static struct config {
     char *client_name;
     int prefer_ipv4; /* Prefer IPv4 over IPv6 on DNS lookup. */
     int prefer_ipv6; /* Prefer IPv6 over IPv4 on DNS lookup. */
+    /* VEMB V16 TCP fast path */
+    int vemb_v16_tcp_enabled;
+    char *vemb_v16_tcp_host;
+    int vemb_v16_tcp_port;
+    int vemb_v16_dim;
+    /* VEMB V16 SHM fast path */
+    int vemb_v16_shm_enabled;
+    char *vemb_v16_shm_socket;
 } config;
 
 /* User preferences. */
@@ -2439,6 +2449,53 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
     size_t *argvlen;
     int j, output_raw;
 
+    /* VEMB V16 SHM fast path (highest priority) */
+    if (config.vemb_v16_shm_enabled && argc >= 2) {
+        if (!strcasecmp(command, "VADD")) {
+            int rc = vemb_v16_cli_shm_vadd(argc, argv);
+            if (rc != -1) return rc;
+        }
+        if (!strcasecmp(command, "VEMB")) {
+            for (long i = 0; i < repeat; i++) {
+                int skip_output = (repeat > 1 && i < repeat - 1) ? 1 : 0;
+                int rc = vemb_v16_cli_shm_vemb(argc, argv, skip_output);
+                if (rc == -1) break;
+            }
+            return REDIS_OK;
+        }
+        if (!strcasecmp(command, "VSIM")) {
+            int rc = vemb_v16_cli_shm_vsim(argc, argv);
+            if (rc != -1) return rc;
+        }
+    }
+
+    /* VEMB V16 TCP fast path */
+    if (config.vemb_v16_tcp_enabled && argc >= 2) {
+        if (!strcasecmp(command, "VADD")) {
+            int rc = vemb_v16_cli_tcp_vadd(argc, argv);
+            if (rc != -1) return rc; /* -1 = fallback to RESP */
+        }
+        if (!strcasecmp(command, "VEMB")) {
+            if (repeat > 1) {
+                int rc = vemb_v16_cli_tcp_vemb_pipeline(argc, argv, 0, (int)repeat);
+                if (rc != -1) return rc;
+            } else {
+                int rc = vemb_v16_cli_tcp_vemb(argc, argv, 0);
+                if (rc != -1) return rc;
+            }
+            return REDIS_OK;
+        }
+        if (!strcasecmp(command, "VSIM")) {
+            if (repeat > 1) {
+                int rc = vemb_v16_cli_tcp_vsim_pipeline(argc, argv, 0, (int)repeat);
+                if (rc != -1) return rc;
+            } else {
+                int rc = vemb_v16_cli_tcp_vsim(argc, argv, 0);
+                if (rc != -1) return rc;
+            }
+        }
+    }
+
     if (context == NULL) return REDIS_ERR;
 
     output_raw = 0;
@@ -3033,6 +3090,14 @@ static int parseOptions(int argc, char **argv) {
             config.resp2 = 1;
         } else if (!strcmp(argv[i],"-3")) {
             config.resp3 = 1;
+        } else if (!strcmp(argv[i],"--vemb-v16") && !lastarg) {
+            config.vemb_v16_shm_socket = argv[++i];
+        } else if (!strcmp(argv[i],"--vemb-v16-tcp-host") && !lastarg) {
+            config.vemb_v16_tcp_host = argv[++i];
+        } else if (!strcmp(argv[i],"--vemb-v16-tcp-port") && !lastarg) {
+            config.vemb_v16_tcp_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i],"--vemb-v16-dim") && !lastarg) {
+            config.vemb_v16_dim = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"--show-pushes") && !lastarg) {
             char *argval = argv[++i];
             if (!strncasecmp(argval, "n", 1)) {
@@ -3318,6 +3383,23 @@ static int issueCommandRepeat(int argc, char **argv, long repeat) {
     }
 
     while (1) {
+        /* VEMB V16 fast path: skip Redis connection for VADD/VEMB/VSIM
+         * when VEMB transport is explicitly configured. */
+        int is_vemb_cmd = (argc >= 1) &&
+            (!strcasecmp(argv[0], "VADD") ||
+             !strcasecmp(argv[0], "VEMB") ||
+             !strcasecmp(argv[0], "VSIM"));
+        int vemb_transport_ready = config.vemb_v16_tcp_enabled ||
+                                    config.vemb_v16_shm_enabled;
+
+        if (vemb_transport_ready && is_vemb_cmd) {
+            if (cliSendCommand(argc,argv,repeat) != REDIS_OK) {
+                cliPrintContextError();
+                return REDIS_ERR;
+            }
+            break;
+        }
+
         if (config.cluster_reissue_command || context == NULL ||
             context->err == REDIS_ERR_IO || context->err == REDIS_ERR_EOF)
         {
@@ -10954,6 +11036,12 @@ int main(int argc, char **argv) {
     config.server_version = NULL;
     config.prefer_ipv4 = 0;
     config.prefer_ipv6 = 0;
+    config.vemb_v16_tcp_enabled = 0;
+    config.vemb_v16_tcp_host = NULL;
+    config.vemb_v16_tcp_port = 0;
+    config.vemb_v16_dim = 0;
+    config.vemb_v16_shm_enabled = 0;
+    config.vemb_v16_shm_socket = NULL;
     config.cluster_manager_command.name = NULL;
     config.cluster_manager_command.argc = 0;
     config.cluster_manager_command.argv = NULL;
@@ -10991,6 +11079,39 @@ int main(int argc, char **argv) {
     firstarg = parseOptions(argc,argv);
     argc -= firstarg;
     argv += firstarg;
+
+    /* Initialize VEMB V16 SHM fast path if requested */
+    if (config.vemb_v16_shm_socket) {
+        config.vemb_v16_shm_enabled = 1;
+        const char *sock = config.vemb_v16_shm_socket;
+        uint32_t dim = config.vemb_v16_dim > 0
+            ? (uint32_t)config.vemb_v16_dim
+            : 300;
+        if (vemb_v16_cli_shm_init(sock, dim) != 0) {
+            fprintf(stderr, "VEMB V16 SHM init failed: %s dim=%u\n",
+                    sock, dim);
+            config.vemb_v16_shm_enabled = 0;
+        }
+        atexit(vemb_v16_cli_shm_cleanup);
+    }
+
+    /* Initialize VEMB V16 TCP fast path if requested */
+    if (config.vemb_v16_tcp_host) {
+        config.vemb_v16_tcp_enabled = 1;
+        const char *host = config.vemb_v16_tcp_host;
+        uint16_t port = config.vemb_v16_tcp_port > 0
+            ? (uint16_t)config.vemb_v16_tcp_port
+            : 6391;
+        uint32_t dim = config.vemb_v16_dim > 0
+            ? (uint32_t)config.vemb_v16_dim
+            : 300;
+        if (vemb_v16_cli_tcp_init(host, port, dim) != 0) {
+            fprintf(stderr, "VEMB V16 TCP init failed: %s:%u dim=%u\n",
+                    host, port, dim);
+            config.vemb_v16_tcp_enabled = 0;
+        }
+        atexit(vemb_v16_cli_tcp_cleanup);
+    }
 
     parseEnv();
 
