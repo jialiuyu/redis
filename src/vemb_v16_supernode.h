@@ -3,7 +3,7 @@
 
 #include "vemb_v16_aeron_ring.h"
 #include "vemb_v16_dataplane.h"
-#include "vemb_v16_tlc.h"
+#include "vemb_v16_storage.h"
 
 #include <stddef.h>
 #include <stdatomic.h>
@@ -43,10 +43,8 @@ typedef struct vemb_v16_supernode_ctx {
     atomic_int *running;
     atomic_int *completion_notify_armed;
     int *completion_notify_fd;
-    vemb_v16_aeron_ring_t *vemb_job_ring;
-    vemb_v16_aeron_ring_t *vadd_job_ring;
     vemb_v16_aeron_ring_t *completion_ring;
-    vemb_v16_tlc_t *tlc;
+    vemb_v16_storage_ctx_t *storage;
     vemb_v16_channel_counters_t *stats;
     sve_operation_stats_t *sve_stats;
 } vemb_v16_supernode_ctx_t;
@@ -66,8 +64,5 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                         size_t *read_result_bytes);
 void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                         vemb_v16_vadd_job_t *vadd_job);
-int vemb_v16_supernode_drain(vemb_v16_supernode_ctx_t *ctx,
-                             vemb_v16_supernode_scratch_t *scratch);
-void *vemb_v16_supernode_thread_main(void *arg);
 
 #endif

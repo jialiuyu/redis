@@ -932,11 +932,11 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(supernode_completion_publish));
     printf("[stats] bitmap lock_success=%llu lock_failure=%llu\n",
            D(bitmap_lock_success), D(bitmap_lock_failure));
-    printf("[stats] depth request=%llu response=%llu vemb_job=%llu vadd_job=%llu completion=%llu channel_ops=%llu\n",
+    printf("[stats] depth request=%llu response=%llu vemb_shard=%llu vadd_shard=%llu completion=%llu channel_ops=%llu\n",
            (unsigned long long)after->request_ring_depth,
            (unsigned long long)after->response_ring_depth,
-           (unsigned long long)after->vemb_job_ring_depth,
-           (unsigned long long)after->vadd_job_ring_depth,
+           (unsigned long long)after->vemb_shard_queue_depth,
+           (unsigned long long)after->vadd_shard_queue_depth,
            (unsigned long long)after->completion_ring_depth,
            D(channel_ops));
     uint64_t samples = after->sample_count - before->sample_count;

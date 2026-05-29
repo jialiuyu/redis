@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -128,34 +129,50 @@ static void iov_advance(struct iovec **iov, int *iovcnt, size_t bytes) {
 }
 
 int vemb_v16_net_readv_full(int fd, const struct iovec *iov, int iovcnt) {
-    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    struct iovec *local = malloc(sizeof(*local) * VEMB_V16_NET_MAX_IOV);
+    if (!local) return -1;
     int nlocal = iov_copy(local, iov, iovcnt);
-    if (nlocal < 0) return -1;
+    if (nlocal < 0) {
+        free(local);
+        return -1;
+    }
 
     struct iovec *cur = local;
     int curcnt = nlocal;
     while (curcnt > 0) {
         ssize_t r = readv(fd, cur, curcnt);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
+        if (r <= 0) {
+            free(local);
+            return -1;
+        }
         iov_advance(&cur, &curcnt, (size_t)r);
     }
+    free(local);
     return 0;
 }
 
 int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
-    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    struct iovec *local = malloc(sizeof(*local) * VEMB_V16_NET_MAX_IOV);
+    if (!local) return -1;
     int nlocal = iov_copy(local, iov, iovcnt);
-    if (nlocal < 0) return -1;
+    if (nlocal < 0) {
+        free(local);
+        return -1;
+    }
 
     struct iovec *cur = local;
     int curcnt = nlocal;
     while (curcnt > 0) {
         ssize_t r = writev(fd, cur, curcnt);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
+        if (r <= 0) {
+            free(local);
+            return -1;
+        }
         iov_advance(&cur, &curcnt, (size_t)r);
     }
+    free(local);
     return 0;
 }
 

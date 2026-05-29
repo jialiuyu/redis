@@ -2,6 +2,7 @@
 #define __VEMB_V16_PROXY_H
 
 #include "vemb_v16_protocol.h"
+#include "vemb_v16_storage.h"
 
 typedef struct vemb_v16_proxy vemb_v16_proxy_t;
 
@@ -9,10 +10,7 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
-                          const char *vector_region_name,
-                          uint32_t warm_region_id,
-                          uint32_t warm_backend_type,
-                          uint64_t warm_mmap_offset);
+                          vemb_v16_storage_ctx_t *storage);
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,
                               uint16_t port);

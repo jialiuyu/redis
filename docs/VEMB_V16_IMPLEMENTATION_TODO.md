@@ -129,15 +129,14 @@ many bench workers / TCP connections / SHM channels
 
 落地 TODO：
 
-1. P0：已完成。新增 `--supernode-workers N`，保留现有 per-channel proxy thread，但 SuperNode 执行从 per-channel thread 改为固定 worker 池。
-   - channel 仍保留自己的 SPSC `vemb_job_ring` / `vadd_job_ring` / `completion_ring`。
-   - 固定 worker 按 `channel_index % supernode_workers` 扫描自己的 channel 集合。
-   - 同一 channel 只被一个 SuperNode worker 消费，避免 MPSC 队列和 response reorder。
-   - `N=0` 保留旧 per-channel SuperNode thread，便于 A/B 对照。
-2. P1：已完成。新增 `--proxy-io-threads N`，把 TCP channel thread 收敛为固定 I/O worker。
+1. P0：已完成。SuperNode 执行已统一收敛为固定 worker 池。
+   - channel 保留 `completion_ring` 作为响应有序与 close 协议边界。
+   - 主请求分发不再依赖 per-channel `vemb_job_ring` / `vadd_job_ring`。
+   - 固定 worker 通过 shard queue 消费请求，并保持同一 channel 的 completion 回写边界。
+2. P1：已完成。proxy 请求处理已统一收敛为固定 I/O worker。
    - accept/control main thread 只负责 accept、HELLO/WELCOME、channel lifecycle。
-   - `proxy_io_worker[k]` 管理多个 TCP fd，处理 frame parse、job dispatch、completion drain、response write。
-   - 第一版使用 `poll` 验证多 fd 生命周期；不传或传 `0` 时保持旧 per-channel proxy thread。
+   - `proxy_io_worker[k]` 管理多个 TCP fd，并轮询自己负责的 SHM channel 子集，处理 request poll、job dispatch、completion drain、response write。
+   - Linux 下 worker 优先使用 `epoll`；非 Linux 继续使用 `poll`。
 3. P2：已完成第一版 Linux epoll 化。
    - Linux 下每个 proxy I/O worker 拥有一个 `epoll_fd`，非 Linux 继续 fallback 到 `poll`。
    - TCP fd 注册 `EPOLLIN | EPOLLERR | EPOLLHUP`，fd 注册状态由 worker 维护。
@@ -145,10 +144,10 @@ many bench workers / TCP connections / SHM channels
    - 已完成第一版慢 client backpressure：Linux pooled proxy I/O channel 在 response 写不动时转入 per-channel backlog，并通过 `EPOLLOUT` 继续 flush，避免同步写长期占住 worker。
    - 已完成第一版 completion 唤醒：Linux proxy I/O worker 使用 worker-local `eventfd`，SuperNode 在 completion 发布后按 arm/disarm 语义通知对应 worker，减少 idle scan；后续再评估是否扩展到 job queue 唤醒。
 4. P3：已完成第一版。队列收敛。
-   - TCP VEMB / VADD 已从 per-channel `vemb_job_ring` / `vadd_job_ring` 收敛到 `proxy_io_worker -> supernode_worker` SPSC shard queue。
-   - shard queue 仅在同时启用 `--proxy-io-threads N` 和 `--supernode-workers M` 时生效。
+   - TCP / SHM VEMB / VADD 主路径均已收敛到 `proxy_io_worker -> supernode_worker` SPSC shard queue。
+   - shard queue 已是当前唯一主路径，不再作为“仅双开 worker 时生效”的可选分支。
    - 当前 VADD 仍走 full-vector payload shard queue，先拿到 pooled 线程模型收益，后续再评估 staged payload 或小 descriptor 化以继续压缩内存/复制成本。
-   - Linux pooled SuperNode worker 已完成第一版 job queue 唤醒：publisher 按目标 `supernode_worker_id` 唤醒 worker-local `eventfd`，worker idle 时按 arm/disarm 语义等待，减少 shard/per-channel job ring 空转扫描。
+   - Linux pooled SuperNode worker 已完成第一版 job queue 唤醒：publisher 按目标 `supernode_worker_id` 唤醒 worker-local `eventfd`，worker idle 时按 arm/disarm 语义等待，减少 shard queue 空转扫描。
 5. P4：跨 worker 并行与 response reorder。
    - 从 `channel_index` 路由升级为 `key_hash` / shard 路由。
    - 单 channel 可并行打到多个 SuperNode worker。

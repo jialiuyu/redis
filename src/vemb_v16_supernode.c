@@ -5,10 +5,10 @@
 #include "vemb_v16_dataplane.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
+#include "redisassert.h"
 #include "zmalloc.h"
 
-#include <pthread.h>
-#include <sched.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
@@ -75,6 +75,8 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                         vemb_v16_vemb_job_t *vemb_job,
                                         float **read_result,
                                         size_t *read_result_bytes) {
+    vemb_v16_storage_ctx_t *storage = ctx->storage;
+    vemb_v16_tlc_t *tlc = storage->tlc;
     vemb_v16_job_base_t *job = &vemb_job->base;
     vemb_v16_completion_t completion = {
         .status = VEMB_V16_STATUS_OK,
@@ -93,15 +95,15 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
     uint64_t lookup_start = sample ? monotonic_ns() : 0;
     uint64_t lookup_ns = 0;
 
-    if (vemb_v16_tlc_get_handle(ctx->tlc, job->key, job->key_len,
+    if (vemb_v16_tlc_get_handle(tlc, job->key, job->key_len,
                                 job->key_hash, &handle, &warm_slot) != 0) {
         completion.status = VEMB_V16_STATUS_NOT_FOUND;
         atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
                                   memory_order_relaxed);
     } else {
         if (sample) lookup_ns = monotonic_ns() - lookup_start;
-        if (job->dim != ctx->tlc->vector_dim ||
-            job->vector_bytes != ctx->tlc->value_size) {
+        if (job->dim != tlc->vector_dim ||
+            job->vector_bytes != tlc->value_size) {
             completion.status = VEMB_V16_STATUS_ERR;
         } else {
             completion.vector_offset = handle.offset;
@@ -123,7 +125,7 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                 uint64_t bitmap_unlock_ns = 0;
                 uint64_t vector_load_ns = 0;
                 if (sve_serial_contiguous_read_blocking_traced(
-                        &ctx->tlc->gather_ctx,
+                        &tlc->gather_ctx,
                         &emb_id,
                         1,
                         *read_result,
@@ -166,6 +168,8 @@ vemb_read_done:
 
 void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                         vemb_v16_vadd_job_t *vadd_job) {
+    vemb_v16_storage_ctx_t *storage = ctx->storage;
+    vemb_v16_tlc_t *tlc = storage->tlc;
     vemb_v16_job_base_t *job = &vadd_job->base;
     vemb_v16_completion_t completion = {
         .status = VEMB_V16_STATUS_OK,
@@ -182,9 +186,9 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
     if (job->op == VEMB_V16_OP_VADD_INLINE) {
         uint32_t warm_slot = 0;
         vemb_v16_vector_handle_t handle = {0};
-        if (job->dim != ctx->tlc->vector_dim ||
-            job->vector_bytes != ctx->tlc->value_size ||
-            vemb_v16_tlc_put(ctx->tlc, job->key, job->key_len,
+        if (job->dim != tlc->vector_dim ||
+            job->vector_bytes != tlc->value_size ||
+            vemb_v16_tlc_put(tlc, job->key, job->key_len,
                              job->key_hash, vadd_job->vector,
                              job->vector_bytes, &handle, &warm_slot) != 0) {
             completion.status = VEMB_V16_STATUS_ERR;
@@ -203,7 +207,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
 }
 
 int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch) {
-    if (!scratch) return -1;
+    assert(scratch != NULL);
     memset(scratch, 0, sizeof(*scratch));
     scratch->vemb_jobs =
         zmalloc(sizeof(*scratch->vemb_jobs) * VEMB_V16_SUPERNODE_BATCH);
@@ -217,74 +221,9 @@ int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch) {
 }
 
 void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch) {
-    if (!scratch) return;
+    assert(scratch != NULL);
     zfree(scratch->read_result);
     zfree(scratch->vemb_jobs);
     zfree(scratch->vadd_jobs);
     memset(scratch, 0, sizeof(*scratch));
-}
-
-int vemb_v16_supernode_drain(vemb_v16_supernode_ctx_t *ctx,
-                             vemb_v16_supernode_scratch_t *scratch) {
-    if (!ctx || !scratch || !scratch->vemb_jobs || !scratch->vadd_jobs)
-        return -1;
-    if (!atomic_load_explicit(ctx->running, memory_order_relaxed) ||
-        !atomic_load_explicit(ctx->channel_active, memory_order_acquire))
-        return 0;
-
-    uint32_t n = vemb_v16_aeron_poll_batch(ctx->vemb_job_ring,
-                                           scratch->vemb_jobs,
-                                           VEMB_V16_SUPERNODE_BATCH);
-    if (n) {
-        atomic_fetch_add_explicit(&ctx->stats->supernode_vemb_poll, n,
-                                  memory_order_relaxed);
-        for (uint32_t i = 0; i < n; i++) {
-            vemb_v16_supernode_handle_vemb_job(ctx,
-                                               &scratch->vemb_jobs[i],
-                                               &scratch->read_result,
-                                               &scratch->read_result_bytes);
-        }
-        return (int)n;
-    }
-
-    n = vemb_v16_aeron_poll_batch(ctx->vadd_job_ring,
-                                  scratch->vadd_jobs,
-                                  VEMB_V16_SUPERNODE_BATCH);
-    if (!n)
-        return 0;
-    atomic_fetch_add_explicit(&ctx->stats->supernode_vadd_poll, n,
-                              memory_order_relaxed);
-    for (uint32_t i = 0; i < n; i++) {
-        vemb_v16_supernode_handle_vadd_job(ctx, &scratch->vadd_jobs[i]);
-    }
-    return (int)n;
-}
-
-void *vemb_v16_supernode_thread_main(void *arg) {
-    vemb_v16_supernode_ctx_t *ctx = arg;
-    vemb_v16_supernode_scratch_t scratch;
-    if (vemb_v16_supernode_scratch_init(&scratch) != 0)
-        return NULL;
-
-#ifdef __linux__
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET((int)((ctx->worker_id * 2 + 2) % 64), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-#endif
-
-    serverLog(LL_VERBOSE, "vemb_v16 supernode worker started: worker_id=%u",
-              ctx->worker_id);
-    while (atomic_load_explicit(ctx->running, memory_order_relaxed) &&
-           atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
-        int n = vemb_v16_supernode_drain(ctx, &scratch);
-        if (n <= 0) {
-            cpu_relax();
-            continue;
-        }
-    }
-    serverLog(LL_VERBOSE, "vemb_v16 supernode worker stopped: worker_id=%u",
-              ctx->worker_id);
-    vemb_v16_supernode_scratch_cleanup(&scratch);
-    return NULL;
 }

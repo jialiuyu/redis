@@ -262,7 +262,7 @@ vemb_v16_supernode.c
 1. 新增 `src/vemb_v16_aeron_ring.h`。
 2. 新增 `src/vemb_v16_dataplane.h`，把 `vemb_v16_job_t` / `vemb_v16_completion_t` 从 `vemb_v16_proxy.c` 移出去。
 3. 用 Aeron typed ring 替换 `vemb_v16_proxy.c` 内部临时 `job_ring_push/poll` 和 `completion_ring_push/poll`。
-4. 新增 `src/vemb_v16_supernode.c/.h`，把 `supernode_thread_main()` 从 proxy 文件拆出。
+4. 新增 `src/vemb_v16_supernode.c/.h`，把 SuperNode 执行内核从 proxy 文件拆出，并供 pooled supernode worker 复用。
 5. 新增 `src/vemb_v16_table.c/.h`，把进程内 vector table 从 proxy 文件拆出。
 6. 拆分 VEMB 小 descriptor job ring 和 VADD full-vector job ring。
 7. 保持 `vadd-inline` 作为当前 VADD 全量传输路径。
@@ -277,6 +277,9 @@ vemb_v16_supernode.c
    - response publish full count
 
 当前实现状态：
+
+- `src/vemb_v16_supernode.c/.h` 已完成拆分，但运行时已进一步收敛到 pooled-only：当前不再依赖 `supernode_thread_main()` / `channel_thread_main()` 这类 per-channel 线程入口。
+- 主请求分发已统一走 `proxy_io_worker -> supernode_worker` shard queue；`completion_ring` 仍保留 per-channel 语义作为 response ordering 与 close 协议边界。
 
 ```text
 P0: done

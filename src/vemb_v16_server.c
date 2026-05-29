@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "vemb_v16_proxy.h"
+#include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
 #include "monotonic.h"
 
@@ -9,8 +10,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static vemb_v16_proxy_t *g_proxy;
+
+static uint32_t clamp_worker_count(long value, uint32_t max_value) {
+    if (value < 1)
+        return 1;
+    if ((unsigned long)value > max_value)
+        return max_value;
+    return (uint32_t)value;
+}
+
+static uint32_t default_proxy_io_threads(void) {
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long target = cpus > 0 ? cpus / 2 : 1;
+    if (target < 1)
+        target = 1;
+    if (target > 16)
+        target = 16;
+    return clamp_worker_count(target, VEMB_V16_MAX_CHANNELS);
+}
+
+static uint32_t default_supernode_workers(void) {
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long target = cpus > 0 ? cpus : 1;
+    if (target > 32)
+        target = 32;
+    return clamp_worker_count(target, VEMB_V16_MAX_CHANNELS);
+}
 
 static void on_signal(int sig) {
     (void)sig;
@@ -29,8 +57,8 @@ int main(int argc, char **argv) {
     const char *transport = "shm";
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
-    uint32_t proxy_io_threads = 0;
-    uint32_t supernode_workers = 0;
+    uint32_t proxy_io_threads = default_proxy_io_threads();
+    uint32_t supernode_workers = default_supernode_workers();
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
@@ -82,38 +110,57 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (proxy_io_threads == 0) {
+        fprintf(stderr, "--proxy-io-threads must be >= 1\n");
+        return 1;
+    }
+    if (supernode_workers == 0) {
+        fprintf(stderr, "--supernode-workers must be >= 1\n");
+        return 1;
+    }
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
+    vemb_v16_storage_ctx_t *storage = NULL;
     serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s",
               transport, uds_path, tcp_host, tcp_port, proxy_io_threads,
               supernode_workers, dim, max_vectors, vector_region_name);
 
+    if (vemb_v16_storage_ctx_create(&storage,
+                                    dim,
+                                    dim * sizeof(float),
+                                    max_vectors,
+                                    vector_region_name,
+                                    warm_region_id,
+                                    warm_backend_type,
+                                    warm_mmap_offset) != 0) {
+        serverLog(LL_WARNING, "failed to create vemb_v16 storage");
+        return 1;
+    }
     if (vemb_v16_proxy_create(&g_proxy,
                               uds_path,
                               dim,
                               max_vectors,
-                              vector_region_name,
-                              warm_region_id,
-                              warm_backend_type,
-                              warm_mmap_offset) != 0) {
+                              storage) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
+        vemb_v16_storage_ctx_destroy(storage);
         return 1;
     }
-    if (supernode_workers &&
-        vemb_v16_proxy_set_supernode_workers(g_proxy, supernode_workers) != 0) {
+    if (vemb_v16_proxy_set_supernode_workers(g_proxy, supernode_workers) != 0) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 supernode workers");
         vemb_v16_proxy_destroy(g_proxy);
+        vemb_v16_storage_ctx_destroy(storage);
         g_proxy = NULL;
         return 1;
     }
-    if (proxy_io_threads &&
-        vemb_v16_proxy_set_proxy_io_threads(g_proxy, proxy_io_threads) != 0) {
+    if (vemb_v16_proxy_set_proxy_io_threads(g_proxy, proxy_io_threads) != 0) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 proxy io threads");
         vemb_v16_proxy_destroy(g_proxy);
+        vemb_v16_storage_ctx_destroy(storage);
         g_proxy = NULL;
         return 1;
     }
@@ -121,6 +168,7 @@ int main(int argc, char **argv) {
         if (vemb_v16_proxy_enable_tcp(g_proxy, tcp_host, tcp_port) != 0) {
             serverLog(LL_WARNING, "failed to enable vemb_v16 tcp transport");
             vemb_v16_proxy_destroy(g_proxy);
+            vemb_v16_storage_ctx_destroy(storage);
             g_proxy = NULL;
             return 1;
         }
@@ -141,15 +189,16 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.bitmap_lock_success,
            (unsigned long long)stats.bitmap_lock_failure,
            (unsigned long long)stats.sample_vector_load_ns);
-    serverLog(LL_NOTICE, "vemb_v16 stats: depth request=%llu response=%llu vemb_job=%llu vadd_job=%llu completion=%llu channel_ops=%llu",
+    serverLog(LL_NOTICE, "vemb_v16 stats: depth request=%llu response=%llu vemb_shard=%llu vadd_shard=%llu completion=%llu channel_ops=%llu",
            (unsigned long long)stats.request_ring_depth,
            (unsigned long long)stats.response_ring_depth,
-           (unsigned long long)stats.vemb_job_ring_depth,
-           (unsigned long long)stats.vadd_job_ring_depth,
+           (unsigned long long)stats.vemb_shard_queue_depth,
+           (unsigned long long)stats.vadd_shard_queue_depth,
            (unsigned long long)stats.completion_ring_depth,
            (unsigned long long)stats.channel_ops);
 
     vemb_v16_proxy_destroy(g_proxy);
+    vemb_v16_storage_ctx_destroy(storage);
     g_proxy = NULL;
     return ret == 0 ? 0 : 1;
 }

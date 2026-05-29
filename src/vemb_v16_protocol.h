@@ -159,8 +159,8 @@ typedef struct vemb_v16_stats {
     uint64_t bitmap_lock_failure;
     uint64_t request_ring_depth;
     uint64_t response_ring_depth;
-    uint64_t vemb_job_ring_depth;
-    uint64_t vadd_job_ring_depth;
+    uint64_t vemb_shard_queue_depth;
+    uint64_t vadd_shard_queue_depth;
     uint64_t completion_ring_depth;
     uint64_t channel_ops;
 } vemb_v16_stats_t;
