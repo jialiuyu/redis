@@ -37,6 +37,11 @@ vemb_v16_bench / future redis-cli-vemb
 | `vemb-read-vector` | 321k QPS | 492k QPS | 在 `vemb-handle` 上增加 client 读 vector region |
 | `vadd-inline` | 219k QPS | 368k QPS | VADD 全量传 1200B vector，进入 VADD full-vector ring |
 
+## 待实现
+
+- TODO：增加 WARM 内存淘汰机制。
+  当前 WARM region / vector table 以固定容量预分配为主，写满后的行为需要补齐。后续应引入 capacity / high-watermark / low-watermark 配置，在 WARM 使用量超过高水位时触发淘汰；淘汰策略可先采用 clock / sampled LRU，优先淘汰 clean、低访问频率、非 hot 的 vector row。若 row 存在 dirty 数据，需要先落 COLD / append log 或确认已有持久副本后再释放。指标侧需要补充 `warm_evict_attempts`、`warm_evict_success`、`warm_evict_dirty_flush`、`warm_evict_fail`、`warm_bytes_used` 和 `warm_bytes_reclaimed`，便于压测观察淘汰是否成为读写路径瓶颈。
+
 ## Phase 1
 
 - `src/vemb_v16_protocol.h` 定义无 Redis 依赖的 channel descriptor、request、response、stats 协议。
