@@ -65,24 +65,34 @@ int vemb_v16_warm_provider_open(vemb_v16_warm_provider_t *provider,
     }
 
     int mmap_flags = MAP_SHARED;
-    /* TODO: keep regular mmap fallback so this path remains build-testable on macOS. */
+    /*
+     * POSIX shm_open() objects live on tmpfs and are not hugetlbfs files.
+     * Mapping them with MAP_HUGETLB fails with EINVAL on normal Linux
+     * deployments, so shm stays on regular MAP_SHARED. UB backend still tries
+     * HugeTLB first because its path may be backed by hugepage-capable memory.
+     */
 #if defined(__linux__) && defined(MAP_HUGETLB)
-    provider->mapping_addr = mmap(NULL,
-                                  provider->mapping_bytes,
-                                  PROT_READ | PROT_WRITE,
-                                  mmap_flags | MAP_HUGETLB,
-                                  provider->fd,
-                                  (off_t)provider->mmap_aligned_offset);
-    if (provider->mapping_addr == MAP_FAILED) {
-        serverLog(LL_WARNING, "vemb_v16 warm provider huge tlb mmap failed, fallback to regular mmap: path=%s size=%zu offset=%llu error=%s",
-                  path,
-                  provider->mapping_bytes,
-                  (unsigned long long)mmap_offset,
-                  strerror(errno));
+    if (provider->backend_type == VEMB_V16_REGION_UB) {
+        provider->mapping_addr = mmap(NULL,
+                                      provider->mapping_bytes,
+                                      PROT_READ | PROT_WRITE,
+                                      mmap_flags | MAP_HUGETLB,
+                                      provider->fd,
+                                      (off_t)provider->mmap_aligned_offset);
+        if (provider->mapping_addr == MAP_FAILED) {
+            serverLog(LL_WARNING, "vemb_v16 warm provider huge tlb mmap failed, fallback to regular mmap: path=%s size=%zu offset=%llu error=%s",
+                      path,
+                      provider->mapping_bytes,
+                      (unsigned long long)mmap_offset,
+                      strerror(errno));
+        }
+    } else {
+        provider->mapping_addr = MAP_FAILED;
     }
 #else
     provider->mapping_addr = MAP_FAILED;
 #endif
+
     if (provider->mapping_addr == MAP_FAILED) {
         provider->mapping_addr = mmap(NULL,
                                       provider->mapping_bytes,

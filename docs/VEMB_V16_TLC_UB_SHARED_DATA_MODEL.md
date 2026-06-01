@@ -374,7 +374,7 @@ output:
 
 `vemb_v16_tlc_create()` 只消费 warm provider 返回的 `mapped_addr/region_id/region_bytes/value_size`。它不会再为 vector payload 自己分配大块内存；`tlc_core_create()` 只分配 HOT/WARM/COLD metadata，并把 `core->warm_data` 指向 warm provider 的 mapped region。
 
-Linux 上 `vemb_v16_warm_provider_open()` 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。这个分支上方保留 TODO，原因是 Linux server 需要 HugeTLB 尝试，但 macOS 编译测试没有 `MAP_HUGETLB`。
+Linux 上默认 `shm` backend 使用普通 `MAP_SHARED`。POSIX shm 对象通常位于 tmpfs，不是 hugetlbfs 文件，隐式叠加 `MAP_HUGETLB` 会在普通部署上返回 `EINVAL`。`ub` backend 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。
 
 ## Channel 生命周期
 
@@ -737,7 +737,7 @@ UB 模式 benchmark 与本地 SHM 模式一致，client 会从 server 返回的 
 --mode mixed-80r20w
 ```
 
-Linux HugeTLB：`vemb_v16_warm_provider_open()` 会在 Linux 上先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。如需 HugeTLB 真正生效，需要预留 huge pages，例如：
+Linux HugeTLB：默认 `--warm-backend shm` 不尝试 `MAP_HUGETLB`，直接使用普通 `MAP_SHARED`；`--warm-backend ub` 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。如需 HugeTLB 真正生效，需要预留 huge pages，例如：
 
 ```bash
 sudo sysctl -w vm.nr_hugepages=512
@@ -769,4 +769,4 @@ ls /dev/shm | grep vemb_v16
 2. 内部 key 当前保留 `key_hash + key bytes`，field 附近已有 TODO 评估后续是否改成 canonical `uint64_t key_hash`。
 3. `write_ts_ns` / `ttl_ns` 暂不赋值，field 附近已有 TODO，属于后续淘汰策略。
 4. 当前 WARM append 满后 fallback 到 COLD append，还没有完整的 WARM slot 淘汰/复用/generation 机制。
-5. Linux HugeTLB 是 best-effort：有 `MAP_HUGETLB` 时先尝试，失败会自动 fallback 到普通 `MAP_SHARED`。
+5. 默认 `shm` backend 不尝试 Linux HugeTLB；`ub` backend 会 best-effort 尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。
