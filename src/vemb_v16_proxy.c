@@ -477,8 +477,8 @@ int vemb_v16_proxy_tcp_response_vector_slice(vemb_v16_channel_t *ch,
                                          vector_bytes);
 }
 
-void vemb_v16_proxy_fill_response_from_completion(vemb_v16_resp_t *resp,
-                                   const vemb_v16_completion_t *completion) {
+void vemb_v16_make_response_from(vemb_v16_resp_t *resp,
+                                 const vemb_v16_completion_t *completion) {
     *resp = (vemb_v16_resp_t){
         .status = completion->status,
         .op = completion->op,
@@ -496,7 +496,7 @@ void vemb_v16_proxy_fill_response_from_completion(vemb_v16_resp_t *resp,
 static void publish_response(vemb_v16_channel_t *ch,
                              const vemb_v16_completion_t *completion) {
     vemb_v16_resp_t resp;
-    vemb_v16_proxy_fill_response_from_completion(&resp, completion);
+    vemb_v16_make_response_from(&resp, completion);
     if (ch->transport_type == VEMB_V16_TRANSPORT_TCP) {
         if (ch->net_fd < 0 ||
             vemb_v16_tcp_publish_response(ch, &resp) != 0) {

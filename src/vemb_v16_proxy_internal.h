@@ -57,8 +57,8 @@ int vemb_v16_proxy_tcp_response_vector_slice(vemb_v16_channel_t *ch,
                                              vemb_v16_resp_t *resp,
                                              const uint8_t **vector,
                                              uint32_t *vector_bytes);
-void vemb_v16_proxy_fill_response_from_completion(vemb_v16_resp_t *resp,
-                                                  const vemb_v16_completion_t *completion);
+void vemb_v16_make_response_from(vemb_v16_resp_t *resp,
+                                 const vemb_v16_completion_t *completion);
 void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
                                    const vemb_v16_req_t *req,
                                    int req_len,

@@ -179,7 +179,7 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
             !vemb_v16_channel_active(ch)) {
             continue;
         }
-        vemb_v16_proxy_fill_response_from_completion(&responses[out], &completions[i]);
+        vemb_v16_make_response_from(&responses[out], &completions[i]);
         vectors[out] = NULL;
         vector_bytes[out] = 0;
         vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out], &vectors[out], &vector_bytes[out]);
@@ -287,7 +287,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 continue;
             }
 
-            vemb_v16_proxy_fill_response_from_completion(&responses[out], &completions[i]);
+            vemb_v16_make_response_from(&responses[out], &completions[i]);
             const uint8_t *vector = NULL;
             uint32_t vector_bytes = 0;
             vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out], &vector, &vector_bytes);
