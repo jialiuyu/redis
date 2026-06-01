@@ -14,7 +14,10 @@
 #define VEMB_V16_SHM_PREFIX "vemb_v16"
 #define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
+#ifndef VEMB_V16_MAX_CHANNELS
 #define VEMB_V16_MAX_CHANNELS 64
+#endif
+
 #define VEMB_V16_MAX_KEY_LEN 128
 #define VEMB_V16_MAX_DIM 4096
 #define VEMB_V16_DEFAULT_DIM 300

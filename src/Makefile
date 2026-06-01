@@ -571,7 +571,8 @@ tlc_urma_server: tlc_urma_server.c liburma.so $(TLC_COMMON_DEPS)
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
 	$(CC) $(TLC_CFLAGS) -o $@ $< $(TLC_COMMON_DEPS) -L. -lurma -Wl,-rpath,'$$ORIGIN' $(TLC_LDFLAGS)
 
-VEMB_V16_CFLAGS = -O3 -Wall -Wextra -pthread -std=gnu11 -I.
+VEMB_V16_MAX_CHANNELS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 64)
+VEMB_V16_CFLAGS = -O3 -Wall -Wextra -pthread -std=gnu11 -I. -DVEMB_V16_MAX_CHANNELS=$(VEMB_V16_MAX_CHANNELS)
 ifeq ($(USE_SVE),yes)
 VEMB_V16_CFLAGS += -DUSE_SVE -DUSE_ARM_SVE -march=armv8.2-a+sve
 endif

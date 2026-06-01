@@ -306,8 +306,7 @@ static void free_vemb_shard_queues(vemb_v16_proxy_t *proxy) {
 }
 
 static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy) {
-    if (!proxy)
-        return -1;
+    assert(proxy != NULL);
     if (proxy->proxy_io_worker_count == 0)
         return -1;
     if (proxy->supernode_worker_count == 0)
@@ -1423,7 +1422,8 @@ static void close_channel(vemb_v16_channel_t *ch) {
 }
 
 static int close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
-    if (!proxy || channel_id == 0) return -1;
+    assert(proxy != NULL);
+    if (channel_id == 0) return -1;
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
         if (atomic_load_explicit(&ch->slot_channel_id,
@@ -1436,7 +1436,7 @@ static int close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
 }
 
 static uint64_t close_all_channels(vemb_v16_proxy_t *proxy) {
-    if (!proxy) return 0;
+    assert(proxy != NULL);
     uint64_t closed = 0;
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
@@ -1883,7 +1883,8 @@ static int start_proxy_io_pool(vemb_v16_proxy_t *proxy) {
 }
 
 static void stop_proxy_io_pool(vemb_v16_proxy_t *proxy) {
-    if (!proxy || !proxy->proxy_io_pool_started)
+    assert(proxy != NULL);
+    if (!proxy->proxy_io_pool_started)
         return;
     for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
         pthread_join(proxy->proxy_io_workers[i].thread, NULL);
@@ -2123,7 +2124,8 @@ static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
 }
 
 static void stop_supernode_pool(vemb_v16_proxy_t *proxy) {
-    if (!proxy || !proxy->supernode_pool_started)
+    assert(proxy != NULL);
+    if (!proxy->supernode_pool_started)
         return;
     for (uint32_t i = 0; i < proxy->supernode_worker_count; i++)
         pthread_join(proxy->supernode_workers[i].thread, NULL);
@@ -2147,7 +2149,8 @@ static void tcp_write_status(int fd, uint8_t status, uint64_t value) {
 
 /// TCP control plane: process one accepted TCP control or channel setup socket.
 static void handle_tcp_fd(vemb_v16_proxy_t *proxy, int fd) {
-    if (!proxy || fd < 0) return;
+    assert(proxy != NULL);
+    if (fd < 0) return;
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0)
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
@@ -2271,16 +2274,17 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
                           vemb_v16_storage_ctx_t *storage) {
-    if (!out) return -1;
-    if (!storage) return -1;
-    if (vector_dim == 0 || vector_dim > VEMB_V16_MAX_DIM)
-        vector_dim = VEMB_V16_DEFAULT_DIM;
-    if (max_vectors == 0) max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
+    assert(out != NULL);
+    assert(uds_path != NULL);
+    assert(uds_path[0] != '\0');
+    assert(storage != NULL);
+    assert(vector_dim != 0);
+    assert(vector_dim <= VEMB_V16_MAX_DIM);
+    assert(max_vectors != 0);
 
     vemb_v16_proxy_t *proxy = zcalloc(sizeof(*proxy));
     if (!proxy) return -1;
-    strncpy(proxy->uds_path, uds_path ? uds_path : VEMB_V16_UDS_PATH,
-            sizeof(proxy->uds_path) - 1);
+    strncpy(proxy->uds_path, uds_path, sizeof(proxy->uds_path) - 1);
     proxy->vector_dim = vector_dim;
     proxy->vector_stride = vector_dim * sizeof(float);
     proxy->request_ring_slot_size =
@@ -2310,44 +2314,50 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,
                               uint16_t port) {
-    if (!proxy) return -1;
-    if (host && host[0]) {
-        if (strlen(host) >= sizeof(proxy->tcp_host))
-            return -1;
-        strncpy(proxy->tcp_host, host, sizeof(proxy->tcp_host) - 1);
-        proxy->tcp_host[sizeof(proxy->tcp_host) - 1] = '\0';
-    }
+    assert(proxy != NULL);
+    assert(host != NULL);
+    assert(host[0] != '\0');
+    assert(strlen(host) < sizeof(proxy->tcp_host));
+    strncpy(proxy->tcp_host, host, sizeof(proxy->tcp_host) - 1);
+    proxy->tcp_host[sizeof(proxy->tcp_host) - 1] = '\0';
     proxy->tcp_port = port ? port : VEMB_V16_TCP_PORT;
     proxy->tcp_enabled = 1;
     return 0;
 }
 
+static int proxy_set_worker_count(vemb_v16_proxy_t *proxy,
+                                  int pool_started,
+                                  uint32_t count,
+                                  uint32_t *dst) {
+    assert(proxy != NULL);
+    assert(dst != NULL);
+    assert(!pool_started);
+    if (count == 0)
+        return -1;
+    if (count > VEMB_V16_MAX_CHANNELS)
+        return -1;
+    *dst = count;
+    return 0;
+}
+
 int vemb_v16_proxy_set_supernode_workers(vemb_v16_proxy_t *proxy,
                                          uint32_t workers) {
-    if (!proxy || proxy->supernode_pool_started)
-        return -1;
-    if (workers == 0)
-        return -1;
-    if (workers > VEMB_V16_MAX_CHANNELS)
-        return -1;
-    proxy->supernode_worker_count = workers;
-    return 0;
+    return proxy_set_worker_count(proxy,
+                                  proxy->supernode_pool_started,
+                                  workers,
+                                  &proxy->supernode_worker_count);
 }
 
 int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
                                         uint32_t threads) {
-    if (!proxy || proxy->proxy_io_pool_started)
-        return -1;
-    if (threads == 0)
-        return -1;
-    if (threads > VEMB_V16_MAX_CHANNELS)
-        return -1;
-    proxy->proxy_io_worker_count = threads;
-    return 0;
+    return proxy_set_worker_count(proxy,
+                                  proxy->proxy_io_pool_started,
+                                  threads,
+                                  &proxy->proxy_io_worker_count);
 }
 
 void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
-    if (!proxy) return;
+    assert(proxy != NULL);
     vemb_v16_proxy_stop(proxy);
     stop_proxy_io_pool(proxy);
     stop_supernode_pool(proxy);
@@ -2473,7 +2483,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
 }
 
 void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy) {
-    if (!proxy) return;
+    assert(proxy != NULL);
     int was_running = atomic_exchange_explicit(&proxy->running, 0,
                                                memory_order_relaxed);
     if (!was_running) return;
@@ -2482,7 +2492,8 @@ void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy) {
 }
 
 void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) {
-    if (!proxy || !stats) return;
+    assert(proxy != NULL);
+    assert(stats != NULL);
     memset(stats, 0, sizeof(*stats));
     pthread_mutex_lock(&proxy->stats_lock);
     stats_add(stats, &proxy->closed_stats);
