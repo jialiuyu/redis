@@ -11,6 +11,7 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
                           vemb_v16_storage_ctx_t *storage);
+int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,
                               uint16_t port);

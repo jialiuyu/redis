@@ -637,7 +637,7 @@ TCP 模式启动 server。默认 TCP 端口是 `6391`，这里显式写出便于
   --loglevel notice
 ```
 
-如需同时保留本机 UDS 控制面和 TCP transport，可将 `--transport tcp` 改为 `--transport both`。当前实现要求显式启用 `--proxy-io-threads N` 与 `--supernode-workers N`，二者均需为正数；`proxy I/O worker` 统一负责 TCP fd 管理与 SHM request ring 轮询，Linux 下内部使用 `epoll`，非 Linux 使用 `poll`。VEMB/VADD 主路径统一走 `proxy_io_worker -> supernode_worker` SPSC shard queue，用于降低高连接数压测时的线程膨胀和 queue 扫描成本。
+Transport 当前是严格二选一，没有 `both` 语义：`--transport tcp` 表示控制面和数据面全部走 TCP，不启动 UDS listener；`--transport shm` 表示控制面走 UDS、数据面走 SHM/Aeron ring，不启动 TCP listener。当前实现要求显式启用 `--proxy-io-threads N` 与 `--supernode-workers N`，二者均需为正数；`proxy I/O worker` 在 TCP 模式负责 TCP fd 管理，在 SHM 模式负责 SHM request ring 轮询，Linux 下内部使用 `epoll`，非 Linux 使用 `poll`。VEMB/VADD 主路径统一走 `proxy_io_worker -> supernode_worker` SPSC shard queue，用于降低高连接数压测时的线程膨胀和 queue 扫描成本。
 
 TCP 模式 benchmark 连通性测试：
 

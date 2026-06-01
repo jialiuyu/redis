@@ -69,8 +69,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
             transport = argv[++i];
             if (strcmp(transport, "shm") &&
-                strcmp(transport, "tcp") &&
-                strcmp(transport, "both")) {
+                strcmp(transport, "tcp")) {
                 fprintf(stderr, "invalid transport\n");
                 goto cleanup;
             }
@@ -108,7 +107,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport shm|tcp|both] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport shm|tcp] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -122,7 +121,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--supernode-workers must be >= 1\n");
         goto cleanup;
     }
-    if (!uds_path || uds_path[0] == '\0' || strlen(uds_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+    if (!uds_path || uds_path[0] == '\0' ||
+        strlen(uds_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
         fprintf(stderr, "--socket path must be non-empty and shorter than %zu bytes\n",
                 sizeof(((struct sockaddr_un *)0)->sun_path));
         goto cleanup;
@@ -173,7 +173,12 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 proxy io threads");
         goto cleanup;
     }
-    if (!strcmp(transport, "tcp") || !strcmp(transport, "both")) {
+    if (!strcmp(transport, "shm")) {
+        if (vemb_v16_proxy_enable_uds(g_proxy) != 0) {
+            serverLog(LL_WARNING, "failed to enable vemb_v16 uds transport");
+            goto cleanup;
+        }
+    } else {
         if (vemb_v16_proxy_enable_tcp(g_proxy, tcp_host, tcp_port) != 0) {
             serverLog(LL_WARNING, "failed to enable vemb_v16 tcp transport");
             goto cleanup;
