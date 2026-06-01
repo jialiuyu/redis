@@ -36,6 +36,8 @@ typedef struct bench_cfg {
     const char *socket_path;
     const char *tcp_host;
     char socket_paths[VEMB_V16_BENCH_MAX_NODES][VEMB_V16_BENCH_PATH_MAX];
+    char tcp_hosts[VEMB_V16_BENCH_MAX_NODES][VEMB_V16_BENCH_PATH_MAX];
+    uint16_t tcp_ports[VEMB_V16_BENCH_MAX_NODES];
     uint32_t node_count;
     bench_hash_node_t hash_nodes[
         VEMB_V16_BENCH_MAX_NODES * VEMB_V16_BENCH_HASH_VNODES];
@@ -112,6 +114,7 @@ typedef struct pending_req {
     uint32_t op_index;
     uint32_t key_id;
     uint32_t node_index;
+    int expect_inline_vector;
 } pending_req_t;
 
 static const char *mode_name(int mode);
@@ -198,11 +201,30 @@ static int alloc_channel_path(const char *socket_path,
     return alloc_channel(&node_cfg, desc);
 }
 
+static const char *tcp_host_for_node(const bench_cfg_t *cfg,
+                                     uint32_t node_index) {
+    if (node_index < VEMB_V16_BENCH_MAX_NODES &&
+        cfg->tcp_hosts[node_index][0]) {
+        return cfg->tcp_hosts[node_index];
+    }
+    return cfg->tcp_host;
+}
+
+static uint16_t tcp_port_for_node(const bench_cfg_t *cfg,
+                                  uint32_t node_index) {
+    if (node_index < VEMB_V16_BENCH_MAX_NODES &&
+        cfg->tcp_ports[node_index] != 0) {
+        return cfg->tcp_ports[node_index];
+    }
+    return cfg->tcp_port;
+}
+
 static int alloc_tcp_channel(const bench_cfg_t *cfg,
+                             uint32_t node_index,
                              vemb_v16_channel_desc_t *desc,
                              int *net_fd) {
-    int fd = vemb_v16_net_connect(cfg->tcp_host,
-                                  cfg->tcp_port,
+    int fd = vemb_v16_net_connect(tcp_host_for_node(cfg, node_index),
+                                  tcp_port_for_node(cfg, node_index),
                                   cfg->timeout_ms);
     if (fd < 0) return -1;
     vemb_v16_alloc_req_t req = {.vector_dim = cfg->dim};
@@ -264,9 +286,11 @@ static int tcp_control_request(const char *host,
     return 0;
 }
 
-static int fetch_stats_tcp(const bench_cfg_t *cfg, vemb_v16_stats_t *stats) {
-    return tcp_control_request(cfg->tcp_host,
-                               cfg->tcp_port,
+static int fetch_stats_tcp(const bench_cfg_t *cfg,
+                           uint32_t node_index,
+                           vemb_v16_stats_t *stats) {
+    return tcp_control_request(tcp_host_for_node(cfg, node_index),
+                               tcp_port_for_node(cfg, node_index),
                                cfg->timeout_ms,
                                VEMB_V16_NET_STATS,
                                0,
@@ -293,10 +317,12 @@ static int close_channel_tcp(const char *host,
     return status.status == VEMB_V16_STATUS_OK ? 0 : -1;
 }
 
-static int close_all_channels_tcp(const bench_cfg_t *cfg, uint64_t *closed) {
+static int close_all_channels_tcp(const bench_cfg_t *cfg,
+                                  uint32_t node_index,
+                                  uint64_t *closed) {
     vemb_v16_net_status_t status;
-    if (tcp_control_request(cfg->tcp_host,
-                            cfg->tcp_port,
+    if (tcp_control_request(tcp_host_for_node(cfg, node_index),
+                            tcp_port_for_node(cfg, node_index),
                             cfg->timeout_ms,
                             VEMB_V16_NET_CLOSE_ALL_CHANNELS,
                             0,
@@ -668,7 +694,9 @@ static void *worker_main(void *arg) {
     }
     uint32_t inline_vector_cap = w->cfg.dim * sizeof(float);
     uint8_t *inline_vector = NULL;
-    if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR) {
+    if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR ||
+        (w->cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
+         w->cfg.mode == MODE_MIXED_80R20W)) {
         inline_vector = zmalloc(inline_vector_cap);
         if (!inline_vector) {
             zfree(pending);
@@ -697,6 +725,7 @@ static void *worker_main(void *arg) {
             int send_failed = 0;
             int mixed_write = w->cfg.mode == MODE_MIXED_80R20W &&
                               (i % 5u) == 0;
+            int expect_inline_vector = 0;
             uint8_t op = (w->cfg.mode == MODE_VEMB_SUPERNODE_READ ||
                           w->cfg.mode == MODE_MIXED_80R20W) ?
                 VEMB_V16_OP_VEMB_SUPERNODE_READ : VEMB_V16_OP_VEMB_HANDLE;
@@ -737,8 +766,12 @@ static void *worker_main(void *arg) {
                 bench_node_channel_t *node = &w->nodes[node_index];
                 prepare_req(&req, op, i + 1, node->desc.channel_id, key,
                             w->cfg.dim);
-                if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR)
+                if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR ||
+                    (w->cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
+                     w->cfg.mode == MODE_MIXED_80R20W)) {
                     req.flags |= VEMB_V16_REQ_F_INLINE_VECTOR;
+                    expect_inline_vector = 1;
+                }
                 w->vemb_sent++;
                 if (send_channel_req(node, &req, req_len,
                                      &w->request_publish_spins,
@@ -757,6 +790,7 @@ static void *worker_main(void *arg) {
             }
             pending[pending_tail].op_index = i;
             pending[pending_tail].key_id = key_id;
+            pending[pending_tail].expect_inline_vector = expect_inline_vector;
             pending_tail = (pending_tail + 1) % pipeline;
             pending_count++;
             sent++;
@@ -814,7 +848,7 @@ static void *worker_main(void *arg) {
             for (uint32_t j = 0; j < resp.vector_bytes; j += 64)
                 checksum ^= p[j];
             w->read_bytes += resp.vector_bytes + checksum * 0u;
-        } else if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR) {
+        } else if (done_req.expect_inline_vector) {
             if (inline_vector_bytes != resp.vector_bytes ||
                 resp.vector_bytes != inline_vector_cap) {
                 fprintf(stderr, "worker %d invalid inline vector at op=%u bytes=%u expected=%u resp_bytes=%u\n",
@@ -864,6 +898,14 @@ static const char *mode_name(int mode) {
     case MODE_MIXED_80R20W: return "mixed-80r20w";
     default: return "unknown";
     }
+}
+
+static int mode_is_read(int mode) {
+    return mode == MODE_VEMB_HANDLE ||
+           mode == MODE_VEMB_READ_VECTOR ||
+           mode == MODE_VEMB_INLINE_VECTOR ||
+           mode == MODE_VEMB_SUPERNODE_READ ||
+           mode == MODE_MIXED_80R20W;
 }
 
 static int append_thread_count(int **threads,
@@ -959,6 +1001,51 @@ static int parse_socket_list(bench_cfg_t *cfg, const char *arg) {
     return build_hash_ring(cfg);
 }
 
+static int parse_endpoint_list(bench_cfg_t *cfg, const char *arg) {
+    if (!cfg || !arg || !arg[0])
+        return -1;
+    cfg->node_count = 0;
+    const char *p = arg;
+    while (*p) {
+        if (cfg->node_count >= VEMB_V16_BENCH_MAX_NODES)
+            return -1;
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == 0 || len >= VEMB_V16_BENCH_PATH_MAX)
+            return -1;
+        const char *colon = NULL;
+        for (const char *q = p; q < p + len; q++) {
+            if (*q == ':') colon = q;
+        }
+        if (!colon || colon == p || colon + 1 >= p + len)
+            return -1;
+        size_t host_len = (size_t)(colon - p);
+        size_t port_len = len - host_len - 1;
+        if (host_len >= VEMB_V16_BENCH_PATH_MAX || port_len == 0)
+            return -1;
+        char port_buf[16];
+        if (port_len >= sizeof(port_buf))
+            return -1;
+        memcpy(cfg->tcp_hosts[cfg->node_count], p, host_len);
+        cfg->tcp_hosts[cfg->node_count][host_len] = '\0';
+        memcpy(port_buf, colon + 1, port_len);
+        port_buf[port_len] = '\0';
+        char *end = NULL;
+        unsigned long port = strtoul(port_buf, &end, 10);
+        if (!end || *end != '\0' || port == 0 || port > UINT16_MAX)
+            return -1;
+        cfg->tcp_ports[cfg->node_count] = (uint16_t)port;
+        cfg->node_count++;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    if (cfg->node_count == 0)
+        return -1;
+    cfg->tcp_host = cfg->tcp_hosts[0];
+    cfg->tcp_port = cfg->tcp_ports[0];
+    return build_hash_ring(cfg);
+}
+
 static void print_stats_delta(const vemb_v16_stats_t *before,
                               const vemb_v16_stats_t *after) {
 #define D(field) (unsigned long long)(after->field - before->field)
@@ -1014,7 +1101,7 @@ static int fetch_stats_for_node(const bench_cfg_t *cfg,
                                 uint32_t node_index,
                                 vemb_v16_stats_t *stats) {
     if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP)
-        return fetch_stats_tcp(cfg, stats);
+        return fetch_stats_tcp(cfg, node_index, stats);
     return fetch_stats(cfg->socket_paths[node_index], stats);
 }
 
@@ -1022,7 +1109,7 @@ static int close_all_for_node(const bench_cfg_t *cfg,
                               uint32_t node_index,
                               uint64_t *closed) {
     if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP)
-        return close_all_channels_tcp(cfg, closed);
+        return close_all_channels_tcp(cfg, node_index, closed);
     return close_all_channels(cfg->socket_paths[node_index], closed);
 }
 
@@ -1070,11 +1157,11 @@ static int setup_node_channel(const bench_cfg_t *cfg,
     memset(node, 0, sizeof(*node));
     node->net_fd = -1;
     node->transport_type = cfg->transport_type;
-    node->tcp_host = cfg->tcp_host;
-    node->tcp_port = cfg->tcp_port;
+    node->tcp_host = tcp_host_for_node(cfg, node_index);
+    node->tcp_port = tcp_port_for_node(cfg, node_index);
     node->timeout_ms = cfg->timeout_ms;
     if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
-        if (alloc_tcp_channel(cfg, &node->desc, &node->net_fd) != 0) {
+        if (alloc_tcp_channel(cfg, node_index, &node->desc, &node->net_fd) != 0) {
             close_node_channel(cfg->socket_paths[node_index], node);
             return -1;
         }
@@ -1102,8 +1189,10 @@ static int run_once(bench_cfg_t cfg) {
     bench_node_channel_t pre_nodes[VEMB_V16_BENCH_MAX_NODES];
     memset(pre_nodes, 0, sizeof(pre_nodes));
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
-        cfg.mode == MODE_VEMB_READ_VECTOR) {
-        fprintf(stderr, "vemb-read-vector requires shm vector-region mmap; use vemb-handle or vemb-supernode-read with --transport tcp\n");
+        mode_is_read(cfg.mode) &&
+        cfg.mode != MODE_VEMB_INLINE_VECTOR &&
+        cfg.mode != MODE_MIXED_80R20W) {
+        fprintf(stderr, "tcp transport read modes require --mode vemb-inline-vector or --mode mixed-80r20w\n");
         return 1;
     }
     if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
@@ -1264,6 +1353,8 @@ int main(int argc, char **argv) {
     };
     cfg.node_count = 1;
     strncpy(cfg.socket_paths[0], cfg.socket_path, sizeof(cfg.socket_paths[0]) - 1);
+    strncpy(cfg.tcp_hosts[0], cfg.tcp_host, sizeof(cfg.tcp_hosts[0]) - 1);
+    cfg.tcp_ports[0] = cfg.tcp_port;
     build_hash_ring(&cfg);
 
     for (int i = 1; i < argc; i++) {
@@ -1281,13 +1372,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
+        else if (!strcmp(argv[i], "--endpoints") && i + 1 < argc) {
+            if (parse_endpoint_list(&cfg, argv[++i]) != 0) {
+                fprintf(stderr, "invalid endpoint list\n");
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
             const char *transport = argv[++i];
             if (!strcmp(transport, "aeron")) {
                 cfg.transport_type = VEMB_V16_TRANSPORT_AERON;
             } else if (!strcmp(transport, "tcp")) {
                 cfg.transport_type = VEMB_V16_TRANSPORT_TCP;
-                cfg.node_count = 1;
             } else {
                 fprintf(stderr, "invalid transport: %s\n", transport);
                 return 1;
@@ -1296,10 +1392,14 @@ int main(int argc, char **argv) {
         else if ((!strcmp(argv[i], "--host") ||
                   !strcmp(argv[i], "--tcp-host")) && i + 1 < argc) {
             cfg.tcp_host = argv[++i];
+            strncpy(cfg.tcp_hosts[0], cfg.tcp_host,
+                    sizeof(cfg.tcp_hosts[0]) - 1);
+            cfg.tcp_hosts[0][sizeof(cfg.tcp_hosts[0]) - 1] = '\0';
         }
         else if ((!strcmp(argv[i], "--port") ||
                   !strcmp(argv[i], "--tcp-port")) && i + 1 < argc) {
             cfg.tcp_port = (uint16_t)strtoul(argv[++i], NULL, 10);
+            cfg.tcp_ports[0] = cfg.tcp_port;
         }
         else if (!strcmp(argv[i], "--dim") && i + 1 < argc) cfg.dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -1327,7 +1427,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
             return 0;
         }
         else {
@@ -1335,20 +1435,41 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP)
-        cfg.node_count = 1;
     g_control_timeout_ms = cfg.timeout_ms;
-    for (uint32_t n = 0; n < cfg.node_count; n++) {
-        uint64_t closed = 0;
-        if (close_all_for_node(&cfg, n, &closed) == 0 && closed)
-            printf("[setup] node=%u closed stale channels=%llu\n",
-                   n, (unsigned long long)closed);
-    }
     if (cfg.mode < 0 ||
         cfg.pipeline == 0 || cfg.pipeline > VEMB_V16_CLIENT_RING_SIZE ||
         cfg.node_count == 0 || cfg.node_count > VEMB_V16_BENCH_MAX_NODES) {
         fprintf(stderr, "invalid arguments\n");
         return 1;
+    }
+    if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
+        mode_is_read(cfg.mode) &&
+        cfg.mode != MODE_VEMB_INLINE_VECTOR &&
+        cfg.mode != MODE_MIXED_80R20W) {
+        fprintf(stderr, "tcp transport read modes require --mode vemb-inline-vector or --mode mixed-80r20w\n");
+        return 1;
+    }
+    if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
+        cfg.mode == MODE_VEMB_INLINE_VECTOR) {
+        fprintf(stderr, "vemb-inline-vector requires --transport tcp\n");
+        return 1;
+    }
+    for (uint32_t n = 0; n < cfg.node_count; n++) {
+        if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP) {
+            if (!cfg.tcp_hosts[n][0] || cfg.tcp_ports[n] == 0) {
+                fprintf(stderr, "tcp multi-node requires --endpoints HOST:PORT[,HOST:PORT...]\n");
+                return 1;
+            }
+        } else if (!cfg.socket_paths[n][0]) {
+            fprintf(stderr, "aeron multi-node requires --sockets PATH[,PATH...]\n");
+            return 1;
+        }
+    }
+    for (uint32_t n = 0; n < cfg.node_count; n++) {
+        uint64_t closed = 0;
+        if (close_all_for_node(&cfg, n, &closed) == 0 && closed)
+            printf("[setup] node=%u closed stale channels=%llu\n",
+                   n, (unsigned long long)closed);
     }
 
     int *thread_list = NULL;
