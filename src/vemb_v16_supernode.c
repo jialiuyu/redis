@@ -6,6 +6,7 @@
 #include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
 #include "redisassert.h"
+#include "sve_similarity.h"
 #include "zmalloc.h"
 
 #include <stdlib.h>
@@ -109,7 +110,32 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
             completion.vector_offset = handle.offset;
             completion.vector_bytes = handle.bytes;
             completion.region_id = handle.region_id;
-            if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
+            if (job->op == VEMB_V16_OP_VSIM_KEY_KEY) {
+                uint32_t warm_slot2 = 0;
+                vemb_v16_vector_handle_t handle2 = {0};
+                if (vemb_v16_tlc_get_handle(tlc, job->key2, job->key2_len,
+                                            job->key2_hash, &handle2,
+                                            &warm_slot2) != 0) {
+                    completion.status = VEMB_V16_STATUS_NOT_FOUND;
+                    atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
+                                              memory_order_relaxed);
+                } else if (!storage->vector_region ||
+                           handle.offset > storage->vector_region_size ||
+                           handle.bytes > storage->vector_region_size - handle.offset ||
+                           handle2.offset > storage->vector_region_size ||
+                           handle2.bytes > storage->vector_region_size - handle2.offset ||
+                           handle.bytes != job->vector_bytes ||
+                           handle2.bytes != job->vector_bytes) {
+                    completion.status = VEMB_V16_STATUS_ERR;
+                } else {
+                    const float *v1 =
+                        (const float *)(const void *)(storage->vector_region + handle.offset);
+                    const float *v2 =
+                        (const float *)(const void *)(storage->vector_region + handle2.offset);
+                    completion.score = sve_cosine_similarity_f32(v1, v2, job->dim);
+                }
+                (void)warm_slot2;
+            } else if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
                 if (*read_result_bytes < job->vector_bytes) {
                     float *next = zrealloc(*read_result, job->vector_bytes);
                     if (!next) {
@@ -158,8 +184,13 @@ vemb_read_done:
                                   lookup_ns,
                                   memory_order_relaxed);
     }
-    atomic_fetch_add_explicit(&ctx->stats->vemb_requests, 1,
-                              memory_order_relaxed);
+    if (job->op == VEMB_V16_OP_VSIM_KEY_KEY) {
+        atomic_fetch_add_explicit(&ctx->stats->vsim_requests, 1,
+                                  memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&ctx->stats->vemb_requests, 1,
+                                  memory_order_relaxed);
+    }
     vemb_v16_publish_completion(ctx,
                                 &completion,
                                 sample ? monotonic_ns() : 0,
@@ -198,6 +229,33 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
             completion.region_id = handle.region_id;
         }
         atomic_fetch_add_explicit(&ctx->stats->vadd_requests, 1,
+                                  memory_order_relaxed);
+    } else if (job->op == VEMB_V16_OP_VSIM_INLINE) {
+        uint32_t warm_slot = 0;
+        vemb_v16_vector_handle_t handle = {0};
+        if (job->dim != tlc->vector_dim ||
+            job->vector_bytes != tlc->value_size ||
+            vemb_v16_tlc_get_handle(tlc, job->key, job->key_len,
+                                    job->key_hash, &handle, &warm_slot) != 0) {
+            completion.status = VEMB_V16_STATUS_NOT_FOUND;
+            atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
+                                      memory_order_relaxed);
+        } else if (!storage->vector_region ||
+                   handle.offset > storage->vector_region_size ||
+                   handle.bytes > storage->vector_region_size - handle.offset ||
+                   handle.bytes != job->vector_bytes) {
+            completion.status = VEMB_V16_STATUS_ERR;
+        } else {
+            const float *stored =
+                (const float *)(const void *)(storage->vector_region + handle.offset);
+            completion.vector_offset = handle.offset;
+            completion.vector_bytes = handle.bytes;
+            completion.region_id = handle.region_id;
+            completion.score = sve_cosine_similarity_f32(stored,
+                                                         vadd_job->vector,
+                                                         job->dim);
+        }
+        atomic_fetch_add_explicit(&ctx->stats->vsim_requests, 1,
                                   memory_order_relaxed);
     } else {
         completion.status = VEMB_V16_STATUS_ERR;

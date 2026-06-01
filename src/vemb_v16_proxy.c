@@ -154,6 +154,7 @@ static void stats_add_channel_counters(vemb_v16_stats_t *dst,
     dst->total_requests += counter_load(&src->total_requests);
     dst->vadd_requests += counter_load(&src->vadd_requests);
     dst->vemb_requests += counter_load(&src->vemb_requests);
+    dst->vsim_requests += counter_load(&src->vsim_requests);
     dst->not_found += counter_load(&src->not_found);
     dst->published_jobs += counter_load(&src->published_jobs);
     dst->completed_jobs += counter_load(&src->completed_jobs);
@@ -182,6 +183,7 @@ static void stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->total_requests += src->total_requests;
     dst->vadd_requests += src->vadd_requests;
     dst->vemb_requests += src->vemb_requests;
+    dst->vsim_requests += src->vsim_requests;
     dst->not_found += src->not_found;
     dst->published_jobs += src->published_jobs;
     dst->completed_jobs += src->completed_jobs;
@@ -489,6 +491,7 @@ void vemb_v16_make_response_from(vemb_v16_resp_t *resp,
         .vector_bytes = completion->vector_bytes,
         .dim = completion->dim,
         .region_id = completion->region_id,
+        .score = completion->score,
     };
 }
 
@@ -587,12 +590,16 @@ static void fill_job_base(vemb_v16_job_base_t *base,
         .req_id = req->req_id,
         .channel_index = ch->index,
         .key_len = key_len,
+        .key2_len = req->key2_len,
         .channel_id = ch->channel_id,
         .key_hash = req->key_hash,
+        .key2_hash = req->key2_hash,
         .dim = req->dim,
         .vector_bytes = req->vector_bytes,
     };
     memcpy(base->key, req->key, key_len);
+    if (req->key2_len)
+        memcpy(base->key2, req->key2, req->key2_len);
 }
 
 static int publish_request_job(vemb_v16_channel_t *ch,
@@ -600,26 +607,29 @@ static int publish_request_job(vemb_v16_channel_t *ch,
                                uint32_t key_len,
                                uint32_t proxy_io_worker_id) {
     int is_vadd = req->op == VEMB_V16_OP_VADD_INLINE;
+    int is_vsim = req->op == VEMB_V16_OP_VSIM_INLINE;
+    int has_inline_vector = is_vadd || is_vsim;
     int is_vemb = req->op == VEMB_V16_OP_VEMB_HANDLE ||
-        req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ;
-    RETURN_IF(!is_vadd && !is_vemb, -1);
+        req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ ||
+        req->op == VEMB_V16_OP_VSIM_KEY_KEY;
+    RETURN_IF(!has_inline_vector && !is_vemb, -1);
 
-    void *job = zmalloc(is_vadd ?
+    void *job = zmalloc(has_inline_vector ?
         sizeof(vemb_v16_vadd_job_t) : sizeof(vemb_v16_vemb_job_t));
     RETURN_IF(!job, -1);
 
     fill_job_base((vemb_v16_job_base_t *)job, ch, req, key_len);
-    if (is_vadd) {
+    if (has_inline_vector) {
         memcpy(((vemb_v16_vadd_job_t *)job)->vector,
                req->vector,
                req->vector_bytes);
     }
 
-    vemb_v16_shard_queue_t *queues = is_vadd ?
+    vemb_v16_shard_queue_t *queues = has_inline_vector ?
         ch->proxy->vadd_shard_queues : ch->proxy->vemb_shard_queues;
-    atomic_uint_fast64_t *ring_full_counter = is_vadd ?
+    atomic_uint_fast64_t *ring_full_counter = has_inline_vector ?
         &ch->stats.proxy_vadd_ring_full : &ch->stats.proxy_vemb_ring_full;
-    atomic_uint_fast64_t *publish_counter = is_vadd ?
+    atomic_uint_fast64_t *publish_counter = has_inline_vector ?
         &ch->stats.proxy_vadd_publish : &ch->stats.proxy_vemb_publish;
 
     int rc = publish_shard_job(ch,
@@ -650,8 +660,13 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         req->channel_id != ch->channel_id) {
         goto error_response;
     }
+    if (req->op == VEMB_V16_OP_VSIM_KEY_KEY &&
+        (req->key2_len == 0 || req->key2_len > VEMB_V16_MAX_KEY_LEN)) {
+        goto error_response;
+    }
 
-    size_t min_len = req->op == VEMB_V16_OP_VADD_INLINE ?
+    size_t min_len = (req->op == VEMB_V16_OP_VADD_INLINE ||
+                      req->op == VEMB_V16_OP_VSIM_INLINE) ?
         vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "sve_config.h"
+#include "sve_similarity.h"
 
 /* SVE Configuration */
 #define SVE_MAX_VECTOR_LENGTH 256  /* Maximum SVE vector length in bits */
@@ -106,8 +107,6 @@ int sve_compute_similarity(sve_context_t *ctx,
                           size_t num_indices,
                           size_t embedding_dim,
                           float *similarities);
-
-float sve_cosine_similarity_f32(const float *a, const float *b, size_t dim);
 
 /* Non-temporal Memory Access (Streaming) */
 int sve_streaming_load_f32(sve_context_t *ctx,

@@ -188,10 +188,11 @@ int main(int argc, char **argv) {
     ret = vemb_v16_proxy_run(g_proxy);
     vemb_v16_stats_t stats;
     vemb_v16_proxy_get_stats(g_proxy, &stats);
-    serverLog(LL_NOTICE, "vemb_v16 stats: total=%llu vadd=%llu vemb=%llu not_found=%llu published=%llu completed=%llu active_channels=%llu",
+    serverLog(LL_NOTICE, "vemb_v16 stats: total=%llu vadd=%llu vemb=%llu vsim=%llu not_found=%llu published=%llu completed=%llu active_channels=%llu",
            (unsigned long long)stats.total_requests,
            (unsigned long long)stats.vadd_requests,
            (unsigned long long)stats.vemb_requests,
+           (unsigned long long)stats.vsim_requests,
            (unsigned long long)stats.not_found,
            (unsigned long long)stats.published_jobs,
            (unsigned long long)stats.completed_jobs,

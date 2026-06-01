@@ -13,6 +13,7 @@ typedef struct vemb_v16_channel_counters {
     atomic_uint_fast64_t total_requests;
     atomic_uint_fast64_t vadd_requests;
     atomic_uint_fast64_t vemb_requests;
+    atomic_uint_fast64_t vsim_requests;
     atomic_uint_fast64_t not_found;
     atomic_uint_fast64_t published_jobs;
     atomic_uint_fast64_t completed_jobs;

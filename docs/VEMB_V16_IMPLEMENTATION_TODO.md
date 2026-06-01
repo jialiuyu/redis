@@ -210,6 +210,153 @@ Bench 机器连接远端节点：
 - 跨机器运行时需要放通 server 端 `--tcp-port`，例如 `6391`。
 - `--transport aeron` 的 multi-node 使用 `--sockets PATH[,PATH...]`，当前适合同机 UDS + SHM/Aeron ring；跨机器 Aeron 需要后续 `aeron-over-UB` 设计。
 
+## VSIM inline / key-key 设计
+
+当前先落地两类 VSIM：
+
+```text
+VSIM key, other_vector_inline_data
+VSIM key1, key2
+```
+
+`VSIM key, other_vector_inline_data` 对应 bench 模式：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
+  --mode vsim-inline \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+语义：
+
+```text
+bench routes key by consistent hash
+SuperNode lookup vector(key)
+SuperNode computes cosine(vector(key), other_vector_inline_data)
+response returns score
+```
+
+`VSIM key1, key2` 对应 bench 模式：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
+  --mode vsim-key-key \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+P0 约束：
+
+- `VSIM key1, key2` 只支持同分片执行。
+- bench 先用 `key1` 做 consistent hash 得到目标 node，再在 `prefill` 范围内选择同 node 的 `key2`。
+- 如果没有找到同 node 的 `key2`，bench 会退回使用 `key1` 自身作为 `key2`，保证请求仍在单 SuperNode 内闭环。
+- Server 不做跨 SuperNode fanout；Proxy 仍不做 hash。
+
+服务端执行：
+
+```text
+SuperNode lookup vector(key1)
+SuperNode lookup vector(key2)
+SuperNode computes cosine(vector(key1), vector(key2))
+response returns score
+```
+
+cosine 计算统一使用轻量抽取出的 `sve_cosine_similarity_f32()`。该函数位于 `sve_similarity.c/.h`，避免 standalone `vemb_v16_server` 链接完整 `sve_compute.c` 时引入 Redis runtime / SDS / Lua 依赖。
+
+### VSIM 测试指令
+
+先启动一个 TCP standalone server，用于本机 smoke：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6400 \
+  --proxy-io-threads 1 \
+  --supernode-workers 1 \
+  --vector-region /v16vsim \
+  --region-id 100 \
+  --warm-backend shm \
+  --dim 8 \
+  --max-vectors 128 \
+  --loglevel warning
+```
+
+场景一：`VSIM key, other_vector_inline_data`。bench 通过 `key` 路由到目标 proxy/SuperNode，请求体携带另一个完整 inline vector，server 返回 cosine score：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6400 \
+  --mode vsim-inline \
+  --dim 8 \
+  --prefill 16 \
+  --ops 16 \
+  --threads 1 \
+  --pipeline 1 \
+  --timeout-ms 5000
+```
+
+场景二：`VSIM key1, key2`。bench 保证 `key2` 与 `key1` 命中同一个 endpoint，server 在同 SuperNode 内读取两个 vector 并返回 cosine score：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6400 \
+  --mode vsim-key-key \
+  --dim 8 \
+  --prefill 16 \
+  --ops 16 \
+  --threads 1 \
+  --pipeline 1 \
+  --timeout-ms 5000
+```
+
+多 proxy/SuperNode 压测时，将 `--endpoints` 改成实际 server 列表即可；bench 侧继续使用 consistent hash 分片：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
+  --mode vsim-inline \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
+  --mode vsim-key-key \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+后续跨分片 `VSIM key1, key2` 有三种可选路线：
+
+- client-side join：bench/CLI 分别向两个节点取 vector，本地计算 cosine。
+- coordinator proxy：key1 所在 proxy 远程请求 key2 所在 proxy，再在 coordinator 计算。
+- UB shared read：依赖后续 `aeron-over-UB` / region map，让 coordinator 可读取远端 WARM region。
+
 关键观察项：
 
 - `request_publish_spins` 高：client -> proxy request ring 消费不及时。

@@ -61,6 +61,8 @@ enum vemb_v16_data_op {
     VEMB_V16_OP_VADD_INLINE = 0x10,
     VEMB_V16_OP_VEMB_HANDLE = 0x20,
     VEMB_V16_OP_VEMB_SUPERNODE_READ = 0x21,
+    VEMB_V16_OP_VSIM_INLINE = 0x30,
+    VEMB_V16_OP_VSIM_KEY_KEY = 0x31,
 };
 
 typedef struct vemb_v16_alloc_req {
@@ -112,10 +114,13 @@ typedef struct vemb_v16_req {
     uint64_t channel_id;
     uint64_t key_hash;
     uint32_t key_len;
+    uint32_t key2_len;
+    uint64_t key2_hash;
     uint32_t dim;
     uint32_t vector_bytes;
     uint32_t reserved1;
     char key[VEMB_V16_MAX_KEY_LEN];
+    char key2[VEMB_V16_MAX_KEY_LEN];
     float vector[VEMB_V16_MAX_DIM];
 } vemb_v16_req_t;
 
@@ -129,13 +134,14 @@ typedef struct vemb_v16_resp {
     uint32_t vector_bytes;
     uint32_t dim;
     uint32_t region_id;
-    uint32_t reserved;
+    float score;
 } vemb_v16_resp_t;
 
 typedef struct vemb_v16_stats {
     uint64_t total_requests;
     uint64_t vadd_requests;
     uint64_t vemb_requests;
+    uint64_t vsim_requests;
     uint64_t not_found;
     uint64_t published_jobs;
     uint64_t completed_jobs;

@@ -91,8 +91,10 @@ typedef struct worker_arg {
     uint64_t read_bytes;
     uint64_t vemb_sent;
     uint64_t vadd_sent;
+    uint64_t vsim_sent;
     uint64_t request_publish_spins;
     uint64_t response_empty_polls;
+    double score_sum;
     uint64_t ns;
     atomic_int stop;
     atomic_int done;
@@ -106,6 +108,8 @@ enum {
     MODE_VEMB_SUPERNODE_READ = 4,
     MODE_MIXED_80R20W = 5,
     MODE_VEMB_INLINE_VECTOR = 6,
+    MODE_VSIM_INLINE = 7,
+    MODE_VSIM_KEY_KEY = 8,
 };
 
 static uint32_t g_control_timeout_ms = 10000;
@@ -540,6 +544,12 @@ static void prepare_req(vemb_v16_req_t *req,
     memcpy(req->key, key, req->key_len);
 }
 
+static void prepare_req_key2(vemb_v16_req_t *req, const char *key2) {
+    req->key2_len = (uint32_t)strlen(key2);
+    req->key2_hash = vemb_v16_murmur3(key2, req->key2_len);
+    memcpy(req->key2, key2, req->key2_len);
+}
+
 static int send_req(vemb_v16_client_ring_t *ring, const vemb_v16_req_t *req, size_t len,
                     uint64_t *publish_spins, uint32_t timeout_ms) {
     uint64_t spins = 0;
@@ -760,6 +770,52 @@ static void *worker_main(void *arg) {
                     send_failed = 1;
                 }
                 pending[pending_tail].node_index = node_index;
+            } else if (w->cfg.mode == MODE_VSIM_INLINE) {
+                make_key(key, sizeof(key), key_id);
+                uint32_t node_index = route_key(&w->cfg, key);
+                bench_node_channel_t *node = &w->nodes[node_index];
+                prepare_req(&req, VEMB_V16_OP_VSIM_INLINE, i + 1,
+                            node->desc.channel_id, key, w->cfg.dim);
+                fill_vector(req.vector, w->cfg.dim, global_id + 0x9e3779b9u);
+                req_len = vemb_v16_req_inline_len(req.vector_bytes);
+                w->vsim_sent++;
+                if (send_channel_req(node, &req, req_len,
+                                     &w->request_publish_spins,
+                                     w->cfg.timeout_ms) != 0) {
+                    fprintf(stderr, "worker %d request publish timeout at op=%u mode=vsim-inline key_id=%u\n",
+                            w->tid, i, key_id);
+                    send_failed = 1;
+                }
+                pending[pending_tail].node_index = node_index;
+            } else if (w->cfg.mode == MODE_VSIM_KEY_KEY) {
+                make_key(key, sizeof(key), key_id);
+                uint32_t node_index = route_key(&w->cfg, key);
+                uint32_t key2_id = key_id;
+                char key2[VEMB_V16_MAX_KEY_LEN];
+                if (w->cfg.prefill > 1) {
+                    for (uint32_t step = 1; step < w->cfg.prefill; step++) {
+                        uint32_t candidate = (key_id + step) % w->cfg.prefill;
+                        make_key(key2, sizeof(key2), candidate);
+                        if (route_key(&w->cfg, key2) == node_index) {
+                            key2_id = candidate;
+                            break;
+                        }
+                    }
+                }
+                make_key(key2, sizeof(key2), key2_id);
+                bench_node_channel_t *node = &w->nodes[node_index];
+                prepare_req(&req, VEMB_V16_OP_VSIM_KEY_KEY, i + 1,
+                            node->desc.channel_id, key, w->cfg.dim);
+                prepare_req_key2(&req, key2);
+                w->vsim_sent++;
+                if (send_channel_req(node, &req, req_len,
+                                     &w->request_publish_spins,
+                                     w->cfg.timeout_ms) != 0) {
+                    fprintf(stderr, "worker %d request publish timeout at op=%u mode=vsim-key-key key_id=%u key2_id=%u\n",
+                            w->tid, i, key_id, key2_id);
+                    send_failed = 1;
+                }
+                pending[pending_tail].node_index = node_index;
             } else {
                 make_key(key, sizeof(key), key_id);
                 uint32_t node_index = route_key(&w->cfg, key);
@@ -864,6 +920,9 @@ static void *worker_main(void *arg) {
             for (uint32_t j = 0; j < inline_vector_bytes; j += 64)
                 checksum ^= inline_vector[j];
             w->read_bytes += inline_vector_bytes + checksum * 0u;
+        } else if (w->cfg.mode == MODE_VSIM_INLINE ||
+                   w->cfg.mode == MODE_VSIM_KEY_KEY) {
+            w->score_sum += (double)resp.score;
         }
         w->ok++;
         completed++;
@@ -884,6 +943,8 @@ static int mode_from_string(const char *s) {
     if (!strcmp(s, "vemb-supernode-read")) return MODE_VEMB_SUPERNODE_READ;
     if (!strcmp(s, "vadd-inline")) return MODE_VADD_INLINE;
     if (!strcmp(s, "mixed-80r20w")) return MODE_MIXED_80R20W;
+    if (!strcmp(s, "vsim-inline")) return MODE_VSIM_INLINE;
+    if (!strcmp(s, "vsim-key-key")) return MODE_VSIM_KEY_KEY;
     return -1;
 }
 
@@ -896,6 +957,8 @@ static const char *mode_name(int mode) {
     case MODE_VEMB_SUPERNODE_READ: return "vemb-supernode-read";
     case MODE_VADD_INLINE: return "vadd-inline";
     case MODE_MIXED_80R20W: return "mixed-80r20w";
+    case MODE_VSIM_INLINE: return "vsim-inline";
+    case MODE_VSIM_KEY_KEY: return "vsim-key-key";
     default: return "unknown";
     }
 }
@@ -1049,8 +1112,9 @@ static int parse_endpoint_list(bench_cfg_t *cfg, const char *arg) {
 static void print_stats_delta(const vemb_v16_stats_t *before,
                               const vemb_v16_stats_t *after) {
 #define D(field) (unsigned long long)(after->field - before->field)
-    printf("[stats] total=%llu vadd=%llu vemb=%llu not_found=%llu published=%llu completed=%llu active_channels=%llu\n",
+    printf("[stats] total=%llu vadd=%llu vemb=%llu vsim=%llu not_found=%llu published=%llu completed=%llu active_channels=%llu\n",
            D(total_requests), D(vadd_requests), D(vemb_requests),
+           D(vsim_requests),
            D(not_found), D(published_jobs), D(completed_jobs),
            (unsigned long long)after->active_channels);
     printf("[stats] proxy request_poll=%llu completion_poll=%llu vemb_publish=%llu vadd_publish=%llu response_publish=%llu\n",
@@ -1289,8 +1353,9 @@ static int run_once(bench_cfg_t cfg) {
         pthread_join(threads[i], NULL);
     uint64_t wall = now_ns() - start;
 
-    uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0, vadd_sent = 0;
+    uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0, vadd_sent = 0, vsim_sent = 0;
     uint64_t request_publish_spins = 0, response_empty_polls = 0;
+    double score_sum = 0.0;
     uint64_t max_ns = 0;
     for (int i = 0; i < cfg.threads; i++) {
         ok += args[i].ok;
@@ -1298,8 +1363,10 @@ static int run_once(bench_cfg_t cfg) {
         read_bytes += args[i].read_bytes;
         vemb_sent += args[i].vemb_sent;
         vadd_sent += args[i].vadd_sent;
+        vsim_sent += args[i].vsim_sent;
         request_publish_spins += args[i].request_publish_spins;
         response_empty_polls += args[i].response_empty_polls;
+        score_sum += args[i].score_sum;
         if (args[i].ns > max_ns) max_ns = args[i].ns;
     }
     uint64_t total_ops = ok + fail;
@@ -1316,11 +1383,13 @@ static int run_once(bench_cfg_t cfg) {
     printf("[client] request_publish_spins=%llu response_empty_polls=%llu\n",
            (unsigned long long)request_publish_spins,
            (unsigned long long)response_empty_polls);
-    if (vemb_sent || vadd_sent) {
-        printf("[client] sent_vemb=%llu sent_vadd=%llu write_ratio=%.2f%%\n",
+    if (vemb_sent || vadd_sent || vsim_sent) {
+        printf("[client] sent_vemb=%llu sent_vadd=%llu sent_vsim=%llu write_ratio=%.2f%% score_sum=%.6f\n",
                (unsigned long long)vemb_sent,
                (unsigned long long)vadd_sent,
-               (double)vadd_sent * 100.0 / (double)(vemb_sent + vadd_sent));
+               (unsigned long long)vsim_sent,
+               (double)vadd_sent * 100.0 / (double)(vemb_sent + vadd_sent + vsim_sent),
+               score_sum);
     }
     for (uint32_t n = 0; n < cfg.node_count; n++) {
         if (fetch_stats_for_node(&cfg, n, &after[n]) == 0)
@@ -1427,7 +1496,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w|vsim-inline|vsim-key-key]\n", argv[0]);
             return 0;
         }
         else {
