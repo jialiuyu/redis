@@ -6,6 +6,7 @@
 #include "vemb_v16_tcp_transport.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
+#include "macro.h"
 #include "redisassert.h"
 #include "zmalloc.h"
 
@@ -514,6 +515,25 @@ static void publish_response(vemb_v16_channel_t *ch,
                               memory_order_relaxed);
 }
 
+static vemb_v16_completion_t make_completion(vemb_v16_channel_t *ch,
+                                             const vemb_v16_req_t *req,
+                                             uint8_t status) {
+    return (vemb_v16_completion_t){
+        .status = status,
+        .op = req->op,
+        .req_id = req->req_id,
+        .channel_index = ch->index,
+        .channel_id = ch->channel_id,
+    };
+}
+
+static void publish_status_response(vemb_v16_channel_t *ch,
+                                    const vemb_v16_req_t *req,
+                                    uint8_t status) {
+    vemb_v16_completion_t completion = make_completion(ch, req, status);
+    publish_response(ch, &completion);
+}
+
 /// Job scheduling: route VADD/VEMB work from proxy IO to a SuperNode shard queue.
 static int publish_shard_job(vemb_v16_channel_t *ch,
                              const void *job,
@@ -557,161 +577,97 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
     return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
 }
 
+static void fill_job_base(vemb_v16_job_base_t *base,
+                          vemb_v16_channel_t *ch,
+                          const vemb_v16_req_t *req,
+                          uint32_t key_len) {
+    *base = (vemb_v16_job_base_t){
+        .op = req->op,
+        .flags = req->flags,
+        .req_id = req->req_id,
+        .channel_index = ch->index,
+        .key_len = key_len,
+        .channel_id = ch->channel_id,
+        .key_hash = req->key_hash,
+        .dim = req->dim,
+        .vector_bytes = req->vector_bytes,
+    };
+    memcpy(base->key, req->key, key_len);
+}
+
+static int publish_request_job(vemb_v16_channel_t *ch,
+                               const vemb_v16_req_t *req,
+                               uint32_t key_len,
+                               uint32_t proxy_io_worker_id) {
+    int is_vadd = req->op == VEMB_V16_OP_VADD_INLINE;
+    int is_vemb = req->op == VEMB_V16_OP_VEMB_HANDLE ||
+        req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ;
+    RETURN_IF(!is_vadd && !is_vemb, -1);
+
+    void *job = zmalloc(is_vadd ?
+        sizeof(vemb_v16_vadd_job_t) : sizeof(vemb_v16_vemb_job_t));
+    RETURN_IF(!job, -1);
+
+    fill_job_base((vemb_v16_job_base_t *)job, ch, req, key_len);
+    if (is_vadd) {
+        memcpy(((vemb_v16_vadd_job_t *)job)->vector,
+               req->vector,
+               req->vector_bytes);
+    }
+
+    vemb_v16_shard_queue_t *queues = is_vadd ?
+        ch->proxy->vadd_shard_queues : ch->proxy->vemb_shard_queues;
+    atomic_uint_fast64_t *ring_full_counter = is_vadd ?
+        &ch->stats.proxy_vadd_ring_full : &ch->stats.proxy_vemb_ring_full;
+    atomic_uint_fast64_t *publish_counter = is_vadd ?
+        &ch->stats.proxy_vadd_publish : &ch->stats.proxy_vemb_publish;
+
+    int rc = publish_shard_job(ch,
+                               job,
+                               proxy_io_worker_id,
+                               queues,
+                               ring_full_counter);
+    zfree(job);
+    RETURN_IF(rc != 0, -1);
+    atomic_fetch_add_explicit(publish_counter, 1, memory_order_relaxed);
+    return 0;
+}
+
 /// Request scheduling: validate protocol input and enqueue execution jobs.
 void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
                     const vemb_v16_req_t *req,
                     int req_len,
                     uint32_t proxy_io_worker_id) {
     if (req->op == VEMB_V16_OP_PING) {
-        vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_OK,
-            .op = req->op,
-            .req_id = req->req_id,
-            .channel_index = ch->index,
-            .channel_id = ch->channel_id,
-        };
         atomic_fetch_add_explicit(&ch->stats.total_requests, 1,
                                   memory_order_relaxed);
-        publish_response(ch, &completion);
+        publish_status_response(ch, req, VEMB_V16_STATUS_OK);
         return;
     }
 
     uint32_t key_len = req->key_len;
     if (key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
         req->channel_id != ch->channel_id) {
-        vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_ERR,
-            .op = req->op,
-            .req_id = req->req_id,
-            .channel_index = ch->index,
-            .channel_id = ch->channel_id,
-        };
-        publish_response(ch, &completion);
-        return;
+        goto error_response;
     }
 
     size_t min_len = req->op == VEMB_V16_OP_VADD_INLINE ?
         vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {
-        vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_ERR,
-            .op = req->op,
-            .req_id = req->req_id,
-            .channel_index = ch->index,
-            .channel_id = ch->channel_id,
-        };
-        publish_response(ch, &completion);
-        return;
+        goto error_response;
     }
 
-    if (req->op == VEMB_V16_OP_VADD_INLINE) {
-        vemb_v16_vadd_job_t *job = zmalloc(sizeof(*job));
-        if (!job) {
-            vemb_v16_completion_t completion = {
-                .status = VEMB_V16_STATUS_ERR,
-                .op = req->op,
-                .req_id = req->req_id,
-                .channel_index = ch->index,
-                .channel_id = ch->channel_id,
-            };
-            publish_response(ch, &completion);
-            return;
-        }
-        *job = (vemb_v16_vadd_job_t){
-            .base = {
-                .op = req->op,
-                .flags = req->flags,
-                .req_id = req->req_id,
-                .channel_index = ch->index,
-                .key_len = key_len,
-                .channel_id = ch->channel_id,
-                .key_hash = req->key_hash,
-                .dim = req->dim,
-                .vector_bytes = req->vector_bytes,
-            },
-        };
-        memcpy(job->base.key, req->key, key_len);
-        memcpy(job->vector, req->vector, req->vector_bytes);
-        if (publish_shard_job(ch,
-                              job,
-                              proxy_io_worker_id,
-                              ch->proxy->vadd_shard_queues,
-                              &ch->stats.proxy_vadd_ring_full) != 0) {
-            zfree(job);
-            vemb_v16_completion_t completion = {
-                .status = VEMB_V16_STATUS_ERR,
-                .op = req->op,
-                .req_id = req->req_id,
-                .channel_index = ch->index,
-                .channel_id = ch->channel_id,
-            };
-            publish_response(ch, &completion);
-            return;
-        }
-        zfree(job);
-        atomic_fetch_add_explicit(&ch->stats.proxy_vadd_publish, 1,
-                                  memory_order_relaxed);
-    } else if (req->op == VEMB_V16_OP_VEMB_HANDLE ||
-               req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
-        vemb_v16_vemb_job_t *job = zmalloc(sizeof(*job));
-        if (!job) {
-            vemb_v16_completion_t completion = {
-                .status = VEMB_V16_STATUS_ERR,
-                .op = req->op,
-                .req_id = req->req_id,
-                .channel_index = ch->index,
-                .channel_id = ch->channel_id,
-            };
-            publish_response(ch, &completion);
-            return;
-        }
-        *job = (vemb_v16_vemb_job_t){
-            .base = {
-                .op = req->op,
-                .flags = req->flags,
-                .req_id = req->req_id,
-                .channel_index = ch->index,
-                .key_len = key_len,
-                .channel_id = ch->channel_id,
-                .key_hash = req->key_hash,
-                .dim = req->dim,
-                .vector_bytes = req->vector_bytes,
-            },
-        };
-        memcpy(job->base.key, req->key, key_len);
-        if (publish_shard_job(ch,
-                              job,
-                              proxy_io_worker_id,
-                              ch->proxy->vemb_shard_queues,
-                              &ch->stats.proxy_vemb_ring_full) != 0) {
-            zfree(job);
-            vemb_v16_completion_t completion = {
-                .status = VEMB_V16_STATUS_ERR,
-                .op = req->op,
-                .req_id = req->req_id,
-                .channel_index = ch->index,
-                .channel_id = ch->channel_id,
-            };
-            publish_response(ch, &completion);
-            return;
-        }
-        zfree(job);
-        atomic_fetch_add_explicit(&ch->stats.proxy_vemb_publish, 1,
-                                  memory_order_relaxed);
-    } else {
-        vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_ERR,
-            .op = req->op,
-            .req_id = req->req_id,
-            .channel_index = ch->index,
-            .channel_id = ch->channel_id,
-        };
-        publish_response(ch, &completion);
-        return;
+    if (publish_request_job(ch, req, key_len, proxy_io_worker_id) != 0) {
+        goto error_response;
     }
+
     atomic_fetch_add_explicit(&ch->stats.published_jobs, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&ch->stats.total_requests, 1, memory_order_relaxed);
+    return;
+
+error_response:
+    publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
 }
 
 /// Response scheduling: drain SuperNode completions and publish by transport.
@@ -954,7 +910,7 @@ static void close_channel(vemb_v16_channel_t *ch) {
 
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy, uint64_t channel_id) {
     assert(proxy != NULL);
-    if (channel_id == 0) return -1;
+    RETURN_IF(channel_id == 0, -1);
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
         if (atomic_load_explicit(&ch->slot_channel_id,
@@ -1682,7 +1638,7 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     assert(max_vectors != 0);
 
     vemb_v16_proxy_t *proxy = zcalloc(sizeof(*proxy));
-    if (!proxy) return -1;
+    RETURN_IF(!proxy, -1);
     strncpy(proxy->uds_path, uds_path, sizeof(proxy->uds_path) - 1);
     proxy->vector_dim = vector_dim;
     proxy->vector_stride = vector_dim * sizeof(float);
