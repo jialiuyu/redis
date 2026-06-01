@@ -148,6 +148,7 @@ static int write_full(int fd, const void *buf, size_t n) {
     return 0;
 }
 
+/// UB/SHM control plane: create the per-channel client request/response rings.
 static int create_shared_ring(const char *name,
                               uint32_t slot_size,
                               vemb_v16_client_ring_t **ring,
@@ -343,6 +344,7 @@ static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
     return proxy->storage;
 }
 
+/// Scheduling plane: allocate the proxy-IO -> SuperNode shard queues.
 static int init_vemb_shard_queues(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
@@ -368,6 +370,7 @@ static int init_vemb_shard_queues(vemb_v16_proxy_t *proxy) {
     return 0;
 }
 
+/// Lifecycle synchronization: reset a channel after TCP or UB/SHM teardown.
 static void reset_closed_channel(vemb_v16_channel_t *ch) {
     assert(ch != NULL);
     atomic_store_explicit(&ch->slot_channel_id, 0, memory_order_release);
@@ -395,6 +398,7 @@ static void reset_closed_channel(vemb_v16_channel_t *ch) {
     memset(&ch->stats, 0, sizeof(ch->stats));
 }
 
+/// Execution-side ownership: let one SuperNode worker safely touch a channel.
 static int supernode_channel_acquire(vemb_v16_channel_t *ch) {
     if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0 ||
         !atomic_load_explicit(&ch->active, memory_order_acquire)) {
@@ -415,6 +419,7 @@ static int supernode_channel_acquire(vemb_v16_channel_t *ch) {
     }
 }
 
+/// Scheduling-side ownership: let one proxy IO worker safely touch a channel.
 static int proxy_io_channel_acquire(vemb_v16_channel_t *ch) {
     if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0 ||
         !atomic_load_explicit(&ch->active, memory_order_acquire)) {
@@ -515,6 +520,7 @@ static void fill_response_from_completion(vemb_v16_resp_t *resp,
                                           const vemb_v16_completion_t *completion);
 
 #ifdef __linux__
+/// TCP transport: queue partial response writes when clients apply backpressure.
 static int tcp_response_backlog_pending(vemb_v16_channel_t *ch) {
     return ch && ch->tcp_response_backlog_len > ch->tcp_response_backlog_sent;
 }
@@ -595,12 +601,15 @@ static int flush_tcp_response_backlog(vemb_v16_channel_t *ch) {
     }
     return 0;
 }
+
+/// TCP transport: compute one response frame size.
 static size_t tcp_response_wire_size(vemb_v16_resp_t *resp,
                                      uint32_t vector_bytes) {
     (void)resp;
     return sizeof(vemb_v16_net_hdr_t) + sizeof(vemb_v16_resp_t) + vector_bytes;
 }
 
+/// TCP transport: encode one response frame, optionally including inline vector bytes.
 static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
                                           vemb_v16_resp_t *resp,
                                           size_t *out_len) {
@@ -635,6 +644,7 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
     return buf;
 }
 
+/// TCP transport: encode a batch of response frames for nonblocking writes.
 static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
                                           const vemb_v16_completion_t *completions,
                                           uint32_t n,
@@ -692,6 +702,7 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
 }
 #endif
 
+/// TCP transport: write one completion response to the socket.
 static int publish_tcp_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp) {
     if (!ch->tcp_backpressure_enabled) {
         const uint8_t *vector = NULL;
@@ -746,6 +757,7 @@ static void fill_response_from_completion(vemb_v16_resp_t *resp,
     };
 }
 
+/// TCP transport: batch completion responses into writev/backlog output.
 static int publish_tcp_response_batch(vemb_v16_channel_t *ch,
                                       const vemb_v16_completion_t *completions,
                                       uint32_t n,
@@ -838,6 +850,7 @@ static int publish_tcp_response_batch(vemb_v16_channel_t *ch,
 #endif
 }
 
+/// Response scheduling: route a completion back to TCP or UB/SHM clients.
 static void publish_response(vemb_v16_channel_t *ch,
                              const vemb_v16_completion_t *completion) {
     vemb_v16_resp_t resp;
@@ -865,24 +878,29 @@ static void publish_response(vemb_v16_channel_t *ch,
                               memory_order_relaxed);
 }
 
-static int publish_vemb_job(vemb_v16_channel_t *ch,
-                            const vemb_v16_vemb_job_t *job,
-                            uint32_t proxy_io_worker_id) {
+/// Job scheduling: route VADD/VEMB work from proxy IO to a SuperNode shard queue.
+static int publish_shard_job(vemb_v16_channel_t *ch,
+                             const void *job,
+                             uint32_t proxy_io_worker_id,
+                             vemb_v16_shard_queue_t *queues,
+                             atomic_uint_fast64_t *ring_full_counter) {
+    assert(ch != NULL);
+    assert(job != NULL);
     vemb_v16_proxy_t *proxy = ch->proxy;
-    if (!shard_queue_topology_ready(proxy) ||
-        proxy_io_worker_id >= proxy->vemb_shard_proxy_count) {
-        return -1;
-    }
+    assert(shard_queue_topology_ready(proxy));
+    assert(queues != NULL);
+    assert(ring_full_counter != NULL);
+    assert(proxy_io_worker_id < proxy->vemb_shard_proxy_count);
 
     uint32_t supernode_id = ch->index % proxy->vemb_shard_supernode_count;
     uint32_t queue_index =
         shard_queue_index(proxy, proxy_io_worker_id, supernode_id);
-    vemb_v16_aeron_ring_t *ring = &proxy->vemb_shard_queues[queue_index].ring;
+    vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
 
     while (vemb_v16_aeron_publish(ring, job) != 0 &&
            atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
-        atomic_fetch_add_explicit(&ch->stats.proxy_vemb_ring_full, 1,
+        atomic_fetch_add_explicit(ring_full_counter, 1,
                                   memory_order_relaxed);
         cpu_relax();
     }
@@ -903,44 +921,7 @@ static int publish_vemb_job(vemb_v16_channel_t *ch,
     return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
 }
 
-static int publish_vadd_job(vemb_v16_channel_t *ch,
-                            const vemb_v16_vadd_job_t *job,
-                            uint32_t proxy_io_worker_id) {
-    vemb_v16_proxy_t *proxy = ch->proxy;
-    if (!shard_queue_topology_ready(proxy) ||
-        proxy_io_worker_id >= proxy->vemb_shard_proxy_count) {
-        return -1;
-    }
-
-    uint32_t supernode_id = ch->index % proxy->vemb_shard_supernode_count;
-    uint32_t queue_index =
-        shard_queue_index(proxy, proxy_io_worker_id, supernode_id);
-    vemb_v16_aeron_ring_t *ring = &proxy->vadd_shard_queues[queue_index].ring;
-
-    while (vemb_v16_aeron_publish(ring, job) != 0 &&
-           atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
-           atomic_load_explicit(&ch->active, memory_order_acquire)) {
-        atomic_fetch_add_explicit(&ch->stats.proxy_vadd_ring_full, 1,
-                                  memory_order_relaxed);
-        cpu_relax();
-    }
-#ifdef __linux__
-    vemb_v16_supernode_pool_worker_t *worker =
-        &proxy->supernode_workers[supernode_id];
-    int expected = 1;
-    if (atomic_compare_exchange_strong_explicit(&worker->job_notify_armed,
-                                                &expected,
-                                                0,
-                                                memory_order_acq_rel,
-                                                memory_order_relaxed) &&
-        worker->notify_fd >= 0) {
-        uint64_t one = 1;
-        (void)write(worker->notify_fd, &one, sizeof(one));
-    }
-#endif
-    return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
-}
-
+/// Request scheduling: validate protocol input and enqueue execution jobs.
 static void handle_request(vemb_v16_channel_t *ch,
                            const vemb_v16_req_t *req,
                            int req_len,
@@ -1016,7 +997,11 @@ static void handle_request(vemb_v16_channel_t *ch,
         };
         memcpy(job->base.key, req->key, key_len);
         memcpy(job->vector, req->vector, req->vector_bytes);
-        if (publish_vadd_job(ch, job, proxy_io_worker_id) != 0) {
+        if (publish_shard_job(ch,
+                              job,
+                              proxy_io_worker_id,
+                              ch->proxy->vadd_shard_queues,
+                              &ch->stats.proxy_vadd_ring_full) != 0) {
             zfree(job);
             vemb_v16_completion_t completion = {
                 .status = VEMB_V16_STATUS_ERR,
@@ -1059,7 +1044,11 @@ static void handle_request(vemb_v16_channel_t *ch,
             },
         };
         memcpy(job->base.key, req->key, key_len);
-        if (publish_vemb_job(ch, job, proxy_io_worker_id) != 0) {
+        if (publish_shard_job(ch,
+                              job,
+                              proxy_io_worker_id,
+                              ch->proxy->vemb_shard_queues,
+                              &ch->stats.proxy_vemb_ring_full) != 0) {
             zfree(job);
             vemb_v16_completion_t completion = {
                 .status = VEMB_V16_STATUS_ERR,
@@ -1089,6 +1078,7 @@ static void handle_request(vemb_v16_channel_t *ch,
     atomic_fetch_add_explicit(&ch->stats.total_requests, 1, memory_order_relaxed);
 }
 
+/// Response scheduling: drain SuperNode completions and publish by transport.
 static int drain_completions(vemb_v16_channel_t *ch) {
     vemb_v16_completion_t completions[VEMB_V16_PROXY_BATCH];
     uint32_t n;
@@ -1143,6 +1133,7 @@ static int tcp_poll_input(int fd) {
     return 0;
 }
 
+/// TCP transport: read one request frame and hand it to the scheduler.
 static int channel_read_tcp_request(vemb_v16_channel_t *ch,
                                     uint32_t proxy_io_worker_id) {
     vemb_v16_net_hdr_t hdr;
@@ -1172,6 +1163,7 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
     return 1;
 }
 
+/// UB/SHM transport: poll client request ring and hand jobs to the scheduler.
 static int channel_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id) {
     if (!ch || !ch->request_ring)
@@ -1204,6 +1196,7 @@ static int channel_poll_shm_requests(vemb_v16_channel_t *ch,
     return (int)req_count;
 }
 
+/// TCP transport: read a bounded batch of already-ready request frames.
 static int channel_read_ready_tcp_requests(vemb_v16_channel_t *ch,
                                            uint32_t proxy_io_worker_id) {
     uint32_t count = 0;
@@ -1228,6 +1221,7 @@ static int channel_read_ready_tcp_requests(vemb_v16_channel_t *ch,
     return (int)count;
 }
 
+/// Control plane: fill the channel descriptor returned to TCP or UB/SHM clients.
 static void fill_channel_desc(vemb_v16_proxy_t *proxy,
                               vemb_v16_channel_t *ch,
                               vemb_v16_channel_desc_t *desc) {
@@ -1264,6 +1258,7 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
     reset_closed_channel(ch);
 }
 
+/// Control plane: allocate channel state for either TCP sockets or UB/SHM rings.
 static int alloc_channel_common(vemb_v16_proxy_t *proxy,
                                 uint32_t transport_type,
                                 int net_fd,
@@ -1378,16 +1373,19 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
     return 0;
 }
 
+/// UB/SHM control plane: allocate a shared-memory client channel.
 static int alloc_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc) {
     return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_SHM, -1, desc);
 }
 
+/// TCP control plane: attach an accepted socket to a channel.
 static int alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                              int net_fd,
                              vemb_v16_channel_desc_t *desc) {
     return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_TCP, net_fd, desc);
 }
 
+/// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
 static void close_channel(vemb_v16_channel_t *ch) {
     if (!ch ||
         atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
@@ -1464,6 +1462,7 @@ static void reap_inactive_tcp_channels(vemb_v16_proxy_t *proxy) {
     }
 }
 
+/// Scheduling cleanup: mark a TCP or UB/SHM channel inactive from proxy IO.
 static void proxy_io_channel_deactivate(vemb_v16_channel_t *ch) {
     assert(ch != NULL);
     proxy_io_channel_disarm_completion_notify(ch);
@@ -1483,6 +1482,7 @@ static void proxy_io_set_affinity(uint32_t worker_id) {
 #endif
 }
 
+/// Proxy IO scheduling: poll-based fallback for TCP sockets and UB/SHM rings.
 static void *proxy_io_poll_thread_main(void *arg) {
     vemb_v16_proxy_io_worker_t *worker = arg;
     vemb_v16_proxy_t *proxy = worker->proxy;
@@ -1581,6 +1581,7 @@ static void *proxy_io_poll_thread_main(void *arg) {
 }
 
 #ifdef __linux__
+/// Proxy IO scheduling: unregister one TCP fd from the Linux epoll worker.
 static void proxy_io_epoll_unregister(vemb_v16_channel_t *ch,
                                       int epfd,
                                       uint64_t *registered_ids,
@@ -1597,6 +1598,7 @@ static void proxy_io_epoll_unregister(vemb_v16_channel_t *ch,
     atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
 }
 
+/// Proxy IO scheduling: epoll TCP sockets, poll UB/SHM rings, and drain completions.
 static void *proxy_io_epoll_thread_main(void *arg) {
     vemb_v16_proxy_io_worker_t *worker = arg;
     vemb_v16_proxy_t *proxy = worker->proxy;
@@ -1893,6 +1895,7 @@ typedef void (*shard_job_apply_fn)(vemb_v16_supernode_ctx_t *ctx,
                                    vemb_v16_supernode_scratch_t *scratch,
                                    vemb_v16_channel_t *ch);
 
+/// Execution: run one VEMB job on the SuperNode storage/backend path.
 static void apply_vemb_shard_job(vemb_v16_supernode_ctx_t *ctx,
                                  void *job,
                                  vemb_v16_supernode_scratch_t *scratch,
@@ -1905,6 +1908,7 @@ static void apply_vemb_shard_job(vemb_v16_supernode_ctx_t *ctx,
                                        &scratch->read_result_bytes);
 }
 
+/// Execution: run one VADD job on the SuperNode storage/backend path.
 static void apply_vadd_shard_job(vemb_v16_supernode_ctx_t *ctx,
                                  void *job,
                                  vemb_v16_supernode_scratch_t *scratch,
@@ -1915,6 +1919,7 @@ static void apply_vadd_shard_job(vemb_v16_supernode_ctx_t *ctx,
     vemb_v16_supernode_handle_vadd_job(ctx, job);
 }
 
+/// Execution scheduling: drain shard queues assigned to one SuperNode worker.
 static int drain_shard_queues(vemb_v16_proxy_t *proxy,
                               uint32_t supernode_worker_id,
                               vemb_v16_supernode_scratch_t *scratch,
@@ -1966,6 +1971,7 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
     return did_work;
 }
 
+/// Execution scheduling: drain VEMB read queues for one SuperNode worker.
 static int drain_vemb_shard_queues(vemb_v16_proxy_t *proxy,
                                    uint32_t supernode_worker_id,
                                    vemb_v16_supernode_scratch_t *scratch) {
@@ -1979,6 +1985,7 @@ static int drain_vemb_shard_queues(vemb_v16_proxy_t *proxy,
                               apply_vemb_shard_job);
 }
 
+/// Execution scheduling: drain VADD write queues for one SuperNode worker.
 static int drain_vadd_shard_queues(vemb_v16_proxy_t *proxy,
                                    uint32_t supernode_worker_id,
                                    vemb_v16_supernode_scratch_t *scratch) {
@@ -1993,6 +2000,7 @@ static int drain_vadd_shard_queues(vemb_v16_proxy_t *proxy,
 }
 
 #ifdef __linux__
+/// Execution scheduling: check whether a SuperNode worker can sleep.
 static int supernode_worker_has_pending(vemb_v16_proxy_t *proxy,
                                         uint32_t worker_id) {
     if (!shard_queue_topology_ready(proxy) ||
@@ -2040,6 +2048,7 @@ static void supernode_worker_wait_for_jobs(vemb_v16_supernode_pool_worker_t *wor
 }
 #endif
 
+/// Execution worker: consume scheduled VEMB/VADD jobs and publish completions.
 static void *supernode_pool_thread_main(void *arg) {
     vemb_v16_supernode_pool_worker_t *worker = arg;
     vemb_v16_proxy_t *proxy = worker->proxy;
@@ -2121,6 +2130,7 @@ static void stop_supernode_pool(vemb_v16_proxy_t *proxy) {
     proxy->supernode_pool_started = 0;
 }
 
+/// TCP control plane: write a small status response frame.
 static void tcp_write_status(int fd, uint8_t status, uint64_t value) {
     vemb_v16_net_status_t st = {
         .status = status,
@@ -2135,6 +2145,7 @@ static void tcp_write_status(int fd, uint8_t status, uint64_t value) {
                              sizeof(st));
 }
 
+/// TCP control plane: process one accepted TCP control or channel setup socket.
 static void handle_tcp_fd(vemb_v16_proxy_t *proxy, int fd) {
     if (!proxy || fd < 0) return;
     int flags = fcntl(fd, F_GETFL, 0);
@@ -2214,6 +2225,7 @@ static void handle_tcp_fd(vemb_v16_proxy_t *proxy, int fd) {
     }
 }
 
+/// UDS control plane: allocate UB/SHM channels and serve stats/close commands.
 static void handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
     uint8_t op = 0;
     if (read(fd, &op, 1) != 1) goto close_fd;
@@ -2349,6 +2361,7 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     zfree(proxy);
 }
 
+/// Top-level control loop: accept UDS UB/SHM control and optional TCP control.
 int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
