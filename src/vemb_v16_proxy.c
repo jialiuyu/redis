@@ -1144,8 +1144,12 @@ static void *proxy_io_epoll_thread_main(void *arg) {
     }
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0)
-        return proxy_io_poll_thread_main(arg);
+    if (epfd < 0) {
+        serverLog(LL_WARNING, "vemb_v16 proxy io epoll create failed: worker_id=%u errno=%d error=%s",
+                  worker->worker_id, errno, strerror(errno));
+        atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+        return NULL;
+    }
     worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (worker->notify_fd >= 0) {
         struct epoll_event ev = {
