@@ -65,6 +65,151 @@ vemb_v16_bench / future redis-cli-vemb
 ./benchmark/vemb_v16_bench --mode vadd-inline --dim 300 --prefill 0 --ops 200000 --threads 1,2,4,8,16
 ```
 
+## Multi-proxy / SuperNode 运行方式
+
+当前 multi-proxy / multi-SuperNode 模型是：
+
+```text
+one vemb_v16_server process = one proxy + one SuperNode group
+bench/CLI consistent_hash(vector_key) -> node_index -> target endpoint
+```
+
+bench 侧通过一致性 hash 分片到各个 `proxy/SuperNode` endpoint。Proxy 不做 hash，不持有拓扑；每个 server 实例使用独立 `--vector-region` 和 `--region-id`。
+
+### 场景一：同机多实例
+
+在同一台机器上启动多个 TCP server 实例，使用不同端口、不同 WARM region：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 4 \
+  --supernode-workers 8 \
+  --vector-region /vemb_v16_vectors_0 \
+  --region-id 0 \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072
+```
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6392 \
+  --proxy-io-threads 4 \
+  --supernode-workers 8 \
+  --vector-region /vemb_v16_vectors_1 \
+  --region-id 1 \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072
+```
+
+bench 使用 `--endpoints` 列出所有本机 endpoint：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
+  --mode vemb-inline-vector \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+80/20 混合读写，全量 vector 返回：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
+  --mode mixed-80r20w \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+### 场景二：bench 跨机器访问多节点
+
+当 bench 不在 server 本机时，server 不能绑定 `127.0.0.1`。应绑定 server 机器的网卡 IP，或绑定 `0.0.0.0`；bench 的 `--endpoints` 使用实际 server IP。
+
+Server 机器 A，假设 IP 为 `10.0.0.11`：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 10.0.0.11 \
+  --tcp-port 6391 \
+  --proxy-io-threads 4 \
+  --supernode-workers 8 \
+  --vector-region /vemb_v16_vectors_0 \
+  --region-id 0 \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072
+```
+
+Server 机器 B，假设 IP 为 `10.0.0.12`：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 10.0.0.12 \
+  --tcp-port 6391 \
+  --proxy-io-threads 4 \
+  --supernode-workers 8 \
+  --vector-region /vemb_v16_vectors_1 \
+  --region-id 1 \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072
+```
+
+Bench 机器连接远端节点：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 10.0.0.11:6391,10.0.0.12:6391 \
+  --mode vemb-inline-vector \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+80/20 混合读写，全量 vector 返回：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 10.0.0.11:6391,10.0.0.12:6391 \
+  --mode mixed-80r20w \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 1,2,4,8,16 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+注意事项：
+
+- TCP 下读模式只允许 `vemb-inline-vector` 或 `mixed-80r20w`；其中 `mixed-80r20w` 的读侧返回全量 vector，写侧仍为 `VADD_INLINE`。
+- 跨机器运行时需要放通 server 端 `--tcp-port`，例如 `6391`。
+- `--transport aeron` 的 multi-node 使用 `--sockets PATH[,PATH...]`，当前适合同机 UDS + SHM/Aeron ring；跨机器 Aeron 需要后续 `aeron-over-UB` 设计。
+
 关键观察项：
 
 - `request_publish_spins` 高：client -> proxy request ring 消费不及时。
@@ -210,6 +355,8 @@ many bench workers / TCP connections / SHM channels
 ## Phase 3+
 
 - 将进程内 vector table 替换为 UB vector table。
+- TODO：bench 多节点拓扑补齐 `aeron` 跨机器模式。
+  当前 `aeron` transport 仍假设 CLI 与 proxy/SuperNode 在同机，通过 UDS control plane + POSIX SHM request/response ring 通信；当 CLI 与 proxy/SuperNode 跨机器部署时，不能直接使用本机 SHM。后续需要设计 `aeron-over-UB` 路径：控制面可走远端 endpoint，request/response ring 与 WARM data region 通过 UB 可 mmap 区域承载，从而实现 CLI 与远端 proxy/SuperNode 的跨机器数据通信。
 - 增加文本命令 CLI，解析兼容 `VADD myvectors ... item:N` / `VEMB myvectors item:N RAW`。
 - 在 VEMB 热路径稳定后，再把 VADD full-vector job ring 改为 staged VADD。
 - 增加 consistent hash ring 和多 SuperNode 进程消费。
