@@ -77,8 +77,7 @@ struct vemb_v16_proxy {
     atomic_uint_fast64_t next_channel_id;
     atomic_uint_fast32_t next_channel_index;
     atomic_int running;
-    int uds_fd;
-    int tcp_fd;
+    int listen_fd;
     uint16_t tcp_port;
     int uds_enabled;
     int tcp_enabled;

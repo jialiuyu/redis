@@ -1242,7 +1242,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
 
             if (registered_ids[i] == 0) {
                 uint32_t desired_events = EPOLLIN | EPOLLERR | EPOLLHUP;
-                if (tcp_response_backlog_pending(ch))
+                if (vemb_v16_tcp_backlog_pending(ch))
                     desired_events |= EPOLLOUT;
                 struct epoll_event ev = {
                     .events = desired_events,
@@ -1263,7 +1263,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
             }
 
             uint32_t desired_events = EPOLLIN | EPOLLERR | EPOLLHUP;
-            if (tcp_response_backlog_pending(ch))
+            if (vemb_v16_tcp_backlog_pending(ch))
                 desired_events |= EPOLLOUT;
             if (registered_ids[i] != 0 &&
                 registered_events[i] != desired_events) {
@@ -1281,7 +1281,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 }
             }
 
-            if (tcp_response_backlog_pending(ch)) {
+            if (vemb_v16_tcp_backlog_pending(ch)) {
                 int flush = vemb_v16_tcp_flush_response_backlog(ch);
                 if (flush < 0) {
                     proxy_io_channel_deactivate(ch);
@@ -1686,8 +1686,7 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
         (uint32_t)vemb_v16_req_inline_len(proxy->vector_stride);
     proxy->response_ring_slot_size = sizeof(vemb_v16_resp_t);
     proxy->max_vectors = max_vectors;
-    proxy->uds_fd = -1;
-    proxy->tcp_fd = -1;
+    proxy->listen_fd = -1;
     proxy->tcp_port = VEMB_V16_TCP_PORT;
     strncpy(proxy->tcp_host, VEMB_V16_TCP_HOST, sizeof(proxy->tcp_host) - 1);
     atomic_init(&proxy->running, 0);
@@ -1765,8 +1764,7 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     free_vemb_shard_queues(proxy);
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++)
         close_channel(&proxy->channels[i]);
-    if (proxy->uds_fd >= 0) close(proxy->uds_fd);
-    if (proxy->tcp_fd >= 0) close(proxy->tcp_fd);
+    if (proxy->listen_fd >= 0) close(proxy->listen_fd);
     if (proxy->uds_enabled && proxy->uds_path[0]) unlink(proxy->uds_path);
     pthread_mutex_destroy(&proxy->stats_lock);
     zfree(proxy);
@@ -1786,12 +1784,11 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
     if (proxy->uds_enabled) {
         if (vemb_v16_aeron_listen(proxy, 4096, &listener) != 0)
             goto cleanup;
-        proxy->uds_fd = listener.fd;
     } else {
         if (vemb_v16_tcp_listen(proxy, 4096, &listener) != 0)
             goto cleanup;
-        proxy->tcp_fd = listener.fd;
     }
+    proxy->listen_fd = listener.fd;
     if (init_vemb_shard_queues(proxy) != 0) {
         serverLog(LL_WARNING, "vemb_v16 vemb shard queue init failed: proxy_io_threads=%u supernode_workers=%u",
                   proxy->proxy_io_worker_count,
@@ -1852,13 +1849,9 @@ cleanup:
     stop_proxy_io_pool(proxy);
     stop_supernode_pool(proxy);
     free_vemb_shard_queues(proxy);
-    if (proxy->uds_fd >= 0) {
-        close(proxy->uds_fd);
-        proxy->uds_fd = -1;
-    }
-    if (proxy->tcp_fd >= 0) {
-        close(proxy->tcp_fd);
-        proxy->tcp_fd = -1;
+    if (proxy->listen_fd >= 0) {
+        close(proxy->listen_fd);
+        proxy->listen_fd = -1;
     }
     if (proxy->uds_enabled && proxy->uds_path[0])
         unlink(proxy->uds_path);
@@ -1870,8 +1863,7 @@ void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy) {
     int was_running = atomic_exchange_explicit(&proxy->running, 0,
                                                memory_order_relaxed);
     if (!was_running) return;
-    if (proxy->uds_fd >= 0) shutdown(proxy->uds_fd, SHUT_RDWR);
-    if (proxy->tcp_fd >= 0) shutdown(proxy->tcp_fd, SHUT_RDWR);
+    if (proxy->listen_fd >= 0) shutdown(proxy->listen_fd, SHUT_RDWR);
 }
 
 void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) {
