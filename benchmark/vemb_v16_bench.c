@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
@@ -43,7 +44,7 @@ typedef struct bench_cfg {
     uint32_t prefill;
     uint32_t ops;
     int threads;
-    char threads_arg[128];
+    const char *threads_arg;
     int mode;
     int hot_key_enabled;
     uint32_t hot_key_id;
@@ -865,28 +866,65 @@ static const char *mode_name(int mode) {
     }
 }
 
-static int parse_thread_list(const bench_cfg_t *cfg, int *threads, int max_threads) {
-    if (cfg->threads_arg[0] == '\0') {
-        threads[0] = cfg->threads;
-        return 1;
-    }
-    int count = 0;
-    const char *p = cfg->threads_arg;
-    while (*p && count < max_threads) {
-        char *end = NULL;
-        long v = strtol(p, &end, 10);
-        if (end == p || v <= 0 || v > VEMB_V16_MAX_CHANNELS)
+static int append_thread_count(int **threads,
+                               int *count,
+                               int *capacity,
+                               int value) {
+    if (*count == *capacity) {
+        int next_capacity = *capacity ? *capacity * 2 : 8;
+        if (next_capacity < *capacity ||
+            (size_t)next_capacity > SIZE_MAX / sizeof(**threads))
             return -1;
-        threads[count++] = (int)v;
+        int *next = zrealloc(*threads, sizeof(**threads) * (size_t)next_capacity);
+        if (!next)
+            return -1;
+        *threads = next;
+        *capacity = next_capacity;
+    }
+    (*threads)[(*count)++] = value;
+    return 0;
+}
+
+static int parse_thread_list(const bench_cfg_t *cfg, int **threads_out) {
+    int *threads = NULL;
+    int count = 0;
+    int capacity = 0;
+    if (!cfg->threads_arg) {
+        if (cfg->threads <= 0)
+            return -1;
+        if (append_thread_count(&threads, &count, &capacity, cfg->threads) != 0)
+            return -1;
+        *threads_out = threads;
+        return count;
+    }
+    const char *p = cfg->threads_arg;
+    while (*p) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(p, &end, 10);
+        if (end == p || errno == ERANGE || v <= 0 || v > INT_MAX) {
+            zfree(threads);
+            return -1;
+        }
+        if (append_thread_count(&threads, &count, &capacity, (int)v) != 0) {
+            zfree(threads);
+            return -1;
+        }
         if (*end == ',') {
             p = end + 1;
         } else if (*end == '\0') {
             break;
         } else {
+            zfree(threads);
             return -1;
         }
     }
-    return count > 0 ? count : -1;
+    if (count <= 0) {
+        zfree(threads);
+        return -1;
+    }
+    *threads_out = threads;
+    return count;
 }
 
 static int parse_socket_list(bench_cfg_t *cfg, const char *arg) {
@@ -1262,14 +1300,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pipeline") && i + 1 < argc) cfg.pipeline = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *arg = argv[++i];
-            if (strlen(arg) >= sizeof(cfg.threads_arg)) {
-                fprintf(stderr, "invalid thread list\n");
-                return 1;
-            }
-            strncpy(cfg.threads_arg, arg, sizeof(cfg.threads_arg) - 1);
-            cfg.threads_arg[sizeof(cfg.threads_arg) - 1] = '\0';
-            if (!strchr(arg, ','))
-                cfg.threads = atoi(arg);
+            cfg.threads_arg = arg;
         }
         else if (!strcmp(argv[i], "--hot-key-id") && i + 1 < argc) {
             cfg.hot_key_enabled = 1;
@@ -1308,8 +1339,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int thread_list[64];
-    int thread_count = parse_thread_list(&cfg, thread_list, 64);
+    int *thread_list = NULL;
+    int thread_count = parse_thread_list(&cfg, &thread_list);
     if (thread_count <= 0) {
         fprintf(stderr, "invalid thread list\n");
         return 1;
@@ -1321,5 +1352,6 @@ int main(int argc, char **argv) {
         ret = run_once(run_cfg);
         if (ret != 0) break;
     }
+    zfree(thread_list);
     return ret;
 }
