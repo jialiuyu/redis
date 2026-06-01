@@ -899,6 +899,12 @@ static int parse_thread_list(const bench_cfg_t *cfg, int **threads_out) {
     }
     const char *p = cfg->threads_arg;
     while (*p) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0') {
+            zfree(threads);
+            return -1;
+        }
         char *end = NULL;
         errno = 0;
         long v = strtol(p, &end, 10);
@@ -910,6 +916,8 @@ static int parse_thread_list(const bench_cfg_t *cfg, int **threads_out) {
             zfree(threads);
             return -1;
         }
+        while (*end == ' ' || *end == '\t')
+            end++;
         if (*end == ',') {
             p = end + 1;
         } else if (*end == '\0') {
@@ -1251,7 +1259,7 @@ int main(int argc, char **argv) {
         .mode = MODE_VEMB_HANDLE,
         .timeout_ms = 10000,
         .pipeline = 1,
-        .transport_type = VEMB_V16_TRANSPORT_SHM,
+        .transport_type = VEMB_V16_TRANSPORT_AERON,
         .tcp_port = VEMB_V16_TCP_PORT,
     };
     cfg.node_count = 1;
@@ -1275,8 +1283,8 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
             const char *transport = argv[++i];
-            if (!strcmp(transport, "shm")) {
-                cfg.transport_type = VEMB_V16_TRANSPORT_SHM;
+            if (!strcmp(transport, "aeron")) {
+                cfg.transport_type = VEMB_V16_TRANSPORT_AERON;
             } else if (!strcmp(transport, "tcp")) {
                 cfg.transport_type = VEMB_V16_TRANSPORT_TCP;
                 cfg.node_count = 1;
@@ -1319,8 +1327,12 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport shm|tcp] [--socket PATH | --sockets PATH[,PATH...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w]\n", argv[0]);
             return 0;
+        }
+        else {
+            fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            return 1;
         }
     }
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP)

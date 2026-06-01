@@ -282,7 +282,7 @@ payload = vemb_v16_resp_t + vector_bytes
 
 TCP 实现要求：
 
-- Transport 是严格二选一：`--transport tcp` 是 TCP-only，控制面和数据面都走 TCP；`--transport shm` 是 UDS + SHM/Aeron-only，不启动 TCP listener；当前没有 `both` 模式。
+- Transport 是严格二选一：`--transport tcp` 是 TCP-only，控制面和数据面都走 TCP；`--transport aeron` 是 UDS + SHM/Aeron-only，不启动 TCP listener；当前没有 `both` 模式。
 - 每个 bench worker 使用一条长连接。
 - 连接建立后先执行 `HELLO/WELCOME`，server 为该连接创建一个 channel。
 - 同一连接内 request 可以 pipeline；response 按连接内 completion 顺序返回。

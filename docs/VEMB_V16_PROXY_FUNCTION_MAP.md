@@ -16,7 +16,7 @@
 Transport 语义是严格二选一：
 
 - `--transport tcp`：控制面和数据面都走 TCP，不启动 UDS listener。
-- `--transport shm`：控制面走 UDS，数据面走 SHM/Aeron ring，不启动 TCP listener。
+- `--transport aeron`：控制面走 UDS，数据面走 SHM/Aeron ring，不启动 TCP listener。
 - 当前没有 `both` 语义；如果以后要支持双开，需要显式重新设计 channel lifecycle 和 stats/close 路径。
 
 主数据流可以先记成两条线：
@@ -104,7 +104,7 @@ Transport 拆文件的目标边界是：
 
 当前已完成独立编译拆分：TCP transport helper 位于 [src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:1)，UDS + SHM/Aeron transport helper 位于 [src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:1)。二者通过 [src/vemb_v16_proxy_internal.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_internal.h:1) 声明的 accessor 和 lifecycle 回调访问 proxy/channel 状态，transport 文件内不直接解引用 `ch->` / `proxy->` 字段。transport 对 proxy 暴露的接口分别声明在 [src/vemb_v16_tcp_transport.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.h:1) 和 [src/vemb_v16_aeron_transport.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.h:1)。
 
-Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/szza/codespace/work/hpc-redis/scripts/vemb_v16_transport_smoke.sh:1) 做轻量回归：脚本会构建 server/bench，确认 `--transport both` 被拒绝，再分别用 `tcp` 和 `shm` 跑一组 `ping`。TCP case 会传入一个临时 `--socket` 并确认不会创建 UDS socket，用来防止 TCP-only 路径重新依赖 UDS。
+Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/szza/codespace/work/hpc-redis/scripts/vemb_v16_transport_smoke.sh:1) 做轻量回归：脚本会构建 server/bench，确认 `--transport both` 被拒绝，再分别用 `tcp` 和 `aeron` 跑一组 `ping`。TCP case 会传入一个临时 `--socket` 并确认不会创建 UDS socket，用来防止 TCP-only 路径重新依赖 UDS。
 
 ### 5.1 TCP 路径
 

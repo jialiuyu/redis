@@ -836,7 +836,7 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
         return -1;
     }
 
-    if (transport_type == VEMB_V16_TRANSPORT_SHM) {
+    if (transport_type == VEMB_V16_TRANSPORT_AERON) {
         snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
                  "/%s_req_%llu", VEMB_V16_SHM_PREFIX,
                  (unsigned long long)ch->channel_id);
@@ -905,7 +905,7 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
 
 /// UB/SHM control plane: allocate a shared-memory client channel.
 int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_SHM, -1, desc);
+    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, desc);
 }
 
 /// TCP control plane: attach an accepted socket to a channel.
@@ -1049,7 +1049,7 @@ static void *proxy_io_poll_thread_main(void *arg) {
                 did_work = 1;
 
             if (atomic_load_explicit(&ch->active, memory_order_acquire) &&
-                ch->transport_type == VEMB_V16_TRANSPORT_SHM) {
+                ch->transport_type == VEMB_V16_TRANSPORT_AERON) {
                 int rc = vemb_v16_aeron_poll_shm_requests(ch, worker->worker_id);
                 if (rc < 0) {
                     proxy_io_channel_deactivate(ch);
@@ -1210,7 +1210,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 continue;
             }
 
-            if (ch->transport_type == VEMB_V16_TRANSPORT_SHM) {
+            if (ch->transport_type == VEMB_V16_TRANSPORT_AERON) {
                 int n = drain_completions(ch);
                 if (n < 0) {
                     proxy_io_channel_deactivate(ch);

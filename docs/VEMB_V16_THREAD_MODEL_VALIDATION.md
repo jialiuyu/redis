@@ -293,7 +293,7 @@
 为补充验证 `SHM + per-channel` 与 `SHM + pooled` 两种线程模型的差异，本轮又整理了 `docs/bench_log` 中的对照结果。统一配置为：
 
 ```text
-transport=shm
+transport=aeron
 dim=300
 prefill=65536
 ops/thread=200000
@@ -478,7 +478,7 @@ accept/control thread
 
 # SHM pooled smoke
 ./benchmark/vemb_v16_bench \
-  --transport shm \
+  --transport aeron \
   --socket /tmp/vemb_v16.sock \
   --mode mixed-80r20w \
   --dim 300 \

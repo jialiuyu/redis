@@ -6,9 +6,9 @@ SERVER="$ROOT_DIR/src/vemb_v16_server"
 BENCH="$ROOT_DIR/benchmark/vemb_v16_bench"
 PORT="${VEMB_V16_SMOKE_PORT:-$((26391 + $$ % 10000))}"
 TCP_SOCKET="/tmp/vemb_v16_transport_smoke_tcp_$$.sock"
-SHM_SOCKET="/tmp/vemb_v16_transport_smoke_shm_$$.sock"
+SHM_SOCKET="/tmp/vemb_v16_transport_smoke_aeron_$$.sock"
 TCP_REGION="/v16sm_tcp_$$"
-SHM_REGION="/v16sm_shm_$$"
+SHM_REGION="/v16sm_aeron_$$"
 TCP_LOG="$(mktemp "${TMPDIR:-/tmp}/vemb_v16_tcp.XXXXXX.log")"
 SHM_LOG="$(mktemp "${TMPDIR:-/tmp}/vemb_v16_shm.XXXXXX.log")"
 BOTH_OUT="/tmp/vemb_v16_transport_both_$$.out"
@@ -106,7 +106,7 @@ wait "$TCP_PID" 2>/dev/null || true
 TCP_PID=""
 
 "$SERVER" \
-    --transport shm \
+    --transport aeron \
     --socket "$SHM_SOCKET" \
     --tcp-host 127.0.0.1 \
     --tcp-port "$PORT" \
@@ -119,9 +119,9 @@ TCP_PID=""
     --loglevel warning >"$SHM_LOG" 2>&1 &
 SHM_PID=$!
 
-run_with_retry "shm ping" \
+run_with_retry "aeron ping" \
     "$BENCH" \
-    --transport shm \
+    --transport aeron \
     --socket "$SHM_SOCKET" \
     --dim 16 \
     --prefill 0 \

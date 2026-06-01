@@ -6,7 +6,7 @@
 
 ```bash
 ./src/vemb_v16_server \
-  --transport shm \
+  --transport aeron \
   --socket /tmp/vemb_v16.sock \
   --proxy-io-threads 16 \
   --supernode-workers 32 \
@@ -21,7 +21,7 @@
 
 ```bash
 ./benchmark/vemb_v16_bench \
-  --transport shm \
+  --transport aeron \
   --socket /tmp/vemb_v16.sock \
   --mode mixed-80r20w \
   --dim 300 \

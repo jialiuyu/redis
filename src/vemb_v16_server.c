@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
     uint32_t warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
     uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
-    const char *transport = "shm";
+    const char *transport = "aeron";
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
     uint32_t proxy_io_threads = default_proxy_io_threads();
@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
             uds_path = argv[++i];
         } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
             transport = argv[++i];
-            if (strcmp(transport, "shm") &&
+            if (strcmp(transport, "aeron") &&
                 strcmp(transport, "tcp")) {
                 fprintf(stderr, "invalid transport\n");
                 goto cleanup;
@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport shm|tcp] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING, "failed to configure vemb_v16 proxy io threads");
         goto cleanup;
     }
-    if (!strcmp(transport, "shm")) {
+    if (!strcmp(transport, "aeron")) {
         if (vemb_v16_proxy_enable_uds(g_proxy) != 0) {
             serverLog(LL_WARNING, "failed to enable vemb_v16 uds transport");
             goto cleanup;
