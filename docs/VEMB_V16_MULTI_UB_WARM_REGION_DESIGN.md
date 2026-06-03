@@ -373,17 +373,3 @@ overwrite keeps original region_id/offset
 cold read-through promotes to available WARM region
 concurrent distinct key writes do not exceed capacity_slots
 ```
-
-## 与现有文档关系
-
-本文是单 WARM layer 多 UB region 的专门设计文档。
-
-相关文档：
-
-```text
-docs/VEMB_V16_TLC_UB_SHARED_DATA_MODEL.md
-docs/VEMB_V16_MULTI_SUPERNODE_HASH_RING_DESIGN.md
-docs/VEMB_V16_IMPLEMENTATION_TODO.md
-```
-
-其中多 SuperNode 文档描述跨 SuperNode 路由；本文描述目标 SuperNode 内部如何在多个 WARM UB region 之间分配 payload。
