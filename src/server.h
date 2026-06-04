@@ -1946,9 +1946,7 @@ struct redisServer {
     ub_mem_config_t ub;          /* UB data-plane configuration */
     /* VEMB V16 dataplane */
     int vemb_v16_enabled;
-    char *vemb_v16_uds_path;
-    char *vemb_v16_tcp_host;
-    int vemb_v16_tcp_port;
+
     int vemb_v16_dim;
     int vemb_v16_max_vectors;
     char *vemb_v16_vector_region;
@@ -1958,6 +1956,7 @@ struct redisServer {
     int vemb_v16_proxy_io_threads;
     vemb_v16_proxy_t *vemb_v16_proxy;
     pthread_t vemb_v16_proxy_thread;
+    int vemb_v16_sniff_port;      /* 0 = disabled; enable VEMB sniff on this port */
     /* Networking */
     int port;                   /* TCP listening port */
     int tls_port;               /* TLS listening port */

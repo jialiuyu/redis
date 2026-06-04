@@ -12,22 +12,9 @@
 
 static int vemb_v16_engine_init(void) {
     if (!server.vemb_v16_enabled) return C_ERR;
-    const char *host = server.vemb_v16_tcp_host && server.vemb_v16_tcp_host[0]
-        ? server.vemb_v16_tcp_host
-        : VEMB_V16_TCP_HOST;
-    uint16_t port = (uint16_t)(server.vemb_v16_tcp_port > 0
-                               ? server.vemb_v16_tcp_port
-                               : VEMB_V16_TCP_PORT);
-    uint32_t dim = server.vemb_v16_dim > 0
-        ? (uint32_t)server.vemb_v16_dim
-        : VEMB_V16_DEFAULT_DIM;
-
-    if (vemb_v16_stc_init(host, port, dim) != 0) {
-        serverLog(LL_WARNING, "vemb_v16_stc_init failed");
-        return C_ERR;
-    }
-    serverLog(LL_NOTICE, "VEMB V16 vector engine initialized: tcp=%s:%u dim=%u",
-              host, port, dim);
+    /* All VEMB traffic arrives via protocol sniffing on the Redis port.
+     * No standalone TCP listener — skip stc_init. */
+    serverLog(LL_NOTICE, "VEMB V16 vector engine: sniff mode, skipping stc_init");
     return C_OK;
 }
 
@@ -224,9 +211,8 @@ static sds vemb_v16_engine_get_config(const char *key) {
 
 static sds vemb_v16_engine_get_stats(void) {
     return sdscatfmt(sdsempty(),
-                     "VEMB V16 engine: tcp=%s:%i dim=%i max_vectors=%i",
-                     server.vemb_v16_tcp_host ? server.vemb_v16_tcp_host : "127.0.0.1",
-                     server.vemb_v16_tcp_port,
+                     "VEMB V16 engine: sniff_port=%i dim=%i max_vectors=%i",
+                     server.vemb_v16_sniff_port,
                      server.vemb_v16_dim,
                      server.vemb_v16_max_vectors);
 }

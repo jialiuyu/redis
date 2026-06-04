@@ -24,7 +24,6 @@ typedef struct vemb_v16_channel_counters {
     atomic_uint_fast64_t proxy_vemb_ring_full;
     atomic_uint_fast64_t proxy_vadd_ring_full;
     atomic_uint_fast64_t proxy_response_publish;
-    atomic_uint_fast64_t proxy_response_ring_full;
     atomic_uint_fast64_t supernode_vemb_poll;
     atomic_uint_fast64_t supernode_vadd_poll;
     atomic_uint_fast64_t supernode_completion_publish;

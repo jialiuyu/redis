@@ -19,27 +19,6 @@
 
 /// TCP transport implementation.
 
-int vemb_v16_tcp_listen(vemb_v16_proxy_t *proxy,
-                        int backlog,
-                        vemb_v16_transport_listener_t *listener) {
-    const char *host = vemb_v16_proxy_tcp_host(proxy);
-    uint16_t port = vemb_v16_proxy_tcp_port(proxy);
-    int fd = vemb_v16_net_listen(host, port, backlog);
-    if (fd < 0) {
-        serverLog(LL_WARNING, "vemb_v16 tcp listen failed: %s:%u errno=%d error=%s",
-                  host, port, errno, strerror(errno));
-        return -1;
-    }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-
-    *listener = (vemb_v16_transport_listener_t){
-        .name = "tcp",
-        .fd = fd,
-        .handle_fd = vemb_v16_tcp_handle_fd,
-    };
-    return 0;
-}
-
 #ifdef __linux__
 /// TCP transport: queue partial response writes when clients apply backpressure.
 static int tcp_response_backlog_pending(vemb_v16_channel_t *ch) {

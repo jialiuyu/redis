@@ -231,7 +231,6 @@ int vemb_v16_net_write_frame2(int fd,
 
 const char *vemb_v16_transport_name(uint32_t transport) {
     switch (transport) {
-    case VEMB_V16_TRANSPORT_AERON: return "aeron";
     case VEMB_V16_TRANSPORT_TCP: return "tcp";
     default: return "unknown";
     }

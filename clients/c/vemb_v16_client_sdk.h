@@ -165,33 +165,6 @@ int vemb_v16_client_fd(const vemb_v16_client_t *client);
 uint64_t vemb_v16_client_channel_id(const vemb_v16_client_t *client);
 
 /* =====================================================================
- *  SHM Client API (UDS control + shared-memory ring buffer)
- * ===================================================================== */
-
-typedef struct vemb_v16_client_shm vemb_v16_client_shm_t;
-
-vemb_v16_client_shm_t *vemb_v16_client_shm_create(const char *socket_path,
-                                                   uint32_t vector_dim);
-void vemb_v16_client_shm_destroy(vemb_v16_client_shm_t *client);
-
-int vemb_v16_client_shm_vadd(vemb_v16_client_shm_t *client,
-                              const char *set_name, const char *elem_name,
-                              const float *vector, uint32_t dim);
-
-int vemb_v16_client_shm_vemb(vemb_v16_client_shm_t *client,
-                              const char *set_name, const char *elem_name,
-                              float *out_vector, uint32_t out_cap,
-                              uint32_t *out_dim);
-
-int vemb_v16_client_shm_vsim(vemb_v16_client_shm_t *client,
-                              const char *set_name, const char *elem_name,
-                              const float *query_vector, uint32_t dim,
-                              float *out_score);
-
-/* Accessor for vector dimension configured at create time */
-uint32_t vemb_v16_client_shm_dim(const vemb_v16_client_shm_t *client);
-
-/* =====================================================================
  *  Async / Buffer-based API (low-level, for event-loop callers)
  * =====================================================================
  *

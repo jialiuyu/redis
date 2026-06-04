@@ -10,7 +10,6 @@
 
 #include "fmacros.h"
 #include "vemb_v16_cli_tcp.h"
-#include "vemb_v16_cli_shm.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -277,12 +276,8 @@ static struct config {
     int prefer_ipv6; /* Prefer IPv6 over IPv4 on DNS lookup. */
     /* VEMB V16 TCP fast path */
     int vemb_v16_tcp_enabled;
-    char *vemb_v16_tcp_host;
-    int vemb_v16_tcp_port;
     int vemb_v16_dim;
-    /* VEMB V16 SHM fast path */
-    int vemb_v16_shm_enabled;
-    char *vemb_v16_shm_socket;
+
 } config;
 
 /* User preferences. */
@@ -2449,26 +2444,6 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
     size_t *argvlen;
     int j, output_raw;
 
-    /* VEMB V16 SHM fast path (highest priority) */
-    if (config.vemb_v16_shm_enabled && argc >= 2) {
-        if (!strcasecmp(command, "VADD")) {
-            int rc = vemb_v16_cli_shm_vadd(argc, argv);
-            if (rc != -1) return rc;
-        }
-        if (!strcasecmp(command, "VEMB")) {
-            for (long i = 0; i < repeat; i++) {
-                int skip_output = (repeat > 1 && i < repeat - 1) ? 1 : 0;
-                int rc = vemb_v16_cli_shm_vemb(argc, argv, skip_output);
-                if (rc == -1) break;
-            }
-            return REDIS_OK;
-        }
-        if (!strcasecmp(command, "VSIM")) {
-            int rc = vemb_v16_cli_shm_vsim(argc, argv);
-            if (rc != -1) return rc;
-        }
-    }
-
     /* VEMB V16 TCP fast path */
     if (config.vemb_v16_tcp_enabled && argc >= 2) {
         if (!strcasecmp(command, "VADD")) {
@@ -3090,12 +3065,6 @@ static int parseOptions(int argc, char **argv) {
             config.resp2 = 1;
         } else if (!strcmp(argv[i],"-3")) {
             config.resp3 = 1;
-        } else if (!strcmp(argv[i],"--vemb-v16") && !lastarg) {
-            config.vemb_v16_shm_socket = argv[++i];
-        } else if (!strcmp(argv[i],"--vemb-v16-tcp-host") && !lastarg) {
-            config.vemb_v16_tcp_host = argv[++i];
-        } else if (!strcmp(argv[i],"--vemb-v16-tcp-port") && !lastarg) {
-            config.vemb_v16_tcp_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"--vemb-v16-dim") && !lastarg) {
             config.vemb_v16_dim = atoi(argv[++i]);
         } else if (!strcmp(argv[i],"--show-pushes") && !lastarg) {
@@ -3389,8 +3358,7 @@ static int issueCommandRepeat(int argc, char **argv, long repeat) {
             (!strcasecmp(argv[0], "VADD") ||
              !strcasecmp(argv[0], "VEMB") ||
              !strcasecmp(argv[0], "VSIM"));
-        int vemb_transport_ready = config.vemb_v16_tcp_enabled ||
-                                    config.vemb_v16_shm_enabled;
+        int vemb_transport_ready = config.vemb_v16_tcp_enabled;
 
         if (vemb_transport_ready && is_vemb_cmd) {
             if (cliSendCommand(argc,argv,repeat) != REDIS_OK) {
@@ -11037,11 +11005,7 @@ int main(int argc, char **argv) {
     config.prefer_ipv4 = 0;
     config.prefer_ipv6 = 0;
     config.vemb_v16_tcp_enabled = 0;
-    config.vemb_v16_tcp_host = NULL;
-    config.vemb_v16_tcp_port = 0;
     config.vemb_v16_dim = 0;
-    config.vemb_v16_shm_enabled = 0;
-    config.vemb_v16_shm_socket = NULL;
     config.cluster_manager_command.name = NULL;
     config.cluster_manager_command.argc = 0;
     config.cluster_manager_command.argv = NULL;
@@ -11080,28 +11044,11 @@ int main(int argc, char **argv) {
     argc -= firstarg;
     argv += firstarg;
 
-    /* Initialize VEMB V16 SHM fast path if requested */
-    if (config.vemb_v16_shm_socket) {
-        config.vemb_v16_shm_enabled = 1;
-        const char *sock = config.vemb_v16_shm_socket;
-        uint32_t dim = config.vemb_v16_dim > 0
-            ? (uint32_t)config.vemb_v16_dim
-            : 300;
-        if (vemb_v16_cli_shm_init(sock, dim) != 0) {
-            fprintf(stderr, "VEMB V16 SHM init failed: %s dim=%u\n",
-                    sock, dim);
-            config.vemb_v16_shm_enabled = 0;
-        }
-        atexit(vemb_v16_cli_shm_cleanup);
-    }
-
-    /* Initialize VEMB V16 TCP fast path if requested */
-    if (config.vemb_v16_tcp_host) {
+    /* Initialize VEMB V16 TCP fast path if --vemb-v16-dim is specified */
+    if (config.vemb_v16_dim > 0) {
         config.vemb_v16_tcp_enabled = 1;
-        const char *host = config.vemb_v16_tcp_host;
-        uint16_t port = config.vemb_v16_tcp_port > 0
-            ? (uint16_t)config.vemb_v16_tcp_port
-            : 6391;
+        const char *host = "127.0.0.1";
+        uint16_t port = (uint16_t)config.conn_info.hostport;
         uint32_t dim = config.vemb_v16_dim > 0
             ? (uint32_t)config.vemb_v16_dim
             : 300;

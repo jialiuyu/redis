@@ -3,8 +3,12 @@ set -e
 
 cd /root/gqs/codespace/UnifiedBus/hpc-redis
 
+SNIFF_PORT=6379
+VEMB_PORT=${VEMB_PORT:-$SNIFF_PORT}
+DIM=${VEMB_DIM:-300}
+
 # 确保server在运行
-if ! ss -tlnp | grep -q ":6391"; then
+if ! ss -tlnp | grep -q ":$SNIFF_PORT"; then
     echo "redis-server not running, starting..."
     pkill -f redis-server 2>/dev/null || true
     sleep 1
@@ -12,8 +16,9 @@ if ! ss -tlnp | grep -q ":6391"; then
       --port 6379 --vemb-v16-enabled yes --vemb-v16-dim 300 \
       --vemb-v16-max-vectors 131072 --vemb-v16-vector-region /dev/obmm_shmdev2 \
       --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 16 \
-      --vemb-v16-supernode-workers 64 --vemb-v16-tcp-host 127.0.0.1 \
-      --vemb-v16-tcp-port 6391 --daemonize yes --loglevel notice \
+      --vemb-v16-supernode-workers 64 \
+      --vemb-v16-sniff-port 6379 \
+      --daemonize yes --loglevel notice \
       --vector-engine vemb-v16
     sleep 3
 fi
@@ -39,6 +44,7 @@ sleep 1
 echo ""
 echo "=========================================="
 echo "  VEMB V16 TCP Fast Path Multi-Client"
+echo "  Port: $VEMB_PORT (sniff-only, no 6391)"
 echo "=========================================="
 echo ""
 
@@ -50,8 +56,7 @@ for N in 1 4 8 16 32 64; do
         set_id=$(( (i - 1) % 32 + 1 ))
         elem_id=$((i % 1000 + 1))
         (
-            { time ./src/redis-cli --vemb-v16-tcp-host 127.0.0.1 \
-                --vemb-v16-tcp-port 6391 --vemb-v16-dim 300 \
+            { time ./src/redis-cli --vemb-v16-dim "$DIM" \
                 -r 200000 VEMB item:${set_id} elem${elem_id} >/dev/null 2>&1; } \
             2>/tmp/vemb_client_${i}.time
         ) &
