@@ -514,8 +514,10 @@ region.is_local = region.home_ub_node_id == supernode.local_ub_node_id
 ```yaml
 supernode_id: 0
 local_ub_node_id: 0
+local_region_weight: 8
 warm_regions:
   - region_id: 1
+    provider: ub
     path: /dev/obmm_shmdev2
     mmap_offset: 0
     bytes: 1073741824
@@ -523,6 +525,7 @@ warm_regions:
     home_ub_node_id: 0
     weight: 1
   - region_id: 2
+    provider: ub
     path: /dev/obmm_shmdev3
     mmap_offset: 0
     bytes: 1073741824
@@ -531,13 +534,7 @@ warm_regions:
     weight: 1
 ```
 
-如果短期无法从 obmmctl 产出 `home_ub_node_id`，可以显式配置：
-
-```text
---local-region-id 1
-```
-
-或者在 region descriptor 中直接配置：
+如果短期无法从 obmmctl 产出 `home_ub_node_id`，可以在 region descriptor 中直接配置 locality：
 
 ```yaml
 is_local: true
@@ -871,43 +868,76 @@ TCP 模式线程扫描可用逗号列表；bench 会按顺序分别执行每个�
   --timeout-ms 120000
 ```
 
-UB 模式启动 server。当前命令行仍是单 WARM region 形态：`--vector-region` 必须是 Linux server 上可 `open(O_RDWR)` 且可 `mmap(MAP_SHARED)` 的 UB 设备或文件路径；`--warm-mmap-offset` 传 UB warm 区域起始偏移。
+多 UB region 运行应使用 manifest/config 驱动，而不是单组 `--vector-region/--warm-mmap-offset/--region-id`。下面给出一个可直接运行的 manifest 示例：
+
+```yaml
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 8
+warm_regions:
+  - region_id: 101
+    provider: shm
+    path: /vemb_v16_manifest_r101
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 202
+    provider: mock_ub
+    path: /vemb_v16_manifest_r202
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+```
+
+启动 multi-region server：
 
 ```bash
 ./src/vemb_v16_server \
-  --socket /tmp/vemb_v16.sock \
-  --vector-region /path/to/ub/device_or_file \
-  --warm-backend ub \
-  --warm-mmap-offset 0 \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 16 \
+  --supernode-workers 64 \
+  --warm-regions-manifest /tmp/vemb_v16_warm_regions.yaml \
   --dim 300 \
   --max-vectors 131072 \
   --loglevel notice
 ```
 
-多 UB region 形态不再适合用一组 `--vector-region/--warm-mmap-offset/--region-id` 描述。交付时应改为 manifest/config 驱动：
+manifest 中需要包含所有 region 的 `region_id/provider/path/mmap_offset/bytes/value_size/home_ub_node_id/weight`，以及本 SuperNode 的 `local_ub_node_id` 和可选 `local_region_weight`。server 初始化时打开并 mmap 所有 region，构建 WARM region hash ring，并按 local weight 优先把新 key 分配到本地 UB region；本地 region 满后自动 fallback 到下一个可用 region。
 
-```bash
-./src/vemb_v16_server \
-  --socket /tmp/vemb_v16.sock \
-  --warm-regions-manifest /etc/vemb/supernode-0-warm-regions.yaml \
-  --dim 300 \
-  --max-vectors 131072 \
-  --loglevel notice
-```
-
-manifest 中需要包含所有 region 的 `region_id/path/mmap_offset/bytes/value_size/home_ub_node_id/weight`，以及本 SuperNode 的 `local_ub_node_id`。server 初始化时打开并 mmap 所有 region，构建 WARM region hash ring，并按 local weight 优先把新 key 分配到本地 UB region；本地 region 满后自动 fallback 到下一个可用 region。
-
-UB 模式 benchmark 与本地 SHM 模式一致，client 会从 server 返回的 channel descriptor 中读取 warm backend、region path、mmap offset 和 region size：
+TCP 模式下读路径当前要求 inline vector 返回，因此 benchmark 推荐使用 `vemb-inline-vector` 或 `mixed-80r20w`。bench/client 会从 server 返回的 channel descriptor 中读取 warm backend、region path、mmap offset 和 region size：
 
 ```bash
 ./benchmark/vemb_v16_bench \
-  --socket /tmp/vemb_v16.sock \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
   --dim 300 \
   --prefill 65536 \
   --ops 200000 \
-  --threads 8 \
-  --pipeline 1 \
-  --mode vemb-supernode-read
+  --threads 8,16,24,32,64 \
+  --pipeline 32 \
+  --timeout-ms 3000 \
+  --mode vemb-inline-vector
+```
+
+混合读写压测可使用：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,64 \
+  --pipeline 32 \
+  --timeout-ms 3000 \
+  --mode mixed-80r20w
 ```
 
 常用 benchmark mode：
@@ -917,6 +947,7 @@ UB 模式 benchmark 与本地 SHM 模式一致，client 会从 server 返回的 
 --mode vadd-inline
 --mode vemb-handle
 --mode vemb-read-vector
+--mode vemb-inline-vector
 --mode vemb-supernode-read
 --mode mixed-80r20w
 ```
