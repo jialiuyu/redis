@@ -79,6 +79,8 @@ typedef struct bench_node_channel {
     uint16_t tcp_port;
     uint32_t timeout_ms;
     bench_region_map_t warm_region;
+    uint32_t warm_region_count;
+    bench_region_map_t warm_regions[VEMB_V16_MAX_DESC_WARM_REGIONS];
 } bench_node_channel_t;
 
 typedef struct worker_arg {
@@ -409,36 +411,42 @@ static int open_ring(const char *name,
     return 0;
 }
 
-static int open_warm_region(const vemb_v16_channel_desc_t *desc,
-                            bench_region_map_t *region) {
-    if (!desc || !region)
+static int open_warm_region_desc(uint32_t region_id,
+                                 uint32_t backend_type,
+                                 uint64_t region_bytes,
+                                 uint64_t mmap_offset,
+                                 uint32_t value_size,
+                                 uint32_t max_vectors,
+                                 const char *path,
+                                 bench_region_map_t *region) {
+    if (!path || !region)
         return -1;
     int fd = -1;
-    if (desc->warm_backend_type == VEMB_V16_REGION_LOCAL_SHM) {
-        fd = shm_open(desc->vector_region_name, O_RDONLY, 0666);
-    } else if (desc->warm_backend_type == VEMB_V16_REGION_UB) {
-        fd = open(desc->vector_region_name, O_RDONLY);
+    if (backend_type == VEMB_V16_REGION_LOCAL_SHM) {
+        fd = shm_open(path, O_RDONLY, 0666);
+    } else if (backend_type == VEMB_V16_REGION_UB) {
+        fd = open(path, O_RDONLY);
     } else {
         return -1;
     }
     if (fd < 0) return -1;
-    size_t size = desc->warm_region_bytes ?
-        (size_t)desc->warm_region_bytes :
-        (size_t)desc->vector_stride * desc->max_vectors;
+    size_t size = region_bytes ?
+        (size_t)region_bytes :
+        (size_t)value_size * max_vectors;
     long page_size = sysconf(_SC_PAGESIZE);
     uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
-    uint64_t aligned_offset = desc->warm_mmap_offset & ~page_mask;
-    size_t offset_delta = (size_t)(desc->warm_mmap_offset - aligned_offset);
+    uint64_t aligned_offset = mmap_offset & ~page_mask;
+    size_t offset_delta = (size_t)(mmap_offset - aligned_offset);
     size_t map_size = size + offset_delta;
     void *ptr = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fd,
                      (off_t)aligned_offset);
     close(fd);
     if (ptr == MAP_FAILED) return -1;
-    region->region_id = desc->warm_region_id;
-    region->backend_type = desc->warm_backend_type;
-    region->value_size = desc->vector_stride;
+    region->region_id = region_id;
+    region->backend_type = backend_type;
+    region->value_size = value_size;
     region->region_bytes = size;
-    region->mmap_offset = desc->warm_mmap_offset;
+    region->mmap_offset = mmap_offset;
     region->mmap_aligned_offset = aligned_offset;
     region->mapping_bytes = map_size;
     region->mapping_addr = ptr;
@@ -446,10 +454,62 @@ static int open_warm_region(const vemb_v16_channel_desc_t *desc,
     return 0;
 }
 
+static int open_warm_region(const vemb_v16_channel_desc_t *desc,
+                            bench_region_map_t *region) {
+    if (!desc || !region)
+        return -1;
+    return open_warm_region_desc(desc->warm_region_id,
+                                 desc->warm_backend_type,
+                                 desc->warm_region_bytes,
+                                 desc->warm_mmap_offset,
+                                 desc->vector_stride,
+                                 desc->max_vectors,
+                                 desc->vector_region_name,
+                                 region);
+}
+
+static int open_warm_regions(const vemb_v16_channel_desc_t *desc,
+                             bench_node_channel_t *node) {
+    uint32_t count = desc->warm_region_count;
+    if (count == 0)
+        count = 1;
+    if (count > VEMB_V16_MAX_DESC_WARM_REGIONS)
+        return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        int rc;
+        if (desc->warm_region_count == 0) {
+            rc = open_warm_region(desc, &node->warm_regions[i]);
+        } else {
+            rc = open_warm_region_desc(desc->warm_regions[i].region_id,
+                                       desc->warm_regions[i].backend_type,
+                                       desc->warm_regions[i].region_bytes,
+                                       desc->warm_regions[i].mmap_offset,
+                                       desc->vector_stride,
+                                       desc->max_vectors,
+                                       desc->warm_regions[i].path,
+                                       &node->warm_regions[i]);
+        }
+        if (rc != 0)
+            return -1;
+    }
+    node->warm_region_count = count;
+    node->warm_region = node->warm_regions[0];
+    return 0;
+}
+
 static void close_warm_region(bench_region_map_t *region) {
     if (!region || !region->mapping_addr) return;
     munmap(region->mapping_addr, (size_t)region->mapping_bytes);
     memset(region, 0, sizeof(*region));
+}
+
+static void close_warm_regions(bench_node_channel_t *node) {
+    if (!node)
+        return;
+    for (uint32_t i = 0; i < node->warm_region_count; i++)
+        close_warm_region(&node->warm_regions[i]);
+    memset(&node->warm_region, 0, sizeof(node->warm_region));
+    node->warm_region_count = 0;
 }
 
 static void fill_vector(float *vector, uint32_t dim, uint32_t seed) {
@@ -519,9 +579,11 @@ static uint32_t route_key(const bench_cfg_t *cfg, const char *key) {
 static bench_region_map_t *find_warm_region(worker_arg_t *w,
                                              uint32_t region_id) {
     for (uint32_t i = 0; i < w->node_count; i++) {
-        if (w->nodes[i].warm_region.mapped_addr &&
-            w->nodes[i].warm_region.region_id == region_id) {
-            return &w->nodes[i].warm_region;
+        for (uint32_t r = 0; r < w->nodes[i].warm_region_count; r++) {
+            if (w->nodes[i].warm_regions[r].mapped_addr &&
+                w->nodes[i].warm_regions[r].region_id == region_id) {
+                return &w->nodes[i].warm_regions[r];
+            }
         }
     }
     return NULL;
@@ -1129,6 +1191,15 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(supernode_completion_publish));
     printf("[stats] bitmap lock_success=%llu lock_failure=%llu\n",
            D(bitmap_lock_success), D(bitmap_lock_failure));
+    printf("[stats] warm regions=%llu full=%llu alloc_local=%llu alloc_remote=%llu fallback=%llu cold_spill=%llu fail=%llu local_pct=%llu\n",
+           (unsigned long long)after->warm_region_count,
+           (unsigned long long)after->warm_region_full_count,
+           D(warm_alloc_local),
+           D(warm_alloc_remote),
+           D(warm_alloc_fallback),
+           D(warm_alloc_cold_spill),
+           D(warm_alloc_fail),
+           (unsigned long long)after->warm_region_hash_local_pct);
     printf("[stats] depth request=%llu response=%llu vemb_shard=%llu vadd_shard=%llu completion=%llu channel_ops=%llu\n",
            (unsigned long long)after->request_ring_depth,
            (unsigned long long)after->response_ring_depth,
@@ -1207,7 +1278,7 @@ static void close_node_channel(const char *socket_path,
         munmap(node->resp_ring,
                vemb_v16_client_ring_bytes(node->desc.response_ring_slot_size));
     }
-    close_warm_region(&node->warm_region);
+    close_warm_regions(node);
     memset(node, 0, sizeof(*node));
     node->net_fd = -1;
 }
@@ -1242,7 +1313,7 @@ static int setup_node_channel(const bench_cfg_t *cfg,
         close_node_channel(socket_path, node);
         return -1;
     }
-    if (open_region && open_warm_region(&node->desc, &node->warm_region) != 0) {
+    if (open_region && open_warm_regions(&node->desc, node) != 0) {
         close_node_channel(socket_path, node);
         return -1;
     }

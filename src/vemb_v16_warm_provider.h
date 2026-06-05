@@ -26,7 +26,10 @@ int vemb_v16_warm_provider_open(vemb_v16_warm_provider_t *provider,
                                 const char *path,
                                 uint64_t mmap_offset,
                                 uint32_t value_size,
-                                uint32_t max_vectors);
+                                uint64_t region_bytes,
+                                uint32_t home_ub_node_id,
+                                uint32_t is_local,
+                                uint32_t weight);
 void vemb_v16_warm_provider_close(vemb_v16_warm_provider_t *provider);
 
 #endif

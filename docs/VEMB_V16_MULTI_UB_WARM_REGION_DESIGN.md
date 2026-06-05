@@ -17,6 +17,29 @@
   <span style="color:red"> **TODO: 需要 Huawei 方提供生产环境 UB 初始化案例，帮助明确 `obmmctl` 的实际部署、export/import 和 region 暴露方式。** </span>
 - <span style="color:red">不做在线 region 迁移、rebalance 或动态扩缩容。</span>
 
+## 当前实现状态
+
+已完成：
+
+- 单进程 `shm/mock_ub` 下支持 `warm_regions[]`，TLC metadata 已从 `warm_idx -> warm_slot` 扩展为 `warm_idx -> TlcWarmLocation`。
+- `tlc_core` 已支持多 WARM region runtime、weighted virtual-node selector、local region weight、region full fallback。
+- overwrite 保持原 `{region_id, offset}`，不会重新 hash 迁移。
+- 所有 WARM region 写满后会 cold spill，并返回 invalid warm handle。
+- `vemb_v16_tlc` 已支持单一 `vemb_v16_tlc_create()` 多 region 初始化、按 `region_id` 查 region、按 handle slice vector。
+- SuperNode read、VSIM key-key、storage vector slice 已按 `handle.region_id` 找 mapped region，不再假设单个 `vector_region + offset`。
+- manifest 路径已打通，支持 `shm`、`mock_ub`、`shm_mock_ub` 和 `ub` provider；manifest 可配置 `local_ub_node_id`、`local_region_weight`、`home_ub_node_id`、`weight`、`is_local`。
+- channel descriptor 和 bench/client 已支持多个 WARM region mmap，并按 response `region_id` 查找 region。
+- aggregate warm stats 已接入 server/bench 输出：`warm_region_count`、`warm_region_full_count`、`warm_alloc_local`、`warm_alloc_remote`、`warm_alloc_fallback`、`warm_alloc_cold_spill`、`warm_alloc_fail`、`warm_region_hash_local_pct`。
+- TCP read path 已明确为 inline vector 模式：TCP 下 `VEMB_HANDLE` / `VEMB_SUPERNODE_READ` 必须带 `INLINE_VECTOR` flag，bench 侧只允许 `vemb-inline-vector` 或 `mixed-80r20w` 读模式。
+- 已补单测覆盖 local full fallback、overwrite no migration、all full cold spill、manifest `shm/mock_ub` create/put/slice/channel desc。
+
+未完成：
+
+- 真实生产 OBMM/UB 环境验证：需要 Huawei 方提供生产环境 UB 初始化案例，明确 `obmmctl export/import`、UB path 创建、region 暴露方式，以及哪块 UB region 是 local region。
+- per-region stats 对外输出尚未补齐：`tlc_core_get_region_stats()` 已有，但 server/bench/protocol 还未输出每个 region 的 `capacity_slots`、`used_slots`、`is_local`、`full`。
+- WARM eviction 未实现：当前 region 满后 fallback，所有 region 满后 cold spill；还没有 high-watermark/low-watermark、clock/LRU、dirty flush、slot reuse。
+- 非 TCP 跨机器 transport 未实现：当前 TCP 只能 inline vector；Aeron/SHM 跨机器需要后续 `aeron-over-UB` 或等价 UB request/response ring 设计。
+
 ## 架构图
 
 ![VEMB V16 SuperNode TLC multi UB warm regions](./assets/vemb_v16_multi_ub_warm_region_arch.svg)
@@ -199,6 +222,165 @@ mapping_bytes = region_bytes + offset_delta
 mapping_addr = mmap(NULL, mapping_bytes, PROT_READ|PROT_WRITE, MAP_SHARED, fd, aligned_offset)
 mapped_addr = mapping_addr + offset_delta
 ```
+
+## 当前实现可运行命令
+
+### 1. 编译
+
+```bash
+make -C src vemb_v16_server
+make -C benchmark vemb_v16_bench vemb_v16_tlc_ut vemb_v16_manifest_ut
+```
+
+本地单测：
+
+```bash
+./benchmark/vemb_v16_tlc_ut
+./benchmark/vemb_v16_manifest_ut
+```
+
+### 2. 单 region 兼容模式
+
+启动 server：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 2 \
+  --supernode-workers 4 \
+  --vector-region /vemb_v16_vectors_single \
+  --region-id 1 \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 65536 \
+  --loglevel notice
+```
+
+TCP bench。TCP 模式只能 inline vector；读模式使用 `vemb-inline-vector`：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
+  --mode vemb-inline-vector \
+  --dim 300 \
+  --prefill 10000 \
+  --ops 20000 \
+  --threads 1,2,4 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+TCP 80/20 混合读写：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
+  --mode mixed-80r20w \
+  --dim 300 \
+  --prefill 10000 \
+  --ops 20000 \
+  --threads 1,2,4 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+### 3. 多 WARM region manifest mock 模式
+
+创建本机 `shm/mock_ub` manifest：
+
+```bash
+cat >/tmp/vemb_v16_warm_regions.yaml <<'YAML'
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 8
+warm_regions:
+  - region_id: 101
+    provider: shm
+    path: /vemb_v16_manifest_r101
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 202
+    provider: mock_ub
+    path: /vemb_v16_manifest_r202
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+YAML
+```
+
+启动 multi-region server：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 2 \
+  --supernode-workers 4 \
+  --warm-regions-manifest /tmp/vemb_v16_warm_regions.yaml \
+  --dim 300 \
+  --max-vectors 65536 \
+  --loglevel notice
+```
+
+运行 TCP inline vector bench：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
+  --mode vemb-inline-vector \
+  --dim 300 \
+  --prefill 10000 \
+  --ops 20000 \
+  --threads 1,2,4 \
+  --pipeline 1 \
+  --timeout-ms 10000
+```
+
+bench 输出会包含 warm region aggregate stats：
+
+```text
+[stats] warm regions=... full=... alloc_local=... alloc_remote=... fallback=... cold_spill=... fail=... local_pct=...
+```
+
+### 4. 真实 UB manifest 预期形态
+
+真实 UB 运行时，将 `provider` 改为 `ub`，`path` 指向 `obmmctl` 预先创建并 import 到本进程可访问 namespace 的 UB path：
+
+```yaml
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 8
+warm_regions:
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev2
+    mmap_offset: 0
+    bytes: 1073741824
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 202
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 1073741824
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+```
+
+这里仍需要 Huawei 方给出生产环境初始化案例，确认 `path`、权限、export/import 生命周期和 local region 标识。
 
 ## Hash + Weight Region Selector
 

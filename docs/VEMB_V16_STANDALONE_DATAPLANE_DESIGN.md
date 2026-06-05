@@ -132,7 +132,7 @@ channel_id -> uint64_t monotonic id, never reused in process lifetime
 原因：
 
 - TCP 语义可靠，跨主机可用，部署与调试成本最低。
-- V16 当前请求形态是 request/response，且 payload 主要是小型 `VEMB_HANDLE` 与约 1200B 的 `VADD_INLINE`，TCP 长连接加 pipeline 可以先把功能和 benchmark 口径跑准。
+- TCP 第一阶段只承诺 INLINE 语义：`VADD` 请求携带完整 vector payload，`VEMB` 响应携带完整 vector payload。WARM handle 只作为 server 内部定位和 completion 元数据，不作为 TCP client 的读路径。
 - DPDK 性能上限最高，但需要 hugepage、NIC binding、queue/core/NUMA 管理和专用部署权限，不应阻塞第一阶段。
 - KCP 适合弱网、丢包和高 jitter 场景；在低丢包机房内网里，它会把可靠性和重传逻辑搬到用户态，复杂度通常不值得作为主路径。
 
@@ -265,20 +265,18 @@ CONTROL_STATUS server -> bench, payload = vemb_v16_net_status_t
 
 - `ping`
 - `vadd-inline`
-- `vemb-handle`
-- `vemb-supernode-read`
 - `vemb-inline-vector`
 - `mixed-80r20w`
 
-`vemb-inline-vector` 是 TCP transport 的跨主机完整 vector 语义。请求使用 `VEMB_V16_OP_VEMB_HANDLE` 并设置 `VEMB_V16_REQ_F_INLINE_VECTOR`；SuperNode 仍然返回 `{region_id, offset, bytes}` completion，proxy 在 TCP `RESPONSE` frame 中写入：
+`vemb-inline-vector` 是 TCP transport 的跨主机完整 vector 语义。请求使用 `VEMB_V16_OP_VEMB_HANDLE` 并设置 `VEMB_V16_REQ_F_INLINE_VECTOR`；SuperNode 内部仍可使用 `{region_id, offset, bytes}` completion 定位 WARM payload，proxy 在 TCP `RESPONSE` frame 中写入：
 
 ```text
 payload = vemb_v16_resp_t + vector_bytes
 ```
 
-其中 `vemb_v16_resp_t` 保留 handle 字段，追加 payload 是从 server 本地 WARM/vector region 按 offset 拷贝出的 vector 内容。第一阶段 `vemb-inline-vector` 只承诺 TCP transport；shared-memory transport 继续使用 `vemb-read-vector` 由客户端 mmap region 后本地读取。
+其中 `vemb_v16_resp_t` 可以保留 handle/debug 字段，但 TCP client 以追加的 `vector_bytes` 为准，不 mmap WARM region。追加 payload 是从 server 本地 WARM/vector region 按 `region_id + offset` 拷贝出的 vector 内容。第一阶段 TCP 只支持这种完整 payload 返回；shared-memory/Aeron transport 才使用 `vemb-read-vector` 由客户端 mmap region 后本地读取。
 
-`vemb-read-vector` 暂不作为跨主机语义，因为当前该模式依赖客户端 mmap WARM/vector region 后按 `{region_id, offset, bytes}` 本地读取。后续如果要进一步优化跨主机完整 vector 返回，应引入 RDMA/URMA/DPDK zero-copy read path，减少 TCP 追加 1200B payload 的内核拷贝。
+`vemb-handle` / `vemb-read-vector` / `vemb-supernode-read` 不作为 TCP 对外语义。后续如果要进一步优化跨主机完整 vector 返回，应引入 RDMA/URMA/DPDK zero-copy read path，减少 TCP 追加 1200B payload 的内核拷贝。
 
 TCP 实现要求：
 

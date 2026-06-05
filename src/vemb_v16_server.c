@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
     vemb_v16_storage_ctx_t *storage = NULL;
     const char *uds_path = VEMB_V16_UDS_PATH;
     const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
+    const char *warm_regions_manifest = NULL;
     uint32_t dim = VEMB_V16_DEFAULT_DIM;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
     uint32_t warm_region_id = 0;
@@ -83,6 +84,8 @@ int main(int argc, char **argv) {
             supernode_workers = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--vector-region") && i + 1 < argc) {
             vector_region_name = argv[++i];
+        } else if (!strcmp(argv[i], "--warm-regions-manifest") && i + 1 < argc) {
+            warm_regions_manifest = argv[++i];
         } else if (!strcmp(argv[i], "--dim") && i + 1 < argc) {
             dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--max-vectors") && i + 1 < argc) {
@@ -107,7 +110,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -142,18 +145,50 @@ int main(int argc, char **argv) {
     monotonicInit();
     vemb_v16_log_init();
     vemb_v16_set_log_level(loglevel);
-    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s",
+    serverLog(LL_NOTICE, "vemb_v16 server starting: transport=%s uds=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s warm_regions_manifest=%s",
               transport, uds_path, tcp_host, tcp_port, proxy_io_threads,
-              supernode_workers, dim, max_vectors, vector_region_name);
+              supernode_workers, dim, max_vectors, vector_region_name,
+              warm_regions_manifest ? warm_regions_manifest : "(none)");
 
-    if (vemb_v16_storage_ctx_create(&storage,
-                                    dim,
-                                    dim * sizeof(float),
-                                    max_vectors,
-                                    vector_region_name,
-                                    warm_region_id,
-                                    warm_backend_type,
-                                    warm_mmap_offset) != 0) {
+    vemb_v16_warm_regions_manifest_t manifest;
+    memset(&manifest, 0, sizeof(manifest));
+    if (warm_regions_manifest) {
+        if (vemb_v16_parse_warm_regions_manifest(warm_regions_manifest,
+                                                 dim * sizeof(float),
+                                                 &manifest) != 0) {
+            serverLog(LL_WARNING, "failed to parse warm regions manifest: %s",
+                      warm_regions_manifest);
+            goto cleanup;
+        }
+    } else {
+        if (!vector_region_name || !vector_region_name[0])
+            vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
+        if (vector_region_name[0] != '/' ||
+            strlen(vector_region_name) >= sizeof(manifest.regions[0].path)) {
+            serverLog(LL_WARNING, "invalid vemb_v16 vector region name: %s",
+                      vector_region_name);
+            goto cleanup;
+        }
+        manifest.local_region_weight = 4;
+        manifest.region_count = 1;
+        vemb_v16_manifest_region_t *region = &manifest.regions[0];
+        region->region_id = warm_region_id;
+        region->backend_type = warm_backend_type ?
+            warm_backend_type : VEMB_V16_REGION_LOCAL_SHM;
+        region->is_local = 1;
+        region->has_is_local = 1;
+        region->weight = 1;
+        region->value_size = dim * sizeof(float);
+        region->mmap_offset = warm_mmap_offset;
+        region->region_bytes = (uint64_t)region->value_size * max_vectors;
+        strncpy(region->path, vector_region_name, sizeof(region->path) - 1);
+    }
+    int storage_rc = vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                               dim,
+                                                               dim * sizeof(float),
+                                                               max_vectors,
+                                                               &manifest);
+    if (storage_rc != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 storage");
         goto cleanup;
     }
@@ -201,6 +236,15 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.bitmap_lock_success,
            (unsigned long long)stats.bitmap_lock_failure,
            (unsigned long long)stats.sample_vector_load_ns);
+    serverLog(LL_NOTICE, "vemb_v16 stats: warm_regions=%llu warm_full=%llu warm_alloc_local=%llu warm_alloc_remote=%llu warm_fallback=%llu warm_cold_spill=%llu warm_fail=%llu warm_local_pct=%llu",
+           (unsigned long long)stats.warm_region_count,
+           (unsigned long long)stats.warm_region_full_count,
+           (unsigned long long)stats.warm_alloc_local,
+           (unsigned long long)stats.warm_alloc_remote,
+           (unsigned long long)stats.warm_alloc_fallback,
+           (unsigned long long)stats.warm_alloc_cold_spill,
+           (unsigned long long)stats.warm_alloc_fail,
+           (unsigned long long)stats.warm_region_hash_local_pct);
     serverLog(LL_NOTICE, "vemb_v16 stats: depth request=%llu response=%llu vemb_shard=%llu vadd_shard=%llu completion=%llu channel_ops=%llu",
            (unsigned long long)stats.request_ring_depth,
            (unsigned long long)stats.response_ring_depth,

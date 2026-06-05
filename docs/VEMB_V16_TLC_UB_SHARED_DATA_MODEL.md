@@ -104,16 +104,17 @@ proxy 与 SuperNode 一一对应
 HOT:
   SuperNode 私有 cache/index
   目标是 L3 cache resident
-  key -> warm_slot
+  key -> warm_idx
   不暴露给 CLI
 
 WARM:
   SuperNode 私有 metadata/index:
-    key -> warm_slot
-    slot state / bitmap lock / access_count / eviction metadata
-  共享 data region:
-    slot_id -> vector bytes
-    provider 可以是 shm，也可以是 UB
+    key -> warm_idx
+    warm_idx -> region_id + offset + bytes
+    state / bitmap lock / access_count / eviction metadata
+  共享 data regions:
+    region_id + offset -> vector bytes
+    provider 可以是 shm，也可以是一个或多个 UB path
     CLI 根据 {region_id, offset, bytes} 直接读取
 
 COLD:
@@ -127,14 +128,77 @@ COLD:
 ```text
 WARM 不是 data region + HOT Layer。
 WARM = shared data region + SuperNode private metadata/index。
-HOT = 独立上一层 cache，只缓存 key -> warm_slot。
+HOT = 独立上一层 cache，只缓存 key -> warm_idx。
 ```
 
 WARM data region 使用 packed vector arena：
 
 ```text
-slot_id * value_size -> vector bytes
-vector_slot[N][1200B]
+single region:
+  slot_id * value_size -> vector bytes
+  vector_slot[N][1200B]
+
+multi region:
+  region_id + local_slot * value_size -> vector bytes
+  warm metadata records key -> {region_id, local_slot, offset, bytes}
+```
+
+### 多 UB Region WARM 设计
+
+一个 SuperNode 的同一个 WARM layer 可以同时挂载多个 UB region。HOT/WARM metadata 仍保持 SuperNode 私有，UB/shared memory 只承载 vector payload。跨进程和跨节点可见的定位信息仍然只有：
+
+```text
+region_id + offset + bytes
+```
+
+新增 region runtime 元数据：
+
+```text
+region_id
+backend_type = shm | ub
+path / mmap_offset / region_bytes
+value_size
+capacity_slots = region_bytes / value_size
+next_slot
+full
+home_ub_node_id
+is_local
+weight
+mapped_addr
+```
+
+新 key 写入流程：
+
+```text
+key_hash
+-> warm_region_hash_ring.lookup(key_hash)
+-> primary region
+-> if primary has free slot: allocate local_slot and write payload
+-> if primary is full: walk next candidate region on the ring
+-> if all WARM regions are full: append COLD / return invalid warm handle
+```
+
+覆盖已有 key 时不重新选择 region。WARM metadata 中已有的 `{region_id, offset}` 是该 key 的稳定 payload 位置，overwrite 直接写回原位置，避免 handle 抖动。
+
+region 选择使用 `three_layer_cache_ub` 中的 hash + weight 思路：
+
+```text
+base_vnodes = N
+effective_weight = region.weight
+if region.is_local:
+  effective_weight *= local_region_weight
+vnodes = base_vnodes * effective_weight
+```
+
+因此本地 UB region 会拥有更多 virtual nodes，默认更容易被选中；但本地 region 满后，allocator 会沿 hash ring 选择下一个可用 UB region。需要统计：
+
+```text
+local_allocs
+remote_allocs
+fallback_allocs
+full_regions
+cold_spills
+hash_ring_local_pct
 ```
 
 ### 元数据 / 用户数据分离设计
@@ -181,6 +245,18 @@ return WARM handle
 
 CLI 启动配置中，`cli` 描述 CLI 自己要使用的 hash 算法和可 mmap 的 WARM region map；`nodes[]` 描述每组一一对应的 Proxy 和 SuperNode 初始化资源。CLI 根据 `cli.hash` 对 `vector_key` 做 `consistent_hash` 得到 `node_id`，再连接对应 node 的 `proxy.endpoint` 申请 channel。
 
+SuperNode 内部还会为自己的 WARM regions 构建第二层 hash ring。两层 hash 的边界不同：
+
+```text
+CLI hash:
+  vector_key -> supernode_id
+  只负责跨 SuperNode 路由
+
+SuperNode WARM region hash:
+  key_hash -> warm region candidate
+  只负责本 SuperNode 内部的 UB region 分配
+```
+
 ```yaml
 cli:
   id: cli-0
@@ -195,9 +271,16 @@ cli:
       bytes: 1073741824
       value_size: 1200
     - region_id: 1
-      node_id: 1
+      node_id: 0
       provider: ub
       path: /dev/obmm_shmdev2
+      mmap_offset: 0
+      bytes: 1073741824
+      value_size: 1200
+    - region_id: 2
+      node_id: 0
+      provider: ub
+      path: /dev/obmm_shmdev3
       mmap_offset: 0
       bytes: 1073741824
       value_size: 1200
@@ -207,26 +290,37 @@ nodes:
     proxy:
       endpoint: /tmp/vemb_proxy_0.sock
     supernode:
+      local_ub_node_id: 0
       tlc:
         warm:
-          region_id: 0
-          provider: shm
-          path: /vemb_warm_0
-          mmap_offset: 0
-          bytes: 1073741824
-          value_size: 1200
-  - id: 1
-    proxy:
-      endpoint: /tmp/vemb_proxy_1.sock
-    supernode:
-      tlc:
-        warm:
-          region_id: 1
-          provider: ub
-          path: /dev/obmm_shmdev2
-          mmap_offset: 0
-          bytes: 1073741824
-          value_size: 1200
+          hash:
+            algorithm: consistent_hash
+            virtual_nodes: 32
+            local_region_weight: 4
+          regions:
+            - region_id: 0
+              provider: shm
+              path: /vemb_warm_0
+              mmap_offset: 0
+              bytes: 1073741824
+              value_size: 1200
+              weight: 1
+            - region_id: 1
+              provider: ub
+              path: /dev/obmm_shmdev2
+              mmap_offset: 0
+              bytes: 1073741824
+              value_size: 1200
+              home_ub_node_id: 0
+              weight: 1
+            - region_id: 2
+              provider: ub
+              path: /dev/obmm_shmdev3
+              mmap_offset: 0
+              bytes: 1073741824
+              value_size: 1200
+              home_ub_node_id: 1
+              weight: 1
 ```
 
 说明：
@@ -235,9 +329,9 @@ nodes:
 - `cli.warm_regions[]` 是 CLI 需要 mmap 的所有 SuperNode WARM data region；VEMB response 的 `region_id` 必须能在这里查到。
 - `node.id` 同时标识 Proxy 和 SuperNode 这一对实例。
 - `node.proxy.endpoint` 是 CLI 连接 Proxy、申请 channel 的地址。
-- `node.supernode.tlc.warm` 是该 SuperNode 初始化 TLC 时使用的 WARM data region descriptor，应与 `cli.warm_regions[]` 中同 `region_id` 的条目一致。
-- 当前 P0 中，每个 SuperNode 的 `warm_layer` 只映射一个 WARM data region；也就是一个 `node.supernode.tlc.warm` 对应一个 `region_id`。
-- 后续如果一个 `warm_layer` 需要映射多个 region，应把配置扩展为 `node.supernode.tlc.warm.regions[]`，并在 TLC metadata 中增加 `warm_slot -> region_id + offset` 映射。
+- `node.supernode.tlc.warm.regions[]` 是该 SuperNode 初始化 TLC 时使用的 WARM data region descriptors，应与 `cli.warm_regions[]` 中同 `region_id` 的条目一致。
+- 当前代码路径仍是单 region P0 形态；多 region 设计要求 `warm_layer` 映射多个 region，并在 TLC metadata 中维护 `warm_idx -> region_id + offset`。
+- `local_ub_node_id` 和 region 的 `home_ub_node_id` 用于判断本地 UB region；如果 OBMM/topology 后续提供自动查询接口，可以由 manifest 生成阶段填充这些字段。
 - SuperNode 不再单独暴露给 CLI 一个 endpoint；Proxy 和 SuperNode 一起初始化，Proxy 负责与本地对应 SuperNode 的数据交互。
 - P0 暂时不需要在 CLI 配置里暴露 `hot/cold`：HOT 是 SuperNode 私有 cache，COLD 是 SuperNode 私有 append 层；二者不被 CLI mmap 读取。
 
@@ -256,6 +350,8 @@ typedef struct vemb_region_desc {
     uint32_t backend_type;
     uint32_t dim;
     uint32_t value_size;
+    uint32_t home_ub_node_id;
+    uint32_t weight;
     uint64_t mmap_offset;
     uint64_t region_bytes;
     char path[256];
@@ -281,13 +377,24 @@ typedef struct vemb_vector_handle {
 typedef struct tlc_warm_region {
     uint32_t region_id;
     uint32_t backend_type;
+    uint32_t home_ub_node_id;
+    uint32_t is_local;
+    uint32_t weight;
     void *mapped_addr;
     uint64_t region_bytes;
     uint32_t value_size;
 } tlc_warm_region_t;
+
+typedef struct tlc_warm_location {
+    uint32_t region_id;
+    uint32_t region_index;
+    uint32_t local_slot;
+    uint32_t bytes;
+    uint64_t offset;
+} tlc_warm_location_t;
 ```
 
-`warm_slot/warm_idx` 可以作为 debug 字段保留，但不应该成为跨进程协议的唯一定位信息。
+`warm_slot/warm_idx` 可以作为 debug 字段保留，但不应该成为跨进程协议的唯一定位信息。多 region 后，`warm_idx` 是 SuperNode 私有 metadata entry index，`local_slot` 才是某个 region 内部的 payload slot。
 
 `vemb_vector_handle_t` 中真正用于定位 vector 的字段是：
 
@@ -310,14 +417,17 @@ sequenceDiagram
     participant CTRL as UDS Control
     participant CLI as CLI or bench
 
-    S->>S: parse --warm-backend/--vector-region/--warm-mmap-offset
+    S->>S: parse warm region config or OBMM manifest
     S->>P: vemb_v16_proxy_create(config)
-    P->>W: vemb_v16_warm_provider_open(config)
-    W->>W: shm_open+ftruncate+mmap or open+mmap UB path
-    W-->>P: mapped_addr, region_id, region_bytes
-    P->>TLC: vemb_v16_tlc_create(warm_provider)
-    TLC->>TLC: build ub_address_space_t over warm data region
-    TLC->>CORE: tlc_core_create(config, warm_data=mapped_addr)
+    P->>W: vemb_v16_warm_provider_open_many(regions[])
+    loop each warm region
+        W->>W: shm_open+ftruncate+mmap or open+mmap UB path
+        W->>W: derive is_local from local_ub_node_id/home_ub_node_id
+    end
+    W-->>P: mapped_addr[], region_id[], region_bytes[]
+    P->>TLC: vemb_v16_tlc_create(warm_regions[])
+    TLC->>TLC: build warm region hash ring with local weight
+    TLC->>CORE: tlc_core_create(config, warm_regions[])
     CORE->>CORE: zcalloc HOT/WARM/COLD metadata and bitmap lock
     CORE-->>TLC: ready
     TLC-->>P: ready
@@ -338,21 +448,24 @@ sequenceDiagram
 初始化边界：
 
 ```text
-WARM vector payload: warm_provider 映射出的 shared shm 或 UB region
+WARM vector payload: warm_provider 映射出的 shared shm 或 UB regions
 TLC/HOT/WARM/COLD metadata: tlc_core 使用本地 zcalloc 分配
 VADD/VEMB 执行线程: SuperNode worker
 channel 生命周期和 response ring: proxy/channel worker
 ```
 
-`vemb_v16_warm_provider_open()` 是 WARM 用户数据区的初始化入口：
+`vemb_v16_warm_provider_open()` 是当前单 WARM 用户数据区的初始化入口。多 region 形态需要增加 `open_many()` 或等价初始化层：
 
 ```text
 input:
-  backend_type = shm | ub
-  region_id
-  path / shm name
-  mmap_offset
-  region_bytes = max_vectors * value_size
+  regions[]
+    backend_type = shm | ub
+    region_id
+    path / shm name
+    mmap_offset
+    region_bytes
+    value_size
+    home_ub_node_id / is_local / weight
 
 local shm:
   shm_open(path)
@@ -364,17 +477,73 @@ ub:
   mmap(MAP_SHARED, offset=mmap_offset)
 
 output:
-  provider->desc.region_id
-  provider->desc.backend_type
-  provider->desc.path
-  provider->desc.mmap_offset
-  provider->desc.region_bytes
-  provider->mapped_addr
+  provider->regions[i].region_id
+  provider->regions[i].backend_type
+  provider->regions[i].path
+  provider->regions[i].mmap_offset
+  provider->regions[i].region_bytes
+  provider->regions[i].mapped_addr
+  provider->regions[i].capacity_slots
+  provider->regions[i].is_local
 ```
 
-`vemb_v16_tlc_create()` 只消费 warm provider 返回的 `mapped_addr/region_id/region_bytes/value_size`。它不会再为 vector payload 自己分配大块内存；`tlc_core_create()` 只分配 HOT/WARM/COLD metadata，并把 `core->warm_data` 指向 warm provider 的 mapped region。
+`vemb_v16_tlc_create()` 只消费 warm provider 返回的 `mapped_addr/region_id/region_bytes/value_size`。它不会再为 vector payload 自己分配大块内存；`tlc_core_create()` 只分配 HOT/WARM/COLD metadata，并把 WARM payload writes 指向 warm provider 的 mapped regions。
 
 Linux 上默认 `shm` backend 使用普通 `MAP_SHARED`。POSIX shm 对象通常位于 tmpfs，不是 hugetlbfs 文件，隐式叠加 `MAP_HUGETLB` 会在普通部署上返回 `EINVAL`。`ub` backend 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。
+
+### OBMM UB Region 初始化与 Local 判定
+
+OBMM 的 export/import 和 UB path 创建由 `obmmctl` 在进程外完成。Redis/VEMB 进程只消费已经存在的 `/dev/obmm_shmdevX` 或等价 UB path：
+
+```text
+obmmctl create/export/import
+-> produce shmdev path and metadata
+-> vemb_v16_server open(path, O_RDWR)
+-> mmap(MAP_SHARED)
+-> register as WARM region
+```
+
+`open + mmap` 只能证明当前进程可以映射这块 UB memory，不能可靠推断这块 region 是否本地。因此 local 判定必须来自控制面：
+
+```text
+region.is_local = region.home_ub_node_id == supernode.local_ub_node_id
+```
+
+推荐由 obmmctl 部署流程生成 manifest：
+
+```yaml
+supernode_id: 0
+local_ub_node_id: 0
+warm_regions:
+  - region_id: 1
+    path: /dev/obmm_shmdev2
+    mmap_offset: 0
+    bytes: 1073741824
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 2
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 1073741824
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+```
+
+如果短期无法从 obmmctl 产出 `home_ub_node_id`，可以显式配置：
+
+```text
+--local-region-id 1
+```
+
+或者在 region descriptor 中直接配置：
+
+```yaml
+is_local: true
+```
+
+不建议通过 `/dev/obmm_shmdevX` 的数字后缀推断 locality；该编号是本机 shmdev 视角的资源 id，不是稳定的物理 UB node id。
 
 ## Channel 生命周期
 
@@ -464,10 +633,10 @@ sequenceDiagram
         CORE->>WMETA: warm_put promotes value to WARM
         CORE->>HOT: hot_put(key_hash, warm_idx)
     end
-    CORE-->>TLC: handle(region_id, warm_idx * value_size, value_size)
+    CORE-->>TLC: handle(region_id, offset, bytes)
     opt VEMB_SUPERNODE_READ mode
-        SN->>TLC: vemb_v16_tlc_read_warm_slot(warm_idx)
-        TLC->>WDATA: sve_serial_contiguous_read_blocking_traced
+        SN->>TLC: vemb_v16_tlc_read_handle(handle)
+        TLC->>WDATA: read from regions[region_id] + offset
     end
     SN->>CQ: publish completion(channel_id, req_id, handle)
     P->>CQ: drain completion
@@ -527,10 +696,11 @@ sequenceDiagram
     TLC->>CORE: tlc_core_put(key, key_len, key_hash, value)
     CORE->>WMETA: warm_put find existing or append new warm_idx
     alt WARM has free slot
+        CORE->>WMETA: resolve/allocate warm location
         CORE->>WDATA: sve_streaming_store or memcpy value bytes
         CORE->>WMETA: publish key/key_hash/state/access_count
         CORE->>HOT: hot_put(key_hash, warm_idx)
-        CORE-->>TLC: handle(region_id, warm_idx * value_size, value_size)
+        CORE-->>TLC: handle(region_id, offset, bytes)
     else WARM full
         CORE->>COLD: cold_append(key, value)
         CORE-->>TLC: invalid warm slot
@@ -572,7 +742,8 @@ sequenceDiagram
     CORE->>COLD: cold_lookup(key)
     COLD-->>CORE: value
     CORE->>WMETA: warm_put allocate warm_idx
-    CORE->>WDATA: copy value into warm_idx * value_size
+    CORE->>WMETA: resolve/allocate warm location
+    CORE->>WDATA: copy value into regions[region_id] + offset
     CORE->>HOT: hot_put(key_hash, warm_idx)
     CORE-->>TLC: WARM handle
     SN->>CQ: publish completion(handle)
@@ -700,7 +871,7 @@ TCP 模式线程扫描可用逗号列表；bench 会按顺序分别执行每个�
   --timeout-ms 120000
 ```
 
-UB 模式启动 server。`--vector-region` 必须是 Linux server 上可 `open(O_RDWR)` 且可 `mmap(MAP_SHARED)` 的 UB 设备或文件路径；`--warm-mmap-offset` 传 UB warm 区域起始偏移。
+UB 模式启动 server。当前命令行仍是单 WARM region 形态：`--vector-region` 必须是 Linux server 上可 `open(O_RDWR)` 且可 `mmap(MAP_SHARED)` 的 UB 设备或文件路径；`--warm-mmap-offset` 传 UB warm 区域起始偏移。
 
 ```bash
 ./src/vemb_v16_server \
@@ -712,6 +883,19 @@ UB 模式启动 server。`--vector-region` 必须是 Linux server 上可 `open(O
   --max-vectors 131072 \
   --loglevel notice
 ```
+
+多 UB region 形态不再适合用一组 `--vector-region/--warm-mmap-offset/--region-id` 描述。交付时应改为 manifest/config 驱动：
+
+```bash
+./src/vemb_v16_server \
+  --socket /tmp/vemb_v16.sock \
+  --warm-regions-manifest /etc/vemb/supernode-0-warm-regions.yaml \
+  --dim 300 \
+  --max-vectors 131072 \
+  --loglevel notice
+```
+
+manifest 中需要包含所有 region 的 `region_id/path/mmap_offset/bytes/value_size/home_ub_node_id/weight`，以及本 SuperNode 的 `local_ub_node_id`。server 初始化时打开并 mmap 所有 region，构建 WARM region hash ring，并按 local weight 优先把新 key 分配到本地 UB region；本地 region 满后自动 fallback 到下一个可用 region。
 
 UB 模式 benchmark 与本地 SHM 模式一致，client 会从 server 返回的 channel descriptor 中读取 warm backend、region path、mmap offset 和 region size：
 

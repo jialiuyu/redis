@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "sve_operation.h"
+#include "tlc_core.h"
 #include "vemb_v16_protocol.h"
 
 typedef enum vemb_v16_region_backend {
@@ -34,13 +35,14 @@ typedef struct vemb_v16_vector_handle {
 typedef struct vemb_v16_tlc_warm_region {
     uint32_t region_id;
     uint32_t backend_type;
+    uint32_t home_ub_node_id;
+    uint32_t is_local;
+    uint32_t weight;
     void *mapped_addr;
     uint64_t region_bytes;
     uint64_t mmap_offset;
     uint32_t value_size;
 } vemb_v16_tlc_warm_region_t;
-
-typedef struct tlc_core tlc_core_t;
 
 typedef struct vemb_v16_tlc {
     uint32_t vector_dim;
@@ -48,17 +50,19 @@ typedef struct vemb_v16_tlc {
     uint32_t max_vectors;
     uint32_t region_id;
     uint32_t backend_type;
-    ub_address_space_t ubas;
+    uint32_t warm_region_count;
+    vemb_v16_tlc_warm_region_t *warm_regions;
     state_bitmap_t bitmap;
     sve_operation_stats_t sve_stats;
-    sve_gather_ctx_t gather_ctx;
     tlc_core_t *core;
 } vemb_v16_tlc_t;
 
 int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         uint32_t vector_dim,
                         uint32_t max_vectors,
-                        const vemb_v16_tlc_warm_region_t *warm_region);
+                        const vemb_v16_tlc_warm_region_t *warm_regions,
+                        uint32_t warm_region_count,
+                        uint32_t local_region_weight);
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc);
 
 int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
@@ -81,5 +85,17 @@ int vemb_v16_tlc_cold_append(vemb_v16_tlc_t *tlc,
                              uint64_t key_hash,
                              const float *vector,
                              uint32_t vector_bytes);
+const vemb_v16_tlc_warm_region_t *vemb_v16_tlc_find_region(
+    const vemb_v16_tlc_t *tlc,
+    uint32_t region_id);
+int vemb_v16_tlc_vector_slice(const vemb_v16_tlc_t *tlc,
+                              const vemb_v16_vector_handle_t *handle,
+                              const uint8_t **vector,
+                              uint32_t *vector_bytes);
+void vemb_v16_tlc_get_core_stats(vemb_v16_tlc_t *tlc,
+                                 tlc_core_stats_t *stats);
+uint32_t vemb_v16_tlc_get_region_stats(vemb_v16_tlc_t *tlc,
+                                       tlc_core_region_stats_t *regions,
+                                       uint32_t max_regions);
 
 #endif

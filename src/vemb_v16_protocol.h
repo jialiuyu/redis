@@ -22,6 +22,7 @@
 #define VEMB_V16_MAX_DIM 4096
 #define VEMB_V16_DEFAULT_DIM 300
 #define VEMB_V16_DEFAULT_MAX_VECTORS 131072
+#define VEMB_V16_MAX_DESC_WARM_REGIONS 16u
 
 #define VEMB_V16_STATUS_OK 0u
 #define VEMB_V16_STATUS_NOT_FOUND 1u
@@ -87,6 +88,15 @@ typedef struct vemb_v16_channel_desc {
     char request_ring_name[64];
     char response_ring_name[64];
     char vector_region_name[256];
+    uint32_t warm_region_count;
+    uint32_t reserved0;
+    struct {
+        uint32_t region_id;
+        uint32_t backend_type;
+        uint64_t region_bytes;
+        uint64_t mmap_offset;
+        char path[256];
+    } warm_regions[VEMB_V16_MAX_DESC_WARM_REGIONS];
 } vemb_v16_channel_desc_t;
 
 typedef struct vemb_v16_net_hdr {
@@ -172,6 +182,14 @@ typedef struct vemb_v16_stats {
     uint64_t vadd_shard_queue_depth;
     uint64_t completion_ring_depth;
     uint64_t channel_ops;
+    uint64_t warm_region_count;
+    uint64_t warm_region_full_count;
+    uint64_t warm_alloc_local;
+    uint64_t warm_alloc_remote;
+    uint64_t warm_alloc_fallback;
+    uint64_t warm_alloc_cold_spill;
+    uint64_t warm_alloc_fail;
+    uint64_t warm_region_hash_local_pct;
 } vemb_v16_stats_t;
 
 static inline uint32_t vemb_v16_murmur3(const char *key, size_t len) {

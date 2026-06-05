@@ -199,8 +199,22 @@ flowchart LR
 - Proxy 和 SuperNode 一一对应，不存在一个 proxy 面对多个 SuperNode 的热路径 fan-out。
 - Proxy 不做 hash，不持有 consistent hash ring。
 - Proxy 不下发 region descriptors。
-- 每个 SuperNode 有独立 TLC：HOT 私有、WARM metadata 私有、WARM data region 可被 CLI mmap 读取、COLD 独立 append。
+- 每个 SuperNode 有独立 TLC：HOT 私有、WARM metadata 私有、一个或多个 WARM data region 可被 CLI mmap 读取、COLD 独立 append。
 - VEMB response 返回 `{region_id, offset, bytes}`，CLI 根据 `region_id` 读取对应 SuperNode 的 WARM data region。
+
+这里存在两层 hash，职责不同：
+
+```text
+CLI consistent hash:
+  vector_key -> supernode_id
+  决定请求发给哪个 Proxy/SuperNode
+
+SuperNode WARM region hash:
+  key_hash -> candidate UB region
+  只在目标 SuperNode 内部使用，负责 WARM payload region 分配
+```
+
+Proxy 不参与任何一层 hash。CLI 的 hash ring 不关心某个 SuperNode 内部有几块 WARM/UB region；SuperNode 内部的 region hash ring 也不会改变跨 SuperNode 路由结果。
 
 ## 初始化时序
 
@@ -256,9 +270,10 @@ sequenceDiagram
     CLI->>P: publish VADD on channel_i
     P->>SN: forward VADD to one-to-one SuperNode
     SN->>TLC: tlc_put(vector_key, value)
-    TLC->>WMETA: find or allocate warm_slot
-    TLC->>WDATA: write value at slot offset
-    TLC->>WMETA: publish/update key -> warm_slot
+    TLC->>WMETA: find or allocate warm_idx
+    TLC->>TLC: resolve/allocate region_id + offset
+    TLC->>WDATA: write value at regions[region_id] + offset
+    TLC->>WMETA: publish/update key -> warm_idx location
     TLC-->>SN: OK
     SN-->>P: OK(req_id)
     P-->>CLI: response OK(req_id)
@@ -285,10 +300,10 @@ sequenceDiagram
     SN->>TLC: tlc_get_handle(vector_key)
     TLC->>HOT: lookup key
     alt HOT miss
-        TLC->>WMETA: lookup key -> warm_slot
+        TLC->>WMETA: lookup key -> warm_idx
     end
-    TLC->>WMETA: validate slot state/key
-    TLC->>TLC: offset = warm_slot * value_size
+    TLC->>WMETA: validate warm_idx state/key
+    TLC->>TLC: resolve warm_idx -> region_id + offset + bytes
     TLC-->>SN: handle(region_id, offset, bytes)
     SN-->>P: response(req_id, handle)
     P-->>CLI: response(req_id, handle)
@@ -304,6 +319,7 @@ sequenceDiagram
 - Proxy 只管理 channel 生命周期和 `channel_id`。
 - Proxy 只把已绑定 channel 的 request 转交给本地对应 SuperNode。
 - SuperNode 执行 VADD/VEMB/VSIM 和 TLC。
+- SuperNode 内部可以使用 hash + weight 在多个 WARM UB region 间分配 payload；本地 UB region 可通过更高 virtual-node weight 优先命中，满后 fallback 到下一个可用 region。
 - CLI 根据 VEMB 返回 handle 读取 WARM data region。
 
 ## 性能影响

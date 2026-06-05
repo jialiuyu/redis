@@ -221,3 +221,4 @@ benchmark/*_ut
 benchmark/*_bench
 /deps/lua/src/lua
 /deps/lua/src/luac
+src/vemb_v16_server

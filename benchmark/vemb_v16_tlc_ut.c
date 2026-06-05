@@ -33,7 +33,7 @@ static void test_put_get_handle(void) {
     uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
 
     memset(region, 0, sizeof(region));
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     fill_vector(vector, dim, 10);
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                             vector, sizeof(vector), &handle, &warm_slot) == 0);
@@ -72,7 +72,7 @@ static void test_overwrite_and_capacity(void) {
     uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
     uint64_t missing_hash = vemb_v16_murmur3(missing, strlen(missing));
 
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     fill_vector(first, dim, 1);
     fill_vector(second, dim, 100);
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
@@ -110,7 +110,7 @@ static void test_cold_read_through_promotes_warm_handle(void) {
     uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
 
     memset(region, 0, sizeof(region));
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     fill_vector(vector, dim, 200);
     assert(vemb_v16_tlc_cold_append(tlc, key, (uint32_t)strlen(key), key_hash,
                                     vector, sizeof(vector)) == 0);
@@ -141,7 +141,7 @@ static void test_hot_is_cache_only(void) {
     char key[32];
 
     memset(region, 0, sizeof(region));
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     for (uint32_t i = 0; i < max_vectors; i++) {
         snprintf(key, sizeof(key), "hot-cache:%u", i);
         fill_vector(vector, dim, i + 1);
@@ -182,7 +182,7 @@ static void test_prefill_distribution_stays_warm(void) {
     char key[32];
 
     assert(region);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     for (uint32_t i = 0; i < prefill; i++) {
         make_key(key, sizeof(key), i);
         fill_vector(vector, dim, i);
@@ -264,7 +264,7 @@ static void test_concurrent_distinct_keys(void) {
     };
 
     memset(region, 0, sizeof(region));
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm) == 0);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     for (int i = 0; i < threads; i++) {
         args[i] = (concurrent_arg_t){
             .tlc = tlc,
@@ -279,6 +279,189 @@ static void test_concurrent_distinct_keys(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
+                                        char keys[][32],
+                                        uint32_t needed) {
+    enum { dim = 2, max_vectors = 64 };
+    float region1[dim * max_vectors];
+    float region2[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t regions[] = {
+        {
+            .region_id = 1,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = region1,
+            .region_bytes = sizeof(region1),
+            .value_size = dim * sizeof(float),
+        },
+        {
+            .region_id = 2,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 0,
+            .weight = 1,
+            .mapped_addr = region2,
+            .region_bytes = sizeof(region2),
+            .value_size = dim * sizeof(float),
+        },
+    };
+    uint32_t found = 0;
+
+    memset(region1, 0, sizeof(region1));
+    memset(region2, 0, sizeof(region2));
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors,
+                                    regions, 2, 16) == 0);
+    fill_vector(vector, dim, 500);
+    for (uint32_t i = 0; i < 10000 && found < needed; i++) {
+        char key[32];
+        vemb_v16_vector_handle_t handle = {0};
+        uint32_t warm_slot = UINT32_MAX;
+        snprintf(key, sizeof(key), "region-probe:%u", i);
+        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                                vector, sizeof(vector),
+                                &handle, &warm_slot) == 0);
+        if (handle.region_id == wanted_region_id) {
+            snprintf(keys[found], 32, "%s", key);
+            found++;
+        }
+    }
+    vemb_v16_tlc_destroy(tlc);
+    return found;
+}
+
+static void test_multi_region_local_full_fallback_and_overwrite(void) {
+    enum { dim = 2 };
+    float local_region[dim * 1];
+    float remote_region[dim * 4];
+    float first[dim], second[dim], overwrite[dim];
+    char local_keys[2][32];
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t regions[] = {
+        {
+            .region_id = 1,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = local_region,
+            .region_bytes = sizeof(local_region),
+            .value_size = dim * sizeof(float),
+        },
+        {
+            .region_id = 2,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 0,
+            .weight = 1,
+            .mapped_addr = remote_region,
+            .region_bytes = sizeof(remote_region),
+            .value_size = dim * sizeof(float),
+        },
+    };
+    vemb_v16_vector_handle_t h1 = {0}, h2 = {0}, h3 = {0};
+    uint32_t warm_slot = UINT32_MAX;
+
+    assert(collect_keys_for_region(1, local_keys, 2) == 2);
+    memset(local_region, 0, sizeof(local_region));
+    memset(remote_region, 0, sizeof(remote_region));
+    assert(vemb_v16_tlc_create(&tlc, dim, 5, regions, 2, 16) == 0);
+
+    fill_vector(first, dim, 10);
+    fill_vector(second, dim, 20);
+    fill_vector(overwrite, dim, 30);
+    uint64_t h1_hash = vemb_v16_murmur3(local_keys[0], strlen(local_keys[0]));
+    uint64_t h2_hash = vemb_v16_murmur3(local_keys[1], strlen(local_keys[1]));
+
+    assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
+                            h1_hash, first, sizeof(first),
+                            &h1, &warm_slot) == 0);
+    assert(h1.region_id == 1);
+    assert(h1.offset == 0);
+    assert(memcmp(local_region, first, sizeof(first)) == 0);
+
+    assert(vemb_v16_tlc_put(tlc, local_keys[1], (uint32_t)strlen(local_keys[1]),
+                            h2_hash, second, sizeof(second),
+                            &h2, &warm_slot) == 0);
+    assert(h2.region_id == 2);
+    assert(h2.offset == 0);
+    assert(memcmp(remote_region, second, sizeof(second)) == 0);
+
+    assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
+                            h1_hash, overwrite, sizeof(overwrite),
+                            &h3, &warm_slot) == 0);
+    assert(h3.region_id == h1.region_id);
+    assert(h3.offset == h1.offset);
+    assert(memcmp(local_region, overwrite, sizeof(overwrite)) == 0);
+    tlc_core_stats_t stats;
+    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    assert(stats.warm_region_count == 2);
+    assert(stats.warm_alloc_local >= 1);
+    assert(stats.warm_alloc_remote >= 1);
+    assert(stats.warm_alloc_fallback >= 1);
+    assert(stats.warm_region_full_count >= 1);
+    vemb_v16_tlc_destroy(tlc);
+}
+
+static void test_multi_region_all_full_spills_cold(void) {
+    enum { dim = 2, max_vectors = 2 };
+    float region1[dim];
+    float region2[dim];
+    float vector[dim];
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t regions[] = {
+        {
+            .region_id = 10,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = region1,
+            .region_bytes = sizeof(region1),
+            .value_size = dim * sizeof(float),
+        },
+        {
+            .region_id = 20,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 0,
+            .weight = 1,
+            .mapped_addr = region2,
+            .region_bytes = sizeof(region2),
+            .value_size = dim * sizeof(float),
+        },
+    };
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = 0;
+    char key[32];
+
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors,
+                                    regions, 2, 8) == 0);
+    fill_vector(vector, dim, 700);
+    for (uint32_t i = 0; i < max_vectors; i++) {
+        snprintf(key, sizeof(key), "full:%u", i);
+        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                                vector, sizeof(vector),
+                                &handle, &warm_slot) == 0);
+        assert(handle.bytes == sizeof(vector));
+    }
+
+    memset(&handle, 0xff, sizeof(handle));
+    snprintf(key, sizeof(key), "full:%u", max_vectors);
+    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                            vector, sizeof(vector),
+                            &handle, &warm_slot) == 0);
+    assert(warm_slot == UINT32_MAX);
+    assert(handle.bytes == 0);
+    tlc_core_stats_t stats;
+    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    assert(stats.warm_region_count == 2);
+    assert(stats.warm_region_full_count == 2);
+    assert(stats.warm_alloc_cold_spill == 1);
+    assert(stats.warm_alloc_fail >= 1);
+    vemb_v16_tlc_destroy(tlc);
+}
+
 int main(void) {
     test_put_get_handle();
     test_overwrite_and_capacity();
@@ -286,6 +469,8 @@ int main(void) {
     test_hot_is_cache_only();
     test_prefill_distribution_stays_warm();
     test_concurrent_distinct_keys();
+    test_multi_region_local_full_fallback_and_overwrite();
+    test_multi_region_all_full_spills_cold();
     printf("vemb_v16_tlc_ut: all tests passed\n");
     return 0;
 }

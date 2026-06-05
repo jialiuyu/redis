@@ -507,6 +507,24 @@ many bench workers / TCP connections / SHM channels
 ## Phase 3+
 
 - 将进程内 vector table 替换为 UB vector table。
+- 单 WARM layer 多 UB region 支持：已完成核心 mock/shm 路径。
+  - warm provider 支持打开 `regions[]`，每个 region 来自 obmmctl 预先创建的 UB path 或 POSIX SHM。
+  - tlc_core metadata 从 `warm_idx -> warm_slot` 扩展为 `warm_idx -> {region_id, local_slot, offset, bytes}`。
+  - 新 key 通过 WARM region hash ring 分配；本地 UB region 使用更高 weight，region 满后 fallback 到下一个可用 region。
+  - overwrite 保持原 `{region_id, offset}`，不重新 hash 迁移。
+- OBMM warm regions manifest：已完成 parser 与 `shm/mock_ub/ub` provider 接入，真实生产 UB 仍待环境验证。
+  - manifest 记录 `region_id/path/mmap_offset/bytes/value_size/home_ub_node_id/weight`。
+  - server 配置 `local_ub_node_id`，用 `home_ub_node_id == local_ub_node_id` 判断 local region。
+  - 不通过 `/dev/obmm_shmdevX` 数字后缀推断 locality。
+- bench/client 多 region mmap：已完成 channel descriptor 多 region 暴露，bench 按 `resp.region_id` 查找 mapped region。
+- TCP read path：已明确只能 inline vector；server 会拒绝未带 `INLINE_VECTOR` flag 的 TCP VEMB read 请求，bench TCP 读模式只允许 `vemb-inline-vector` 或 `mixed-80r20w`。
+- warm region aggregate stats：已完成 server/bench 输出 `warm_region_count`、`warm_region_full_count`、`warm_alloc_local`、`warm_alloc_remote`、`warm_alloc_fallback`、`warm_alloc_cold_spill`、`warm_alloc_fail`、`warm_region_hash_local_pct`。
+- TODO：真实生产 OBMM/UB 验证。
+  需要 Huawei 方提供生产环境 UB 初始化案例，明确 `obmmctl export/import`、UB path 创建、region 暴露方式，以及哪块 UB region 是 local region。
+- TODO：per-region stats 对外输出。
+  `tlc_core_get_region_stats()` 已实现，但协议/bench/server 还未输出每个 region 的 `capacity_slots`、`used_slots`、`is_local`、`full`。
+- TODO：WARM eviction。
+  当前 region 满后 fallback，所有 region 满后 cold spill；还没有 high-watermark/low-watermark、clock/LRU、dirty flush、slot reuse。
 - TODO：bench 多节点拓扑补齐 `aeron` 跨机器模式。
   当前 `aeron` transport 仍假设 CLI 与 proxy/SuperNode 在同机，通过 UDS control plane + POSIX SHM request/response ring 通信；当 CLI 与 proxy/SuperNode 跨机器部署时，不能直接使用本机 SHM。后续需要设计 `aeron-over-UB` 路径：控制面可走远端 endpoint，request/response ring 与 WARM data region 通过 UB 可 mmap 区域承载，从而实现 CLI 与远端 proxy/SuperNode 的跨机器数据通信。
 - 增加文本命令 CLI，解析兼容 `VADD myvectors ... item:N` / `VEMB myvectors item:N RAW`。

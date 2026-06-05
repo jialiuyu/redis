@@ -119,20 +119,21 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                     completion.status = VEMB_V16_STATUS_NOT_FOUND;
                     atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
                                               memory_order_relaxed);
-                } else if (!storage->vector_region ||
-                           handle.offset > storage->vector_region_size ||
-                           handle.bytes > storage->vector_region_size - handle.offset ||
-                           handle2.offset > storage->vector_region_size ||
-                           handle2.bytes > storage->vector_region_size - handle2.offset ||
-                           handle.bytes != job->vector_bytes ||
-                           handle2.bytes != job->vector_bytes) {
-                    completion.status = VEMB_V16_STATUS_ERR;
                 } else {
-                    const float *v1 =
-                        (const float *)(const void *)(storage->vector_region + handle.offset);
-                    const float *v2 =
-                        (const float *)(const void *)(storage->vector_region + handle2.offset);
-                    completion.score = sve_cosine_similarity_f32(v1, v2, job->dim);
+                    const uint8_t *v1_bytes = NULL;
+                    const uint8_t *v2_bytes = NULL;
+                    uint32_t v1_len = 0;
+                    uint32_t v2_len = 0;
+                    if (vemb_v16_tlc_vector_slice(tlc, &handle, &v1_bytes, &v1_len) != 0 ||
+                        vemb_v16_tlc_vector_slice(tlc, &handle2, &v2_bytes, &v2_len) != 0 ||
+                        v1_len != job->vector_bytes ||
+                        v2_len != job->vector_bytes) {
+                        completion.status = VEMB_V16_STATUS_ERR;
+                    } else {
+                        const float *v1 = (const float *)(const void *)v1_bytes;
+                        const float *v2 = (const float *)(const void *)v2_bytes;
+                        completion.score = sve_cosine_similarity_f32(v1, v2, job->dim);
+                    }
                 }
                 (void)warm_slot2;
             } else if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
@@ -146,29 +147,20 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                     *read_result_bytes = job->vector_bytes;
                 }
 
-                uint64_t emb_id = warm_slot;
-                uint64_t bitmap_lock_ns = 0;
-                uint64_t bitmap_unlock_ns = 0;
-                uint64_t vector_load_ns = 0;
-                if (sve_serial_contiguous_read_blocking_traced(
-                        &tlc->gather_ctx,
-                        &emb_id,
-                        1,
-                        *read_result,
-                        &bitmap_lock_ns,
-                        &bitmap_unlock_ns,
-                        &vector_load_ns) != 0) {
+                const uint8_t *vector_bytes = NULL;
+                uint32_t vector_len = 0;
+                uint64_t vector_load_start = sample ? monotonic_ns() : 0;
+                if (vemb_v16_tlc_vector_slice(tlc, &handle,
+                                              &vector_bytes,
+                                              &vector_len) != 0 ||
+                    vector_len != job->vector_bytes) {
                     completion.status = VEMB_V16_STATUS_ERR;
+                } else {
+                    memcpy(*read_result, vector_bytes, vector_len);
                 }
                 if (sample) {
-                    atomic_fetch_add_explicit(&ctx->stats->sample_bitmap_lock_ns,
-                                              bitmap_lock_ns,
-                                              memory_order_relaxed);
-                    atomic_fetch_add_explicit(&ctx->stats->sample_bitmap_unlock_ns,
-                                              bitmap_unlock_ns,
-                                              memory_order_relaxed);
                     atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
-                                              vector_load_ns,
+                                              monotonic_ns() - vector_load_start,
                                               memory_order_relaxed);
                 }
             }
@@ -240,20 +232,23 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
             completion.status = VEMB_V16_STATUS_NOT_FOUND;
             atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
                                       memory_order_relaxed);
-        } else if (!storage->vector_region ||
-                   handle.offset > storage->vector_region_size ||
-                   handle.bytes > storage->vector_region_size - handle.offset ||
-                   handle.bytes != job->vector_bytes) {
-            completion.status = VEMB_V16_STATUS_ERR;
         } else {
-            const float *stored =
-                (const float *)(const void *)(storage->vector_region + handle.offset);
-            completion.vector_offset = handle.offset;
-            completion.vector_bytes = handle.bytes;
-            completion.region_id = handle.region_id;
-            completion.score = sve_cosine_similarity_f32(stored,
-                                                         vadd_job->vector,
-                                                         job->dim);
+            const uint8_t *stored_bytes = NULL;
+            uint32_t stored_len = 0;
+            if (vemb_v16_tlc_vector_slice(tlc, &handle,
+                                          &stored_bytes,
+                                          &stored_len) != 0 ||
+                stored_len != job->vector_bytes) {
+                completion.status = VEMB_V16_STATUS_ERR;
+            } else {
+                const float *stored = (const float *)(const void *)stored_bytes;
+                completion.vector_offset = handle.offset;
+                completion.vector_bytes = handle.bytes;
+                completion.region_id = handle.region_id;
+                completion.score = sve_cosine_similarity_f32(stored,
+                                                             vadd_job->vector,
+                                                             job->dim);
+            }
         }
         atomic_fetch_add_explicit(&ctx->stats->vsim_requests, 1,
                                   memory_order_relaxed);

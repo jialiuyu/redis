@@ -643,6 +643,16 @@ static int publish_request_job(vemb_v16_channel_t *ch,
     return 0;
 }
 
+static int tcp_vemb_read_requires_inline_vector(vemb_v16_channel_t *ch,
+                                                const vemb_v16_req_t *req) {
+    if (ch->transport_type != VEMB_V16_TRANSPORT_TCP)
+        return 0;
+    if (req->op != VEMB_V16_OP_VEMB_HANDLE &&
+        req->op != VEMB_V16_OP_VEMB_SUPERNODE_READ)
+        return 0;
+    return (req->flags & VEMB_V16_REQ_F_INLINE_VECTOR) ? 0 : -1;
+}
+
 /// Request scheduling: validate protocol input and enqueue execution jobs.
 void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
                     const vemb_v16_req_t *req,
@@ -670,6 +680,9 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {
+        goto error_response;
+    }
+    if (tcp_vemb_read_requires_inline_vector(ch, req) != 0) {
         goto error_response;
     }
 
@@ -1856,6 +1869,16 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
         stats->bitmap_lock_failure =
             atomic_load_explicit(&sve_stats->lock_failure, memory_order_relaxed);
     }
+    tlc_core_stats_t core_stats;
+    vemb_v16_tlc_get_core_stats(proxy_storage(proxy)->tlc, &core_stats);
+    stats->warm_region_count = core_stats.warm_region_count;
+    stats->warm_region_full_count = core_stats.warm_region_full_count;
+    stats->warm_alloc_local = core_stats.warm_alloc_local;
+    stats->warm_alloc_remote = core_stats.warm_alloc_remote;
+    stats->warm_alloc_fallback = core_stats.warm_alloc_fallback;
+    stats->warm_alloc_cold_spill = core_stats.warm_alloc_cold_spill;
+    stats->warm_alloc_fail = core_stats.warm_alloc_fail;
+    stats->warm_region_hash_local_pct = core_stats.warm_region_hash_local_pct;
     if (proxy->vemb_shard_queues) {
         uint32_t count = proxy->vemb_shard_proxy_count *
             proxy->vemb_shard_supernode_count;

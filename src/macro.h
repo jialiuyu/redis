@@ -1,17 +1,26 @@
 #ifndef __MACRO_H
 #define __MACRO_H
 
+#include "config.h"
+
 #define RETURN_IF0(expr)     \
     do {                     \
-        if ((expr)) {        \
+        if (unlikely(expr)) { \
             return;          \
         }                    \
     } while (0)
 
 #define RETURN_IF1(expr, rc) \
     do {                     \
-        if ((expr)) {        \
+        if (unlikely(expr)) { \
             return (rc);     \
+        }                    \
+    } while (0)
+
+#define GOTO_IF(expr, label) \
+    do {                     \
+        if (unlikely(expr)) { \
+            goto label;      \
         }                    \
     } while (0)
 
