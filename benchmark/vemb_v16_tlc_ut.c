@@ -15,6 +15,19 @@ static void make_key(char *buf, size_t len, uint32_t id) {
     snprintf(buf, len, "item:%u", id);
 }
 
+static void init_test_allocator(vemb_v16_shared_region_allocator_t *allocator,
+                                uint32_t region_id,
+                                uint32_t capacity_slots) {
+    memset(allocator, 0, sizeof(*allocator));
+    atomic_init(&allocator->magic, VEMB_V16_SHARED_ALLOCATOR_MAGIC);
+    allocator->version = VEMB_V16_SHARED_ALLOCATOR_VERSION;
+    allocator->region_id = region_id;
+    allocator->capacity_slots = capacity_slots;
+    atomic_init(&allocator->next_slot, 0);
+    atomic_init(&allocator->full, 0);
+    atomic_init(&allocator->used_slots, 0);
+}
+
 static void test_put_get_handle(void) {
     enum { dim = 4, max_vectors = 8 };
     float region[dim * max_vectors];
@@ -462,6 +475,136 @@ static void test_multi_region_all_full_spills_cold(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+static void test_shared_allocator_two_tlcs_unique_slots(void) {
+    enum { dim = 2, max_vectors = 4 };
+    float region[dim * max_vectors];
+    float v1[dim], v2[dim], overwrite[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *tlc1 = NULL, *tlc2 = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 77,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_vector_handle_t h1 = {0}, h2 = {0}, h3 = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    const char *key1 = "shared:one";
+    const char *key2 = "shared:two";
+    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 77, max_vectors);
+    assert(vemb_v16_tlc_create(&tlc1, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&tlc2, dim, max_vectors, &warm, 1, 4) == 0);
+
+    fill_vector(v1, dim, 1000);
+    fill_vector(v2, dim, 2000);
+    fill_vector(overwrite, dim, 3000);
+    assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
+                            v1, sizeof(v1), &h1, &warm_slot) == 0);
+    assert(h1.region_id == 77);
+    assert(h1.offset == 0);
+    assert(warm_slot == 0);
+    assert(vemb_v16_tlc_put(tlc2, key2, (uint32_t)strlen(key2), key2_hash,
+                            v2, sizeof(v2), &h2, &warm_slot) == 0);
+    assert(h2.region_id == 77);
+    assert(h2.offset == sizeof(v2));
+    assert(warm_slot == 1);
+    assert(vemb_v16_shared_allocator_used_slots(&allocator) == 2);
+
+    assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
+                            overwrite, sizeof(overwrite), &h3,
+                            &warm_slot) == 0);
+    assert(h3.region_id == h1.region_id);
+    assert(h3.offset == h1.offset);
+    assert(warm_slot == 0);
+    assert(vemb_v16_shared_allocator_used_slots(&allocator) == 2);
+    assert(memcmp(region, overwrite, sizeof(overwrite)) == 0);
+    assert(memcmp(region + dim, v2, sizeof(v2)) == 0);
+
+    vemb_v16_tlc_destroy(tlc2);
+    vemb_v16_tlc_destroy(tlc1);
+}
+
+static void test_shared_allocator_local_set_before_remote(void) {
+    enum { dim = 2, max_vectors = 6 };
+    float local0[dim], local1[dim], remote[dim * 4];
+    vemb_v16_shared_region_allocator_t alloc0, alloc1, alloc_remote;
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t regions[] = {
+        {
+            .region_id = 100,
+            .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = local0,
+            .region_bytes = sizeof(local0),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &alloc0,
+        },
+        {
+            .region_id = 101,
+            .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = local1,
+            .region_bytes = sizeof(local1),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &alloc1,
+        },
+        {
+            .region_id = 200,
+            .backend_type = VEMB_V16_REGION_UB,
+            .is_local = 0,
+            .weight = 1,
+            .mapped_addr = remote,
+            .region_bytes = sizeof(remote),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &alloc_remote,
+        },
+    };
+    float vector[dim];
+    uint32_t local_writes = 0;
+    uint32_t remote_writes = 0;
+
+    memset(local0, 0, sizeof(local0));
+    memset(local1, 0, sizeof(local1));
+    memset(remote, 0, sizeof(remote));
+    init_test_allocator(&alloc0, 100, 1);
+    init_test_allocator(&alloc1, 101, 1);
+    init_test_allocator(&alloc_remote, 200, 4);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, regions, 3, 4) == 0);
+    fill_vector(vector, dim, 4000);
+
+    for (uint32_t i = 0; i < 3; i++) {
+        char key[32];
+        vemb_v16_vector_handle_t handle = {0};
+        uint32_t warm_slot = UINT32_MAX;
+        snprintf(key, sizeof(key), "local-first:%u", i);
+        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                                vector, sizeof(vector), &handle,
+                                &warm_slot) == 0);
+        if (handle.region_id == 100 || handle.region_id == 101)
+            local_writes++;
+        if (handle.region_id == 200)
+            remote_writes++;
+    }
+    assert(local_writes == 2);
+    assert(remote_writes == 1);
+    assert(vemb_v16_shared_allocator_full(&alloc0) == 1);
+    assert(vemb_v16_shared_allocator_full(&alloc1) == 1);
+    assert(vemb_v16_shared_allocator_used_slots(&alloc_remote) == 1);
+
+    vemb_v16_tlc_destroy(tlc);
+}
+
 int main(void) {
     test_put_get_handle();
     test_overwrite_and_capacity();
@@ -471,6 +614,8 @@ int main(void) {
     test_concurrent_distinct_keys();
     test_multi_region_local_full_fallback_and_overwrite();
     test_multi_region_all_full_spills_cold();
+    test_shared_allocator_two_tlcs_unique_slots();
+    test_shared_allocator_local_set_before_remote();
     printf("vemb_v16_tlc_ut: all tests passed\n");
     return 0;
 }

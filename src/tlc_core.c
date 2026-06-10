@@ -2,6 +2,7 @@
 #include "cpu_relax.h"
 #include "macro.h"
 #include "sve_operation.h"
+#include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
 #include "zmalloc.h"
 
@@ -62,8 +63,7 @@ typedef struct tlc_core_warm_region_runtime {
     uint32_t weight;
     uint32_t value_size;
     uint32_t capacity_slots;
-    atomic_uint_fast32_t next_slot;
-    atomic_int full;
+    vemb_v16_shared_region_allocator_t *shared_allocator;
     uint64_t region_bytes;
     uint8_t *mapped_addr;
 } tlc_core_warm_region_runtime_t;
@@ -298,6 +298,7 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
     for (uint32_t i = 0; i < region_count; i++) {
         const tlc_core_warm_region_config_t *src = &regions[i];
         RETURN_IF(!src->mapped_addr ||
+                  !src->shared_allocator ||
                   src->value_size != core->value_size ||
                   src->region_bytes < src->value_size,
                   -1);
@@ -323,11 +324,23 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
             .weight = weight,
             .value_size = src->value_size,
             .capacity_slots = (uint32_t)capacity_slots,
+            .shared_allocator = src->shared_allocator,
             .region_bytes = src->region_bytes,
             .mapped_addr = src->mapped_addr,
         };
-        atomic_init(&warm->regions[i].next_slot, 0);
-        atomic_init(&warm->regions[i].full, 0);
+        serverLog(LL_NOTICE,
+                  "tlc warm region init: region_index=%u region_id=%u backend_type=%u is_local=%u weight=%u effective_weight=%u value_size=%u region_bytes=%llu capacity_slots=%u mapped_addr=%p shared_allocator=%p",
+                  i,
+                  warm->regions[i].region_id,
+                  warm->regions[i].backend_type,
+                  warm->regions[i].is_local,
+                  warm->regions[i].weight,
+                  effective_weight,
+                  warm->regions[i].value_size,
+                  (unsigned long long)warm->regions[i].region_bytes,
+                  warm->regions[i].capacity_slots,
+                  warm->regions[i].mapped_addr,
+                  (void *)warm->regions[i].shared_allocator);
     }
 
     warm->vnodes = zcalloc(sizeof(*warm->vnodes) * total_vnodes);
@@ -354,38 +367,87 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
     return 0;
 }
 
-static int warm_alloc_location(tlc_core_t *core,
-                               uint64_t key_hash,
-                               tlc_warm_location_t *location) {
-    tlc_core_warm_layer_t *warm = &core->warm;
-    uint32_t tried[TLC_CORE_MAX_WARM_REGIONS];
-    uint32_t tried_count = 0;
-    RETURN_IF(!location || warm->region_count == 0 ||
-              warm->vnode_count == 0, -1);
+static int warm_region_is_full(tlc_core_warm_region_runtime_t *region) {
+    return vemb_v16_shared_allocator_full(region->shared_allocator);
+}
 
+static int warm_region_alloc_slot(tlc_core_warm_region_runtime_t *region, uint32_t *local_slot) {
+    return vemb_v16_shared_allocator_alloc(region->shared_allocator, local_slot);
+}
+
+static uint32_t warm_region_used_slots(tlc_core_warm_region_runtime_t *region) {
+    return vemb_v16_shared_allocator_used_slots(region->shared_allocator);
+}
+
+static void log_warm_region_switch(const char *reason,
+                                   uint64_t key_hash,
+                                   uint32_t want_local,
+                                   uint32_t attempted_regions,
+                                   uint32_t vnode_pos,
+                                   uint32_t region_index,
+                                   tlc_core_warm_region_runtime_t *region,
+                                   int alloc_rc) {
+    vemb_v16_shared_region_allocator_t *allocator = region->shared_allocator;
+    uint32_t magic = atomic_load_explicit(&allocator->magic, memory_order_acquire);
+    uint32_t next_slot = atomic_load_explicit(&allocator->next_slot, memory_order_relaxed);
+    uint32_t full = atomic_load_explicit(&allocator->full, memory_order_acquire);
+    uint32_t used_slots = atomic_load_explicit(&allocator->used_slots, memory_order_relaxed);
+    serverLog(LL_NOTICE,
+              "tlc warm region switch: reason=%s key_hash=%llu want_local=%u attempted_regions=%u vnode_pos=%u region_index=%u region_id=%u allocator_region_id=%u alloc_rc=%d magic=%08x version=%u next_slot=%u used_slots=%u full=%u capacity_slots=%u generation=%llu",
+              reason,
+              (unsigned long long)key_hash,
+              want_local,
+              attempted_regions,
+              vnode_pos,
+              region_index,
+              region->region_id,
+              allocator->region_id,
+              alloc_rc,
+              magic,
+              allocator->version,
+              next_slot,
+              used_slots,
+              full,
+              allocator->capacity_slots,
+              (unsigned long long)allocator->generation);
+}
+
+static int warm_alloc_location_pass(tlc_core_t *core,
+                                    uint64_t key_hash,
+                                    uint32_t want_local,
+                                    uint8_t *tried,
+                                    uint32_t *attempted_regions,
+                                    tlc_warm_location_t *location) {
+    tlc_core_warm_layer_t *warm = &core->warm;
     uint32_t start = vnode_lower_bound(warm, mix32(key_hash));
     for (uint32_t i = 0; i < warm->vnode_count; i++) {
         uint32_t vnode_pos = (start + i) % warm->vnode_count;
         uint32_t region_index = warm->vnodes[vnode_pos].region_index;
-        int seen = 0;
-        for (uint32_t t = 0; t < tried_count; t++) {
-            if (tried[t] == region_index) {
-                seen = 1;
-                break;
-            }
-        }
-        if (seen)
+        if (region_index >= warm->region_count || tried[region_index]) {
             continue;
-        tried[tried_count++] = region_index;
-
+        }
         tlc_core_warm_region_runtime_t *region = &warm->regions[region_index];
-        if (atomic_load_explicit(&region->full, memory_order_acquire))
-            goto next_region;
+        if ((region->is_local ? 1u : 0u) != want_local) {
+            continue;
+        }
+        tried[region_index] = 1;
+        (*attempted_regions)++;
 
-        uint32_t local_slot =
-            (uint32_t)atomic_fetch_add_explicit(&region->next_slot, 1,
-                                                memory_order_relaxed);
-        if (local_slot < region->capacity_slots) {
+        if (warm_region_is_full(region)) {
+            log_warm_region_switch("region_full",
+                                   key_hash,
+                                   want_local,
+                                   *attempted_regions,
+                                   vnode_pos,
+                                   region_index,
+                                   region,
+                                   VEMB_V16_SHARED_ALLOCATOR_FULL);
+            continue;
+        }
+
+        uint32_t local_slot = TLC_CORE_INVALID_SLOT;
+        int alloc_rc = warm_region_alloc_slot(region, &local_slot);
+        if (alloc_rc == VEMB_V16_SHARED_ALLOCATOR_OK) {
             *location = (tlc_warm_location_t){
                 .region_id = region->region_id,
                 .region_index = region_index,
@@ -398,22 +460,85 @@ static int warm_alloc_location(tlc_core_t *core,
                                       &core->warm_alloc_remote,
                                       1,
                                       memory_order_relaxed);
-            if (tried_count > 1) {
-                atomic_fetch_add_explicit(&core->warm_alloc_fallback,
-                                          1,
-                                          memory_order_relaxed);
+            if (*attempted_regions > 1) {
+                atomic_fetch_add_explicit(&core->warm_alloc_fallback, 1, memory_order_relaxed);
             }
             return 0;
         }
-        atomic_store_explicit(&region->full, 1, memory_order_release);
-
-next_region:
-        if (tried_count >= warm->region_count)
-            break;
+        log_warm_region_switch("alloc_retry_next_region",
+                               key_hash,
+                               want_local,
+                               *attempted_regions,
+                               vnode_pos,
+                               region_index,
+                               region,
+                               alloc_rc);
     }
+    serverLog(LL_WARNING,
+              "tlc warm alloc pass failed: key_hash=%llu want_local=%u attempted_regions=%u region_count=%u vnode_count=%u",
+              (unsigned long long)key_hash,
+              want_local,
+              *attempted_regions,
+              warm->region_count,
+              warm->vnode_count);
+    return -1;
+}
+
+static int warm_alloc_location(tlc_core_t *core,
+                               uint64_t key_hash,
+                               tlc_warm_location_t *location) {
+    tlc_core_warm_layer_t *warm = &core->warm;
+    uint8_t tried[TLC_CORE_MAX_WARM_REGIONS] = {0};
+    uint32_t attempted_regions = 0;
+    RETURN_IF(!location || warm->region_count == 0 || warm->vnode_count == 0, -1);
+    if (warm_alloc_location_pass(core, key_hash, 1, tried,
+                                 &attempted_regions, location) == 0) {
+        tlc_core_warm_region_runtime_t *region = &warm->regions[location->region_index];
+        vemb_v16_shared_region_allocator_t *allocator = region->shared_allocator;
+        serverLog(LL_DEBUG,
+                  "tlc warm local alloc success: key_hash=%llu region_id=%u region_index=%u local_slot=%u offset=%llu attempted_regions=%u is_local=%u next_slot=%u used_slots=%u full=%u capacity_slots=%u",
+                  (unsigned long long)key_hash,
+                  location->region_id,
+                  location->region_index,
+                  location->local_slot,
+                  (unsigned long long)location->offset,
+                  attempted_regions,
+                  region->is_local,
+                  atomic_load_explicit(&allocator->next_slot, memory_order_relaxed),
+                  atomic_load_explicit(&allocator->used_slots, memory_order_relaxed),
+                  atomic_load_explicit(&allocator->full, memory_order_acquire),
+                  allocator->capacity_slots);
+        return 0;
+    }
+    memset(tried, 0, sizeof(tried));
+    if (warm_alloc_location_pass(core, key_hash, 0, tried,
+                                 &attempted_regions, location) == 0) {
+        tlc_core_warm_region_runtime_t *region = &warm->regions[location->region_index];
+        vemb_v16_shared_region_allocator_t *allocator = region->shared_allocator;
+        serverLog(LL_DEBUG,
+                  "tlc warm remote alloc success: key_hash=%llu region_id=%u region_index=%u local_slot=%u offset=%llu attempted_regions=%u is_local=%u next_slot=%u used_slots=%u full=%u capacity_slots=%u",
+                  (unsigned long long)key_hash,
+                  location->region_id,
+                  location->region_index,
+                  location->local_slot,
+                  (unsigned long long)location->offset,
+                  attempted_regions,
+                  region->is_local,
+                  atomic_load_explicit(&allocator->next_slot, memory_order_relaxed),
+                  atomic_load_explicit(&allocator->used_slots, memory_order_relaxed),
+                  atomic_load_explicit(&allocator->full, memory_order_acquire),
+                  allocator->capacity_slots);
+        return 0;
+    }
+
+    serverLog(LL_WARNING,
+              "tlc warm alloc failed: key_hash=%llu attempted_regions=%u region_count=%u vnode_count=%u",
+              (unsigned long long)key_hash,
+              attempted_regions,
+              warm->region_count,
+              warm->vnode_count);
     *location = tlc_invalid_location;
-    atomic_fetch_add_explicit(&core->warm_alloc_fail, 1,
-                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&core->warm_alloc_fail, 1, memory_order_relaxed);
     return -1;
 }
 
@@ -435,8 +560,9 @@ static int warm_init(tlc_core_t *core, const tlc_core_config_t *config) {
     atomic_init(&warm->count, 0);
     atomic_init(&warm->hits, 0);
     atomic_init(&warm->misses, 0);
-    if (warm_regions_init(core, config) != 0)
+    if (warm_regions_init(core, config) != 0) {
         return -1;
+    }
     return bitmap_init(&warm->locks, warm->hash_capacity);
 }
 
@@ -521,23 +647,16 @@ static int warm_reserve_entry(tlc_core_warm_layer_t *warm,
 
 static void warm_release_location(tlc_core_t *core,
                                   const tlc_warm_location_t *location) {
-    tlc_core_warm_layer_t *warm = &core->warm;
-    if (location->region_index >= warm->region_count)
-        return;
-    tlc_core_warm_region_runtime_t *region =
-        &warm->regions[location->region_index];
-    uint_fast32_t expected = (uint_fast32_t)location->local_slot + 1;
-    if (atomic_compare_exchange_strong_explicit(&region->next_slot,
-                                                &expected,
-                                                location->local_slot,
-                                                memory_order_relaxed,
-                                                memory_order_relaxed)) {
-        atomic_fetch_sub_explicit(region->is_local ?
-                                  &core->warm_alloc_local :
-                                  &core->warm_alloc_remote,
-                                  1,
-                                  memory_order_relaxed);
-    }
+    /*
+     * Warm region slots are currently allocated from a shared append-only
+     * allocator. Once a slot is reserved, neither the local process nor a
+     * peer can safely roll allocator->next_slot / used_slots back here.
+     *
+     * A later write failure therefore leaks the reserved slot by design
+     * instead of attempting an unsafe cross-process rollback.
+     */
+    (void)core;
+    (void)location;
 }
 
 static int warm_lookup(tlc_core_t *core,
@@ -629,6 +748,19 @@ static int warm_put(tlc_core_t *core,
     return 0;
 
 error:
+    serverLog(LL_WARNING,
+              "tlc warm put failed: key_hash=%llu key_len=%u value_size=%u target=%d empty_pos=%u region_id=%u region_index=%u local_slot=%u offset=%llu warm_count=%u warm_capacity=%u",
+              (unsigned long long)key_hash,
+              key_len,
+              value_size,
+              target,
+              empty_pos,
+              loc.region_id,
+              loc.region_index,
+              loc.local_slot,
+              (unsigned long long)loc.offset,
+              (unsigned)atomic_load_explicit(&warm->count, memory_order_relaxed),
+              warm->capacity);
     bitmap_unlock(&warm->locks, lock_id);
     return -1;
 }
@@ -883,10 +1015,12 @@ int tlc_core_get_warm_location(tlc_core_t *core,
 
     atomic_fetch_add_explicit(&core->total_reads, 1, memory_order_relaxed);
     int32_t hot_idx = hot_get(core, key_hash);
-    if (warm_validate_idx(core, hot_idx, key, key_len, key_hash, location) == 0)
+    if (warm_validate_idx(core, hot_idx, key, key_len, key_hash, location) == 0) {
         return 0;
-    if (warm_lookup(core, key, key_len, key_hash, location) == 0)
+    }
+    if (warm_lookup(core, key, key_len, key_hash, location) == 0) {
         return 0;
+    }
 
     const uint8_t *cold_value = NULL;
     uint32_t cold_value_size = 0;
@@ -960,8 +1094,7 @@ void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
     tlc_core_warm_layer_t *warm = &core->warm;
     stats->warm_region_count = warm->region_count;
     for (uint32_t i = 0; i < warm->region_count; i++) {
-        if (atomic_load_explicit(&warm->regions[i].full,
-                                 memory_order_relaxed)) {
+        if (warm_region_is_full(&warm->regions[i])) {
             stats->warm_region_full_count++;
         }
     }
@@ -984,27 +1117,19 @@ void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
 uint32_t tlc_core_get_region_stats(tlc_core_t *core,
                                    tlc_core_region_stats_t *regions,
                                    uint32_t max_regions) {
-    if (!core)
-        return 0;
     tlc_core_warm_layer_t *warm = &core->warm;
     uint32_t n = warm->region_count;
-    if (!regions || max_regions == 0)
-        return n;
+    RETURN_IF (!regions || max_regions == 0, n);
     if (n > max_regions)
         n = max_regions;
     for (uint32_t i = 0; i < n; i++) {
         tlc_core_warm_region_runtime_t *region = &warm->regions[i];
-        uint32_t used = (uint32_t)atomic_load_explicit(&region->next_slot,
-                                                       memory_order_relaxed);
-        if (used > region->capacity_slots)
-            used = region->capacity_slots;
         regions[i] = (tlc_core_region_stats_t){
             .region_id = region->region_id,
             .is_local = region->is_local,
-            .full = (uint32_t)atomic_load_explicit(&region->full,
-                                                   memory_order_relaxed),
+            .full = (uint32_t)warm_region_is_full(region),
             .capacity_slots = region->capacity_slots,
-            .used_slots = used,
+            .used_slots = warm_region_used_slots(region),
         };
     }
     return n;

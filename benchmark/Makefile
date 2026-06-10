@@ -129,12 +129,16 @@ vemb_v16_slow_client_bench: vemb_v16_slow_client_bench.c ../src/vemb_v16_protoco
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"
 
-vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+vemb_v16_shared_allocator_ut: vemb_v16_shared_allocator_ut.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/cpu_relax.h ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
 	@echo "✅ Built: $@"
 
-vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"
 
 # Ring buffer unit test

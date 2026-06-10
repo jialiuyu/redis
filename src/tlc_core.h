@@ -1,7 +1,7 @@
 #ifndef __TLC_CORE_H
 #define __TLC_CORE_H
 
-#include "sve_operation.h"
+#include "vemb_v16_shared_allocator.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -29,6 +29,7 @@ typedef struct tlc_core_warm_region_config {
     uint32_t value_size;
     uint64_t region_bytes;
     uint8_t *mapped_addr;
+    vemb_v16_shared_region_allocator_t *shared_allocator;
 } tlc_core_warm_region_config_t;
 
 typedef struct tlc_core_region_stats {

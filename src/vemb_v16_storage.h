@@ -2,6 +2,7 @@
 #define __VEMB_V16_STORAGE_H
 
 #include "vemb_v16_protocol.h"
+#include "vemb_v16_shared_allocator.h"
 #include "vemb_v16_tlc.h"
 #include "vemb_v16_warm_provider.h"
 
@@ -43,7 +44,10 @@ typedef struct vemb_v16_storage_ctx {
     char vector_region_name[256];
     uint32_t warm_region_count;
     uint32_t local_region_weight;
+    vemb_v16_mapped_region_t *warm_data_mappings;
+    vemb_v16_mapped_region_t *warm_allocator_mappings;
     vemb_v16_warm_provider_t *warm_providers;
+    vemb_v16_shared_allocator_mapping_t *warm_allocators;
     vemb_v16_warm_provider_t warm_provider;
     vemb_v16_tlc_t *tlc;
 } vemb_v16_storage_ctx_t;
@@ -56,6 +60,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
 int vemb_v16_parse_warm_regions_manifest(const char *path,
                                          uint32_t value_size,
                                          vemb_v16_warm_regions_manifest_t *manifest);
+int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest_t *manifest);
 void vemb_v16_storage_ctx_destroy(vemb_v16_storage_ctx_t *storage);
 const char *vemb_v16_storage_vector_region_name(vemb_v16_storage_ctx_t *storage);
 size_t vemb_v16_storage_vector_region_size(vemb_v16_storage_ctx_t *storage);

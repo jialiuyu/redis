@@ -151,6 +151,7 @@ region.is_local = region.home_ub_node_id == supernode.local_ub_node_id
 ```yaml
 supernode_id: 0
 local_ub_node_id: 0
+local_region_weight: 8
 warm_regions:
   - region_id: 1
     provider: ub
@@ -170,16 +171,10 @@ warm_regions:
     weight: 1
 ```
 
-短期无法从 obmmctl 输出 `home_ub_node_id` 时，可以显式配置本地 region：
+短期无法从 obmmctl 输出 `home_ub_node_id` 时，可以在 region descriptor 中直接显式配置 locality：
 
 ```yaml
-supernode_id: 0
-local_region_ids: [1]
-warm_regions:
-  - region_id: 1
-    provider: ub
-    path: /dev/obmm_shmdev2
-    is_local: true
+is_local: true
 ```
 
 不建议用 `/dev/obmm_shmdevX` 的 `X` 推断 locality。该编号是本机 shmdev 资源 id，不是稳定的物理 UB node id。
@@ -248,13 +243,13 @@ make -C benchmark vemb_v16_bench vemb_v16_tlc_ut vemb_v16_manifest_ut
   --transport tcp \
   --tcp-host 127.0.0.1 \
   --tcp-port 6391 \
-  --proxy-io-threads 2 \
-  --supernode-workers 4 \
+  --proxy-io-threads 8 \
+  --supernode-workers 16 \
   --vector-region /vemb_v16_vectors_single \
   --region-id 1 \
   --warm-backend shm \
   --dim 300 \
-  --max-vectors 65536 \
+  --max-vectors 131072 \
   --loglevel notice
 ```
 
@@ -266,11 +261,11 @@ TCP bench。TCP 模式只能 inline vector；读模式使用 `vemb-inline-vector
   --endpoints 127.0.0.1:6391 \
   --mode vemb-inline-vector \
   --dim 300 \
-  --prefill 10000 \
-  --ops 20000 \
-  --threads 1,2,4 \
-  --pipeline 1 \
-  --timeout-ms 10000
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,48 \
+  --pipeline 32 \
+  --timeout-ms 120000
 ```
 
 TCP 80/20 混合读写：
@@ -281,11 +276,11 @@ TCP 80/20 混合读写：
   --endpoints 127.0.0.1:6391 \
   --mode mixed-80r20w \
   --dim 300 \
-  --prefill 10000 \
-  --ops 20000 \
-  --threads 1,2,4 \
-  --pipeline 1 \
-  --timeout-ms 10000
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,48 \
+  --pipeline 32 \
+  --timeout-ms 120000
 ```
 
 ### 3. 多 WARM region manifest mock 模式
@@ -324,11 +319,11 @@ YAML
   --transport tcp \
   --tcp-host 127.0.0.1 \
   --tcp-port 6391 \
-  --proxy-io-threads 2 \
-  --supernode-workers 4 \
+  --proxy-io-threads 8 \
+  --supernode-workers 16 \
   --warm-regions-manifest /tmp/vemb_v16_warm_regions.yaml \
   --dim 300 \
-  --max-vectors 65536 \
+  --max-vectors 131072 \
   --loglevel notice
 ```
 
@@ -340,11 +335,11 @@ YAML
   --endpoints 127.0.0.1:6391 \
   --mode vemb-inline-vector \
   --dim 300 \
-  --prefill 10000 \
-  --ops 20000 \
-  --threads 1,2,4 \
-  --pipeline 1 \
-  --timeout-ms 10000
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,48 \
+  --pipeline 32 \
+  --timeout-ms 120000
 ```
 
 bench 输出会包含 warm region aggregate stats：

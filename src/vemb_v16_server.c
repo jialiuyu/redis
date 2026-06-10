@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
     uint32_t proxy_io_threads = default_proxy_io_threads();
     uint32_t supernode_workers = default_supernode_workers();
+    int reset_warm_regions = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) {
@@ -86,6 +87,8 @@ int main(int argc, char **argv) {
             vector_region_name = argv[++i];
         } else if (!strcmp(argv[i], "--warm-regions-manifest") && i + 1 < argc) {
             warm_regions_manifest = argv[++i];
+        } else if (!strcmp(argv[i], "--reset-warm-regions")) {
+            reset_warm_regions = 1;
         } else if (!strcmp(argv[i], "--dim") && i + 1 < argc) {
             dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--max-vectors") && i + 1 < argc) {
@@ -110,7 +113,7 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
         } else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH] [--tcp-host HOST] [--tcp-port PORT] [--proxy-io-threads N] [--supernode-workers N] [--vector-region SHM_NAME_OR_UB_PATH] [--warm-regions-manifest PATH] [--reset-warm-regions] [--region-id N] [--warm-backend shm|ub] [--warm-mmap-offset N] [--dim N] [--max-vectors N] [--loglevel debug|verbose|notice|warning|nothing]\n", argv[0]);
             ret = 0;
             goto cleanup;
         }
@@ -182,6 +185,13 @@ int main(int argc, char **argv) {
         region->mmap_offset = warm_mmap_offset;
         region->region_bytes = (uint64_t)region->value_size * max_vectors;
         strncpy(region->path, vector_region_name, sizeof(region->path) - 1);
+    }
+    if (reset_warm_regions) {
+        serverLog(LL_NOTICE, "resetting vemb_v16 warm regions before storage open");
+        if (vemb_v16_storage_reset_manifest_regions(&manifest) != 0) {
+            serverLog(LL_WARNING, "failed to reset vemb_v16 warm regions");
+            goto cleanup;
+        }
     }
     int storage_rc = vemb_v16_storage_ctx_create_from_manifest(&storage,
                                                                dim,

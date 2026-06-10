@@ -63,6 +63,7 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
             .value_size = warm_regions[i].value_size,
             .region_bytes = warm_regions[i].region_bytes,
             .mapped_addr = warm_regions[i].mapped_addr,
+            .shared_allocator = warm_regions[i].shared_allocator,
         };
     }
     tlc_core_config_t core_config = {
