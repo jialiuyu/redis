@@ -55,6 +55,7 @@ typedef struct bench_cfg {
     uint32_t pipeline;
     uint32_t transport_type;
     uint16_t tcp_port;
+    int vsim_key2_owner;
 } bench_cfg_t;
 
 typedef struct bench_region_map {
@@ -112,6 +113,11 @@ enum {
     MODE_VEMB_INLINE_VECTOR = 6,
     MODE_VSIM_INLINE = 7,
     MODE_VSIM_KEY_KEY = 8,
+};
+
+enum {
+    VSIM_KEY2_OWNER_SAME = 0,
+    VSIM_KEY2_OWNER_REMOTE = 1,
 };
 
 static uint32_t g_control_timeout_ms = 10000;
@@ -576,6 +582,27 @@ static uint32_t route_key(const bench_cfg_t *cfg, const char *key) {
     return route_hash(cfg, vemb_v16_murmur3(key, strlen(key)));
 }
 
+static uint32_t choose_vsim_key2_id(const bench_cfg_t *cfg,
+                                    uint32_t key_id,
+                                    uint32_t key1_node_index) {
+    if (!cfg || cfg->prefill <= 1)
+        return key_id;
+
+    char key2[VEMB_V16_MAX_KEY_LEN];
+    for (uint32_t step = 1; step < cfg->prefill; step++) {
+        uint32_t candidate = (key_id + step) % cfg->prefill;
+        make_key(key2, sizeof(key2), candidate);
+        uint32_t key2_node_index = route_key(cfg, key2);
+        if (cfg->vsim_key2_owner == VSIM_KEY2_OWNER_REMOTE) {
+            if (key2_node_index != key1_node_index)
+                return candidate;
+        } else if (key2_node_index == key1_node_index) {
+            return candidate;
+        }
+    }
+    return key_id;
+}
+
 static bench_region_map_t *find_warm_region(worker_arg_t *w,
                                              uint32_t region_id) {
     for (uint32_t i = 0; i < w->node_count; i++) {
@@ -852,18 +879,9 @@ static void *worker_main(void *arg) {
             } else if (w->cfg.mode == MODE_VSIM_KEY_KEY) {
                 make_key(key, sizeof(key), key_id);
                 uint32_t node_index = route_key(&w->cfg, key);
-                uint32_t key2_id = key_id;
+                uint32_t key2_id =
+                    choose_vsim_key2_id(&w->cfg, key_id, node_index);
                 char key2[VEMB_V16_MAX_KEY_LEN];
-                if (w->cfg.prefill > 1) {
-                    for (uint32_t step = 1; step < w->cfg.prefill; step++) {
-                        uint32_t candidate = (key_id + step) % w->cfg.prefill;
-                        make_key(key2, sizeof(key2), candidate);
-                        if (route_key(&w->cfg, key2) == node_index) {
-                            key2_id = candidate;
-                            break;
-                        }
-                    }
-                }
                 make_key(key2, sizeof(key2), key2_id);
                 bench_node_channel_t *node = &w->nodes[node_index];
                 prepare_req(&req, VEMB_V16_OP_VSIM_KEY_KEY, i + 1,
@@ -1490,6 +1508,7 @@ int main(int argc, char **argv) {
         .pipeline = 1,
         .transport_type = VEMB_V16_TRANSPORT_AERON,
         .tcp_port = VEMB_V16_TCP_PORT,
+        .vsim_key2_owner = VSIM_KEY2_OWNER_SAME,
     };
     cfg.node_count = 1;
     strncpy(cfg.socket_paths[0], cfg.socket_path, sizeof(cfg.socket_paths[0]) - 1);
@@ -1566,8 +1585,19 @@ int main(int argc, char **argv) {
             cfg.pin_threads = 0;
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
+        else if (!strcmp(argv[i], "--vsim-key2-owner") && i + 1 < argc) {
+            const char *owner = argv[++i];
+            if (!strcmp(owner, "same")) {
+                cfg.vsim_key2_owner = VSIM_KEY2_OWNER_SAME;
+            } else if (!strcmp(owner, "remote")) {
+                cfg.vsim_key2_owner = VSIM_KEY2_OWNER_REMOTE;
+            } else {
+                fprintf(stderr, "invalid --vsim-key2-owner: %s\n", owner);
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w|vsim-inline|vsim-key-key]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
             return 0;
         }
         else {

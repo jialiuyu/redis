@@ -463,7 +463,7 @@ static int warm_alloc_location_pass(tlc_core_t *core,
                                region,
                                alloc_rc);
     }
-    serverLog(LL_WARNING,
+    serverLog(LL_DEBUG,
               "tlc warm alloc pass failed: key_hash=%llu want_local=%u attempted_regions=%u region_count=%u vnode_count=%u",
               (unsigned long long)key_hash,
               want_local,

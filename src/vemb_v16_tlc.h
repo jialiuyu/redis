@@ -8,6 +8,14 @@
 #include "tlc_core.h"
 #include "vemb_v16_protocol.h"
 
+#define VEMB_V16_TLC_MAX_REMOTE_META_VIEWS 16u
+
+typedef struct vemb_v16_remote_meta_view vemb_v16_remote_meta_view_t;
+typedef uint32_t (*vemb_v16_tlc_owner_resolver_fn)(uint64_t key_hash,
+                                                   const char *key,
+                                                   uint32_t key_len,
+                                                   void *arg);
+
 typedef enum vemb_v16_region_backend {
     VEMB_V16_TLC_REGION_LOCAL_SHM = VEMB_V16_REGION_LOCAL_SHM,
     VEMB_V16_TLC_REGION_UB = VEMB_V16_REGION_UB,
@@ -32,6 +40,12 @@ typedef struct vemb_v16_vector_handle {
     uint64_t key_hash;
 } vemb_v16_vector_handle_t;
 
+typedef enum vemb_v16_tlc_lookup_source {
+    VEMB_V16_TLC_LOOKUP_SOURCE_NONE = 0,
+    VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL = 1,
+    VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE = 2,
+} vemb_v16_tlc_lookup_source_t;
+
 typedef struct vemb_v16_tlc_warm_region {
     uint32_t region_id;
     uint32_t backend_type;
@@ -45,6 +59,11 @@ typedef struct vemb_v16_tlc_warm_region {
     void *shared_allocator;
 } vemb_v16_tlc_warm_region_t;
 
+typedef struct vemb_v16_tlc_remote_meta_owner_view {
+    uint32_t owner_id;
+    vemb_v16_remote_meta_view_t *view;
+} vemb_v16_tlc_remote_meta_owner_view_t;
+
 typedef struct vemb_v16_tlc {
     uint32_t vector_dim;
     uint32_t value_size;
@@ -56,6 +75,12 @@ typedef struct vemb_v16_tlc {
     state_bitmap_t bitmap;
     sve_operation_stats_t sve_stats;
     tlc_core_t *core;
+    vemb_v16_remote_meta_view_t *remote_meta_view;
+    uint32_t remote_meta_retry_budget;
+    uint32_t remote_meta_view_count;
+    vemb_v16_tlc_remote_meta_owner_view_t remote_meta_views[VEMB_V16_TLC_MAX_REMOTE_META_VIEWS];
+    vemb_v16_tlc_owner_resolver_fn owner_resolver;
+    void *owner_resolver_arg;
 } vemb_v16_tlc_t;
 
 int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
@@ -72,6 +97,26 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
                             uint64_t key_hash,
                             vemb_v16_vector_handle_t *handle,
                             uint32_t *warm_slot);
+int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
+                                  const char *key2,
+                                  uint32_t key2_len,
+                                  uint64_t key2_hash,
+                                  vemb_v16_vector_handle_t *handle,
+                                  vemb_v16_tlc_lookup_source_t *source);
+void vemb_v16_tlc_set_remote_meta_view(vemb_v16_tlc_t *tlc,
+                                       vemb_v16_remote_meta_view_t *view,
+                                       uint32_t retry_budget);
+int vemb_v16_tlc_set_remote_meta_owner_view(vemb_v16_tlc_t *tlc,
+                                            uint32_t owner_id,
+                                            vemb_v16_remote_meta_view_t *view);
+void vemb_v16_tlc_set_owner_resolver(vemb_v16_tlc_t *tlc,
+                                     vemb_v16_tlc_owner_resolver_fn resolver,
+                                     void *arg);
+int vemb_v16_tlc_publish_remote_meta(vemb_v16_tlc_t *tlc,
+                                     const char *key,
+                                     uint32_t key_len,
+                                     uint64_t key_hash,
+                                     const vemb_v16_vector_handle_t *handle);
 int vemb_v16_tlc_put(vemb_v16_tlc_t *tlc,
                      const char *key,
                      uint32_t key_len,

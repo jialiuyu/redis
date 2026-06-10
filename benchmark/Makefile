@@ -133,13 +133,20 @@ vemb_v16_shared_allocator_ut: vemb_v16_shared_allocator_ut.c ../src/vemb_v16_sha
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
 	@echo "✅ Built: $@"
 
-vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
+vemb_v16_remote_meta_ut: vemb_v16_remote_meta_ut.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_hash.h ../src/cpu_relax.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_remote_meta.c -pthread -lm
 	@echo "✅ Built: $@"
 
-vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
 	@echo "✅ Built: $@"
+
+vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_remote_vsim_smoke: vemb_v16_bench
+	./vemb_v16_remote_vsim_smoke.sh
 
 # Ring buffer unit test
 ring_buffer_ut: ring_buffer_ut.c test_runtime_shim.c ../src/ring_buffer.c

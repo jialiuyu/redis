@@ -111,11 +111,21 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
             completion.vector_bytes = handle.bytes;
             completion.region_id = handle.region_id;
             if (job->op == VEMB_V16_OP_VSIM_KEY_KEY) {
-                uint32_t warm_slot2 = 0;
                 vemb_v16_vector_handle_t handle2 = {0};
-                if (vemb_v16_tlc_get_handle(tlc, job->key2, job->key2_len,
-                                            job->key2_hash, &handle2,
-                                            &warm_slot2) != 0) {
+                vemb_v16_tlc_lookup_source_t key2_source =
+                    VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+                if (vemb_v16_tlc_lookup_vsim_key2(tlc,
+                                                  job->key2,
+                                                  job->key2_len,
+                                                  job->key2_hash,
+                                                  &handle2,
+                                                  &key2_source) != 0) {
+                    serverLog(LL_NOTICE,
+                              "vemb_v16 vsim key-key key2 lookup miss: req_id=%u key_hash=%llu key2_hash=%llu key2_len=%u",
+                              job->req_id,
+                              (unsigned long long)job->key_hash,
+                              (unsigned long long)job->key2_hash,
+                              job->key2_len);
                     completion.status = VEMB_V16_STATUS_NOT_FOUND;
                     atomic_fetch_add_explicit(&ctx->stats->not_found, 1,
                                               memory_order_relaxed);
@@ -128,14 +138,36 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                         vemb_v16_tlc_vector_slice(tlc, &handle2, &v2_bytes, &v2_len) != 0 ||
                         v1_len != job->vector_bytes ||
                         v2_len != job->vector_bytes) {
+                        serverLog(LL_WARNING,
+                                  "vemb_v16 vsim key-key vector slice failed: req_id=%u key_hash=%llu key2_hash=%llu region1=%u offset1=%llu bytes1=%u region2=%u offset2=%llu bytes2=%u expected_bytes=%u",
+                                  job->req_id,
+                                  (unsigned long long)job->key_hash,
+                                  (unsigned long long)job->key2_hash,
+                                  handle.region_id,
+                                  (unsigned long long)handle.offset,
+                                  handle.bytes,
+                                  handle2.region_id,
+                                  (unsigned long long)handle2.offset,
+                                  handle2.bytes,
+                                  job->vector_bytes);
                         completion.status = VEMB_V16_STATUS_ERR;
                     } else {
                         const float *v1 = (const float *)(const void *)v1_bytes;
                         const float *v2 = (const float *)(const void *)v2_bytes;
                         completion.score = sve_cosine_similarity_f32(v1, v2, job->dim);
+                        serverLog(LL_DEBUG,
+                                  "vemb_v16 vsim key-key ok: req_id=%u key_hash=%llu key2_hash=%llu key2_source=%u region1=%u offset1=%llu region2=%u offset2=%llu score=%f",
+                                  job->req_id,
+                                  (unsigned long long)job->key_hash,
+                                  (unsigned long long)job->key2_hash,
+                                  key2_source,
+                                  handle.region_id,
+                                  (unsigned long long)handle.offset,
+                                  handle2.region_id,
+                                  (unsigned long long)handle2.offset,
+                                  completion.score);
                     }
                 }
-                (void)warm_slot2;
             } else if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
                 if (*read_result_bytes < job->vector_bytes) {
                     float *next = zrealloc(*read_result, job->vector_bytes);
@@ -219,6 +251,19 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
             completion.vector_offset = handle.offset;
             completion.vector_bytes = handle.bytes;
             completion.region_id = handle.region_id;
+            if (vemb_v16_tlc_publish_remote_meta(tlc,
+                                                 job->key,
+                                                 job->key_len,
+                                                 job->key_hash,
+                                                 &handle) != 0) {
+                serverLog(LL_WARNING,
+                          "vemb_v16 vadd remote meta publish failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
+                          job->req_id,
+                          (unsigned long long)job->key_hash,
+                          handle.region_id,
+                          (unsigned long long)handle.offset,
+                          handle.bytes);
+            }
         }
         atomic_fetch_add_explicit(&ctx->stats->vadd_requests, 1,
                                   memory_order_relaxed);

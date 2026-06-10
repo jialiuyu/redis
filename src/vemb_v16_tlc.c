@@ -1,5 +1,6 @@
 #include "tlc_core.h"
 #include "vemb_v16_tlc.h"
+#include "vemb_v16_remote_meta.h"
 #include "zmalloc.h"
 #include "macro.h"
 
@@ -108,6 +109,135 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
     if (warm_slot) *warm_slot = location.local_slot;
     make_handle(tlc, key_hash, &location, handle);
     return 0;
+}
+
+void vemb_v16_tlc_set_remote_meta_view(vemb_v16_tlc_t *tlc,
+                                       vemb_v16_remote_meta_view_t *view,
+                                       uint32_t retry_budget) {
+    RETURN_IF(!tlc);
+    tlc->remote_meta_view = view;
+    tlc->remote_meta_retry_budget = retry_budget;
+    if (view && view->header) {
+        (void)vemb_v16_tlc_set_remote_meta_owner_view(
+            tlc,
+            view->header->owner_supernode_id,
+            view);
+    }
+}
+
+int vemb_v16_tlc_set_remote_meta_owner_view(vemb_v16_tlc_t *tlc,
+                                            uint32_t owner_id,
+                                            vemb_v16_remote_meta_view_t *view) {
+    RETURN_IF(!tlc || !view, -1);
+    for (uint32_t i = 0; i < tlc->remote_meta_view_count; i++) {
+        if (tlc->remote_meta_views[i].owner_id == owner_id) {
+            tlc->remote_meta_views[i].view = view;
+            return 0;
+        }
+    }
+    RETURN_IF(tlc->remote_meta_view_count >= VEMB_V16_TLC_MAX_REMOTE_META_VIEWS, -1);
+    tlc->remote_meta_views[tlc->remote_meta_view_count++] =
+        (vemb_v16_tlc_remote_meta_owner_view_t){
+            .owner_id = owner_id,
+            .view = view,
+        };
+    return 0;
+}
+
+void vemb_v16_tlc_set_owner_resolver(vemb_v16_tlc_t *tlc,
+                                     vemb_v16_tlc_owner_resolver_fn resolver,
+                                     void *arg) {
+    RETURN_IF(!tlc);
+    tlc->owner_resolver = resolver;
+    tlc->owner_resolver_arg = arg;
+}
+
+static vemb_v16_remote_meta_view_t *remote_meta_view_for_key(vemb_v16_tlc_t *tlc,
+                                                             const char *key,
+                                                             uint32_t key_len,
+                                                             uint64_t key_hash) {
+    if (!tlc->owner_resolver)
+        return tlc->remote_meta_view;
+
+    uint32_t owner_id = tlc->owner_resolver(key_hash,
+                                            key,
+                                            key_len,
+                                            tlc->owner_resolver_arg);
+    for (uint32_t i = 0; i < tlc->remote_meta_view_count; i++) {
+        if (tlc->remote_meta_views[i].owner_id == owner_id)
+            return tlc->remote_meta_views[i].view;
+    }
+    return NULL;
+}
+
+int vemb_v16_tlc_publish_remote_meta(vemb_v16_tlc_t *tlc,
+                                     const char *key,
+                                     uint32_t key_len,
+                                     uint64_t key_hash,
+                                     const vemb_v16_vector_handle_t *handle) {
+    RETURN_IF(!tlc || !key || key_len == 0 || !handle, -1);
+    if (!tlc->remote_meta_view)
+        return 0;
+
+    vemb_v16_remote_meta_handle_t remote_handle = {
+        .region_id = handle->region_id,
+        .bytes = handle->bytes,
+        .offset = handle->offset,
+        .key_hash = key_hash,
+    };
+    return vemb_v16_remote_meta_publish(tlc->remote_meta_view,
+                                        key,
+                                        key_len,
+                                        key_hash,
+                                        &remote_handle) ==
+        VEMB_V16_REMOTE_META_OK ? 0 : -1;
+}
+
+int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
+                                  const char *key2,
+                                  uint32_t key2_len,
+                                  uint64_t key2_hash,
+                                  vemb_v16_vector_handle_t *handle,
+                                  vemb_v16_tlc_lookup_source_t *source) {
+    RETURN_IF(!tlc || !key2 || key2_len == 0 || !handle, -1);
+    if (source)
+        *source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+
+    if (vemb_v16_tlc_get_handle(tlc,
+                                key2,
+                                key2_len,
+                                key2_hash,
+                                handle,
+                                NULL) == 0) {
+        if (source)
+            *source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
+        return 0;
+    }
+
+    vemb_v16_remote_meta_view_t *remote_meta =
+        remote_meta_view_for_key(tlc, key2, key2_len, key2_hash);
+    if (remote_meta) {
+        vemb_v16_remote_meta_handle_t remote_handle = {0};
+        if (vemb_v16_remote_meta_lookup(remote_meta,
+                                        key2,
+                                        key2_len,
+                                        key2_hash,
+                                        tlc->remote_meta_retry_budget,
+                                        &remote_handle) ==
+            VEMB_V16_REMOTE_META_OK) {
+            *handle = (vemb_v16_vector_handle_t){
+                .region_id = remote_handle.region_id,
+                .bytes = remote_handle.bytes,
+                .offset = remote_handle.offset,
+                .key_hash = key2_hash,
+            };
+            if (source)
+                *source = VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE;
+            return 0;
+        }
+    }
+
+    return -1;
 }
 
 int vemb_v16_tlc_put(vemb_v16_tlc_t *tlc,
