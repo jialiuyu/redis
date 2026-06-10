@@ -367,18 +367,6 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
     return 0;
 }
 
-static int warm_region_is_full(tlc_core_warm_region_runtime_t *region) {
-    return vemb_v16_shared_allocator_full(region->shared_allocator);
-}
-
-static int warm_region_alloc_slot(tlc_core_warm_region_runtime_t *region, uint32_t *local_slot) {
-    return vemb_v16_shared_allocator_alloc(region->shared_allocator, local_slot);
-}
-
-static uint32_t warm_region_used_slots(tlc_core_warm_region_runtime_t *region) {
-    return vemb_v16_shared_allocator_used_slots(region->shared_allocator);
-}
-
 static void log_warm_region_switch(const char *reason,
                                    uint64_t key_hash,
                                    uint32_t want_local,
@@ -433,7 +421,7 @@ static int warm_alloc_location_pass(tlc_core_t *core,
         tried[region_index] = 1;
         (*attempted_regions)++;
 
-        if (warm_region_is_full(region)) {
+        if (vemb_v16_shared_allocator_full(region->shared_allocator)) {
             log_warm_region_switch("region_full",
                                    key_hash,
                                    want_local,
@@ -446,7 +434,8 @@ static int warm_alloc_location_pass(tlc_core_t *core,
         }
 
         uint32_t local_slot = TLC_CORE_INVALID_SLOT;
-        int alloc_rc = warm_region_alloc_slot(region, &local_slot);
+        int alloc_rc =
+            vemb_v16_shared_allocator_alloc(region->shared_allocator, &local_slot);
         if (alloc_rc == VEMB_V16_SHARED_ALLOCATOR_OK) {
             *location = (tlc_warm_location_t){
                 .region_id = region->region_id,
@@ -1094,7 +1083,7 @@ void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
     tlc_core_warm_layer_t *warm = &core->warm;
     stats->warm_region_count = warm->region_count;
     for (uint32_t i = 0; i < warm->region_count; i++) {
-        if (warm_region_is_full(&warm->regions[i])) {
+        if (vemb_v16_shared_allocator_full(warm->regions[i].shared_allocator)) {
             stats->warm_region_full_count++;
         }
     }
@@ -1127,9 +1116,11 @@ uint32_t tlc_core_get_region_stats(tlc_core_t *core,
         regions[i] = (tlc_core_region_stats_t){
             .region_id = region->region_id,
             .is_local = region->is_local,
-            .full = (uint32_t)warm_region_is_full(region),
+            .full =
+                vemb_v16_shared_allocator_full(region->shared_allocator),
             .capacity_slots = region->capacity_slots,
-            .used_slots = warm_region_used_slots(region),
+            .used_slots =
+                vemb_v16_shared_allocator_used_slots(region->shared_allocator),
         };
     }
     return n;
