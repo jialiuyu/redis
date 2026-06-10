@@ -3,49 +3,6 @@
 
 #include <string.h>
 
-uint32_t murmur3_hash(const char *key, size_t len) {
-    const uint32_t c1 = 0xcc9e2d51;
-    const uint32_t c2 = 0x1b873593;
-    const uint32_t seed = 0x5bd1e995;
-
-    uint32_t h = seed;
-    const uint8_t *data = (const uint8_t *)key;
-    const int nblocks = len / 4;
-
-    const uint32_t *blocks = (const uint32_t *)(data + nblocks * 4);
-    for (int i = -nblocks; i; i++) {
-        uint32_t k = blocks[i];
-        k *= c1;
-        k = (k << 15) | (k >> (32 - 15));
-        k *= c2;
-
-        h ^= k;
-        h = (h << 13) | (h >> (32 - 13));
-        h = h * 5 + 0xe6546b64;
-    }
-
-    const uint8_t *tail = (const uint8_t *)(data + nblocks * 4);
-    uint32_t k = 0;
-    switch (len & 3) {
-        case 3: k ^= tail[2] << 16; /* fall through */
-        case 2: k ^= tail[1] << 8; /* fall through */
-        case 1: k ^= tail[0];
-                k *= c1;
-                k = (k << 15) | (k >> (32 - 15));
-                k *= c2;
-                h ^= k;
-    }
-
-    h ^= len;
-    h ^= h >> 16;
-    h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
-    h ^= h >> 16;
-
-    return h;
-}
-
 int consistent_hash_init(consistent_hash_ring_t **ring, int num_supernodes) {
     *ring = zmalloc(sizeof(consistent_hash_ring_t));
     RETURN_IF(!*ring, C_ERR);

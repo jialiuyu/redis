@@ -5,6 +5,7 @@
  */
 
 #include "ub_client.h"
+#include "vemb_v16_hash.h"
 #include "macro.h"
 
 #ifdef UB_CLIENT_STANDALONE
@@ -289,18 +290,6 @@ static int create_addr_space(const ub_mem_config_t *cfg, ub_address_space_t **ad
     return C_OK;
 }
 
-static uint64_t fnv1a64(const char *text)
-{
-    const unsigned char *p = (const unsigned char *)text;
-    uint64_t hash = UINT64_C(1469598103934665603);
-
-    while (*p) {
-        hash ^= (uint64_t)*p++;
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
 static int parse_u64_strict(const char *text, uint64_t *value)
 {
     char *end = NULL;
@@ -431,7 +420,7 @@ int ub_client_resolve_element_index(const char *element_name,
         }
         break;
     case UB_ELEMENT_INDEX_HASH:
-        resolved = fnv1a64(element_name) % capacity;
+        resolved = vemb_v16_fnv1a64(element_name) % capacity;
         break;
     default:
         return C_ERR;

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "vemb_v16_hash.h"
 #include "vemb_v16_shared_allocator.h"
 #include "cpu_relax.h"
 #include "macro.h"
@@ -9,15 +10,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-
-static uint64_t fnv1a64(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
-    for (; s && *s; s++) {
-        h ^= (unsigned char)*s;
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
 
 int vemb_v16_shared_allocator_name_from_region_path(const char *region_path,
                                                     uint32_t region_id,
@@ -31,7 +23,7 @@ int vemb_v16_shared_allocator_name_from_region_path(const char *region_path,
         snprintf(out, out_len, "%s.alloc", region_path);
         return 0;
     }
-    uint64_t h = fnv1a64(region_path);
+    uint64_t h = vemb_v16_fnv1a64(region_path);
     int n = snprintf(out, out_len,
                      "/v16a_%08x_%08x",
                      region_id,

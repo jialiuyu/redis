@@ -7,6 +7,7 @@
  */
 
 #include "../src/ub_client.h"
+#include "../src/vemb_v16_hash.h"
 #include "../src/sve_config.h"
 
 #include <errno.h>
@@ -237,18 +238,6 @@ static size_t capacity_rows(const ub_ut_options_t *opts)
 static float expected_value(uint64_t row, size_t dim_idx)
 {
     return (float)(row * 1000ULL + (uint64_t)dim_idx);
-}
-
-static uint64_t fnv1a64_local(const char *text)
-{
-    const unsigned char *p = (const unsigned char *)text;
-    uint64_t hash = UINT64_C(1469598103934665603);
-
-    while (*p) {
-        hash ^= (uint64_t)*p++;
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
 }
 
 static void fill_fixture_vectors(float *table,
@@ -820,7 +809,7 @@ static int run_selftest(void)
 
     opts.resolver_mode = UB_ELEMENT_INDEX_HASH;
     opts.element = "hash-key";
-    hash_expected = fnv1a64_local(opts.element) % opts.fill_rows;
+    hash_expected = vemb_v16_fnv1a64(opts.element) % opts.fill_rows;
     opts.expected_index = hash_expected;
     if (run_read_verify(&opts) != 0) {
         goto cleanup;

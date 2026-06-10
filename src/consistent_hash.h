@@ -2,6 +2,7 @@
 #define __CONSISTENT_HASH_H
 
 #include "server.h"
+#include "vemb_v16_hash.h"
 #include <pthread.h>
 #include <stdint.h>
 
@@ -19,7 +20,6 @@ typedef struct consistent_hash_ring {
     pthread_rwlock_t lock;              /* 读写锁 */
 } consistent_hash_ring_t;
 
-uint32_t murmur3_hash(const char *key, size_t len);
 int consistent_hash_init(consistent_hash_ring_t **ring, int num_supernodes);
 void consistent_hash_destroy(consistent_hash_ring_t *ring);
 int consistent_hash_get_node_by_hash(consistent_hash_ring_t *ring, uint32_t hash);
