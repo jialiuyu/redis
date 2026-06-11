@@ -33,8 +33,9 @@ void vemb_v16_timing_acc_add(vemb_v16_timing_acc_t *acc, uint64_t ns) {
 void vemb_v16_channel_counters_add_timing(vemb_v16_channel_counters_t *stats,
                                           vemb_v16_timing_stage_t stage,
                                           const vemb_v16_timing_acc_t *acc) {
-    if (!acc || acc->count == 0)
+    if (acc->count == 0) {
         return;
+    }
 
     atomic_uint_fast64_t *count = NULL;
     atomic_uint_fast64_t *sum = NULL;

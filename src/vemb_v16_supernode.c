@@ -99,7 +99,7 @@ static void log_request_timing(vemb_v16_supernode_ctx_t *ctx,
 
 static void vemb_v16_notify_completion_consumer(vemb_v16_supernode_ctx_t *ctx) {
 #ifdef __linux__
-    if (!ctx || !ctx->completion_notify_armed || !ctx->completion_notify_fd)
+    if (!ctx->completion_notify_armed || !ctx->completion_notify_fd)
         return;
     int expected = 1;
     if (!atomic_compare_exchange_strong_explicit(ctx->completion_notify_armed,
@@ -196,15 +196,14 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                 vemb_v16_tlc_lookup_source_t key2_source =
                     VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
                 vemb_v16_tlc_lookup_timing_t key2_timing = {0};
-                if (vemb_v16_tlc_lookup_vsim_key2_timed(tlc,
-                                                        job->key2,
-                                                        job->key2_len,
-                                                        job->key2_hash,
-                                                        &handle2,
-                                                        &key2_source,
-                    &key2_timing) != 0) {
-                    if (key2_timing.local_lookup_count)
-                        vemb_v16_timing_acc_add(&secondary_lookup, key2_timing.local_lookup_ns);
+                if (vemb_v16_tlc_lookup_vsim_key2(tlc,
+                                                  job->key2,
+                                                  job->key2_len,
+                                                  job->key2_hash,
+                                                  &handle2,
+                                                  &key2_source,
+                                                  &key2_timing) != 0) {
+                    vemb_v16_timing_acc_add(&secondary_lookup, key2_timing.local_lookup_ns);
                     if (key2_timing.remote_meta_lookup_count)
                         vemb_v16_timing_acc_add(&remote_meta_lookup, key2_timing.remote_meta_lookup_ns);
                     serverLog(LL_NOTICE,
@@ -221,8 +220,7 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                     const uint8_t *v2_bytes = NULL;
                     uint32_t v1_len = 0;
                     uint32_t v2_len = 0;
-                    if (key2_timing.local_lookup_count)
-                        vemb_v16_timing_acc_add(&secondary_lookup, key2_timing.local_lookup_ns);
+                    vemb_v16_timing_acc_add(&secondary_lookup, key2_timing.local_lookup_ns);
                     if (key2_timing.remote_meta_lookup_count)
                         vemb_v16_timing_acc_add(&remote_meta_lookup, key2_timing.remote_meta_lookup_ns);
                     uint64_t slice_start = monotonic_ns();
@@ -326,7 +324,6 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
 
 vemb_read_done:
     if (sample) {
-        if (!lookup_ns) lookup_ns = monotonic_ns() - lookup_start;
         atomic_fetch_add_explicit(&ctx->stats->sample_count, 1,
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&ctx->stats->sample_table_lookup_ns,

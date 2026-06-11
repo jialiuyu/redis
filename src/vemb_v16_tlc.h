@@ -109,14 +109,8 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   uint32_t key2_len,
                                   uint64_t key2_hash,
                                   vemb_v16_vector_handle_t *handle,
-                                  vemb_v16_tlc_lookup_source_t *source);
-int vemb_v16_tlc_lookup_vsim_key2_timed(vemb_v16_tlc_t *tlc,
-                                        const char *key2,
-                                        uint32_t key2_len,
-                                        uint64_t key2_hash,
-                                        vemb_v16_vector_handle_t *handle,
-                                        vemb_v16_tlc_lookup_source_t *source,
-                                        vemb_v16_tlc_lookup_timing_t *timing);
+                                  vemb_v16_tlc_lookup_source_t *source,
+                                  vemb_v16_tlc_lookup_timing_t *timing);
 void vemb_v16_tlc_set_remote_meta_view(vemb_v16_tlc_t *tlc,
                                        vemb_v16_remote_meta_view_t *view,
                                        uint32_t retry_budget);

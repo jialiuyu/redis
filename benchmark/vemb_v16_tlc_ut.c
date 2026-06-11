@@ -585,6 +585,7 @@ static void test_vsim_key2_lookup_local_source(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t key2_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     const char *key1 = "vsim:one";
     const char *key2 = "vsim:two";
@@ -609,8 +610,11 @@ static void test_vsim_key2_lookup_local_source(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &key2_handle,
-                                         &source) == 0);
+                                         &source,
+                                         &timing) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL);
+    assert(timing.local_lookup_count == 1);
+    assert(timing.remote_meta_lookup_count == 0);
     assert(key2_handle.region_id == 88);
     assert(key2_handle.offset == sizeof(v2));
     assert(key2_handle.bytes == sizeof(v2));
@@ -622,8 +626,11 @@ static void test_vsim_key2_lookup_local_source(void) {
                                          (uint32_t)strlen(missing),
                                          missing_hash,
                                          &key2_handle,
-                                         &source) != 0);
+                                         &source,
+                                         &timing) != 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_NONE);
+    assert(timing.local_lookup_count == 1);
+    assert(timing.remote_meta_lookup_count == 0);
 
     vemb_v16_tlc_destroy(tlc);
 }
@@ -654,6 +661,7 @@ static void test_vsim_key2_lookup_remote_source(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     const uint8_t *bytes = NULL;
     uint32_t len = 0;
@@ -689,8 +697,11 @@ static void test_vsim_key2_lookup_remote_source(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &remote_handle,
-                                         &source) == 0);
+                                         &source,
+                                         &timing) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE);
+    assert(timing.local_lookup_count == 1);
+    assert(timing.remote_meta_lookup_count == 1);
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
@@ -764,6 +775,7 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     const uint8_t *bytes = NULL;
     uint32_t len = 0;
@@ -822,8 +834,11 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &remote_handle,
-                                         &source) == 0);
+                                         &source,
+                                         &timing) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE);
+    assert(timing.local_lookup_count == 1);
+    assert(timing.remote_meta_lookup_count == 1);
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
