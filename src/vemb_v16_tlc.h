@@ -46,6 +46,13 @@ typedef enum vemb_v16_tlc_lookup_source {
     VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE = 2,
 } vemb_v16_tlc_lookup_source_t;
 
+typedef struct vemb_v16_tlc_lookup_timing {
+    uint64_t local_lookup_ns;
+    uint64_t remote_meta_lookup_ns;
+    uint32_t local_lookup_count;
+    uint32_t remote_meta_lookup_count;
+} vemb_v16_tlc_lookup_timing_t;
+
 typedef struct vemb_v16_tlc_warm_region {
     uint32_t region_id;
     uint32_t backend_type;
@@ -103,6 +110,13 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   uint64_t key2_hash,
                                   vemb_v16_vector_handle_t *handle,
                                   vemb_v16_tlc_lookup_source_t *source);
+int vemb_v16_tlc_lookup_vsim_key2_timed(vemb_v16_tlc_t *tlc,
+                                        const char *key2,
+                                        uint32_t key2_len,
+                                        uint64_t key2_hash,
+                                        vemb_v16_vector_handle_t *handle,
+                                        vemb_v16_tlc_lookup_source_t *source,
+                                        vemb_v16_tlc_lookup_timing_t *timing);
 void vemb_v16_tlc_set_remote_meta_view(vemb_v16_tlc_t *tlc,
                                        vemb_v16_remote_meta_view_t *view,
                                        uint32_t retry_budget);

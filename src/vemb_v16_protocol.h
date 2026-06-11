@@ -192,6 +192,27 @@ typedef struct vemb_v16_stats {
     uint64_t warm_alloc_cold_spill;
     uint64_t warm_alloc_fail;
     uint64_t warm_region_hash_local_pct;
+    uint64_t timing_job_count;
+    uint64_t timing_job_total_ns;
+    uint64_t timing_job_total_max_ns;
+    uint64_t timing_primary_lookup_count;
+    uint64_t timing_primary_lookup_ns;
+    uint64_t timing_primary_lookup_max_ns;
+    uint64_t timing_secondary_lookup_count;
+    uint64_t timing_secondary_lookup_ns;
+    uint64_t timing_secondary_lookup_max_ns;
+    uint64_t timing_remote_meta_lookup_count;
+    uint64_t timing_remote_meta_lookup_ns;
+    uint64_t timing_remote_meta_lookup_max_ns;
+    uint64_t timing_payload_local_slice_count;
+    uint64_t timing_payload_local_slice_ns;
+    uint64_t timing_payload_local_slice_max_ns;
+    uint64_t timing_payload_remote_slice_count;
+    uint64_t timing_payload_remote_slice_ns;
+    uint64_t timing_payload_remote_slice_max_ns;
+    uint64_t timing_compute_count;
+    uint64_t timing_compute_ns;
+    uint64_t timing_compute_max_ns;
 } vemb_v16_stats_t;
 
 static inline size_t vemb_v16_req_handle_len(void) {

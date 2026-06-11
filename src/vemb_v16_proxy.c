@@ -6,6 +6,7 @@
 #include "vemb_v16_tcp_transport.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
+#include "vemb_v16_stats.h"
 #include "macro.h"
 #include "redisassert.h"
 #include "zmalloc.h"
@@ -144,69 +145,6 @@ void vemb_v16_tcp_backlog_reset(vemb_v16_channel_t *ch) {
     ch->tcp_response_backlog_sent = 0;
 }
 #endif
-
-static uint64_t counter_load(atomic_uint_fast64_t *counter) {
-    return atomic_load_explicit(counter, memory_order_relaxed);
-}
-
-static void stats_add_channel_counters(vemb_v16_stats_t *dst,
-                                       vemb_v16_channel_counters_t *src) {
-    dst->total_requests += counter_load(&src->total_requests);
-    dst->vadd_requests += counter_load(&src->vadd_requests);
-    dst->vemb_requests += counter_load(&src->vemb_requests);
-    dst->vsim_requests += counter_load(&src->vsim_requests);
-    dst->not_found += counter_load(&src->not_found);
-    dst->published_jobs += counter_load(&src->published_jobs);
-    dst->completed_jobs += counter_load(&src->completed_jobs);
-    dst->proxy_request_poll += counter_load(&src->proxy_request_poll);
-    dst->proxy_completion_poll += counter_load(&src->proxy_completion_poll);
-    dst->proxy_vemb_publish += counter_load(&src->proxy_vemb_publish);
-    dst->proxy_vadd_publish += counter_load(&src->proxy_vadd_publish);
-    dst->proxy_vemb_ring_full += counter_load(&src->proxy_vemb_ring_full);
-    dst->proxy_vadd_ring_full += counter_load(&src->proxy_vadd_ring_full);
-    dst->proxy_response_publish += counter_load(&src->proxy_response_publish);
-    dst->proxy_response_ring_full += counter_load(&src->proxy_response_ring_full);
-    dst->supernode_vemb_poll += counter_load(&src->supernode_vemb_poll);
-    dst->supernode_vadd_poll += counter_load(&src->supernode_vadd_poll);
-    dst->supernode_completion_publish += counter_load(&src->supernode_completion_publish);
-    dst->supernode_completion_ring_full += counter_load(&src->supernode_completion_ring_full);
-    dst->sample_count += counter_load(&src->sample_count);
-    dst->sample_table_lookup_ns += counter_load(&src->sample_table_lookup_ns);
-    dst->sample_bitmap_lock_ns += counter_load(&src->sample_bitmap_lock_ns);
-    dst->sample_bitmap_unlock_ns += counter_load(&src->sample_bitmap_unlock_ns);
-    dst->sample_vector_load_ns += counter_load(&src->sample_vector_load_ns);
-    dst->sample_completion_publish_ns += counter_load(&src->sample_completion_publish_ns);
-    dst->channel_ops += counter_load(&src->channel_ops);
-}
-
-static void stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
-    dst->total_requests += src->total_requests;
-    dst->vadd_requests += src->vadd_requests;
-    dst->vemb_requests += src->vemb_requests;
-    dst->vsim_requests += src->vsim_requests;
-    dst->not_found += src->not_found;
-    dst->published_jobs += src->published_jobs;
-    dst->completed_jobs += src->completed_jobs;
-    dst->proxy_request_poll += src->proxy_request_poll;
-    dst->proxy_completion_poll += src->proxy_completion_poll;
-    dst->proxy_vemb_publish += src->proxy_vemb_publish;
-    dst->proxy_vadd_publish += src->proxy_vadd_publish;
-    dst->proxy_vemb_ring_full += src->proxy_vemb_ring_full;
-    dst->proxy_vadd_ring_full += src->proxy_vadd_ring_full;
-    dst->proxy_response_publish += src->proxy_response_publish;
-    dst->proxy_response_ring_full += src->proxy_response_ring_full;
-    dst->supernode_vemb_poll += src->supernode_vemb_poll;
-    dst->supernode_vadd_poll += src->supernode_vadd_poll;
-    dst->supernode_completion_publish += src->supernode_completion_publish;
-    dst->supernode_completion_ring_full += src->supernode_completion_ring_full;
-    dst->sample_count += src->sample_count;
-    dst->sample_table_lookup_ns += src->sample_table_lookup_ns;
-    dst->sample_bitmap_lock_ns += src->sample_bitmap_lock_ns;
-    dst->sample_bitmap_unlock_ns += src->sample_bitmap_unlock_ns;
-    dst->sample_vector_load_ns += src->sample_vector_load_ns;
-    dst->sample_completion_publish_ns += src->sample_completion_publish_ns;
-    dst->channel_ops += src->channel_ops;
-}
 
 static void vemb_v16_channel_free_slots(vemb_v16_channel_t *ch) {
     assert(ch != NULL);
@@ -922,7 +860,7 @@ static void close_channel(vemb_v16_channel_t *ch) {
         supernode_channel_wait_closed(ch);
     }
     pthread_mutex_lock(&ch->proxy->stats_lock);
-    stats_add_channel_counters(&ch->proxy->closed_stats, &ch->stats);
+    vemb_v16_stats_add_channel_counters(&ch->proxy->closed_stats, &ch->stats);
     pthread_mutex_unlock(&ch->proxy->stats_lock);
     vemb_v16_aeron_destroy_shared_ring(ch->request_ring_name, ch->request_ring,
                         ch->request_ring_bytes);
@@ -1859,7 +1797,7 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
     assert(stats != NULL);
     memset(stats, 0, sizeof(*stats));
     pthread_mutex_lock(&proxy->stats_lock);
-    stats_add(stats, &proxy->closed_stats);
+    vemb_v16_stats_add(stats, &proxy->closed_stats);
     pthread_mutex_unlock(&proxy->stats_lock);
     sve_operation_stats_t *sve_stats =
         vemb_v16_storage_sve_stats(proxy_storage(proxy));
@@ -1883,29 +1821,25 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
         uint32_t count = proxy->vemb_shard_proxy_count *
             proxy->vemb_shard_supernode_count;
         for (uint32_t i = 0; i < count; i++) {
-            stats->vemb_shard_queue_depth +=
-                vemb_v16_aeron_available(&proxy->vemb_shard_queues[i].ring);
+            stats->vemb_shard_queue_depth += vemb_v16_aeron_available(&proxy->vemb_shard_queues[i].ring);
         }
     }
     if (proxy->vadd_shard_queues) {
         uint32_t count = proxy->vemb_shard_proxy_count *
             proxy->vemb_shard_supernode_count;
         for (uint32_t i = 0; i < count; i++) {
-            stats->vadd_shard_queue_depth +=
-                vemb_v16_aeron_available(&proxy->vadd_shard_queues[i].ring);
+            stats->vadd_shard_queue_depth += vemb_v16_aeron_available(&proxy->vadd_shard_queues[i].ring);
         }
     }
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
         vemb_v16_channel_t *ch = &proxy->channels[i];
         if (atomic_load_explicit(&ch->active, memory_order_acquire)) {
             stats->active_channels++;
-            stats_add_channel_counters(stats, &ch->stats);
+            vemb_v16_stats_add_channel_counters(stats, &ch->stats);
             if (ch->request_ring)
-                stats->request_ring_depth +=
-                    vemb_v16_client_available(ch->request_ring);
+                stats->request_ring_depth += vemb_v16_client_available(ch->request_ring);
             if (ch->response_ring)
-                stats->response_ring_depth +=
-                    vemb_v16_client_available(ch->response_ring);
+                stats->response_ring_depth += vemb_v16_client_available(ch->response_ring);
             stats->completion_ring_depth += vemb_v16_aeron_available(&ch->completion_ring);
         }
     }

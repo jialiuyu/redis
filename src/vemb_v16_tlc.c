@@ -6,6 +6,13 @@
 
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static void make_handle(vemb_v16_tlc_t *tlc,
                         uint64_t key_hash,
@@ -199,25 +206,53 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   uint64_t key2_hash,
                                   vemb_v16_vector_handle_t *handle,
                                   vemb_v16_tlc_lookup_source_t *source) {
+    return vemb_v16_tlc_lookup_vsim_key2_timed(tlc,
+                                               key2,
+                                               key2_len,
+                                               key2_hash,
+                                               handle,
+                                               source,
+                                               NULL);
+}
+
+int vemb_v16_tlc_lookup_vsim_key2_timed(vemb_v16_tlc_t *tlc,
+                                        const char *key2,
+                                        uint32_t key2_len,
+                                        uint64_t key2_hash,
+                                        vemb_v16_vector_handle_t *handle,
+                                        vemb_v16_tlc_lookup_source_t *source,
+                                        vemb_v16_tlc_lookup_timing_t *timing) {
     RETURN_IF(!tlc || !key2 || key2_len == 0 || !handle, -1);
     if (source)
         *source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    if (timing)
+        memset(timing, 0, sizeof(*timing));
 
+    uint64_t stage_start = timing ? monotonic_ns() : 0;
     if (vemb_v16_tlc_get_handle(tlc,
                                 key2,
                                 key2_len,
                                 key2_hash,
                                 handle,
                                 NULL) == 0) {
+        if (timing) {
+            timing->local_lookup_count = 1;
+            timing->local_lookup_ns = monotonic_ns() - stage_start;
+        }
         if (source)
             *source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
         return 0;
+    }
+    if (timing) {
+        timing->local_lookup_count = 1;
+        timing->local_lookup_ns = monotonic_ns() - stage_start;
     }
 
     vemb_v16_remote_meta_view_t *remote_meta =
         remote_meta_view_for_key(tlc, key2, key2_len, key2_hash);
     if (remote_meta) {
         vemb_v16_remote_meta_handle_t remote_handle = {0};
+        stage_start = timing ? monotonic_ns() : 0;
         if (vemb_v16_remote_meta_lookup(remote_meta,
                                         key2,
                                         key2_len,
@@ -225,6 +260,10 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                         tlc->remote_meta_retry_budget,
                                         &remote_handle) ==
             VEMB_V16_REMOTE_META_OK) {
+            if (timing) {
+                timing->remote_meta_lookup_count = 1;
+                timing->remote_meta_lookup_ns = monotonic_ns() - stage_start;
+            }
             *handle = (vemb_v16_vector_handle_t){
                 .region_id = remote_handle.region_id,
                 .bytes = remote_handle.bytes,
@@ -234,6 +273,10 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
             if (source)
                 *source = VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE;
             return 0;
+        }
+        if (timing) {
+            timing->remote_meta_lookup_count = 1;
+            timing->remote_meta_lookup_ns = monotonic_ns() - stage_start;
         }
     }
 

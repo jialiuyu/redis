@@ -1240,6 +1240,45 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
                (double)(after->sample_completion_publish_ns -
                         before->sample_completion_publish_ns) / (double)samples);
     }
+    uint64_t timing_jobs = D(timing_job_count);
+    if (timing_jobs) {
+        uint64_t primary = D(timing_primary_lookup_count);
+        uint64_t secondary = D(timing_secondary_lookup_count);
+        uint64_t remote_meta = D(timing_remote_meta_lookup_count);
+        uint64_t payload_local = D(timing_payload_local_slice_count);
+        uint64_t payload_remote = D(timing_payload_remote_slice_count);
+        uint64_t compute = D(timing_compute_count);
+        printf("[stats] timing job_count=%llu job_total_avg_ns=%.1f job_total_max_ns=%llu primary_lookup_count=%llu primary_lookup_avg_ns=%.1f primary_lookup_max_ns=%llu\n",
+               (unsigned long long)timing_jobs,
+               (double)D(timing_job_total_ns) / (double)timing_jobs,
+               (unsigned long long)after->timing_job_total_max_ns,
+               (unsigned long long)primary,
+               primary ? (double)D(timing_primary_lookup_ns) /
+                   (double)primary : 0.0,
+               (unsigned long long)after->timing_primary_lookup_max_ns);
+        printf("[stats] timing secondary_lookup_count=%llu secondary_lookup_avg_ns=%.1f secondary_lookup_max_ns=%llu remote_meta_lookup_count=%llu remote_meta_lookup_avg_ns=%.1f remote_meta_lookup_max_ns=%llu\n",
+               (unsigned long long)secondary,
+               secondary ? (double)D(timing_secondary_lookup_ns) /
+                   (double)secondary : 0.0,
+               (unsigned long long)after->timing_secondary_lookup_max_ns,
+               (unsigned long long)remote_meta,
+               remote_meta ? (double)D(timing_remote_meta_lookup_ns) /
+                   (double)remote_meta : 0.0,
+               (unsigned long long)after->timing_remote_meta_lookup_max_ns);
+        printf("[stats] timing payload_local_slice_count=%llu payload_local_slice_avg_ns=%.1f payload_local_slice_max_ns=%llu payload_remote_slice_count=%llu payload_remote_slice_avg_ns=%.1f payload_remote_slice_max_ns=%llu compute_count=%llu compute_avg_ns=%.1f compute_max_ns=%llu\n",
+               (unsigned long long)payload_local,
+               payload_local ? (double)D(timing_payload_local_slice_ns) /
+                   (double)payload_local : 0.0,
+               (unsigned long long)after->timing_payload_local_slice_max_ns,
+               (unsigned long long)payload_remote,
+               payload_remote ? (double)D(timing_payload_remote_slice_ns) /
+                   (double)payload_remote : 0.0,
+               (unsigned long long)after->timing_payload_remote_slice_max_ns,
+               (unsigned long long)compute,
+               compute ? (double)D(timing_compute_ns) /
+                   (double)compute : 0.0,
+               (unsigned long long)after->timing_compute_max_ns);
+    }
 #undef D
 }
 

@@ -262,6 +262,55 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.vadd_shard_queue_depth,
            (unsigned long long)stats.completion_ring_depth,
            (unsigned long long)stats.channel_ops);
+    if (stats.timing_job_count) {
+        double total_avg = (double)stats.timing_job_total_ns /
+            (double)stats.timing_job_count;
+        double primary_avg = stats.timing_primary_lookup_count ?
+            (double)stats.timing_primary_lookup_ns /
+            (double)stats.timing_primary_lookup_count : 0.0;
+        double secondary_avg = stats.timing_secondary_lookup_count ?
+            (double)stats.timing_secondary_lookup_ns /
+            (double)stats.timing_secondary_lookup_count : 0.0;
+        double remote_meta_avg = stats.timing_remote_meta_lookup_count ?
+            (double)stats.timing_remote_meta_lookup_ns /
+            (double)stats.timing_remote_meta_lookup_count : 0.0;
+        double payload_local_avg = stats.timing_payload_local_slice_count ?
+            (double)stats.timing_payload_local_slice_ns /
+            (double)stats.timing_payload_local_slice_count : 0.0;
+        double payload_remote_avg = stats.timing_payload_remote_slice_count ?
+            (double)stats.timing_payload_remote_slice_ns /
+            (double)stats.timing_payload_remote_slice_count : 0.0;
+        double compute_avg = stats.timing_compute_count ?
+            (double)stats.timing_compute_ns /
+            (double)stats.timing_compute_count : 0.0;
+        serverLog(LL_NOTICE,
+                  "vemb_v16 stats: timing job_count=%llu job_total_avg_ns=%.1f job_total_max_ns=%llu primary_lookup_count=%llu primary_lookup_avg_ns=%.1f primary_lookup_max_ns=%llu",
+                  (unsigned long long)stats.timing_job_count,
+                  total_avg,
+                  (unsigned long long)stats.timing_job_total_max_ns,
+                  (unsigned long long)stats.timing_primary_lookup_count,
+                  primary_avg,
+                  (unsigned long long)stats.timing_primary_lookup_max_ns);
+        serverLog(LL_NOTICE,
+                  "vemb_v16 stats: timing secondary_lookup_count=%llu secondary_lookup_avg_ns=%.1f secondary_lookup_max_ns=%llu remote_meta_lookup_count=%llu remote_meta_lookup_avg_ns=%.1f remote_meta_lookup_max_ns=%llu",
+                  (unsigned long long)stats.timing_secondary_lookup_count,
+                  secondary_avg,
+                  (unsigned long long)stats.timing_secondary_lookup_max_ns,
+                  (unsigned long long)stats.timing_remote_meta_lookup_count,
+                  remote_meta_avg,
+                  (unsigned long long)stats.timing_remote_meta_lookup_max_ns);
+        serverLog(LL_NOTICE,
+                  "vemb_v16 stats: timing payload_local_slice_count=%llu payload_local_slice_avg_ns=%.1f payload_local_slice_max_ns=%llu payload_remote_slice_count=%llu payload_remote_slice_avg_ns=%.1f payload_remote_slice_max_ns=%llu compute_count=%llu compute_avg_ns=%.1f compute_max_ns=%llu",
+                  (unsigned long long)stats.timing_payload_local_slice_count,
+                  payload_local_avg,
+                  (unsigned long long)stats.timing_payload_local_slice_max_ns,
+                  (unsigned long long)stats.timing_payload_remote_slice_count,
+                  payload_remote_avg,
+                  (unsigned long long)stats.timing_payload_remote_slice_max_ns,
+                  (unsigned long long)stats.timing_compute_count,
+                  compute_avg,
+                  (unsigned long long)stats.timing_compute_max_ns);
+    }
 
 cleanup:
     if (g_proxy) {
