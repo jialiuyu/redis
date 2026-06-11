@@ -96,7 +96,7 @@ uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy) {
 
 #ifdef __linux__
 int vemb_v16_tcp_backlog_pending(vemb_v16_channel_t *ch) {
-    return ch && ch->tcp_response_backlog_len > ch->tcp_response_backlog_sent;
+    return ch->tcp_response_backlog_len > ch->tcp_response_backlog_sent;
 }
 
 size_t vemb_v16_tcp_backlog_pending_bytes(vemb_v16_channel_t *ch) {
@@ -172,8 +172,6 @@ static int init_shard_queue_array(vemb_v16_shard_queue_t **out,
                                   uint32_t count,
                                   size_t slot_size,
                                   uint32_t ring_size) {
-    if (!out)
-        return -1;
     *out = NULL;
 
     vemb_v16_shard_queue_t *queues = zcalloc(sizeof(*queues) * count);
@@ -353,7 +351,7 @@ static void proxy_io_channel_disarm_completion_notify(vemb_v16_channel_t *ch) {
 
 #ifdef __linux__
 static int proxy_io_channel_arm_completion_notify(vemb_v16_channel_t *ch) {
-    if (!ch || !atomic_load_explicit(&ch->active, memory_order_acquire)) {
+    if (!atomic_load_explicit(&ch->active, memory_order_acquire)) {
         return 0;
     }
 
@@ -839,8 +837,7 @@ int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
 
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
 static void close_channel(vemb_v16_channel_t *ch) {
-    if (!ch ||
-        atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
+    if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
         return;
     }
     serverLog(LL_VERBOSE, "vemb_v16 channel closing: index=%u channel_id=%llu",
@@ -1484,7 +1481,7 @@ static int supernode_worker_has_pending(vemb_v16_proxy_t *proxy,
 }
 
 static void supernode_worker_wait_for_jobs(vemb_v16_supernode_pool_worker_t *worker) {
-    if (!worker || worker->notify_fd < 0)
+    if (worker->notify_fd < 0)
         return;
 
     atomic_store_explicit(&worker->job_notify_armed, 1, memory_order_release);

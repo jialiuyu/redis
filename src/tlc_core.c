@@ -479,7 +479,7 @@ static int warm_alloc_location(tlc_core_t *core,
     tlc_core_warm_layer_t *warm = &core->warm;
     uint8_t tried[TLC_CORE_MAX_WARM_REGIONS] = {0};
     uint32_t attempted_regions = 0;
-    RETURN_IF(!location || warm->region_count == 0 || warm->vnode_count == 0, -1);
+    RETURN_IF(warm->region_count == 0 || warm->vnode_count == 0, -1);
     if (warm_alloc_location_pass(core, key_hash, 1, tried,
                                  &attempted_regions, location) == 0) {
         tlc_core_warm_region_runtime_t *region = &warm->regions[location->region_index];
@@ -959,7 +959,6 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
 }
 
 void tlc_core_destroy(tlc_core_t *core) {
-    RETURN_IF(!core);
     bitmap_destroy(&core->warm.locks);
     bitmap_destroy(&core->cold.locks);
     if (core->hold.table) zfree(core->hold.table);
@@ -998,7 +997,6 @@ int tlc_core_get_warm_location(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                tlc_warm_location_t *location) {
-    RETURN_IF(!core || !location, -1);
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!valid_key, -1);
 
@@ -1046,7 +1044,6 @@ int tlc_core_put_location(tlc_core_t *core,
                           const void *value,
                           uint32_t value_size,
                           tlc_warm_location_t *location) {
-    RETURN_IF(!core || !location || !value, -1);
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!valid_key || value_size != core->value_size, -1);
 
@@ -1071,14 +1068,12 @@ int tlc_core_cold_append(tlc_core_t *core,
                          uint64_t key_hash,
                          const void *value,
                          uint32_t value_size) {
-    RETURN_IF(!core || !value, -1);
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!valid_key || value_size != core->value_size, -1);
     return cold_append(core, key, key_len, key_hash, value, value_size);
 }
 
 void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
-    RETURN_IF(!core || !stats);
     memset(stats, 0, sizeof(*stats));
     tlc_core_warm_layer_t *warm = &core->warm;
     stats->warm_region_count = warm->region_count;

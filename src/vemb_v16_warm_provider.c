@@ -29,8 +29,7 @@ int vemb_v16_warm_provider_attach(vemb_v16_warm_provider_t *provider,
                                   uint32_t home_ub_node_id,
                                   uint32_t is_local,
                                   uint32_t weight) {
-    RETURN_IF(!provider || !mapping || !path || !path[0], -1);
-    RETURN_IF(mapping->mapping_addr == NULL || mapping->mapped_addr == NULL, -1);
+    RETURN_IF(!path[0], -1);
     RETURN_IF(region_bytes == 0 || region_bytes > SIZE_MAX || value_size == 0, -1);
     RETURN_IF(strlen(path) >= sizeof(provider->path), -1);
     RETURN_IF(view_offset > mapping->requested_size ||
@@ -86,7 +85,7 @@ int vemb_v16_warm_provider_open(vemb_v16_warm_provider_t *provider,
                                 uint32_t home_ub_node_id,
                                 uint32_t is_local,
                                 uint32_t weight) {
-    RETURN_IF(!provider || !path || !path[0], -1);
+    RETURN_IF(!path[0], -1);
     RETURN_IF(region_bytes == 0 || region_bytes > SIZE_MAX || value_size == 0, -1);
 
     size_t requested_size = (size_t)region_bytes;
@@ -131,7 +130,6 @@ int vemb_v16_warm_provider_open(vemb_v16_warm_provider_t *provider,
 }
 
 void vemb_v16_warm_provider_close(vemb_v16_warm_provider_t *provider) {
-    RETURN_IF(!provider);
     if (provider->owns_mapping)
         vemb_v16_mapped_region_close(&provider->owned_mapping);
     memset(provider, 0, sizeof(*provider));

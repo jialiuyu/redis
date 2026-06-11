@@ -78,8 +78,6 @@ static uint32_t storage_owner_resolver(uint64_t key_hash,
     (void)key;
     (void)key_len;
     const vemb_v16_storage_ctx_t *storage = arg;
-    if (!storage || storage->owner_hash_node_count == 0)
-        return 0;
 
     uint32_t hash = (uint32_t)key_hash;
     uint32_t left = 0;
@@ -177,8 +175,6 @@ static int storage_remote_meta_open_view(vemb_v16_storage_ctx_t *storage,
                                          uint32_t *entry_count,
                                          uint32_t *bucket_count,
                                          vemb_v16_remote_meta_view_t *view) {
-    RETURN_IF(!storage || !mapping || !is_mapped || !base || !bytes ||
-              !entry_count || !bucket_count || !view, -1);
     *is_mapped = 0;
     *base = NULL;
     *entry_count = requested_entry_count ?
@@ -313,7 +309,6 @@ static int storage_remote_meta_init(vemb_v16_storage_ctx_t *storage,
 static int storage_remote_meta_owner_views_init(
         vemb_v16_storage_ctx_t *storage,
         const vemb_v16_warm_regions_manifest_t *manifest) {
-    RETURN_IF(!storage || !manifest || !storage->tlc, -1);
     for (uint32_t i = 0; i < manifest->remote_meta_view_count; i++) {
         const vemb_v16_manifest_remote_meta_view_t *src =
             &manifest->remote_meta_views[i];
@@ -371,7 +366,6 @@ static int storage_remote_meta_owner_views_init(
 static int storage_owner_resolver_init(
         vemb_v16_storage_ctx_t *storage,
         const vemb_v16_warm_regions_manifest_t *manifest) {
-    RETURN_IF(!storage || !manifest || !storage->tlc, -1);
     uint32_t owners[VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS + 1u];
     uint32_t owner_count = 0;
     owners[owner_count++] = manifest->has_local_ub_node_id ?
@@ -636,7 +630,7 @@ int vemb_v16_parse_warm_regions_manifest(
 }
 
 static int unlink_shm_if_exists(const char *name) {
-    if (!name || name[0] != '/')
+    if (name[0] != '/')
         return -1;
     if (shm_unlink(name) == 0)
         return 0;
@@ -650,7 +644,7 @@ static int reset_remote_meta_backing(uint32_t owner_id,
                                      uint32_t value_size,
                                      uint32_t entry_count,
                                      uint32_t bucket_count) {
-    RETURN_IF(!path || !path[0], 0);
+    RETURN_IF(!path[0], 0);
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM) {
         int rc = unlink_shm_if_exists(path);
         int unlink_remote_meta_errno = errno;
@@ -726,7 +720,6 @@ static int reset_remote_meta_backing(uint32_t owner_id,
 }
 
 int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest_t *manifest) {
-    RETURN_IF(!manifest, -1);
     for (uint32_t i = 0; i < manifest->region_count; i++) {
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
         uint32_t capacity_slots = (uint32_t)(region->region_bytes / region->value_size);

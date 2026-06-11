@@ -14,6 +14,17 @@ static uint64_t monotonic_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static uint32_t default_remote_meta_owner_resolver(uint64_t key_hash,
+                                                   const char *key,
+                                                   uint32_t key_len,
+                                                   void *arg) {
+    (void)key_hash;
+    (void)key;
+    (void)key_len;
+    vemb_v16_remote_meta_view_t *view = arg;
+    return view->header->owner_supernode_id;
+}
+
 static void make_handle(vemb_v16_tlc_t *tlc,
                         uint64_t key_hash,
                         const tlc_warm_location_t *location,
@@ -95,7 +106,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
 }
 
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {
-    RETURN_IF(!tlc);
     bitmap_destroy(&tlc->bitmap);
     tlc_core_destroy(tlc->core);
     if (tlc->warm_regions) zfree(tlc->warm_regions);
@@ -121,21 +131,21 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
 void vemb_v16_tlc_set_remote_meta_view(vemb_v16_tlc_t *tlc,
                                        vemb_v16_remote_meta_view_t *view,
                                        uint32_t retry_budget) {
-    RETURN_IF(!tlc);
     tlc->remote_meta_view = view;
     tlc->remote_meta_retry_budget = retry_budget;
-    if (view && view->header) {
-        (void)vemb_v16_tlc_set_remote_meta_owner_view(
-            tlc,
-            view->header->owner_supernode_id,
-            view);
+    if (!tlc->owner_resolver) {
+        tlc->owner_resolver = default_remote_meta_owner_resolver;
+        tlc->owner_resolver_arg = view;
     }
+    (void)vemb_v16_tlc_set_remote_meta_owner_view(
+        tlc,
+        view->header->owner_supernode_id,
+        view);
 }
 
 int vemb_v16_tlc_set_remote_meta_owner_view(vemb_v16_tlc_t *tlc,
                                             uint32_t owner_id,
                                             vemb_v16_remote_meta_view_t *view) {
-    RETURN_IF(!tlc || !view, -1);
     for (uint32_t i = 0; i < tlc->remote_meta_view_count; i++) {
         if (tlc->remote_meta_views[i].owner_id == owner_id) {
             tlc->remote_meta_views[i].view = view;
@@ -154,7 +164,6 @@ int vemb_v16_tlc_set_remote_meta_owner_view(vemb_v16_tlc_t *tlc,
 void vemb_v16_tlc_set_owner_resolver(vemb_v16_tlc_t *tlc,
                                      vemb_v16_tlc_owner_resolver_fn resolver,
                                      void *arg) {
-    RETURN_IF(!tlc);
     tlc->owner_resolver = resolver;
     tlc->owner_resolver_arg = arg;
 }
@@ -163,9 +172,7 @@ static vemb_v16_remote_meta_view_t *remote_meta_view_for_key(vemb_v16_tlc_t *tlc
                                                              const char *key,
                                                              uint32_t key_len,
                                                              uint64_t key_hash) {
-    if (!tlc->owner_resolver)
-        return tlc->remote_meta_view;
-
+    RETURN_IF(tlc->remote_meta_view_count == 0, NULL);
     uint32_t owner_id = tlc->owner_resolver(key_hash,
                                             key,
                                             key_len,
@@ -182,10 +189,6 @@ int vemb_v16_tlc_publish_remote_meta(vemb_v16_tlc_t *tlc,
                                      uint32_t key_len,
                                      uint64_t key_hash,
                                      const vemb_v16_vector_handle_t *handle) {
-    RETURN_IF(!tlc || !key || key_len == 0 || !handle, -1);
-    if (!tlc->remote_meta_view)
-        return 0;
-
     vemb_v16_remote_meta_handle_t remote_handle = {
         .region_id = handle->region_id,
         .bytes = handle->bytes,
@@ -207,8 +210,6 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   vemb_v16_vector_handle_t *handle,
                                   vemb_v16_tlc_lookup_source_t *source,
                                   vemb_v16_tlc_lookup_timing_t *timing) {
-    RETURN_IF(!tlc || !key2 || key2_len == 0 || !handle || !source || !timing,
-              -1);
     *source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
     memset(timing, 0, sizeof(*timing));
 

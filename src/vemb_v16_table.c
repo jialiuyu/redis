@@ -78,30 +78,29 @@ int vemb_v16_table_create(vemb_v16_table_t **out,
 }
 
 void vemb_v16_table_destroy(vemb_v16_table_t *table) {
-    if (!table) return;
     bitmap_destroy(&table->bitmap);
     zfree(table->index);
     zfree(table);
 }
 
 uint32_t vemb_v16_table_dim(vemb_v16_table_t *table) {
-    return table ? table->vector_dim : 0;
+    return table->vector_dim;
 }
 
 uint32_t vemb_v16_table_stride(vemb_v16_table_t *table) {
-    return table ? table->vector_stride : 0;
+    return table->vector_stride;
 }
 
 uint32_t vemb_v16_table_max_vectors(vemb_v16_table_t *table) {
-    return table ? table->max_vectors : 0;
+    return table->max_vectors;
 }
 
 sve_gather_ctx_t *vemb_v16_table_gather_ctx(vemb_v16_table_t *table) {
-    return table ? &table->gather_ctx : NULL;
+    return &table->gather_ctx;
 }
 
 sve_operation_stats_t *vemb_v16_table_sve_stats(vemb_v16_table_t *table) {
-    return table ? &table->sve_stats : NULL;
+    return &table->sve_stats;
 }
 
 int vemb_v16_table_lookup(vemb_v16_table_t *table,
@@ -109,8 +108,7 @@ int vemb_v16_table_lookup(vemb_v16_table_t *table,
                           uint32_t key_len,
                           uint64_t key_hash,
                           uint32_t *row_id) {
-    if (!table || !key || !row_id || key_len == 0 ||
-        key_len > VEMB_V16_MAX_KEY_LEN) {
+    if (key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN) {
         return -1;
     }
 
@@ -135,8 +133,7 @@ int vemb_v16_table_upsert(vemb_v16_table_t *table,
                           const float *vector,
                           uint32_t vector_bytes,
                           uint32_t *row_id) {
-    if (!table || !key || !vector || !row_id || key_len == 0 ||
-        key_len > VEMB_V16_MAX_KEY_LEN ||
+    if (key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
         vector_bytes != table->vector_stride ||
         table->vector_region_size < (size_t)table->vector_stride * table->max_vectors) {
         return -1;

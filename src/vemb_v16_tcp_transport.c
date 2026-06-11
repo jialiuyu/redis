@@ -48,8 +48,6 @@ static int tcp_response_backlog_pending(vemb_v16_channel_t *ch) {
 
 static int ensure_tcp_response_backlog_capacity(vemb_v16_channel_t *ch,
                                                 size_t append_bytes) {
-    if (!ch)
-        return -1;
     size_t pending = vemb_v16_tcp_backlog_pending_bytes(ch);
     if (append_bytes > VEMB_V16_TCP_RESPONSE_BACKLOG_LIMIT ||
         pending > VEMB_V16_TCP_RESPONSE_BACKLOG_LIMIT - append_bytes) {
@@ -80,7 +78,7 @@ static int ensure_tcp_response_backlog_capacity(vemb_v16_channel_t *ch,
 static int append_tcp_response_backlog(vemb_v16_channel_t *ch,
                                        const void *buf,
                                        size_t len) {
-    if (!ch || (!buf && len != 0))
+    if (!buf && len != 0)
         return -1;
     if (ensure_tcp_response_backlog_capacity(ch, len) != 0)
         return -1;
@@ -102,7 +100,7 @@ static ssize_t tcp_send_nonblocking(int fd, const void *buf, size_t len) {
 }
 
 int vemb_v16_tcp_flush_response_backlog(vemb_v16_channel_t *ch) {
-    if (!ch || vemb_v16_channel_net_fd(ch) < 0 || !tcp_response_backlog_pending(ch))
+    if (vemb_v16_channel_net_fd(ch) < 0 || !tcp_response_backlog_pending(ch))
         return 1;
 
     size_t pending = vemb_v16_tcp_backlog_pending_bytes(ch);
