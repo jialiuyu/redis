@@ -280,6 +280,12 @@ ub_client_ut: test_runtime_shim.c $(UB_UT_SRCS)
 
 .PHONY: ub_client_ut
 
+ub_cc_nc_visibility_ut: ub_cc_nc_visibility_ut.c
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
+	@echo "✅ Built: $@"
+
+.PHONY: ub_cc_nc_visibility_ut
+
 # SVE cross-embedding gather benchmark on UB.MEM
 # make sve_gather_ub_bench USE_SVE=yes [USE_CC_MODE=yes]
 SVE_GATHER_CFLAGS = -O3 -Wall -march=native -pthread -std=gnu11 \
@@ -375,6 +381,7 @@ help:
 	@echo ""
 	@echo "UB cross-node validation:"
 	@echo "  make ub_client_ut [USE_CC_MODE=yes] [USE_SVE=yes]"
+	@echo "  make ub_cc_nc_visibility_ut"
 	@echo ""
 	@echo "Scatter/Gather benchmark:"
 	@echo "  make scatter_gather_bench [USE_SVE=yes]"
