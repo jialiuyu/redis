@@ -106,11 +106,7 @@ static int write_full(int fd, const void *buf, size_t n) {
 /// UB/SHM transport: poll client request ring and hand jobs to the scheduler.
 int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id) {
-    if (!ch)
-        return -1;
     vemb_v16_client_ring_t *request_ring = vemb_v16_channel_request_ring(ch);
-    if (!request_ring)
-        return -1;
 
     vemb_v16_req_t *req_buf =
         zmalloc(sizeof(*req_buf) * VEMB_V16_PROXY_BATCH);

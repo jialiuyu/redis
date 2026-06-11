@@ -37,7 +37,6 @@ int vemb_v16_net_set_tcp_nodelay(int fd) {
 static int vemb_v16_addr4(const char *host,
                           uint16_t port,
                           struct sockaddr_in *addr) {
-    if (!addr) return -1;
     memset(addr, 0, sizeof(*addr));
     addr->sin_family = AF_INET;
     addr->sin_port = htons(port);
@@ -105,7 +104,7 @@ int vemb_v16_net_write_full(int fd, const void *buf, size_t n) {
 }
 
 static int iov_copy(struct iovec *dst, const struct iovec *src, int iovcnt) {
-    if (!dst || !src || iovcnt <= 0 || iovcnt > VEMB_V16_NET_MAX_IOV)
+    if (iovcnt <= 0 || iovcnt > VEMB_V16_NET_MAX_IOV)
         return -1;
     int out = 0;
     for (int i = 0; i < iovcnt; i++) {
@@ -177,7 +176,6 @@ int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
 }
 
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr) {
-    if (!hdr) return -1;
     if (vemb_v16_net_read_full(fd, hdr, sizeof(*hdr)) != 0)
         return -1;
     if (hdr->magic != VEMB_V16_MAGIC || hdr->version != VEMB_V16_VERSION)

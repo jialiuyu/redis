@@ -41,7 +41,7 @@ static int layout(vemb_v16_remote_meta_view_t *view,
         entries_off +
         (size_t)entry_count * sizeof(vemb_v16_remote_meta_entry_t);
 
-    RETURN_IF(!view || !base || bytes < need, -1);
+    RETURN_IF(bytes < need, -1);
     view->base = base;
     view->bytes = bytes;
     view->header = (void *)((uint8_t *)base + header_off);
@@ -95,8 +95,7 @@ int vemb_v16_remote_meta_init(vemb_v16_remote_meta_view_t *view,
 int vemb_v16_remote_meta_attach(vemb_v16_remote_meta_view_t *view,
                                 void *base,
                                 size_t bytes) {
-    RETURN_IF(!view || !base ||
-              bytes < sizeof(vemb_v16_remote_meta_header_t),
+    RETURN_IF(bytes < sizeof(vemb_v16_remote_meta_header_t),
               VEMB_V16_REMOTE_META_INVALID);
     vemb_v16_remote_meta_header_t *header = base;
     RETURN_IF(header->magic != VEMB_V16_REMOTE_META_MAGIC ||
@@ -141,8 +140,7 @@ int vemb_v16_remote_meta_publish(vemb_v16_remote_meta_view_t *view,
                                  uint32_t key_len,
                                  uint64_t key_hash,
                                  const vemb_v16_remote_meta_handle_t *handle) {
-    RETURN_IF(!view || !view->header || !key || key_len == 0 || !handle,
-              VEMB_V16_REMOTE_META_INVALID);
+    RETURN_IF(key_len == 0, VEMB_V16_REMOTE_META_INVALID);
 
     uint64_t fp = fingerprint_key(key, key_len);
     uint32_t pos = (uint32_t)key_hash & view->header->bucket_mask;
@@ -246,8 +244,7 @@ int vemb_v16_remote_meta_lookup(vemb_v16_remote_meta_view_t *view,
                                 uint64_t key_hash,
                                 uint32_t retry_budget,
                                 vemb_v16_remote_meta_handle_t *handle) {
-    RETURN_IF(!view || !view->header || !key || key_len == 0 || !handle,
-              VEMB_V16_REMOTE_META_INVALID);
+    RETURN_IF(key_len == 0, VEMB_V16_REMOTE_META_INVALID);
 
     uint64_t fp = fingerprint_key(key, key_len);
     uint32_t pos = (uint32_t)key_hash & view->header->bucket_mask;

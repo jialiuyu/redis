@@ -101,7 +101,7 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 const char *path,
                                 uint64_t mmap_offset,
                                 size_t requested_size) {
-    RETURN_IF(!region || !path || !path[0] || requested_size == 0, -1);
+    RETURN_IF(!path[0] || requested_size == 0, -1);
     RETURN_IF(strlen(path) >= sizeof(region->path), -1);
     memset(region, 0, sizeof(*region));
     region->fd = -1;
@@ -263,7 +263,6 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
 }
 
 void vemb_v16_mapped_region_close(vemb_v16_mapped_region_t *region) {
-    RETURN_IF(!region);
     if (region->mapping_addr)
         munmap(region->mapping_addr, region->mapping_bytes);
     if (region->fd >= 0)

@@ -15,7 +15,7 @@ int vemb_v16_shared_allocator_name_from_region_path(const char *region_path,
                                                     uint32_t region_id,
                                                     char *out,
                                                     size_t out_len) {
-    RETURN_IF(!region_path || !region_path[0] || !out || out_len == 0, -1);
+    RETURN_IF(!region_path[0] || out_len == 0, -1);
     if (region_path[0] == '/' &&
         strchr(region_path + 1, '/') == NULL &&
         strlen(region_path) + strlen(".alloc") < out_len &&
@@ -87,8 +87,7 @@ int vemb_v16_shared_allocator_attach(vemb_v16_shared_allocator_mapping_t *mappin
                                      uint64_t mmap_offset,
                                      uint32_t region_id,
                                      uint32_t capacity_slots) {
-    RETURN_IF(!mapping || !region || !path || !path[0], -1);
-    RETURN_IF(region->mapped_addr == NULL || region->mapping_addr == NULL, -1);
+    RETURN_IF(!path[0], -1);
     RETURN_IF(strlen(path) >= sizeof(mapping->name), -1);
     RETURN_IF(view_offset > region->requested_size ||
               sizeof(vemb_v16_shared_region_allocator_t) >
@@ -150,7 +149,7 @@ int vemb_v16_shared_allocator_open(vemb_v16_shared_allocator_mapping_t *mapping,
                                    uint64_t mmap_offset,
                                    uint32_t region_id,
                                    uint32_t capacity_slots) {
-    RETURN_IF(!mapping || !path || !path[0] || capacity_slots == 0, -1);
+    RETURN_IF(!path[0] || capacity_slots == 0, -1);
     if (backend_type == VEMB_V16_REGION_UB &&
         (mmap_offset % VEMB_V16_SHARED_ALLOCATOR_ALIGNMENT) != 0) {
         serverLog(LL_WARNING,
@@ -202,7 +201,7 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
                                     uint64_t mmap_offset,
                                     uint32_t region_id,
                                     uint32_t capacity_slots) {
-    RETURN_IF(!path || !path[0] || capacity_slots == 0, -1);
+    RETURN_IF(!path[0] || capacity_slots == 0, -1);
     backend_type = backend_type ? backend_type : VEMB_V16_REGION_LOCAL_SHM;
     if (backend_type == VEMB_V16_REGION_LOCAL_SHM)
         return vemb_v16_shared_allocator_unlink(path);
@@ -241,7 +240,6 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
 }
 
 void vemb_v16_shared_allocator_close(vemb_v16_shared_allocator_mapping_t *mapping) {
-    RETURN_IF(!mapping);
     if (mapping->owns_mapping)
         vemb_v16_mapped_region_close(&mapping->owned_mapping);
     memset(mapping, 0, sizeof(*mapping));
@@ -249,13 +247,12 @@ void vemb_v16_shared_allocator_close(vemb_v16_shared_allocator_mapping_t *mappin
 }
 
 int vemb_v16_shared_allocator_unlink(const char *name) {
-    RETURN_IF(!name || name[0] != '/', -1);
+    RETURN_IF(name[0] != '/', -1);
     return shm_unlink(name);
 }
 
 int vemb_v16_shared_allocator_alloc(vemb_v16_shared_region_allocator_t *allocator,
                                     uint32_t *local_slot) {
-    RETURN_IF(!allocator || !local_slot, -1);
     if (atomic_load_explicit(&allocator->full, memory_order_acquire))
         return VEMB_V16_SHARED_ALLOCATOR_FULL;
 
@@ -273,15 +270,11 @@ int vemb_v16_shared_allocator_alloc(vemb_v16_shared_region_allocator_t *allocato
 }
 
 uint32_t vemb_v16_shared_allocator_full(const vemb_v16_shared_region_allocator_t *allocator) {
-    if (!allocator)
-        return 1;
     return atomic_load_explicit((const _Atomic uint32_t *)&allocator->full,
                                 memory_order_acquire);
 }
 
 uint32_t vemb_v16_shared_allocator_used_slots(const vemb_v16_shared_region_allocator_t *allocator) {
-    if (!allocator)
-        return 0;
     uint32_t used =
         atomic_load_explicit((const _Atomic uint32_t *)&allocator->used_slots,
                              memory_order_relaxed);
