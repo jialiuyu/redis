@@ -5,6 +5,7 @@
 #include "vemb_v16_remote_meta.h"
 #include "vemb_v16_shared_allocator.h"
 #include "vemb_v16_tlc.h"
+#include "vemb_v16_ub_rpc.h"
 #include "vemb_v16_warm_provider.h"
 
 #include <stddef.h>
@@ -12,10 +13,13 @@
 
 #define VEMB_V16_MAX_MANIFEST_REGIONS VEMB_V16_MAX_DESC_WARM_REGIONS
 #define VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS VEMB_V16_TLC_MAX_REMOTE_META_VIEWS
+#define VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS VEMB_V16_UB_RPC_MAX_PEERS
 #define VEMB_V16_STORAGE_OWNER_HASH_VNODES 10u
+#define VEMB_V16_STORAGE_MAX_OWNER_COUNT \
+    (VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS + \
+     VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS + 1u)
 #define VEMB_V16_STORAGE_MAX_OWNER_HASH_NODES \
-    ((VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS + 1u) * \
-     VEMB_V16_STORAGE_OWNER_HASH_VNODES)
+    (VEMB_V16_STORAGE_MAX_OWNER_COUNT * VEMB_V16_STORAGE_OWNER_HASH_VNODES)
 
 typedef struct vemb_v16_manifest_region {
     uint32_t region_id;
@@ -37,9 +41,20 @@ typedef struct vemb_v16_manifest_remote_meta_view {
     uint32_t has_backend_type;
     uint32_t entry_count;
     uint32_t bucket_count;
+    uint32_t set_count;
+    uint32_t ways;
     uint64_t mmap_offset;
     char path[256];
 } vemb_v16_manifest_remote_meta_view_t;
+
+typedef struct vemb_v16_manifest_ub_rpc_peer {
+    uint32_t owner_id;
+    uint32_t has_owner_id;
+    vemb_v16_ub_rpc_ring_config_t request;
+    vemb_v16_ub_rpc_ring_config_t response;
+    vemb_v16_ub_rpc_ring_config_t inbound_request;
+    vemb_v16_ub_rpc_ring_config_t outbound_response;
+} vemb_v16_manifest_ub_rpc_peer_t;
 
 typedef struct vemb_v16_warm_regions_manifest {
     uint32_t local_ub_node_id;
@@ -49,11 +64,17 @@ typedef struct vemb_v16_warm_regions_manifest {
     uint32_t has_remote_meta_backend_type;
     uint32_t remote_meta_entry_count;
     uint32_t remote_meta_bucket_count;
+    uint32_t remote_meta_set_count;
+    uint32_t remote_meta_ways;
     uint64_t remote_meta_mmap_offset;
     char remote_meta_path[256];
     uint32_t remote_meta_view_count;
     vemb_v16_manifest_remote_meta_view_t
         remote_meta_views[VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS];
+    uint32_t ub_rpc_timeout_ms;
+    uint32_t ub_rpc_peer_count;
+    vemb_v16_manifest_ub_rpc_peer_t
+        ub_rpc_peers[VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS];
     uint32_t region_count;
     vemb_v16_manifest_region_t regions[VEMB_V16_MAX_MANIFEST_REGIONS];
 } vemb_v16_warm_regions_manifest_t;
@@ -68,6 +89,8 @@ typedef struct vemb_v16_storage_remote_meta_view {
     size_t bytes;
     uint32_t entry_count;
     uint32_t bucket_count;
+    uint32_t set_count;
+    uint32_t ways;
     vemb_v16_mapped_region_t mapping;
     vemb_v16_remote_meta_view_t view;
 } vemb_v16_storage_remote_meta_view_t;
@@ -104,7 +127,10 @@ typedef struct vemb_v16_storage_ctx {
     size_t remote_meta_bytes;
     uint32_t remote_meta_entry_count;
     uint32_t remote_meta_bucket_count;
+    uint32_t remote_meta_set_count;
+    uint32_t remote_meta_ways;
     vemb_v16_remote_meta_view_t remote_meta_view;
+    vemb_v16_ub_rpc_t *ub_rpc;
     uint32_t remote_meta_owner_view_count;
     vemb_v16_storage_remote_meta_view_t
         remote_meta_owner_views[VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS];

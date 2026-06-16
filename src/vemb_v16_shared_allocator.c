@@ -11,6 +11,50 @@
 #include <string.h>
 #include <sys/mman.h>
 
+static size_t slot_meta_bytes(uint32_t capacity_slots) {
+    return (size_t)capacity_slots * sizeof(vemb_v16_warm_slot_meta_t);
+}
+
+size_t vemb_v16_shared_allocator_layout_bytes(uint32_t capacity_slots) {
+    return sizeof(vemb_v16_shared_region_allocator_t) +
+           slot_meta_bytes(capacity_slots);
+}
+
+vemb_v16_warm_slot_meta_t *vemb_v16_shared_allocator_slot_meta(
+    vemb_v16_shared_region_allocator_t *allocator) {
+    if (!allocator || !(allocator->flags & VEMB_V16_SHARED_ALLOCATOR_F_SLOT_META))
+        return NULL;
+    return (vemb_v16_warm_slot_meta_t *)((uint8_t *)allocator +
+                                         sizeof(*allocator));
+}
+
+const vemb_v16_warm_slot_meta_t *vemb_v16_shared_allocator_const_slot_meta(
+    const vemb_v16_shared_region_allocator_t *allocator) {
+    if (!allocator || !(allocator->flags & VEMB_V16_SHARED_ALLOCATOR_F_SLOT_META))
+        return NULL;
+    return (const vemb_v16_warm_slot_meta_t *)((const uint8_t *)allocator +
+                                               sizeof(*allocator));
+}
+
+static void init_slot_meta(vemb_v16_shared_region_allocator_t *allocator,
+                           uint32_t region_id,
+                           uint32_t capacity_slots) {
+    vemb_v16_warm_slot_meta_t *slots =
+        (vemb_v16_warm_slot_meta_t *)((uint8_t *)allocator +
+                                      sizeof(*allocator));
+    memset(slots, 0, slot_meta_bytes(capacity_slots));
+    for (uint32_t i = 0; i < capacity_slots; i++) {
+        slots[i].region_id = region_id;
+        slots[i].local_slot = i;
+        atomic_init(&slots[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slots[i].owner_generation, 0);
+        atomic_init(&slots[i].write_seq, 0);
+        atomic_init(&slots[i].last_access_ns, 0);
+        atomic_init(&slots[i].clock_bit, 0);
+        atomic_init(&slots[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+    }
+}
+
 int vemb_v16_shared_allocator_name_from_region_path(const char *region_path,
                                                     uint32_t region_id,
                                                     char *out,
@@ -34,14 +78,19 @@ int vemb_v16_shared_allocator_name_from_region_path(const char *region_path,
 
 static void init_allocator(vemb_v16_shared_region_allocator_t *allocator,
                            uint32_t region_id,
-                           uint32_t capacity_slots) {
+                           uint32_t capacity_slots,
+                           int with_slot_meta) {
     memset(allocator, 0, sizeof(*allocator));
     allocator->region_id = region_id;
     allocator->capacity_slots = capacity_slots;
     allocator->version = VEMB_V16_SHARED_ALLOCATOR_VERSION;
+    allocator->flags = with_slot_meta ?
+        VEMB_V16_SHARED_ALLOCATOR_F_SLOT_META : 0;
     atomic_init(&allocator->next_slot, 0);
     atomic_init(&allocator->full, 0);
     atomic_init(&allocator->used_slots, 0);
+    if (with_slot_meta)
+        init_slot_meta(allocator, region_id, capacity_slots);
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&allocator->magic,
                           VEMB_V16_SHARED_ALLOCATOR_MAGIC,
@@ -50,7 +99,8 @@ static void init_allocator(vemb_v16_shared_region_allocator_t *allocator,
 
 static int wait_allocator_ready(vemb_v16_shared_region_allocator_t *allocator,
                                 uint32_t region_id,
-                                uint32_t capacity_slots) {
+                                uint32_t capacity_slots,
+                                int with_slot_meta) {
     for (uint32_t i = 0; i < 1000000u; i++) {
         uint32_t magic = atomic_load_explicit(&allocator->magic,
                                               memory_order_acquire);
@@ -60,6 +110,12 @@ static int wait_allocator_ready(vemb_v16_shared_region_allocator_t *allocator,
             RETURN_IF(allocator->region_id != region_id ||
                       allocator->capacity_slots != capacity_slots,
                       -1);
+            if (with_slot_meta &&
+                !(allocator->flags & VEMB_V16_SHARED_ALLOCATOR_F_SLOT_META)) {
+                init_slot_meta(allocator, region_id, capacity_slots);
+                atomic_thread_fence(memory_order_release);
+                allocator->flags |= VEMB_V16_SHARED_ALLOCATOR_F_SLOT_META;
+            }
             return 0;
         }
         if (magic == 0) {
@@ -70,7 +126,8 @@ static int wait_allocator_ready(vemb_v16_shared_region_allocator_t *allocator,
                     VEMB_V16_SHARED_ALLOCATOR_INITIALIZING,
                     memory_order_acq_rel,
                     memory_order_acquire)) {
-                init_allocator(allocator, region_id, capacity_slots);
+                init_allocator(allocator, region_id, capacity_slots,
+                               with_slot_meta);
                 return 0;
             }
         }
@@ -89,6 +146,11 @@ int vemb_v16_shared_allocator_attach(vemb_v16_shared_allocator_mapping_t *mappin
                                      uint32_t capacity_slots) {
     RETURN_IF(!path[0], -1);
     RETURN_IF(strlen(path) >= sizeof(mapping->name), -1);
+    size_t layout_bytes =
+        vemb_v16_shared_allocator_layout_bytes(capacity_slots);
+    int with_slot_meta =
+        region->requested_size >= view_offset &&
+        layout_bytes <= region->requested_size - (size_t)view_offset;
     RETURN_IF(view_offset > region->requested_size ||
               sizeof(vemb_v16_shared_region_allocator_t) >
                   region->requested_size - (size_t)view_offset,
@@ -108,7 +170,8 @@ int vemb_v16_shared_allocator_attach(vemb_v16_shared_allocator_mapping_t *mappin
     mapping->fd = -1;
     mapping->mapping = region;
     mapping->backend_type = backend_type ? backend_type : VEMB_V16_REGION_LOCAL_SHM;
-    mapping->mapping_size = sizeof(vemb_v16_shared_region_allocator_t);
+    mapping->mapping_size = with_slot_meta ? layout_bytes :
+        sizeof(vemb_v16_shared_region_allocator_t);
     mapping->mmap_offset = mmap_offset;
     mapping->mmap_aligned_offset = region->mmap_aligned_offset;
     mapping->mapping_addr = region->mapping_addr;
@@ -126,7 +189,8 @@ int vemb_v16_shared_allocator_attach(vemb_v16_shared_allocator_mapping_t *mappin
               mapping->allocator,
               region_id,
               capacity_slots);
-    if (wait_allocator_ready(mapping->allocator, region_id, capacity_slots) != 0) {
+    if (wait_allocator_ready(mapping->allocator, region_id, capacity_slots,
+                             with_slot_meta) != 0) {
         serverLog(LL_WARNING,
                   "vemb_v16 shared allocator ready check failed: backend=%u path=%s region_id=%u capacity=%u magic=%08x version=%u existing_region_id=%u existing_capacity=%u",
                   mapping->backend_type,
@@ -166,7 +230,8 @@ int vemb_v16_shared_allocator_open(vemb_v16_shared_allocator_mapping_t *mapping,
                                     backend_type,
                                     path,
                                     mmap_offset,
-                                    sizeof(vemb_v16_shared_region_allocator_t)) != 0) {
+                                    vemb_v16_shared_allocator_layout_bytes(
+                                        capacity_slots)) != 0) {
         serverLog(LL_WARNING,
                   "vemb_v16 shared allocator open failed: backend=%u path=%s offset=%llu region_id=%u capacity=%u",
                   backend_type,
@@ -211,7 +276,8 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
                                     backend_type,
                                     path,
                                     mmap_offset,
-                                    sizeof(vemb_v16_shared_region_allocator_t)) != 0) {
+                                    vemb_v16_shared_allocator_layout_bytes(
+                                        capacity_slots)) != 0) {
         serverLog(LL_WARNING,
                   "vemb_v16 shared allocator reset open failed: backend=%u path=%s offset=%llu region_id=%u capacity=%u",
                   backend_type,
@@ -228,13 +294,13 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
               backend_type,
               path,
               (unsigned long long)mmap_offset,
-              sizeof(vemb_v16_shared_region_allocator_t),
+              vemb_v16_shared_allocator_layout_bytes(capacity_slots),
               region.mapping_bytes,
               region.mapping_addr,
               allocator,
               region_id,
               capacity_slots);
-    init_allocator(allocator, region_id, capacity_slots);
+    init_allocator(allocator, region_id, capacity_slots, 1);
     vemb_v16_mapped_region_close(&region);
     return 0;
 }

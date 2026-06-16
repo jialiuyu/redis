@@ -19,6 +19,7 @@ typedef struct tlc_warm_location {
     uint32_t local_slot;
     uint32_t bytes;
     uint64_t offset;
+    uint64_t owner_generation;
 } tlc_warm_location_t;
 
 typedef struct tlc_core_warm_region_config {
@@ -48,6 +49,11 @@ typedef struct tlc_core_stats {
     uint64_t warm_alloc_fallback;
     uint64_t warm_alloc_cold_spill;
     uint64_t warm_alloc_fail;
+    uint64_t warm_eviction_success;
+    uint64_t warm_eviction_fail;
+    uint64_t warm_same_key_overwrite;
+    uint64_t warm_stale_handle_reject;
+    uint64_t remote_meta_stale;
     uint64_t warm_region_hash_local_pct;
 } tlc_core_stats_t;
 
@@ -97,6 +103,10 @@ int tlc_core_cold_append(tlc_core_t *core,
                          uint64_t key_hash,
                          const void *value,
                          uint32_t value_size);
+int tlc_core_validate_warm_location(tlc_core_t *core,
+                                    uint64_t key_hash,
+                                    const tlc_warm_location_t *location);
+void tlc_core_note_remote_meta_stale(tlc_core_t *core);
 void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats);
 uint32_t tlc_core_get_region_stats(tlc_core_t *core,
                                    tlc_core_region_stats_t *regions,

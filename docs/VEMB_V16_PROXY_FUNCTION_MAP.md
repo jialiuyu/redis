@@ -9,7 +9,7 @@
 1. 入口和生命周期：`vemb_v16_proxy_create()`、`vemb_v16_proxy_run()`、`vemb_v16_proxy_stop()`、`vemb_v16_proxy_destroy()`
 2. 控制面：`vemb_v16_aeron_handle_control_fd()`、`vemb_v16_tcp_handle_fd()`、`alloc_channel_common()`、`close_channel()`
 3. 调度主路径：`vemb_v16_proxy_handle_request()`、`publish_shard_job()`、`drain_completions()`
-4. 执行主路径：`supernode_pool_thread_main()`、`drain_shard_queues()`、`apply_vemb_shard_job()`、`apply_vadd_shard_job()`
+4. 执行主路径：`supernode_pool_thread_main()`、`drain_job_shard_queues()`、`apply_unified_shard_job()`、`apply_vemb_job()`、`apply_vadd_job()`
 5. 传输细节：TCP 请求/响应、UB/SHM ring 读写
 6. 并发同步：`*_acquire()`、`*_release()`、`*_close_begin()`、`*_wait_closed()`
 
@@ -21,14 +21,14 @@ Transport 语义是严格二选一：
 
 主数据流可以先记成两条线：
 
-- TCP：`TCP request -> proxy io worker -> shard queue -> supernode worker -> completion ring -> TCP response`
-- SHM：`SHM/Aeron request ring -> proxy io worker -> shard queue -> supernode worker -> completion ring -> SHM/Aeron response ring`
+- TCP：`TCP request -> proxy io worker -> job shard queue -> supernode worker -> completion ring -> TCP response`
+- SHM：`SHM/Aeron request ring -> proxy io worker -> job shard queue -> supernode worker -> completion ring -> SHM/Aeron response ring`
 
 ## 0. 核心对象
 
 阅读前先认 4 个结构体：
 
-- `vemb_v16_proxy_t`：全局运行时，持有监听 fd、worker 池、channel 表、shard queue 和统计信息。[src/vemb_v16_proxy_types.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_types.h:67)
+- `vemb_v16_proxy_t`：全局运行时，持有监听 fd、worker 池、channel 表、job shard queue 和统计信息。[src/vemb_v16_proxy_types.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_types.h:67)
 - `vemb_v16_channel_t`：单个 client channel 的状态，统一承载 TCP 和 UB/SHM 两种接入方式。[src/vemb_v16_proxy_types.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_types.h:38)
 - `vemb_v16_proxy_io_worker_t`：负责接入侧轮询、收请求、发 completion 的调度 worker。[src/vemb_v16_proxy_types.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_types.h:14)
 - `vemb_v16_supernode_pool_worker_t`：负责执行 VADD/VEMB job 的 worker。[src/vemb_v16_proxy_types.h](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy_types.h:23)
@@ -42,7 +42,7 @@ Transport 语义是严格二选一：
 - `vemb_v16_proxy_enable_tcp()`：打开 TCP-only 接入配置；控制帧和数据帧都走 TCP。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1697)
 - `vemb_v16_proxy_set_supernode_workers()`：设置执行侧 worker 数量。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1732)
 - `vemb_v16_proxy_set_proxy_io_threads()`：设置调度侧 worker 数量。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1740)
-- `vemb_v16_proxy_run()`：按已启用的 transport 启动监听、初始化 shard queue、拉起 worker 池，并进入 accept 主循环；`tcp` 只 accept TCP，`shm` 只 accept UDS。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1774)
+- `vemb_v16_proxy_run()`：按已启用的 transport 启动监听、初始化 job shard queue、拉起 worker 池，并进入 accept 主循环；`tcp` 只 accept TCP，`shm` 只 accept UDS。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1774)
 - `vemb_v16_proxy_stop()`：把 `running` 置 0，并打断监听 fd。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1883)
 - `vemb_v16_proxy_destroy()`：停机、join worker、释放 channel 和队列资源。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1748)
 - `vemb_v16_proxy_get_stats()`：汇总活跃 channel、关闭 channel、queue depth 与底层存储统计。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1892)
@@ -67,9 +67,11 @@ Transport 语义是严格二选一：
 
 ### 3.1 请求调度
 
-- `vemb_v16_proxy_handle_request()`：解析和校验协议字段，构造 `vadd` 或 `vemb` job，然后投递给 shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:549)
-- `publish_shard_job()`：调度层核心函数，把 job 从某个 proxy io worker 路由到某个 supernode worker 对应的 shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:506)
-- `init_vemb_shard_queues()`、`shard_queue_index()`、`shard_queue_topology_ready()`：维护调度拓扑和路由索引。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:296)
+- `vemb_v16_proxy_handle_request()`：解析和校验协议字段，构造统一 request job，然后投递给 job shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:549)
+- `publish_shard_job()`：调度层核心函数，把 job 从某个 proxy io worker 路由到某个 supernode worker 对应的 job shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:506)
+- `init_job_shard_queues()`、`shard_queue_index()`、`shard_queue_topology_ready()`：维护调度拓扑和路由索引。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:296)
+
+同一 channel/connection 的 `PING/VEMB/VADD/VSIM` 请求在源头进入同一个 job shard queue，因此连接内保持 FIFO；不同 channel 之间仍允许交错执行。协议校验失败的 `error_response` 是异常直返路径，当前不进入 job FIFO。
 
 ### 3.2 completion 调度
 
@@ -81,12 +83,12 @@ Transport 语义是严格二选一：
 
 这一层是 SuperNode worker 真正做事的地方，负责消费 job 并调用底层执行逻辑。
 
-- `supernode_pool_thread_main()`：执行侧主循环，持续 drain `vemb` 和 `vadd` 两组 shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1572)
-- `drain_shard_queues()`：执行侧核心函数，对一个 supernode worker 扫描它负责的所有 shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1443)
-- `drain_vemb_shard_queues()`：消费 VEMB 读路径 job。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1495)
-- `drain_vadd_shard_queues()`：消费 VADD 写路径 job。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1509)
-- `apply_vemb_shard_job()`：调用 `vemb_v16_supernode_handle_vemb_job()` 执行读取类工作。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1419)
-- `apply_vadd_shard_job()`：调用 `vemb_v16_supernode_handle_vadd_job()` 执行写入类工作。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1432)
+- `supernode_pool_thread_main()`：执行侧主循环，持续 drain 统一 job shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1572)
+- `drain_job_shard_queues()`：执行侧核心函数，对一个 supernode worker 扫描它负责的所有 job shard queue。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1594)
+- `drain_shard_queues()`：通用 batch drain helper，按 queue 批量取 job 后调用统一分发函数。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1527)
+- `apply_unified_shard_job()`：按 op 分发 `PING/VEMB/VADD/VSIM`，其中 PING 生成 synthetic completion。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1486)
+- `apply_vemb_job()`：调用 `vemb_v16_supernode_handle_vemb_job()` 执行读取类工作。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1425)
+- `apply_vadd_job()`：调用 `vemb_v16_supernode_handle_vadd_job()` 执行写入类工作。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1438)
 
 这层可以只盯住一件事：它不负责接入，不负责协议，只负责“消费 job 并把结果放进 completion ring”。
 
@@ -122,6 +124,8 @@ Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/
 - `encode_tcp_response_bytes()`、`encode_tcp_response_batch()`：把 response 编码成 TCP frame。[src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:130)
 - `vemb_v16_tcp_flush_response_backlog()`、`append_tcp_response_backlog()`、`ensure_tcp_response_backlog_capacity()`：处理非阻塞写和 backpressure backlog。[src/vemb_v16_tcp_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_tcp_transport.c:104)
 
+TCP inline vector response 的 payload 由 SuperNode 写入 completion snapshot，TCP 编码阶段只消费 snapshot，不再按 handle 回源读取 WARM slot。这样 TCP 路径不会在 SuperNode completion 到 proxy encode 之间重新打开 stale handle 窗口。
+
 ### 5.2 UB/SHM 路径
 
 - `vemb_v16_aeron_listen()`：创建 UDS listener，并返回 transport listener ops。[src/vemb_v16_aeron_transport.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_aeron_transport.c:21)
@@ -147,7 +151,7 @@ Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/
 
 - 主线程：只做 accept 和控制面分发。核心函数是 `vemb_v16_proxy_run()`、`vemb_v16_aeron_handle_control_fd()`、`vemb_v16_tcp_handle_fd()`。
 - proxy io worker：只做接入侧调度和回写 completion。核心函数是 `proxy_io_poll_thread_main()` 或 Linux 下的 `proxy_io_epoll_thread_main()`。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1005)
-- supernode worker：只做 VADD/VEMB 执行。核心函数是 `supernode_pool_thread_main()`。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1572)
+- supernode worker：只做 PING/VADD/VEMB/VSIM job 执行或分发。核心函数是 `supernode_pool_thread_main()`。[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1572)
 
 启动和停止入口：
 
@@ -164,7 +168,7 @@ Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/
 4. `vemb_v16_proxy_handle_request()`：[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:549)
 5. `publish_shard_job()`：[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:506)
 6. `drain_completions()`：[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:706)
-7. `drain_shard_queues()`：[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1443)
+7. `drain_job_shard_queues()`：[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1594)
 8. `supernode_pool_thread_main()`：[src/vemb_v16_proxy.c](/Users/szza/codespace/work/hpc-redis/src/vemb_v16_proxy.c:1572)
 
 ## 9. 分析时建议问的 4 个问题
@@ -174,6 +178,6 @@ Transport 二选一语义可以用 [scripts/vemb_v16_transport_smoke.sh](/Users/
 1. 它属于哪一层：入口、控制、调度、执行、传输、同步？
 2. 它处理的是 TCP 还是 UB/SHM？
 3. 它是在搬运请求/响应，还是在真正执行业务？
-4. 它操作的核心对象是什么：`channel`、`shard queue`、`completion ring`、`worker`？
+4. 它操作的核心对象是什么：`channel`、`job shard queue`、`completion ring`、`worker`？
 
 这样读下来，函数很多，但不会混。

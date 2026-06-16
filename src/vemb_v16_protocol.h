@@ -68,6 +68,24 @@ enum vemb_v16_data_op {
     VEMB_V16_OP_VSIM_KEY_KEY = 0x31,
 };
 
+enum vemb_v16_ub_lookup_rpc_op {
+    VEMB_V16_UB_LOOKUP_RPC_LOOKUP_HANDLE = 0x01,
+};
+
+enum vemb_v16_ub_lookup_rpc_status {
+    VEMB_V16_UB_LOOKUP_RPC_OK = 0,
+    VEMB_V16_UB_LOOKUP_RPC_NOT_FOUND = 1,
+    VEMB_V16_UB_LOOKUP_RPC_BUSY = 2,
+    VEMB_V16_UB_LOOKUP_RPC_ERROR = 3,
+    VEMB_V16_UB_LOOKUP_RPC_TIMEOUT = 4,
+};
+
+enum vemb_v16_ub_lookup_rpc_kind {
+    VEMB_V16_UB_LOOKUP_RPC_KIND_NONE = 0,
+    VEMB_V16_UB_LOOKUP_RPC_KIND_HANDLE = 1,
+    VEMB_V16_UB_LOOKUP_RPC_KIND_SNAPSHOT = 2,
+};
+
 typedef struct vemb_v16_alloc_req {
     uint32_t vector_dim;
     uint32_t flags;
@@ -146,8 +164,35 @@ typedef struct vemb_v16_resp {
     uint32_t vector_bytes;
     uint32_t dim;
     uint32_t region_id;
+    uint32_t local_slot;
+    uint64_t owner_generation;
     float score;
 } vemb_v16_resp_t;
+
+typedef struct vemb_v16_ub_lookup_rpc_req {
+    uint64_t request_id;
+    uint32_t src_owner_id;
+    uint32_t dst_owner_id;
+    uint32_t op;
+    uint32_t flags;
+    uint64_t key_hash;
+    uint32_t key_len;
+    uint32_t timeout_ns;
+    char key[VEMB_V16_MAX_KEY_LEN];
+} vemb_v16_ub_lookup_rpc_req_t;
+
+typedef struct vemb_v16_ub_lookup_rpc_resp {
+    uint64_t request_id;
+    uint32_t status;
+    uint32_t kind;
+    uint64_t key_hash;
+    uint32_t region_id;
+    uint32_t local_slot;
+    uint64_t offset;
+    uint32_t bytes;
+    uint32_t snapshot_bytes;
+    uint64_t owner_generation;
+} vemb_v16_ub_lookup_rpc_resp_t;
 
 typedef struct vemb_v16_stats {
     uint64_t total_requests;
@@ -180,8 +225,8 @@ typedef struct vemb_v16_stats {
     uint64_t bitmap_lock_failure;
     uint64_t request_ring_depth;
     uint64_t response_ring_depth;
-    uint64_t vemb_shard_queue_depth;
-    uint64_t vadd_shard_queue_depth;
+    uint64_t job_shard_queue_depth;
+    uint64_t reserved_shard_queue_depth;
     uint64_t completion_ring_depth;
     uint64_t channel_ops;
     uint64_t warm_region_count;
@@ -191,6 +236,37 @@ typedef struct vemb_v16_stats {
     uint64_t warm_alloc_fallback;
     uint64_t warm_alloc_cold_spill;
     uint64_t warm_alloc_fail;
+    uint64_t warm_eviction_success;
+    uint64_t warm_eviction_fail;
+    uint64_t warm_same_key_overwrite;
+    uint64_t warm_stale_handle_reject;
+    uint64_t remote_meta_stale;
+    uint64_t remote_meta_lookup_hit;
+    uint64_t remote_meta_lookup_miss;
+    uint64_t remote_meta_lookup_busy;
+    uint64_t remote_meta_lookup_way_probe;
+    uint64_t remote_meta_lookup_set_conflict;
+    uint64_t remote_meta_publish_async_enqueue;
+    uint64_t remote_meta_publish_async_drop;
+    uint64_t remote_meta_publish_async_coalesce;
+    uint64_t remote_meta_publish_ok;
+    uint64_t remote_meta_publish_busy;
+    uint64_t remote_meta_publish_insert;
+    uint64_t remote_meta_publish_update;
+    uint64_t remote_meta_publish_evict;
+    uint64_t remote_meta_publish_ns;
+    uint64_t ub_lookup_rpc_count;
+    uint64_t ub_lookup_rpc_ok;
+    uint64_t ub_lookup_rpc_not_found;
+    uint64_t ub_lookup_rpc_busy;
+    uint64_t ub_lookup_rpc_timeout;
+    uint64_t ub_lookup_rpc_error;
+    uint64_t ub_lookup_rpc_handle;
+    uint64_t ub_lookup_rpc_snapshot;
+    uint64_t ub_lookup_rpc_ns;
+    uint64_t remote_meta_repair_enqueue;
+    uint64_t remote_meta_repair_ok;
+    uint64_t remote_meta_repair_drop;
     uint64_t warm_region_hash_local_pct;
     uint64_t timing_job_count;
     uint64_t timing_job_total_ns;

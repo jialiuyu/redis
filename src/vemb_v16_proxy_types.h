@@ -87,10 +87,9 @@ struct vemb_v16_proxy {
     uint32_t supernode_worker_count;
     int supernode_pool_started;
     vemb_v16_supernode_pool_worker_t supernode_workers[VEMB_V16_MAX_CHANNELS];
-    uint32_t vemb_shard_proxy_count;
-    uint32_t vemb_shard_supernode_count;
-    vemb_v16_shard_queue_t *vemb_shard_queues;
-    vemb_v16_shard_queue_t *vadd_shard_queues;
+    uint32_t job_shard_proxy_count;
+    uint32_t job_shard_supernode_count;
+    vemb_v16_shard_queue_t *job_shard_queues;
     pthread_mutex_t stats_lock;
     vemb_v16_stats_t closed_stats;
 };

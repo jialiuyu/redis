@@ -10,6 +10,7 @@ typedef struct vemb_v16_mapped_region {
     int fd;
     uint32_t backend_type;
     int unlink_on_destroy;
+    int created;
     size_t requested_size;
     size_t mapping_bytes;
     uint64_t mmap_offset;

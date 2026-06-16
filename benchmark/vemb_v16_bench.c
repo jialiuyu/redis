@@ -124,8 +124,10 @@ static uint32_t g_control_timeout_ms = 10000;
 
 typedef struct pending_req {
     uint32_t op_index;
+    uint32_t req_id;
     uint32_t key_id;
     uint32_t node_index;
+    uint8_t op;
     int expect_inline_vector;
 } pending_req_t;
 
@@ -925,7 +927,9 @@ static void *worker_main(void *arg) {
                 goto worker_done;
             }
             pending[pending_tail].op_index = i;
+            pending[pending_tail].req_id = req.req_id;
             pending[pending_tail].key_id = key_id;
+            pending[pending_tail].op = req.op;
             pending[pending_tail].expect_inline_vector = expect_inline_vector;
             pending_tail = (pending_tail + 1) % pipeline;
             pending_count++;
@@ -957,8 +961,18 @@ static void *worker_main(void *arg) {
         pending_head = (pending_head + 1) % pipeline;
         pending_count--;
         if (resp.status != VEMB_V16_STATUS_OK) {
-            fprintf(stderr, "worker %d response error at op=%u status=%u key_id=%u\n",
-                    w->tid, done_req.op_index, resp.status, done_req.key_id);
+            fprintf(stderr,
+                    "worker %d response error at op=%u status=%u key_id=%u expected_req_id=%u expected_op=%u resp_req_id=%u resp_op=%u resp_bytes=%u inline_bytes=%u\n",
+                    w->tid,
+                    done_req.op_index,
+                    resp.status,
+                    done_req.key_id,
+                    done_req.req_id,
+                    done_req.op,
+                    resp.req_id,
+                    resp.op,
+                    resp.vector_bytes,
+                    inline_vector_bytes);
             w->fail++;
             completed++;
             continue;
@@ -969,12 +983,17 @@ static void *worker_main(void *arg) {
                 resp.vector_offset + resp.vector_bytes >
                     warm_region->region_bytes ||
                 resp.vector_bytes != warm_region->value_size) {
-                fprintf(stderr, "worker %d invalid vector handle at op=%u region=%u offset=%llu bytes=%u\n",
+                fprintf(stderr,
+                        "worker %d invalid vector handle at op=%u region=%u offset=%llu bytes=%u expected_req_id=%u expected_op=%u resp_req_id=%u resp_op=%u\n",
                         w->tid,
                         done_req.op_index,
                         resp.region_id,
                         (unsigned long long)resp.vector_offset,
-                        resp.vector_bytes);
+                        resp.vector_bytes,
+                        done_req.req_id,
+                        done_req.op,
+                        resp.req_id,
+                        resp.op);
                 w->fail += w->cfg.ops - completed;
                 goto worker_done;
             }
@@ -987,12 +1006,18 @@ static void *worker_main(void *arg) {
         } else if (done_req.expect_inline_vector) {
             if (inline_vector_bytes != resp.vector_bytes ||
                 resp.vector_bytes != inline_vector_cap) {
-                fprintf(stderr, "worker %d invalid inline vector at op=%u bytes=%u expected=%u resp_bytes=%u\n",
+                fprintf(stderr,
+                        "worker %d invalid inline vector at op=%u bytes=%u expected=%u resp_bytes=%u expected_req_id=%u expected_op=%u resp_req_id=%u resp_op=%u pending_expect_inline=%d\n",
                         w->tid,
                         done_req.op_index,
                         inline_vector_bytes,
                         inline_vector_cap,
-                        resp.vector_bytes);
+                        resp.vector_bytes,
+                        done_req.req_id,
+                        done_req.op,
+                        resp.req_id,
+                        resp.op,
+                        done_req.expect_inline_vector);
                 w->fail += w->cfg.ops - completed;
                 goto worker_done;
             }
@@ -1197,11 +1222,11 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(vsim_requests),
            D(not_found), D(published_jobs), D(completed_jobs),
            (unsigned long long)after->active_channels);
-    printf("[stats] proxy request_poll=%llu completion_poll=%llu vemb_publish=%llu vadd_publish=%llu response_publish=%llu\n",
+    printf("[stats] proxy request_poll=%llu completion_poll=%llu job_publish_vemb=%llu job_publish_vadd=%llu response_publish=%llu\n",
            D(proxy_request_poll), D(proxy_completion_poll),
            D(proxy_vemb_publish), D(proxy_vadd_publish),
            D(proxy_response_publish));
-    printf("[stats] full vemb_ring=%llu vadd_ring=%llu response_ring=%llu completion_ring=%llu\n",
+    printf("[stats] full job_ring_vemb=%llu job_ring_vadd=%llu response_ring=%llu completion_ring=%llu\n",
            D(proxy_vemb_ring_full), D(proxy_vadd_ring_full),
            D(proxy_response_ring_full), D(supernode_completion_ring_full));
     printf("[stats] supernode vemb_poll=%llu vadd_poll=%llu completion_publish=%llu\n",
@@ -1209,7 +1234,7 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(supernode_completion_publish));
     printf("[stats] bitmap lock_success=%llu lock_failure=%llu\n",
            D(bitmap_lock_success), D(bitmap_lock_failure));
-    printf("[stats] warm regions=%llu full=%llu alloc_local=%llu alloc_remote=%llu fallback=%llu cold_spill=%llu fail=%llu local_pct=%llu\n",
+    printf("[stats] warm regions=%llu full=%llu alloc_local=%llu alloc_remote=%llu fallback=%llu cold_spill=%llu fail=%llu evict_ok=%llu evict_fail=%llu overwrite=%llu stale_handle=%llu remote_meta_stale=%llu local_pct=%llu\n",
            (unsigned long long)after->warm_region_count,
            (unsigned long long)after->warm_region_full_count,
            D(warm_alloc_local),
@@ -1217,14 +1242,39 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(warm_alloc_fallback),
            D(warm_alloc_cold_spill),
            D(warm_alloc_fail),
+           D(warm_eviction_success),
+           D(warm_eviction_fail),
+           D(warm_same_key_overwrite),
+           D(warm_stale_handle_reject),
+           D(remote_meta_stale),
            (unsigned long long)after->warm_region_hash_local_pct);
-    printf("[stats] depth request=%llu response=%llu vemb_shard=%llu vadd_shard=%llu completion=%llu channel_ops=%llu\n",
+    printf("[stats] depth request=%llu response=%llu job_shard=%llu completion=%llu channel_ops=%llu\n",
            (unsigned long long)after->request_ring_depth,
            (unsigned long long)after->response_ring_depth,
-           (unsigned long long)after->vemb_shard_queue_depth,
-           (unsigned long long)after->vadd_shard_queue_depth,
+           (unsigned long long)after->job_shard_queue_depth,
            (unsigned long long)after->completion_ring_depth,
            D(channel_ops));
+    printf("[stats] remote_meta hit=%llu miss=%llu busy=%llu probes=%llu async_enqueue=%llu async_drop=%llu publish_ok=%llu insert=%llu update=%llu evict=%llu repair_enqueue=%llu repair_ok=%llu rpc_count=%llu rpc_ok=%llu rpc_not_found=%llu rpc_busy=%llu rpc_timeout=%llu rpc_error=%llu rpc_handle=%llu rpc_snapshot=%llu\n",
+           D(remote_meta_lookup_hit),
+           D(remote_meta_lookup_miss),
+           D(remote_meta_lookup_busy),
+           D(remote_meta_lookup_way_probe),
+           D(remote_meta_publish_async_enqueue),
+           D(remote_meta_publish_async_drop),
+           D(remote_meta_publish_ok),
+           D(remote_meta_publish_insert),
+           D(remote_meta_publish_update),
+           D(remote_meta_publish_evict),
+           D(remote_meta_repair_enqueue),
+           D(remote_meta_repair_ok),
+           D(ub_lookup_rpc_count),
+           D(ub_lookup_rpc_ok),
+           D(ub_lookup_rpc_not_found),
+           D(ub_lookup_rpc_busy),
+           D(ub_lookup_rpc_timeout),
+           D(ub_lookup_rpc_error),
+           D(ub_lookup_rpc_handle),
+           D(ub_lookup_rpc_snapshot));
     uint64_t samples = after->sample_count - before->sample_count;
     if (samples) {
         printf("[stats] samples=%llu table_lookup_avg_ns=%.1f bitmap_lock_avg_ns=%.1f bitmap_unlock_avg_ns=%.1f vector_load_avg_ns=%.1f completion_publish_avg_ns=%.1f\n",

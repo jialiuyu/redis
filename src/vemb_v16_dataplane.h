@@ -44,6 +44,12 @@ typedef struct vemb_v16_completion {
     uint64_t vector_offset;
     uint32_t vector_bytes;
     uint32_t region_id;
+    uint32_t local_slot;
+    uint32_t reserved1;
+    uint64_t owner_generation;
+    uint8_t *inline_vector;
+    uint32_t inline_vector_bytes;
+    uint32_t reserved2;
     float score;
 } vemb_v16_completion_t;
 

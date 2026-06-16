@@ -80,7 +80,7 @@
 ### 1. SuperNode 执行从 per-channel thread 收敛为固定 worker 池
 
 - 新增 `--supernode-workers N`，支持将 SuperNode 执行从每个 channel 一个线程，收敛为固定数量的 worker 池。
-- 同一 channel 仍保持单 worker 消费，避免立即引入 MPSC 队列和 response reorder。
+- 同一 channel/connection 的请求在源头进入同一个统一 job shard queue，连接内保持 FIFO；不同 channel 之间仍可交错执行，不引入 response reorder buffer。
 - 当前实现已将 `--supernode-workers` 作为必选主路径配置，`0` 不再作为可运行回退模式；本文中的 `0` 仅保留历史对照意义。
 
 ### 2. TCP proxy 处理从 per-channel thread 收敛为固定 I/O worker 池
@@ -110,9 +110,9 @@
 
 ### 6. 队列结构从 per-channel 收敛到 per-worker/per-shard
 
-- 当前 TCP / SHM VEMB/VADD 主路径均已收敛为 `proxy_io_worker -> supernode_worker` 的 SPSC shard queue。
+- 当前 TCP / SHM 的 `PING/VEMB/VADD/VSIM` 主路径均已收敛为 `proxy_io_worker -> supernode_worker` 的统一 SPSC job shard queue。
 - 该设计降低了高连接数场景下的线程数量、queue 数量、内存占用和 cache 压力。
-- 当前 VADD 仍沿用 full-vector payload shard queue，优先获取 pooled 线程模型收益，后续再考虑 staged payload 或小 descriptor 化。
+- VADD/VSIM inline 仍把 full-vector payload 放入 job slot，优先获取 pooled 线程模型收益，后续再考虑 staged payload 或小 descriptor 化。
 
 ### 7. 保留可观测性与历史对照能力
 
@@ -429,21 +429,21 @@ accept/control thread
 
 ### 阶段四：队列结构收敛到 shard queue（已完成）
 
-1. 主请求路径现已只保留：
-   - `proxy->vemb_shard_queues[proxy_worker][supernode_worker]`
-   - `proxy->vadd_shard_queues[proxy_worker][supernode_worker]`
-2. `completion_ring` 继续保持 per-channel，避免 response reorder 与 close 协议复杂化。
-3. 统计项已同步调整为以 shard queue 深度与 ring-full 为主，不再把 per-channel job ring 作为长期观测对象。
+1. 主请求路径现已只保留 `proxy->job_shard_queues[proxy_worker][supernode_worker]`。
+2. 同一 channel/connection 的 `PING/VEMB/VADD/VSIM` 共用同一个源头队列，因此连接内 FIFO；不同 channel 之间允许交错。
+3. `completion_ring` 继续保持 per-channel，用于 response 回写、slow-client 隔离和 close 协议；当前没有 response reorder buffer。
+4. 协议校验失败的 `error_response` 仍是异常直返路径，不收纳进 job FIFO。
+5. 统计项已同步调整为以 `job_shard` 深度与 ring-full 为主，不再把 per-channel job ring 作为长期观测对象。
 
 ### 阶段五：文档、配置与测试收口（进行中）
 
 已完成：
 
 1. 文档中已移除 `0/0`、`0/16` 作为正常配置的写法，仅保留历史对照意义。
-2. stats / bench 输出口径已从 `vemb_job` / `vadd_job` 调整为 `vemb_shard` / `vadd_shard`。
+2. stats / bench 输出口径已从早期读写分离标签收敛为 `job_shard`。
 3. pooled-only 的最小 TCP / SHM smoke 已补齐，当前已确认：
    - TCP `vadd-inline`
-   - TCP `vemb-supernode-read`
+   - TCP `vemb-inline-vector`
    - SHM `vadd-inline`
    - SHM `vemb-supernode-read`
    - SHM `mixed-80r20w`
@@ -452,12 +452,12 @@ accept/control thread
 
 1. benchmark 收敛为 pooled worker sizing 对照，例如 `4/8`、`8/16`、`16/32`、`32/64`。
 2. 回归项固定覆盖：
-   - TCP `vemb-supernode-read`
+   - TCP `vemb-inline-vector`
    - TCP `mixed-80r20w`
    - TCP slow-client bench
    - SHM `vemb-supernode-read`
    - SHM `mixed-80r20w`
-3. 后续新增或更新 benchmark 记录时，统一使用 `vemb_shard` / `vadd_shard` 统计标签。
+3. 后续新增或更新 benchmark 记录时，统一使用 `job_shard` 统计标签。
 
 推荐的 pooled-only 回归命令模板：
 
@@ -467,7 +467,7 @@ accept/control thread
   --transport tcp \
   --host 127.0.0.1 \
   --port 6391 \
-  --mode vemb-supernode-read \
+  --mode vemb-inline-vector \
   --dim 300 \
   --prefill 8 \
   --ops 20 \
@@ -507,9 +507,9 @@ accept/control thread
 
 1. `proxy-io-threads` / `supernode-workers` 默认启用，并禁止以 `0` 回退到旧模型。
 2. `per-channel supernode thread`、`per-channel proxy thread` 已从主运行路径移除。
-3. 主请求分发已统一收敛到 `proxy_worker x supernode_worker shard queue`，不再走 channel-local job ring fallback。
+3. 主请求分发已统一收敛到 `proxy_worker x supernode_worker job shard queue`，不再走 channel-local job ring fallback。
 4. SHM pooled 路径的剩余阻塞点已定位并修复：`proxy_io_channel_acquire()` 原先错误地只允许 `TCP channel` 进入 pooled proxy worker，导致 SHM request ring 无法被轮询；修复后 SHM 与 TCP 均走同一套 pooled worker 调度。
-5. 统计口径已与新架构对齐：`vemb_job` / `vadd_job` 深度现已明确改为 `vemb_shard` / `vadd_shard`，避免把 pooled shard queue 误读为 per-channel job ring。
+5. 统计口径已与新架构对齐：早期读写分离的 queue depth 标签现已收敛为 `job_shard`，避免把 pooled shard queue 误读为 per-channel job ring 或读写两条独立执行队列。
 
 当前剩余工作重点已从“删除旧路径”转向“补足 pooled-only 回归覆盖与继续清理遗留辅助分支”。
 
@@ -540,7 +540,7 @@ accept/control thread
 client (SHM/TCP)
   -> channel
   -> proxy I/O worker
-  -> proxy_worker x supernode_worker shard queue
+  -> proxy_worker x supernode_worker job shard queue
   -> supernode worker
   -> per-channel completion ring
   -> proxy I/O worker
@@ -548,17 +548,15 @@ client (SHM/TCP)
 ```
 
 - `channel` 当前主要承载连接状态、request/response ring、completion ring 和 close/backlog 边界。
-- 主请求分发已经统一走：
-  - `proxy->vemb_shard_queues[proxy_worker][supernode_worker]`
-  - `proxy->vadd_shard_queues[proxy_worker][supernode_worker]`
-- `completion_ring` 仍保持 per-channel，以维持 response ordering、slow-client 隔离和 channel close 协议简单性。
+- 主请求分发已经统一走 `proxy->job_shard_queues[proxy_worker][supernode_worker]`。
+- `completion_ring` 仍保持 per-channel，以维持 response 回写、slow-client 隔离和 channel close 协议简单性；response ordering 由连接内 FIFO 的执行源头保证，不靠 completion reorder。
 
 #### 4. 模块职责边界
 
 - `proxy`
   - 负责 accept、HELLO/WELCOME、channel 生命周期管理
   - 负责 TCP frame parse / SHM request ring poll
-  - 负责将请求发布到 shard queue
+  - 负责将请求发布到 job shard queue
   - 负责 drain completion 并回写 response
 - `storage`
   - 持有 `warm_provider`
@@ -566,7 +564,7 @@ client (SHM/TCP)
   - 持有 `vector_region` 及相关 warm/vector 元数据
   - 对外提供 channel desc 填充、stats 访问、inline vector slice 等公共接口
 - `supernode`
-  - 负责消费 `vemb/vadd` shard job
+  - 负责消费 `PING/VEMB/VADD/VSIM` job shard
   - 负责执行 TLC 读写与向量加载
   - 负责将 completion 发布回 channel completion ring
 

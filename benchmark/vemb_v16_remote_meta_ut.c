@@ -41,10 +41,11 @@ static void test_layout_and_attach(void) {
                                      buckets) == VEMB_V16_REMOTE_META_OK);
     assert(view.header->owner_supernode_id == 3);
     assert(view.header->entry_count == entries);
-    assert(view.header->bucket_count == buckets);
-    assert(view.header->bucket_mask == buckets - 1);
+    assert(view.header->bucket_count == 1);
+    assert(view.header->bucket_mask == 0);
+    assert(view.header->ways == entries);
     assert(view.header->value_size == value_size);
-    assert(((uintptr_t)view.buckets & 63u) == 0);
+    assert(view.buckets == NULL);
     assert(((uintptr_t)view.entries & 63u) == 0);
     assert(vemb_v16_remote_meta_attach(&attached, base, bytes) ==
            VEMB_V16_REMOTE_META_OK);
@@ -65,8 +66,10 @@ static void test_publish_lookup_and_overwrite(void) {
     vemb_v16_remote_meta_handle_t handle = {
         .region_id = 9,
         .bytes = 32,
+        .local_slot = 4,
         .offset = 128,
         .key_hash = key_hash,
+        .owner_generation = 7,
     };
     vemb_v16_remote_meta_handle_t out = {0};
 
@@ -88,13 +91,17 @@ static void test_publish_lookup_and_overwrite(void) {
            VEMB_V16_REMOTE_META_OK);
     assert(out.region_id == handle.region_id);
     assert(out.bytes == handle.bytes);
+    assert(out.local_slot == handle.local_slot);
     assert(out.offset == handle.offset);
     assert(out.key_hash == key_hash);
+    assert(out.owner_generation == handle.owner_generation);
     assert(atomic_load_explicit(&view.header->next_entry,
                                 memory_order_relaxed) == 1);
 
     handle.offset = 256;
     handle.region_id = 10;
+    handle.local_slot = 5;
+    handle.owner_generation = 8;
     assert(vemb_v16_remote_meta_publish(&view,
                                         key,
                                         (uint32_t)strlen(key),
@@ -110,29 +117,35 @@ static void test_publish_lookup_and_overwrite(void) {
                                        &out) ==
            VEMB_V16_REMOTE_META_OK);
     assert(out.region_id == 10);
+    assert(out.local_slot == 5);
     assert(out.offset == 256);
+    assert(out.owner_generation == 8);
     assert(atomic_load_explicit(&view.header->next_entry,
                                 memory_order_relaxed) == 1);
 
     free(base);
 }
 
-static void test_lookup_miss_and_full(void) {
-    enum { entries = 1, buckets = 2 };
+static void test_lookup_miss_and_evict(void) {
+    enum { sets = 1, ways = 1 };
     const char *key1 = "remote-meta:key1";
     const char *key2 = "remote-meta:key2";
     size_t bytes = 0;
-    void *base = alloc_meta_region(entries, buckets, &bytes);
+    void *base = NULL;
+    bytes = vemb_v16_remote_meta_layout_bytes_for_sets(sets, ways);
+    assert(posix_memalign(&base, 64, bytes) == 0);
     vemb_v16_remote_meta_view_t view;
     vemb_v16_remote_meta_handle_t handle = {
         .region_id = 1,
         .bytes = 8,
+        .local_slot = 0,
         .offset = 0,
+        .owner_generation = 1,
     };
     vemb_v16_remote_meta_handle_t out = {0};
 
-    assert(vemb_v16_remote_meta_init(&view, base, bytes, 1, 8,
-                                     entries, buckets) ==
+    assert(vemb_v16_remote_meta_init_sets(&view, base, bytes, 1, 8,
+                                          sets, ways) ==
            VEMB_V16_REMOTE_META_OK);
     assert(vemb_v16_remote_meta_lookup(&view,
                                        key1,
@@ -152,7 +165,21 @@ static void test_lookup_miss_and_full(void) {
                                         (uint32_t)strlen(key2),
                                         hash_key(key2),
                                         &handle) ==
-           VEMB_V16_REMOTE_META_FULL);
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_lookup(&view,
+                                       key1,
+                                       (uint32_t)strlen(key1),
+                                       hash_key(key1),
+                                       8,
+                                       &out) ==
+           VEMB_V16_REMOTE_META_NOT_FOUND);
+    assert(vemb_v16_remote_meta_lookup(&view,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       hash_key(key2),
+                                       8,
+                                       &out) ==
+           VEMB_V16_REMOTE_META_OK);
 
     free(base);
 }
@@ -167,8 +194,10 @@ static void test_busy_entry_retry_budget(void) {
     vemb_v16_remote_meta_handle_t handle = {
         .region_id = 7,
         .bytes = 16,
+        .local_slot = 3,
         .offset = 64,
         .key_hash = key_hash,
+        .owner_generation = 2,
     };
     vemb_v16_remote_meta_handle_t out = {0};
 
@@ -196,7 +225,7 @@ static void test_busy_entry_retry_budget(void) {
 int main(void) {
     test_layout_and_attach();
     test_publish_lookup_and_overwrite();
-    test_lookup_miss_and_full();
+    test_lookup_miss_and_evict();
     test_busy_entry_retry_budget();
     printf("vemb_v16_remote_meta_ut: all tests passed\n");
     return 0;

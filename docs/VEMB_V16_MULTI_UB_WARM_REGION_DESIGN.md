@@ -40,14 +40,28 @@
 - WARM eviction 未实现：当前 region 满后 fallback，所有 region 满后 cold spill；还没有 high-watermark/low-watermark、clock/LRU、dirty flush、slot reuse。
 - 非 TCP 跨机器 transport 未实现：当前 TCP 只能 inline vector；Aeron/SHM 跨机器需要后续 `aeron-over-UB` 或等价 UB request/response ring 设计。
 
+## 后续演进文档拆分
+
+UB WARM 后续演进已经拆成独立文档维护，避免当前 multi-region 落地文档继续承载过多后续设计细节：
+
+```text
+docs/VEMB_V16_UB_WARM_HASH_CACHE_EVICTION_DESIGN.md
+  Hash WARM Cache、slot_meta、set-associative placement、remote_meta locator、内存淘汰、COLD-backed cache。
+
+docs/VEMB_V16_UB_WARM_REPLICA_PAXOS_DESIGN.md
+  UB WARM primary storage、多副本、durability_state、Paxos/Raft 提交、故障恢复。
+```
+
+本文后续只保留当前 multi UB warm region 的实现状态、现有架构和落地约束。
+
 ## 架构图
 
 ![VEMB V16 SuperNode TLC multi UB warm regions](./assets/vemb_v16_multi_ub_warm_region_arch.svg)
 
-图示说明：
+图示说明（当前实现状态）：
 
 - `SuperNode` 持有单个 `TlcCore / WarmMetadata`，负责 `warm_put`、`warm_get` 和按 `region_id` 查找 region runtime。
-- `TlcCore / WarmMetadata` 维护私有元数据：`key -> warm_idx` 与 `warm_idx -> TlcWarmLocation`，不把 hash table、锁和状态位放进 UB region。
+- 当前 `TlcCore / WarmMetadata` 维护私有元数据：`key -> warm_idx` 与 `warm_idx -> TlcWarmLocation`，不把 hash table、锁和状态位放进 UB region。后续 hash WARM cache 淘汰方案会新增 UB `slot_meta`，但它只作为 payload slot 的权威状态，不替代 SuperNode private index。
 - `WarmRegionSelector` 维护带权 virtual-node ring，基于 `key_hash` 优先选择本地 `WarmRegionRuntime`，region 满时执行 fallback。
 - `WarmRegionRuntime` 表示一个已 mmap 的 WARM UB region，负责 slot 分配、满位标记和 `offset -> payload` 地址解析。
 - `TlcWarmLocation` 描述 payload 在某个 region 内的具体位置：`{region_id, region_index, local_slot, offset, bytes}`。
@@ -68,7 +82,7 @@
   - `bytes`：该 payload 的有效字节数，用于返回 handle 和读路径边界校验。
   - `offset`：该 payload 在目标 region `mapped_addr` 内的字节偏移，实际读写地址为 `mapped_addr + offset`。
 
-- `VectorHandle` 是适合非 TCP transport 模式的稳定寻址句柄，保持 ABI 为 `{region_id, offset, bytes}`
+- 当前 `VectorHandle` 是适合非 TCP transport 模式的稳定寻址句柄，保持 ABI 为 `{region_id, offset, bytes}`。支持 slot 复用后，需要按上文演进为携带 `local_slot/owner_generation` 的可校验 handle。
 
     跨进程 response 仍返回：
 

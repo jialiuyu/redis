@@ -19,6 +19,53 @@
 
 /// TCP transport implementation.
 
+#define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
+
+static int diag_should_log_req(uint32_t req_id) {
+    return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
+}
+
+static int tcp_response_needs_inline_snapshot(const vemb_v16_resp_t *resp) {
+    return resp->status == VEMB_V16_STATUS_OK &&
+        (resp->flags & VEMB_V16_REQ_F_INLINE_VECTOR) &&
+        resp->vector_bytes != 0;
+}
+
+static int tcp_completion_inline_vector(const vemb_v16_completion_t *completion,
+                                        const vemb_v16_resp_t *resp,
+                                        const uint8_t **vector,
+                                        uint32_t *vector_bytes) {
+    *vector = NULL;
+    *vector_bytes = 0;
+    if (!tcp_response_needs_inline_snapshot(resp))
+        return 0;
+    if (completion->inline_vector &&
+        completion->inline_vector_bytes == resp->vector_bytes) {
+        *vector = completion->inline_vector;
+        *vector_bytes = completion->inline_vector_bytes;
+        return 0;
+    }
+    serverLog(LL_WARNING,
+              "vemb_v16 tcp inline response missing completion snapshot: req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u region_id=%u local_slot=%u owner_generation=%llu",
+              resp->req_id,
+              resp->op,
+              resp->status,
+              resp->flags,
+              resp->vector_bytes,
+              completion->inline_vector_bytes,
+              resp->region_id,
+              resp->local_slot,
+              (unsigned long long)resp->owner_generation);
+    return -1;
+}
+
+static void tcp_mark_inline_snapshot_error(vemb_v16_resp_t *resp) {
+    resp->status = VEMB_V16_STATUS_ERR;
+    resp->vector_bytes = 0;
+    resp->vector_offset = 0;
+    resp->flags &= ~VEMB_V16_REQ_F_INLINE_VECTOR;
+}
+
 int vemb_v16_tcp_listen(vemb_v16_proxy_t *proxy,
                         int backlog,
                         vemb_v16_transport_listener_t *listener) {
@@ -130,7 +177,30 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
                                           size_t *out_len) {
     const uint8_t *vector = NULL;
     uint32_t vector_bytes = 0;
-    vemb_v16_proxy_tcp_response_vector_slice(ch, resp, &vector, &vector_bytes);
+    if (tcp_response_needs_inline_snapshot(resp)) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 tcp direct inline response has no completion snapshot: channel_id=%llu req_id=%u op=%u flags=%u vector_bytes=%u",
+                  (unsigned long long)vemb_v16_channel_id(ch),
+                  resp->req_id,
+                  resp->op,
+                  resp->flags,
+                  resp->vector_bytes);
+        tcp_mark_inline_snapshot_error(resp);
+    }
+    if (diag_should_log_req(resp->req_id)) {
+        serverLog(LL_DEBUG,
+                  "vemb_v16 diag tcp encode single: channel_id=%llu req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u region_id=%u local_slot=%u owner_generation=%llu",
+                  (unsigned long long)vemb_v16_channel_id(ch),
+                  resp->req_id,
+                  resp->op,
+                  resp->status,
+                  resp->flags,
+                  resp->vector_bytes,
+                  vector_bytes,
+                  resp->region_id,
+                  resp->local_slot,
+                  (unsigned long long)resp->owner_generation);
+    }
 
     size_t bytes = tcp_response_wire_size(resp, vector_bytes);
     uint8_t *buf = zmalloc(bytes);
@@ -180,7 +250,11 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
         vemb_v16_make_response_from(&responses[out], &completions[i]);
         vectors[out] = NULL;
         vector_bytes[out] = 0;
-        vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out], &vectors[out], &vector_bytes[out]);
+        if (tcp_completion_inline_vector(&completions[i],
+                                         &responses[out],
+                                         &vectors[out],
+                                         &vector_bytes[out]) != 0)
+            tcp_mark_inline_snapshot_error(&responses[out]);
         headers[out] = (vemb_v16_net_hdr_t){
             .magic = VEMB_V16_MAGIC,
             .version = VEMB_V16_VERSION,
@@ -190,6 +264,24 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
             .channel_id = vemb_v16_channel_id(ch),
             .req_id = responses[out].req_id,
         };
+        if (diag_should_log_req(responses[out].req_id)) {
+            serverLog(LL_DEBUG,
+                      "vemb_v16 diag tcp encode batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
+                      (unsigned long long)vemb_v16_channel_id(ch),
+                      i,
+                      out,
+                      n,
+                      responses[out].req_id,
+                      responses[out].op,
+                      responses[out].status,
+                      responses[out].flags,
+                      responses[out].vector_bytes,
+                      vector_bytes[out],
+                      sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes[out],
+                      responses[out].region_id,
+                      responses[out].local_slot,
+                      (unsigned long long)responses[out].owner_generation);
+        }
         total_bytes += sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes[out];
         out++;
     }
@@ -222,7 +314,16 @@ int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp)
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
         const uint8_t *vector = NULL;
         uint32_t vector_bytes = 0;
-        vemb_v16_proxy_tcp_response_vector_slice(ch, resp, &vector, &vector_bytes);
+        if (tcp_response_needs_inline_snapshot(resp)) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 tcp direct inline response has no completion snapshot: channel_id=%llu req_id=%u op=%u flags=%u vector_bytes=%u",
+                      (unsigned long long)vemb_v16_channel_id(ch),
+                      resp->req_id,
+                      resp->op,
+                      resp->flags,
+                      resp->vector_bytes);
+            tcp_mark_inline_snapshot_error(resp);
+        }
         return vemb_v16_net_write_frame2(vemb_v16_channel_net_fd(ch),
                                          VEMB_V16_NET_RESPONSE,
                                          vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
@@ -288,7 +389,11 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
             vemb_v16_make_response_from(&responses[out], &completions[i]);
             const uint8_t *vector = NULL;
             uint32_t vector_bytes = 0;
-            vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out], &vector, &vector_bytes);
+            if (tcp_completion_inline_vector(&completions[i],
+                                             &responses[out],
+                                             &vector,
+                                             &vector_bytes) != 0)
+                tcp_mark_inline_snapshot_error(&responses[out]);
 
             headers[out] = (vemb_v16_net_hdr_t){
                 .magic = VEMB_V16_MAGIC,
@@ -299,6 +404,24 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 .channel_id = vemb_v16_channel_id(ch),
                 .req_id = responses[out].req_id,
             };
+            if (diag_should_log_req(responses[out].req_id)) {
+                serverLog(LL_DEBUG,
+                          "vemb_v16 diag tcp writev batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
+                          (unsigned long long)vemb_v16_channel_id(ch),
+                          i,
+                          out,
+                          n,
+                          responses[out].req_id,
+                          responses[out].op,
+                          responses[out].status,
+                          responses[out].flags,
+                          responses[out].vector_bytes,
+                          vector_bytes,
+                          sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes,
+                          responses[out].region_id,
+                          responses[out].local_slot,
+                          (unsigned long long)responses[out].owner_generation);
+            }
             iov[iovcnt++] = (struct iovec){ .iov_base = &headers[out], .iov_len = sizeof(headers[out]) };
             iov[iovcnt++] = (struct iovec){ .iov_base = &responses[out], .iov_len = sizeof(responses[out]) };
             if (vector_bytes) {
@@ -390,6 +513,19 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
     if (vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch), req, hdr.payload_len) != 0) {
         zfree(req);
         return -1;
+    }
+    if (diag_should_log_req(req->req_id)) {
+        serverLog(LL_DEBUG,
+                  "vemb_v16 diag tcp request recv: proxy_worker=%u channel_id=%llu hdr_req_id=%u req_id=%u op=%u flags=%u payload_len=%u key_hash=%llu vector_bytes=%u",
+                  proxy_io_worker_id,
+                  (unsigned long long)vemb_v16_channel_id(ch),
+                  hdr.req_id,
+                  req->req_id,
+                  req->op,
+                  req->flags,
+                  hdr.payload_len,
+                  (unsigned long long)req->key_hash,
+                  req->vector_bytes);
     }
     vemb_v16_proxy_handle_request(ch, req, (int)hdr.payload_len, proxy_io_worker_id);
     zfree(req);

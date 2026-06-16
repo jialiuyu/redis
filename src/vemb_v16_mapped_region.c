@@ -245,6 +245,7 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
         return -1;
     }
     region->mapped_addr = (uint8_t *)region->mapping_addr + offset_delta;
+    region->created = created;
     serverLog(LL_NOTICE,
               "vemb_v16 mapped region mmap ok: backend=%u path=%s fd=%d request_size=%zu offset=%llu aligned_offset=%llu mapping_bytes=%zu mapping_addr=%p mapped_addr=%p created=%d",
               region->backend_type,

@@ -101,8 +101,10 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     unlink(ub2);
     int ub_fd = open(ub2, O_CREAT | O_TRUNC | O_RDWR, 0666);
     assert(ub_fd >= 0);
+    size_t ub2_allocator_layout =
+        vemb_v16_shared_allocator_layout_bytes(2);
     assert(ftruncate(ub_fd,
-                     sizeof(vemb_v16_shared_region_allocator_t) +
+                     ub2_allocator_layout +
                      sizeof(float) * dim * 2) == 0);
     close(ub_fd);
 
@@ -163,8 +165,7 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     assert(!strcmp(desc.warm_regions[0].path, shm1));
     assert(!strcmp(desc.warm_regions[1].path, ub2));
     assert(desc.warm_regions[1].backend_type == VEMB_V16_REGION_UB);
-    assert(desc.warm_regions[1].mmap_offset ==
-           sizeof(vemb_v16_shared_region_allocator_t));
+    assert(desc.warm_regions[1].mmap_offset == ub2_allocator_layout);
 
     fill_vector(vector, dim, 42);
     assert(vemb_v16_tlc_put(storage->tlc,
@@ -201,6 +202,8 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
+    assert(remote_handle.local_slot == handle.local_slot);
+    assert(remote_handle.owner_generation == handle.owner_generation);
 
     vemb_v16_storage_ctx_destroy(storage);
     unlink(manifest_path);
@@ -305,6 +308,8 @@ static void test_manifest_remote_meta_shm_attach_existing(void) {
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
+    assert(remote_handle.local_slot == handle.local_slot);
+    assert(remote_handle.owner_generation == handle.owner_generation);
 
     vemb_v16_storage_ctx_destroy(second);
     unlink(manifest_path);
@@ -322,6 +327,9 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
     vemb_v16_storage_ctx_t *storage = NULL;
     char key[64];
     uint64_t key_hash = 0;
+    float vector[dim];
+    vemb_v16_vector_handle_t published = {0};
+    uint32_t warm_slot = UINT32_MAX;
 
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_manifest_%ld_remote_meta_views.yaml",
@@ -409,11 +417,22 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
     }
     assert(routed_owner == 2);
 
+    fill_vector(vector, dim, 1100);
+    assert(vemb_v16_tlc_put(storage->tlc,
+                            key,
+                            (uint32_t)strlen(key),
+                            key_hash,
+                            vector,
+                            sizeof(vector),
+                            &published,
+                            &warm_slot) == 0);
     vemb_v16_remote_meta_handle_t remote_handle = {
-        .region_id = 1702,
-        .bytes = dim * sizeof(float),
-        .offset = 4096,
+        .region_id = published.region_id,
+        .bytes = published.bytes,
+        .local_slot = published.local_slot,
+        .offset = published.offset,
         .key_hash = key_hash,
+        .owner_generation = published.owner_generation,
     };
     assert(vemb_v16_remote_meta_publish(&storage->remote_meta_owner_views[1].view,
                                         key,
@@ -438,6 +457,16 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
     assert(handle.region_id == remote_handle.region_id);
     assert(handle.offset == remote_handle.offset);
     assert(handle.bytes == remote_handle.bytes);
+    assert(handle.local_slot == remote_handle.local_slot);
+    assert(handle.owner_generation == remote_handle.owner_generation);
+    const uint8_t *slice = NULL;
+    uint32_t slice_bytes = 0;
+    assert(vemb_v16_tlc_vector_slice(storage->tlc,
+                                     &handle,
+                                     &slice,
+                                     &slice_bytes) == 0);
+    assert(slice_bytes == sizeof(vector));
+    assert(memcmp(slice, vector, sizeof(vector)) == 0);
 
     vemb_v16_storage_ctx_destroy(storage);
     assert(vemb_v16_storage_reset_manifest_regions(&manifest) == 0);
@@ -448,6 +477,107 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
     shm_unlink(remote_meta_owner1);
     shm_unlink(remote_meta_owner2);
     cleanup_region_and_allocator(shm1, 701);
+}
+
+static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
+    enum { dim = 2, max_vectors = 4 };
+    char manifest_path[128];
+    char shm1[64];
+    char remote_meta_default[64];
+    char req0_1[64];
+    char req1_0[64];
+    char resp0_1[64];
+    char resp1_0[64];
+    vemb_v16_storage_ctx_t *storage = NULL;
+
+    snprintf(manifest_path, sizeof(manifest_path),
+             "/tmp/vemb_v16_manifest_%ld_ub_rpc.yaml", (long)getpid());
+    snprintf(shm1, sizeof(shm1), "/v16rpcmr_%ld", (long)getpid());
+    snprintf(remote_meta_default, sizeof(remote_meta_default),
+             "/v16rpcmd_%ld", (long)getpid());
+    snprintf(req0_1, sizeof(req0_1), "/v16rpcm_%ld_req_0_1", (long)getpid());
+    snprintf(req1_0, sizeof(req1_0), "/v16rpcm_%ld_req_1_0", (long)getpid());
+    snprintf(resp0_1, sizeof(resp0_1), "/v16rpcm_%ld_resp_0_1", (long)getpid());
+    snprintf(resp1_0, sizeof(resp1_0), "/v16rpcm_%ld_resp_1_0", (long)getpid());
+    cleanup_region_and_allocator(shm1, 801);
+    shm_unlink(remote_meta_default);
+    shm_unlink(req0_1);
+    shm_unlink(req1_0);
+    shm_unlink(resp0_1);
+    shm_unlink(resp1_0);
+
+    FILE *fp = fopen(manifest_path, "w");
+    assert(fp != NULL);
+    fprintf(fp,
+            "local_ub_node_id: 0\n"
+            "remote_meta_provider: shm\n"
+            "remote_meta_path: %s\n"
+            "remote_meta_entries: %u\n"
+            "remote_meta_buckets: %u\n"
+            "ub_rpc_timeout_ms: 123\n"
+            "warm_regions:\n"
+            "  - region_id: 801\n"
+            "    provider: shm\n"
+            "    path: %s\n"
+            "    mmap_offset: 0\n"
+            "    bytes: %u\n"
+            "    value_size: %u\n"
+            "    home_ub_node_id: 0\n"
+            "    is_local: true\n"
+            "    weight: 1\n"
+            "ub_rpc_peers:\n"
+            "  - owner_id: 1\n"
+            "    provider: shm\n"
+            "    request_path: %s\n"
+            "    response_path: %s\n"
+            "    inbound_request_path: %s\n"
+            "    outbound_response_path: %s\n",
+            remote_meta_default,
+            max_vectors,
+            max_vectors * 2,
+            shm1,
+            (unsigned)(sizeof(float) * dim * max_vectors),
+            (unsigned)(sizeof(float) * dim),
+            req0_1,
+            resp1_0,
+            req1_0,
+            resp0_1);
+    fclose(fp);
+
+    vemb_v16_warm_regions_manifest_t manifest;
+    assert(vemb_v16_parse_warm_regions_manifest(manifest_path,
+                                                dim * sizeof(float),
+                                                &manifest) == 0);
+    assert(manifest.ub_rpc_timeout_ms == 123);
+    assert(manifest.ub_rpc_peer_count == 1);
+    assert(manifest.ub_rpc_peers[0].owner_id == 1);
+    assert(!strcmp(manifest.ub_rpc_peers[0].request.path, req0_1));
+    assert(!strcmp(manifest.ub_rpc_peers[0].response.path, resp1_0));
+    assert(!strcmp(manifest.ub_rpc_peers[0].inbound_request.path, req1_0));
+    assert(!strcmp(manifest.ub_rpc_peers[0].outbound_response.path, resp0_1));
+
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                     dim,
+                                                     dim * sizeof(float),
+                                                     max_vectors,
+                                                     &manifest) == 0);
+    assert(storage->ub_rpc != NULL);
+    assert(storage->owner_hash_node_count == 20);
+    vemb_v16_storage_ctx_destroy(storage);
+
+    assert(vemb_v16_storage_reset_manifest_regions(&manifest) == 0);
+    assert(shm_open(req0_1, O_RDWR, 0666) < 0);
+    assert(shm_open(req1_0, O_RDWR, 0666) < 0);
+    assert(shm_open(resp0_1, O_RDWR, 0666) < 0);
+    assert(shm_open(resp1_0, O_RDWR, 0666) < 0);
+
+    unlink(manifest_path);
+    shm_unlink(remote_meta_default);
+    shm_unlink(req0_1);
+    shm_unlink(req1_0);
+    shm_unlink(resp0_1);
+    shm_unlink(resp1_0);
+    cleanup_region_and_allocator(shm1, 801);
 }
 
 static void test_storage_reset_clears_payload_and_allocator(void) {
@@ -545,6 +675,7 @@ int main(void) {
     test_manifest_shm_mock_ub_create_and_put();
     test_manifest_remote_meta_shm_attach_existing();
     test_manifest_remote_meta_owner_views_route_key2();
+    test_manifest_ub_rpc_peer_parse_and_storage_init();
     test_storage_reset_clears_payload_and_allocator();
     printf("vemb_v16_manifest_ut: all tests passed\n");
     return 0;

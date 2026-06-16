@@ -1,11 +1,14 @@
 #include "../src/vemb_v16_tlc.h"
 #include "../src/vemb_v16_remote_meta.h"
+#include "../src/vemb_v16_ub_rpc.h"
 
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static void fill_vector(float *vector, uint32_t dim, uint32_t seed) {
     for (uint32_t i = 0; i < dim; i++)
@@ -27,6 +30,46 @@ static void init_test_allocator(vemb_v16_shared_region_allocator_t *allocator,
     atomic_init(&allocator->next_slot, 0);
     atomic_init(&allocator->full, 0);
     atomic_init(&allocator->used_slots, 0);
+}
+
+static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
+                         const char *path) {
+    memset(ring, 0, sizeof(*ring));
+    ring->backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    snprintf(ring->path, sizeof(ring->path), "%s", path);
+}
+
+static void cleanup_rpc_rings(const char *req_a_b,
+                              const char *req_b_a,
+                              const char *resp_a_b,
+                              const char *resp_b_a) {
+    shm_unlink(req_a_b);
+    shm_unlink(req_b_a);
+    shm_unlink(resp_a_b);
+    shm_unlink(resp_b_a);
+}
+
+static void make_rpc_peers(vemb_v16_ub_rpc_peer_t *peer_a_to_b,
+                           uint32_t owner_b,
+                           vemb_v16_ub_rpc_peer_t *peer_b_to_a,
+                           uint32_t owner_a,
+                           const char *req_a_b,
+                           const char *req_b_a,
+                           const char *resp_a_b,
+                           const char *resp_b_a) {
+    memset(peer_a_to_b, 0, sizeof(*peer_a_to_b));
+    memset(peer_b_to_a, 0, sizeof(*peer_b_to_a));
+    peer_a_to_b->owner_id = owner_b;
+    set_rpc_ring(&peer_a_to_b->request, req_a_b);
+    set_rpc_ring(&peer_a_to_b->response, resp_b_a);
+    set_rpc_ring(&peer_a_to_b->inbound_request, req_b_a);
+    set_rpc_ring(&peer_a_to_b->outbound_response, resp_a_b);
+
+    peer_b_to_a->owner_id = owner_a;
+    set_rpc_ring(&peer_b_to_a->request, req_b_a);
+    set_rpc_ring(&peer_b_to_a->response, resp_a_b);
+    set_rpc_ring(&peer_b_to_a->inbound_request, req_a_b);
+    set_rpc_ring(&peer_b_to_a->outbound_response, resp_b_a);
 }
 
 static void test_put_get_handle(void) {
@@ -56,6 +99,8 @@ static void test_put_get_handle(void) {
                             vector, sizeof(vector), &handle, &warm_slot) == 0);
     assert(handle.region_id == 7);
     assert(handle.bytes == sizeof(vector));
+    assert(handle.local_slot == 0);
+    assert(handle.owner_generation == 1);
     assert(handle.offset == 0);
     assert(warm_slot == 0);
     assert(memcmp(region, vector, sizeof(vector)) == 0);
@@ -66,6 +111,8 @@ static void test_put_get_handle(void) {
                                    &handle, &warm_slot) == 0);
     assert(handle.region_id == 7);
     assert(handle.offset == 0);
+    assert(handle.local_slot == 0);
+    assert(handle.owner_generation == 1);
     assert(warm_slot == 0);
     vemb_v16_tlc_destroy(tlc);
 }
@@ -87,9 +134,9 @@ static void test_overwrite_and_capacity(void) {
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = 0;
     const char *key = "only";
-    const char *missing = "extra";
+    const char *evicting = "extra";
     uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
-    uint64_t missing_hash = vemb_v16_murmur3(missing, strlen(missing));
+    uint64_t evicting_hash = vemb_v16_murmur3(evicting, strlen(evicting));
 
     init_test_allocator(&allocator, 0, max_vectors);
     assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
@@ -103,12 +150,66 @@ static void test_overwrite_and_capacity(void) {
     assert(memcmp(region, second, sizeof(second)) == 0);
     memset(&handle, 0xff, sizeof(handle));
     warm_slot = 0;
-    assert(vemb_v16_tlc_put(tlc, missing, (uint32_t)strlen(missing), missing_hash,
+    assert(vemb_v16_tlc_put(tlc, evicting, (uint32_t)strlen(evicting), evicting_hash,
                             first, sizeof(first), &handle, &warm_slot) == 0);
-    assert(warm_slot == UINT32_MAX);
-    assert(handle.bytes == 0);
-    assert(vemb_v16_tlc_get_handle(tlc, missing, (uint32_t)strlen(missing),
-                                   missing_hash, &handle, &warm_slot) != 0);
+    assert(warm_slot == 0);
+    assert(handle.bytes == sizeof(first));
+    assert(handle.owner_generation == 2);
+    assert(vemb_v16_tlc_get_handle(tlc, evicting, (uint32_t)strlen(evicting),
+                                   evicting_hash, &handle, &warm_slot) == 0);
+    tlc_core_stats_t stats;
+    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    assert(stats.warm_same_key_overwrite >= 1);
+    assert(stats.warm_eviction_success >= 1);
+    vemb_v16_tlc_destroy(tlc);
+}
+
+static void test_eviction_rejects_stale_handle(void) {
+    enum { dim = 2, max_vectors = 1 };
+    float region[dim * max_vectors];
+    float first[dim], second[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 6,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_vector_handle_t stale = {0};
+    vemb_v16_vector_handle_t fresh = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    const uint8_t *bytes = NULL;
+    uint32_t len = 0;
+    const char *key1 = "stale:one";
+    const char *key2 = "stale:two";
+    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 6, max_vectors);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    fill_vector(first, dim, 11);
+    fill_vector(second, dim, 22);
+    assert(vemb_v16_tlc_put(tlc, key1, (uint32_t)strlen(key1), key1_hash,
+                            first, sizeof(first), &stale, &warm_slot) == 0);
+    assert(vemb_v16_tlc_vector_slice(tlc, &stale, &bytes, &len) == 0);
+    assert(len == sizeof(first));
+    assert(memcmp(bytes, first, sizeof(first)) == 0);
+
+    assert(vemb_v16_tlc_put(tlc, key2, (uint32_t)strlen(key2), key2_hash,
+                            second, sizeof(second), &fresh, &warm_slot) == 0);
+    assert(fresh.local_slot == stale.local_slot);
+    assert(fresh.owner_generation == stale.owner_generation + 1);
+    assert(vemb_v16_tlc_vector_slice(tlc, &stale, &bytes, &len) != 0);
+    assert(vemb_v16_tlc_vector_slice(tlc, &fresh, &bytes, &len) == 0);
+    assert(len == sizeof(second));
+    assert(memcmp(bytes, second, sizeof(second)) == 0);
+    tlc_core_stats_t stats;
+    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    assert(stats.warm_stale_handle_reject >= 1);
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -425,9 +526,9 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     assert(vemb_v16_tlc_put(tlc, local_keys[1], (uint32_t)strlen(local_keys[1]),
                             h2_hash, second, sizeof(second),
                             &h2, &warm_slot) == 0);
-    assert(h2.region_id == 2);
+    assert(h2.region_id == 1);
     assert(h2.offset == 0);
-    assert(memcmp(remote_region, second, sizeof(second)) == 0);
+    assert(memcmp(local_region, second, sizeof(second)) == 0);
 
     assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
                             h1_hash, overwrite, sizeof(overwrite),
@@ -439,13 +540,11 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     vemb_v16_tlc_get_core_stats(tlc, &stats);
     assert(stats.warm_region_count == 2);
     assert(stats.warm_alloc_local >= 1);
-    assert(stats.warm_alloc_remote >= 1);
-    assert(stats.warm_alloc_fallback >= 1);
     assert(stats.warm_region_full_count >= 1);
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_multi_region_all_full_spills_cold(void) {
+static void test_multi_region_all_full_evicts_committed_warm(void) {
     enum { dim = 2, max_vectors = 2 };
     float region1[dim];
     float region2[dim];
@@ -498,14 +597,14 @@ static void test_multi_region_all_full_spills_cold(void) {
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                             vector, sizeof(vector),
                             &handle, &warm_slot) == 0);
-    assert(warm_slot == UINT32_MAX);
-    assert(handle.bytes == 0);
+    assert(warm_slot != UINT32_MAX);
+    assert(handle.bytes == sizeof(vector));
+    assert(handle.owner_generation >= 2);
     tlc_core_stats_t stats;
     vemb_v16_tlc_get_core_stats(tlc, &stats);
     assert(stats.warm_region_count == 2);
-    assert(stats.warm_region_full_count == 2);
-    assert(stats.warm_alloc_cold_spill == 1);
-    assert(stats.warm_alloc_fail >= 1);
+    assert(stats.warm_region_full_count >= 1);
+    assert(stats.warm_alloc_cold_spill == 0);
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -635,6 +734,11 @@ static void test_vsim_key2_lookup_local_source(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+static uint32_t fixed_owner_resolver(uint64_t key_hash,
+                                     const char *key,
+                                     uint32_t key_len,
+                                     void *arg);
+
 static void test_vsim_key2_lookup_remote_source(void) {
     enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
     float region[dim * max_vectors];
@@ -652,10 +756,13 @@ static void test_vsim_key2_lookup_remote_source(void) {
         .value_size = dim * sizeof(float),
         .shared_allocator = &allocator,
     };
-    vemb_v16_remote_meta_view_t remote_meta;
+    vemb_v16_remote_meta_view_t owner_meta;
+    vemb_v16_remote_meta_view_t reader_meta;
     size_t remote_meta_bytes =
         vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
-    void *remote_meta_base = NULL;
+    void *owner_meta_base = NULL;
+    void *reader_meta_base = NULL;
+    uint32_t wanted_owner = 1;
     const char *key2 = "vsim:remote-key2";
     uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
     vemb_v16_vector_handle_t handle = {0};
@@ -668,11 +775,20 @@ static void test_vsim_key2_lookup_remote_source(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 99, max_vectors);
-    assert(posix_memalign(&remote_meta_base, 64, remote_meta_bytes) == 0);
-    assert(vemb_v16_remote_meta_init(&remote_meta,
-                                     remote_meta_base,
+    assert(posix_memalign(&owner_meta_base, 64, remote_meta_bytes) == 0);
+    assert(posix_memalign(&reader_meta_base, 64, remote_meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init(&owner_meta,
+                                     owner_meta_base,
                                      remote_meta_bytes,
                                      1,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_init(&reader_meta,
+                                     reader_meta_base,
+                                     remote_meta_bytes,
+                                     2,
                                      dim * sizeof(float),
                                      remote_entries,
                                      remote_buckets) ==
@@ -680,8 +796,12 @@ static void test_vsim_key2_lookup_remote_source(void) {
 
     assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
     assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
-    vemb_v16_tlc_set_remote_meta_view(owner, &remote_meta, 8);
-    vemb_v16_tlc_set_remote_meta_view(reader, &remote_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
+    assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
+    vemb_v16_tlc_set_owner_resolver(reader,
+                                    fixed_owner_resolver,
+                                    &wanted_owner);
 
     fill_vector(vector, dim, 300);
     assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
@@ -705,13 +825,858 @@ static void test_vsim_key2_lookup_remote_source(void) {
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
+    assert(remote_handle.local_slot == handle.local_slot);
+    assert(remote_handle.owner_generation == handle.owner_generation);
     assert(vemb_v16_tlc_vector_slice(reader, &remote_handle, &bytes, &len) == 0);
     assert(len == sizeof(vector));
     assert(memcmp(bytes, vector, sizeof(vector)) == 0);
 
     vemb_v16_tlc_destroy(reader);
     vemb_v16_tlc_destroy(owner);
-    free(remote_meta_base);
+    free(reader_meta_base);
+    free(owner_meta_base);
+}
+
+static void test_remote_meta_async_publish_flush(void) {
+    enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
+    float region[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 299,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_remote_meta_view_t meta;
+    size_t meta_bytes =
+        vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
+    void *meta_base = NULL;
+    const char *key = "remote-meta:async";
+    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    vemb_v16_vector_handle_t handle = {0};
+    vemb_v16_remote_meta_handle_t remote_handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    vemb_v16_stats_t stats;
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 299, max_vectors);
+    assert(posix_memalign(&meta_base, 64, meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init(&meta,
+                                     meta_base,
+                                     meta_bytes,
+                                     9,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
+    vemb_v16_tlc_set_remote_meta_view(tlc, &meta, 8);
+
+    fill_vector(vector, dim, 700);
+    assert(vemb_v16_tlc_put(tlc,
+                            key,
+                            (uint32_t)strlen(key),
+                            key_hash,
+                            vector,
+                            sizeof(vector),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_publish_remote_meta_async(tlc,
+                                                  key,
+                                                  (uint32_t)strlen(key),
+                                                  key_hash,
+                                                  &handle) == 0);
+    (void)vemb_v16_tlc_flush_remote_meta_publishes(tlc, 0);
+    assert(vemb_v16_remote_meta_lookup(&meta,
+                                       key,
+                                       (uint32_t)strlen(key),
+                                       key_hash,
+                                       8,
+                                       &remote_handle) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(remote_handle.local_slot == handle.local_slot);
+    memset(&stats, 0, sizeof(stats));
+    vemb_v16_tlc_get_runtime_stats(tlc, &stats);
+    assert(stats.remote_meta_publish_async_enqueue >= 1);
+    assert(stats.remote_meta_publish_ok >= 1);
+
+    vemb_v16_tlc_destroy(tlc);
+    free(meta_base);
+}
+
+static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
+    enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
+    float region[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *owner = NULL;
+    vemb_v16_tlc_t *reader = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 399,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_remote_meta_view_t owner_meta;
+    vemb_v16_remote_meta_view_t reader_meta;
+    size_t remote_meta_bytes =
+        vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
+    void *owner_meta_base = NULL;
+    void *reader_meta_base = NULL;
+    uint32_t wanted_owner = 1;
+    const char *key2 = "vsim:rpc-key2";
+    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    vemb_v16_vector_handle_t handle = {0};
+    vemb_v16_vector_handle_t remote_handle = {0};
+    vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    vemb_v16_remote_meta_handle_t repaired = {0};
+    vemb_v16_stats_t stats;
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 399, max_vectors);
+    assert(posix_memalign(&owner_meta_base, 64, remote_meta_bytes) == 0);
+    assert(posix_memalign(&reader_meta_base, 64, remote_meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init(&owner_meta,
+                                     owner_meta_base,
+                                     remote_meta_bytes,
+                                     1,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_init(&reader_meta,
+                                     reader_meta_base,
+                                     remote_meta_bytes,
+                                     2,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+
+    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
+    assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
+    vemb_v16_tlc_set_owner_resolver(reader,
+                                    fixed_owner_resolver,
+                                    &wanted_owner);
+    vemb_v16_tlc_set_lookup_rpc(reader,
+                                vemb_v16_tlc_lookup_rpc_local_handler,
+                                owner);
+
+    fill_vector(vector, dim, 800);
+    assert(vemb_v16_tlc_put(owner,
+                            key2,
+                            (uint32_t)strlen(key2),
+                            key2_hash,
+                            vector,
+                            sizeof(vector),
+                            &handle,
+                            &warm_slot) == 0);
+
+    assert(vemb_v16_tlc_lookup_vsim_key2(reader,
+                                         key2,
+                                         (uint32_t)strlen(key2),
+                                         key2_hash,
+                                         &remote_handle,
+                                         &source,
+                                         &timing) == 0);
+    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
+    assert(timing.remote_meta_lookup_count == 1);
+    assert(remote_handle.local_slot == handle.local_slot);
+    assert(remote_handle.owner_generation == handle.owner_generation);
+
+    (void)vemb_v16_tlc_flush_remote_meta_publishes(reader, 0);
+    assert(vemb_v16_remote_meta_lookup(&owner_meta,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       key2_hash,
+                                       8,
+                                       &repaired) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(repaired.local_slot == handle.local_slot);
+    memset(&stats, 0, sizeof(stats));
+    vemb_v16_tlc_get_runtime_stats(reader, &stats);
+    assert(stats.remote_meta_lookup_miss >= 1);
+    assert(stats.ub_lookup_rpc_ok >= 1);
+    assert(stats.ub_lookup_rpc_handle >= 1);
+    assert(stats.remote_meta_repair_enqueue >= 1);
+
+    vemb_v16_tlc_destroy(reader);
+    vemb_v16_tlc_destroy(owner);
+    free(reader_meta_base);
+    free(owner_meta_base);
+}
+
+static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
+    enum { dim = 2, max_vectors = 8, remote_entries = 8, remote_buckets = 16 };
+    float region[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *owner = NULL;
+    vemb_v16_tlc_t *reader = NULL;
+    vemb_v16_ub_rpc_t *owner_rpc = NULL;
+    vemb_v16_ub_rpc_t *reader_rpc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 499,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_remote_meta_view_t owner_meta;
+    vemb_v16_remote_meta_view_t reader_meta;
+    size_t remote_meta_bytes =
+        vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
+    void *owner_meta_base = NULL;
+    void *reader_meta_base = NULL;
+    uint32_t wanted_owner = 1;
+    const char *key2 = "vsim:ub-ring-rpc-key2";
+    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    vemb_v16_vector_handle_t handle = {0};
+    vemb_v16_vector_handle_t remote_handle = {0};
+    vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    vemb_v16_remote_meta_handle_t repaired = {0};
+    vemb_v16_stats_t stats;
+    char req_reader_owner[64];
+    char req_owner_reader[64];
+    char resp_reader_owner[64];
+    char resp_owner_reader[64];
+    vemb_v16_ub_rpc_peer_t reader_peer;
+    vemb_v16_ub_rpc_peer_t owner_peer;
+
+    snprintf(req_reader_owner, sizeof(req_reader_owner),
+             "/v16rpc_%ld_req_2_1", (long)getpid());
+    snprintf(req_owner_reader, sizeof(req_owner_reader),
+             "/v16rpc_%ld_req_1_2", (long)getpid());
+    snprintf(resp_reader_owner, sizeof(resp_reader_owner),
+             "/v16rpc_%ld_resp_2_1", (long)getpid());
+    snprintf(resp_owner_reader, sizeof(resp_owner_reader),
+             "/v16rpc_%ld_resp_1_2", (long)getpid());
+    cleanup_rpc_rings(req_reader_owner,
+                      req_owner_reader,
+                      resp_reader_owner,
+                      resp_owner_reader);
+    make_rpc_peers(&reader_peer,
+                   1,
+                   &owner_peer,
+                   2,
+                   req_reader_owner,
+                   req_owner_reader,
+                   resp_reader_owner,
+                   resp_owner_reader);
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 499, max_vectors);
+    assert(posix_memalign(&owner_meta_base, 64, remote_meta_bytes) == 0);
+    assert(posix_memalign(&reader_meta_base, 64, remote_meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init(&owner_meta,
+                                     owner_meta_base,
+                                     remote_meta_bytes,
+                                     1,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_init(&reader_meta,
+                                     reader_meta_base,
+                                     remote_meta_bytes,
+                                     2,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+
+    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
+    assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
+    vemb_v16_tlc_set_owner_resolver(reader,
+                                    fixed_owner_resolver,
+                                    &wanted_owner);
+    assert(vemb_v16_ub_rpc_create(&owner_rpc,
+                                  owner,
+                                  1,
+                                  100,
+                                  &owner_peer,
+                                  1) == 0);
+    assert(vemb_v16_ub_rpc_create(&reader_rpc,
+                                  reader,
+                                  2,
+                                  100,
+                                  &reader_peer,
+                                  1) == 0);
+
+    fill_vector(vector, dim, 1800);
+    assert(vemb_v16_tlc_put(owner,
+                            key2,
+                            (uint32_t)strlen(key2),
+                            key2_hash,
+                            vector,
+                            sizeof(vector),
+                            &handle,
+                            &warm_slot) == 0);
+
+    assert(vemb_v16_tlc_lookup_vsim_key2(reader,
+                                         key2,
+                                         (uint32_t)strlen(key2),
+                                         key2_hash,
+                                         &remote_handle,
+                                         &source,
+                                         &timing) == 0);
+    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
+    assert(timing.remote_meta_lookup_count == 1);
+    assert(remote_handle.local_slot == handle.local_slot);
+    assert(remote_handle.owner_generation == handle.owner_generation);
+
+    (void)vemb_v16_tlc_flush_remote_meta_publishes(reader, 0);
+    assert(vemb_v16_remote_meta_lookup(&owner_meta,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       key2_hash,
+                                       8,
+                                       &repaired) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(repaired.local_slot == handle.local_slot);
+    memset(&stats, 0, sizeof(stats));
+    vemb_v16_tlc_get_runtime_stats(reader, &stats);
+    assert(stats.ub_lookup_rpc_ok >= 1);
+    assert(stats.ub_lookup_rpc_handle >= 1);
+    assert(stats.remote_meta_repair_enqueue >= 1);
+
+    vemb_v16_ub_rpc_destroy(reader_rpc);
+    vemb_v16_ub_rpc_destroy(owner_rpc);
+    vemb_v16_tlc_destroy(reader);
+    vemb_v16_tlc_destroy(owner);
+    free(reader_meta_base);
+    free(owner_meta_base);
+    cleanup_rpc_rings(req_reader_owner,
+                      req_owner_reader,
+                      resp_reader_owner,
+                      resp_owner_reader);
+}
+
+typedef struct ub_ring_rpc_concurrent_arg {
+    vemb_v16_tlc_t *reader;
+    char (*keys)[VEMB_V16_MAX_KEY_LEN];
+    uint64_t *hashes;
+    uint32_t key_count;
+    uint32_t loops;
+    uint32_t tid;
+    atomic_uint_fast32_t *ok_count;
+} ub_ring_rpc_concurrent_arg_t;
+
+static void *ub_ring_rpc_concurrent_worker(void *arg) {
+    ub_ring_rpc_concurrent_arg_t *ctx = arg;
+    for (uint32_t i = 0; i < ctx->loops; i++) {
+        uint32_t idx = (i + ctx->tid) % ctx->key_count;
+        vemb_v16_vector_handle_t handle = {0};
+        vemb_v16_tlc_lookup_source_t source =
+            VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+        vemb_v16_tlc_lookup_timing_t timing = {0};
+        assert(vemb_v16_tlc_lookup_vsim_key2(
+                   ctx->reader,
+                   ctx->keys[idx],
+                   (uint32_t)strlen(ctx->keys[idx]),
+                   ctx->hashes[idx],
+                   &handle,
+                   &source,
+                   &timing) == 0);
+        assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
+        assert(handle.key_hash == ctx->hashes[idx]);
+        assert(handle.bytes != 0);
+        atomic_fetch_add_explicit(ctx->ok_count, 1,
+                                  memory_order_relaxed);
+    }
+    return NULL;
+}
+
+static void test_vsim_key2_lookup_ub_ring_rpc_concurrent(void) {
+    enum {
+        dim = 2,
+        max_vectors = 32,
+        remote_entries = 8,
+        remote_buckets = 16,
+        key_count = 8,
+        thread_count = 4,
+        loops = 32,
+    };
+    float region[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *owner = NULL;
+    vemb_v16_tlc_t *reader = NULL;
+    vemb_v16_ub_rpc_t *owner_rpc = NULL;
+    vemb_v16_ub_rpc_t *reader_rpc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 599,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_remote_meta_view_t owner_meta;
+    vemb_v16_remote_meta_view_t reader_meta;
+    size_t remote_meta_bytes =
+        vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
+    void *owner_meta_base = NULL;
+    void *reader_meta_base = NULL;
+    uint32_t wanted_owner = 1;
+    char keys[key_count][VEMB_V16_MAX_KEY_LEN];
+    uint64_t hashes[key_count];
+    pthread_t threads[thread_count];
+    ub_ring_rpc_concurrent_arg_t args[thread_count];
+    atomic_uint_fast32_t ok_count;
+    char req_reader_owner[64];
+    char req_owner_reader[64];
+    char resp_reader_owner[64];
+    char resp_owner_reader[64];
+    vemb_v16_ub_rpc_peer_t reader_peer;
+    vemb_v16_ub_rpc_peer_t owner_peer;
+
+    snprintf(req_reader_owner, sizeof(req_reader_owner),
+             "/v16rpc_%ld_c_req_2_1", (long)getpid());
+    snprintf(req_owner_reader, sizeof(req_owner_reader),
+             "/v16rpc_%ld_c_req_1_2", (long)getpid());
+    snprintf(resp_reader_owner, sizeof(resp_reader_owner),
+             "/v16rpc_%ld_c_resp_2_1", (long)getpid());
+    snprintf(resp_owner_reader, sizeof(resp_owner_reader),
+             "/v16rpc_%ld_c_resp_1_2", (long)getpid());
+    cleanup_rpc_rings(req_reader_owner,
+                      req_owner_reader,
+                      resp_reader_owner,
+                      resp_owner_reader);
+    make_rpc_peers(&reader_peer,
+                   1,
+                   &owner_peer,
+                   2,
+                   req_reader_owner,
+                   req_owner_reader,
+                   resp_reader_owner,
+                   resp_owner_reader);
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 599, max_vectors);
+    atomic_init(&ok_count, 0);
+    assert(posix_memalign(&owner_meta_base, 64, remote_meta_bytes) == 0);
+    assert(posix_memalign(&reader_meta_base, 64, remote_meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init(&owner_meta,
+                                     owner_meta_base,
+                                     remote_meta_bytes,
+                                     1,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_init(&reader_meta,
+                                     reader_meta_base,
+                                     remote_meta_bytes,
+                                     2,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+
+    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
+    vemb_v16_tlc_set_owner_resolver(reader,
+                                    fixed_owner_resolver,
+                                    &wanted_owner);
+    assert(vemb_v16_ub_rpc_create(&owner_rpc,
+                                  owner,
+                                  1,
+                                  100,
+                                  &owner_peer,
+                                  1) == 0);
+    assert(vemb_v16_ub_rpc_create(&reader_rpc,
+                                  reader,
+                                  2,
+                                  100,
+                                  &reader_peer,
+                                  1) == 0);
+
+    for (uint32_t i = 0; i < key_count; i++) {
+        vemb_v16_vector_handle_t handle = {0};
+        uint32_t warm_slot = UINT32_MAX;
+        snprintf(keys[i], sizeof(keys[i]), "vsim:ub-ring-rpc-conc:%u", i);
+        hashes[i] = vemb_v16_murmur3(keys[i], strlen(keys[i]));
+        fill_vector(vector, dim, 2000 + i);
+        assert(vemb_v16_tlc_put(owner,
+                                keys[i],
+                                (uint32_t)strlen(keys[i]),
+                                hashes[i],
+                                vector,
+                                sizeof(vector),
+                                &handle,
+                                &warm_slot) == 0);
+    }
+
+    for (uint32_t t = 0; t < thread_count; t++) {
+        args[t] = (ub_ring_rpc_concurrent_arg_t){
+            .reader = reader,
+            .keys = keys,
+            .hashes = hashes,
+            .key_count = key_count,
+            .loops = loops,
+            .tid = t,
+            .ok_count = &ok_count,
+        };
+        assert(pthread_create(&threads[t],
+                              NULL,
+                              ub_ring_rpc_concurrent_worker,
+                              &args[t]) == 0);
+    }
+    for (uint32_t t = 0; t < thread_count; t++)
+        assert(pthread_join(threads[t], NULL) == 0);
+    assert(atomic_load_explicit(&ok_count, memory_order_relaxed) ==
+           thread_count * loops);
+
+    vemb_v16_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    vemb_v16_tlc_get_runtime_stats(reader, &stats);
+    assert(stats.ub_lookup_rpc_ok >= thread_count * loops);
+    assert(stats.ub_lookup_rpc_handle >= thread_count * loops);
+
+    vemb_v16_ub_rpc_destroy(reader_rpc);
+    vemb_v16_ub_rpc_destroy(owner_rpc);
+    vemb_v16_tlc_destroy(reader);
+    vemb_v16_tlc_destroy(owner);
+    free(reader_meta_base);
+    free(owner_meta_base);
+    cleanup_rpc_rings(req_reader_owner,
+                      req_owner_reader,
+                      resp_reader_owner,
+                      resp_owner_reader);
+}
+
+static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
+    enum { dim = 2, max_vectors = 8 };
+    float region[dim * max_vectors];
+    float first[dim], second[dim], other[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *owner = NULL;
+    vemb_v16_tlc_t *reader = NULL;
+    vemb_v16_ub_rpc_t *owner_rpc = NULL;
+    vemb_v16_ub_rpc_t *reader_rpc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 699,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_remote_meta_view_t owner_meta;
+    vemb_v16_remote_meta_view_t reader_meta;
+    size_t remote_meta_bytes =
+        vemb_v16_remote_meta_layout_bytes_for_sets(1, 1);
+    void *owner_meta_base = NULL;
+    void *reader_meta_base = NULL;
+    uint32_t wanted_owner = 1;
+    const char *stale_key = "vsim:ub-ring-rpc-stale";
+    const char *evict_a = "vsim:ub-ring-rpc-evict-a";
+    const char *evict_b = "vsim:ub-ring-rpc-evict-b";
+    uint64_t stale_hash = vemb_v16_murmur3(stale_key, strlen(stale_key));
+    uint64_t evict_a_hash = vemb_v16_murmur3(evict_a, strlen(evict_a));
+    uint64_t evict_b_hash = vemb_v16_murmur3(evict_b, strlen(evict_b));
+    vemb_v16_vector_handle_t stale_old = {0};
+    vemb_v16_vector_handle_t stale_new = {0};
+    vemb_v16_vector_handle_t evict_a_handle = {0};
+    vemb_v16_vector_handle_t evict_b_handle = {0};
+    vemb_v16_vector_handle_t remote_handle = {0};
+    vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    vemb_v16_stats_t stats;
+    char req_reader_owner[64];
+    char req_owner_reader[64];
+    char resp_reader_owner[64];
+    char resp_owner_reader[64];
+    vemb_v16_ub_rpc_peer_t reader_peer;
+    vemb_v16_ub_rpc_peer_t owner_peer;
+
+    snprintf(req_reader_owner, sizeof(req_reader_owner),
+             "/v16rpc_%ld_sc_req_2_1", (long)getpid());
+    snprintf(req_owner_reader, sizeof(req_owner_reader),
+             "/v16rpc_%ld_sc_req_1_2", (long)getpid());
+    snprintf(resp_reader_owner, sizeof(resp_reader_owner),
+             "/v16rpc_%ld_sc_resp_2_1", (long)getpid());
+    snprintf(resp_owner_reader, sizeof(resp_owner_reader),
+             "/v16rpc_%ld_sc_resp_1_2", (long)getpid());
+    cleanup_rpc_rings(req_reader_owner,
+                      req_owner_reader,
+                      resp_reader_owner,
+                      resp_owner_reader);
+    make_rpc_peers(&reader_peer,
+                   1,
+                   &owner_peer,
+                   2,
+                   req_reader_owner,
+                   req_owner_reader,
+                   resp_reader_owner,
+                   resp_owner_reader);
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 699, max_vectors);
+    assert(posix_memalign(&owner_meta_base, 64, remote_meta_bytes) == 0);
+    assert(posix_memalign(&reader_meta_base, 64, remote_meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init_sets(&owner_meta,
+                                          owner_meta_base,
+                                          remote_meta_bytes,
+                                          1,
+                                          dim * sizeof(float),
+                                          1,
+                                          1) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_init_sets(&reader_meta,
+                                          reader_meta_base,
+                                          remote_meta_bytes,
+                                          2,
+                                          dim * sizeof(float),
+                                          1,
+                                          1) ==
+           VEMB_V16_REMOTE_META_OK);
+
+    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
+    assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
+    vemb_v16_tlc_set_owner_resolver(reader,
+                                    fixed_owner_resolver,
+                                    &wanted_owner);
+    assert(vemb_v16_ub_rpc_create(&owner_rpc,
+                                  owner,
+                                  1,
+                                  100,
+                                  &owner_peer,
+                                  1) == 0);
+    assert(vemb_v16_ub_rpc_create(&reader_rpc,
+                                  reader,
+                                  2,
+                                  100,
+                                  &reader_peer,
+                                  1) == 0);
+
+    fill_vector(first, dim, 3000);
+    assert(vemb_v16_tlc_put(owner,
+                            stale_key,
+                            (uint32_t)strlen(stale_key),
+                            stale_hash,
+                            first,
+                            sizeof(first),
+                            &stale_new,
+                            &warm_slot) == 0);
+    fill_vector(second, dim, 3100);
+    assert(vemb_v16_tlc_put(owner,
+                            stale_key,
+                            (uint32_t)strlen(stale_key),
+                            stale_hash,
+                            second,
+                            sizeof(second),
+                            &stale_new,
+                            &warm_slot) == 0);
+    stale_old = stale_new;
+    stale_old.owner_generation++;
+    assert(vemb_v16_tlc_publish_remote_meta(owner,
+                                            stale_key,
+                                            (uint32_t)strlen(stale_key),
+                                            stale_hash,
+                                            &stale_old) == 0);
+
+    assert(vemb_v16_tlc_lookup_vsim_key2(reader,
+                                         stale_key,
+                                         (uint32_t)strlen(stale_key),
+                                         stale_hash,
+                                         &remote_handle,
+                                         &source,
+                                         &timing) == 0);
+    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
+    assert(remote_handle.owner_generation == stale_new.owner_generation);
+    assert(remote_handle.local_slot == stale_new.local_slot);
+    (void)vemb_v16_tlc_flush_remote_meta_publishes(reader, 0);
+
+    fill_vector(first, dim, 3200);
+    fill_vector(other, dim, 3300);
+    assert(vemb_v16_tlc_put(owner,
+                            evict_a,
+                            (uint32_t)strlen(evict_a),
+                            evict_a_hash,
+                            first,
+                            sizeof(first),
+                            &evict_a_handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_publish_remote_meta(owner,
+                                            evict_a,
+                                            (uint32_t)strlen(evict_a),
+                                            evict_a_hash,
+                                            &evict_a_handle) == 0);
+    assert(vemb_v16_tlc_put(owner,
+                            evict_b,
+                            (uint32_t)strlen(evict_b),
+                            evict_b_hash,
+                            other,
+                            sizeof(other),
+                            &evict_b_handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_publish_remote_meta(owner,
+                                            evict_b,
+                                            (uint32_t)strlen(evict_b),
+                                            evict_b_hash,
+                                            &evict_b_handle) == 0);
+
+    memset(&remote_handle, 0, sizeof(remote_handle));
+    source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
+    memset(&timing, 0, sizeof(timing));
+    assert(vemb_v16_tlc_lookup_vsim_key2(reader,
+                                         evict_a,
+                                         (uint32_t)strlen(evict_a),
+                                         evict_a_hash,
+                                         &remote_handle,
+                                         &source,
+                                         &timing) == 0);
+    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
+    assert(remote_handle.local_slot == evict_a_handle.local_slot);
+    assert(remote_handle.owner_generation == evict_a_handle.owner_generation);
+
+    memset(&stats, 0, sizeof(stats));
+    vemb_v16_tlc_get_runtime_stats(reader, &stats);
+    assert(stats.ub_lookup_rpc_ok >= 2);
+    assert(stats.ub_lookup_rpc_handle >= 2);
+    assert(stats.remote_meta_lookup_set_conflict >= 1);
+
+    vemb_v16_ub_rpc_destroy(reader_rpc);
+    vemb_v16_ub_rpc_destroy(owner_rpc);
+    vemb_v16_tlc_destroy(reader);
+    vemb_v16_tlc_destroy(owner);
+    free(reader_meta_base);
+    free(owner_meta_base);
+    cleanup_rpc_rings(req_reader_owner,
+                      req_owner_reader,
+                      resp_reader_owner,
+                      resp_owner_reader);
+}
+
+static void test_vsim_key2_lookup_remote_meta_stale(void) {
+    enum { dim = 2, max_vectors = 1, remote_entries = 4, remote_buckets = 8 };
+    float region[dim * max_vectors];
+    float first[dim], second[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *owner = NULL;
+    vemb_v16_tlc_t *reader = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 199,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    vemb_v16_remote_meta_view_t owner_meta;
+    vemb_v16_remote_meta_view_t reader_meta;
+    size_t remote_meta_bytes =
+        vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
+    void *owner_meta_base = NULL;
+    void *reader_meta_base = NULL;
+    uint32_t wanted_owner = 1;
+    const char *key1 = "vsim:remote-stale-old";
+    const char *key2 = "vsim:remote-stale-new";
+    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    vemb_v16_vector_handle_t handle = {0};
+    vemb_v16_vector_handle_t remote_handle = {0};
+    vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
+    vemb_v16_tlc_lookup_timing_t timing = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    tlc_core_stats_t stats;
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 199, max_vectors);
+    assert(posix_memalign(&owner_meta_base, 64, remote_meta_bytes) == 0);
+    assert(posix_memalign(&reader_meta_base, 64, remote_meta_bytes) == 0);
+    assert(vemb_v16_remote_meta_init(&owner_meta,
+                                     owner_meta_base,
+                                     remote_meta_bytes,
+                                     1,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+    assert(vemb_v16_remote_meta_init(&reader_meta,
+                                     reader_meta_base,
+                                     remote_meta_bytes,
+                                     2,
+                                     dim * sizeof(float),
+                                     remote_entries,
+                                     remote_buckets) ==
+           VEMB_V16_REMOTE_META_OK);
+
+    assert(vemb_v16_tlc_create(&owner, dim, max_vectors, &warm, 1, 4) == 0);
+    assert(vemb_v16_tlc_create(&reader, dim, max_vectors, &warm, 1, 4) == 0);
+    vemb_v16_tlc_set_remote_meta_view(owner, &owner_meta, 8);
+    vemb_v16_tlc_set_remote_meta_view(reader, &reader_meta, 8);
+    assert(vemb_v16_tlc_set_remote_meta_owner_view(reader, 1, &owner_meta) == 0);
+    vemb_v16_tlc_set_owner_resolver(reader,
+                                    fixed_owner_resolver,
+                                    &wanted_owner);
+
+    fill_vector(first, dim, 500);
+    fill_vector(second, dim, 600);
+    assert(vemb_v16_tlc_put(owner, key1, (uint32_t)strlen(key1), key1_hash,
+                            first, sizeof(first), &handle, &warm_slot) == 0);
+    assert(vemb_v16_tlc_publish_remote_meta(owner,
+                                            key1,
+                                            (uint32_t)strlen(key1),
+                                            key1_hash,
+                                            &handle) == 0);
+    assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
+                            second, sizeof(second), &handle, &warm_slot) == 0);
+
+    assert(vemb_v16_tlc_lookup_vsim_key2(reader,
+                                         key1,
+                                         (uint32_t)strlen(key1),
+                                         key1_hash,
+                                         &remote_handle,
+                                         &source,
+                                         &timing) != 0);
+    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_NONE);
+    assert(timing.remote_meta_lookup_count == 1);
+    vemb_v16_tlc_get_core_stats(reader, &stats);
+    assert(stats.remote_meta_stale >= 1);
+    assert(stats.warm_stale_handle_reject >= 1);
+
+    vemb_v16_tlc_destroy(reader);
+    vemb_v16_tlc_destroy(owner);
+    free(reader_meta_base);
+    free(owner_meta_base);
 }
 
 static uint32_t fixed_owner_resolver(uint64_t key_hash,
@@ -842,6 +1807,8 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
+    assert(remote_handle.local_slot == handle.local_slot);
+    assert(remote_handle.owner_generation == handle.owner_generation);
     assert(vemb_v16_tlc_vector_slice(reader, &remote_handle, &bytes, &len) == 0);
     assert(len == sizeof(vector));
     assert(memcmp(bytes, vector, sizeof(vector)) == 0);
@@ -916,11 +1883,11 @@ static void test_shared_allocator_local_set_before_remote(void) {
         if (handle.region_id == 200)
             remote_writes++;
     }
-    assert(local_writes == 2);
-    assert(remote_writes == 1);
+    assert(local_writes == 3);
+    assert(remote_writes == 0);
     assert(vemb_v16_shared_allocator_full(&alloc0) == 1);
     assert(vemb_v16_shared_allocator_full(&alloc1) == 1);
-    assert(vemb_v16_shared_allocator_used_slots(&alloc_remote) == 1);
+    assert(vemb_v16_shared_allocator_used_slots(&alloc_remote) == 0);
 
     vemb_v16_tlc_destroy(tlc);
 }
@@ -928,15 +1895,22 @@ static void test_shared_allocator_local_set_before_remote(void) {
 int main(void) {
     test_put_get_handle();
     test_overwrite_and_capacity();
+    test_eviction_rejects_stale_handle();
     test_cold_read_through_promotes_warm_handle();
     test_hot_is_cache_only();
     test_prefill_distribution_stays_warm();
     test_concurrent_distinct_keys();
     test_multi_region_local_full_fallback_and_overwrite();
-    test_multi_region_all_full_spills_cold();
+    test_multi_region_all_full_evicts_committed_warm();
     test_shared_allocator_two_tlcs_unique_slots();
     test_vsim_key2_lookup_local_source();
     test_vsim_key2_lookup_remote_source();
+    test_remote_meta_async_publish_flush();
+    test_vsim_key2_lookup_rpc_fallback_and_repair();
+    test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair();
+    test_vsim_key2_lookup_ub_ring_rpc_concurrent();
+    test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict();
+    test_vsim_key2_lookup_remote_meta_stale();
     test_vsim_key2_lookup_remote_owner_routing();
     test_shared_allocator_local_set_before_remote();
     printf("vemb_v16_tlc_ut: all tests passed\n");

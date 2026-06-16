@@ -80,7 +80,7 @@ flowchart LR
 - CLI 从本地配置读取 proxy、SuperNode、hash ring 和 WARM region。
 - CLI 本地执行 `consistent_hash(vector_key)`，选择目标 SuperNode。
 - CLI 向 proxy 申请绑定到目标 SuperNode 的 channel。
-- Proxy 管理 `channel_id`、CLI request/response ring 生命周期，以及 Proxy worker 到 SuperNode worker 的 job/completion ring。
+- Proxy 管理 `channel_id`、CLI request/response ring 生命周期，以及 Proxy worker 到 SuperNode worker 的统一 job shard queue 和 per-channel completion ring。
 - Proxy 不下发拓扑/hash/region，不做 VEMB/VSIM 计算，不读写 WARM/COLD。
 - SuperNode worker 执行 VADD/VEMB，内部调用 `vemb_v16_tlc`；`tlc_core` 管理 HOT、WARM metadata、bitmap lock、COLD，WARM vector bytes 写到 `warm_provider` 映射出的 data region。
 - 当前 P0 代码中，`vemb_v16_proxy_create()` 仍负责 `vemb_v16_warm_provider_open()` 和 `vemb_v16_tlc_create()`；代码中已记录 TODO，后续要移动到 SuperNode 初始化路径，语义是 `supernode owns storage`。
@@ -589,7 +589,7 @@ sequenceDiagram
     P-->>C: released
 ```
 
-`channel_id` 由 proxy 单调分配。Proxy 负责 CLI channel 创建、回收和异常清理，维护 `channel_id -> SuperNode worker context` 绑定，并把 request ring 上的 VADD/VEMB 转成 typed job ring descriptor。SuperNode 只写 completion ring，不直接持有 response ring。
+`channel_id` 由 proxy 单调分配。Proxy 负责 CLI channel 创建、回收和异常清理，维护 channel 与 SuperNode worker 的路由关系，并把 request ring 上的 PING/VADD/VEMB/VSIM 转成统一 job shard queue 中的 job。SuperNode 只写 completion ring，不直接持有 response ring。
 
 ## VEMB 时序
 
@@ -837,7 +837,7 @@ TCP 模式只返回 WARM handle 的 VEMB benchmark：
   --mode vemb-handle
 ```
 
-TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。`vemb-read-vector` 依赖 client 本地 mmap WARM/vector region，不作为 TCP 跨主机读 vector 语义：
+TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。该模式由 SuperNode 在 completion 中携带 inline vector snapshot，TCP proxy 只负责把 snapshot 编码到 response frame 后面，不再按 handle 回源读取 WARM slot。`vemb-read-vector` 依赖 client 本地 mmap WARM/vector region，不作为 TCP 跨主机读 vector 语义：
 
 ```bash
 ./benchmark/vemb_v16_bench \

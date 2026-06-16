@@ -9,6 +9,7 @@
 #include "redisassert.h"
 #include "sve_similarity.h"
 #include "zmalloc.h"
+#include "macro.h"
 
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -20,6 +21,11 @@
 
 #define VEMB_V16_SAMPLE_MASK 1023u
 #define VEMB_V16_SUPERNODE_BATCH 32u
+#define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
+
+static int diag_should_log_req(uint32_t req_id) {
+    return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
+}
 
 static uint64_t monotonic_ns(void) {
     struct timespec ts;
@@ -47,6 +53,56 @@ static int vector_handle_is_local(vemb_v16_tlc_t *tlc,
     const vemb_v16_tlc_warm_region_t *region =
         vemb_v16_tlc_find_region(tlc, handle->region_id);
     return region && region->is_local;
+}
+
+static int vemb_read_job_needs_payload_snapshot(const vemb_v16_job_base_t *job) {
+    return job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ ||
+        ((job->flags & VEMB_V16_REQ_F_INLINE_VECTOR) &&
+         job->op == VEMB_V16_OP_VEMB_HANDLE);
+}
+
+static int snapshot_vemb_payload(vemb_v16_tlc_t *tlc,
+                                 const vemb_v16_job_base_t *job,
+                                 const vemb_v16_vector_handle_t *handle,
+                                 vemb_v16_completion_t *completion,
+                                 float **read_result,
+                                 size_t *read_result_bytes,
+                                 vemb_v16_timing_acc_t *payload_local_slice,
+                                 vemb_v16_timing_acc_t *payload_remote_slice) {
+    if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ &&
+        *read_result_bytes < job->vector_bytes) {
+        float *next = zrealloc(*read_result, job->vector_bytes);
+        if (!next)
+            return -1;
+        *read_result = next;
+        *read_result_bytes = job->vector_bytes;
+    }
+
+    const uint8_t *vector_bytes = NULL;
+    uint32_t vector_len = 0;
+    uint64_t vector_load_start = monotonic_ns();
+    int slice_rc = vemb_v16_tlc_vector_slice(tlc,
+                                             handle,
+                                             &vector_bytes,
+                                             &vector_len);
+    uint64_t vector_load_ns = monotonic_ns() - vector_load_start;
+    if (vector_handle_is_local(tlc, handle))
+        vemb_v16_timing_acc_add(payload_local_slice, vector_load_ns);
+    else
+        vemb_v16_timing_acc_add(payload_remote_slice, vector_load_ns);
+    if (slice_rc != 0 || vector_len != job->vector_bytes)
+        return -1;
+
+    if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ)
+        memcpy(*read_result, vector_bytes, vector_len);
+
+    if (job->flags & VEMB_V16_REQ_F_INLINE_VECTOR) {
+        completion->inline_vector = zmalloc(vector_len);
+        RETURN_IF(!completion->inline_vector, -1);
+        memcpy(completion->inline_vector, vector_bytes, vector_len);
+        completion->inline_vector_bytes = vector_len;
+    }
+    return 0;
 }
 
 static void log_request_timing(vemb_v16_supernode_ctx_t *ctx,
@@ -140,6 +196,24 @@ static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
                               memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->stats->completed_jobs, 1,
                               memory_order_relaxed);
+    if (diag_should_log_req(completion->req_id)) {
+        serverLog(LL_DEBUG,
+                  "vemb_v16 diag supernode completion publish: worker_id=%u channel_index=%u channel_id=%llu req_id=%u op=%u status=%u flags=%u key_hash=%llu vector_bytes=%u inline_vector_bytes=%u region_id=%u local_slot=%u owner_generation=%llu offset=%llu",
+                  ctx->worker_id,
+                  completion->channel_index,
+                  (unsigned long long)completion->channel_id,
+                  completion->req_id,
+                  completion->op,
+                  completion->status,
+                  completion->flags,
+                  (unsigned long long)completion->key_hash,
+                  completion->vector_bytes,
+                  completion->inline_vector_bytes,
+                  completion->region_id,
+                  completion->local_slot,
+                  (unsigned long long)completion->owner_generation,
+                  (unsigned long long)completion->vector_offset);
+    }
     vemb_v16_notify_completion_consumer(ctx);
 }
 
@@ -191,6 +265,8 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
             completion.vector_offset = handle.offset;
             completion.vector_bytes = handle.bytes;
             completion.region_id = handle.region_id;
+            completion.local_slot = handle.local_slot;
+            completion.owner_generation = handle.owner_generation;
             if (job->op == VEMB_V16_OP_VSIM_KEY_KEY) {
                 vemb_v16_vector_handle_t handle2 = {0};
                 vemb_v16_tlc_lookup_source_t key2_source =
@@ -280,37 +356,17 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                   completion.score);
                     }
                 }
-            } else if (job->op == VEMB_V16_OP_VEMB_SUPERNODE_READ) {
-                if (*read_result_bytes < job->vector_bytes) {
-                    float *next = zrealloc(*read_result, job->vector_bytes);
-                    if (!next) {
-                        completion.status = VEMB_V16_STATUS_ERR;
-                        goto vemb_read_done;
-                    }
-                    *read_result = next;
-                    *read_result_bytes = job->vector_bytes;
-                }
-
-                const uint8_t *vector_bytes = NULL;
-                uint32_t vector_len = 0;
-                uint64_t vector_load_start = monotonic_ns();
-                if (vemb_v16_tlc_vector_slice(tlc, &handle,
-                                              &vector_bytes,
-                                              &vector_len) != 0 ||
-                    vector_len != job->vector_bytes) {
-                    uint64_t vector_load_ns = monotonic_ns() - vector_load_start;
-                    if (vector_handle_is_local(tlc, &handle))
-                        vemb_v16_timing_acc_add(&payload_local_slice, vector_load_ns);
-                    else
-                        vemb_v16_timing_acc_add(&payload_remote_slice, vector_load_ns);
+            } else if (vemb_read_job_needs_payload_snapshot(job)) {
+                if (snapshot_vemb_payload(tlc,
+                                          job,
+                                          &handle,
+                                          &completion,
+                                          read_result,
+                                          read_result_bytes,
+                                          &payload_local_slice,
+                                          &payload_remote_slice) != 0) {
                     completion.status = VEMB_V16_STATUS_ERR;
-                } else {
-                    uint64_t vector_load_ns = monotonic_ns() - vector_load_start;
-                    if (vector_handle_is_local(tlc, &handle))
-                        vemb_v16_timing_acc_add(&payload_local_slice, vector_load_ns);
-                    else
-                        vemb_v16_timing_acc_add(&payload_remote_slice, vector_load_ns);
-                    memcpy(*read_result, vector_bytes, vector_len);
+                    completion.vector_bytes = 0;
                 }
                 if (sample) {
                     atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
@@ -322,7 +378,6 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
         }
     }
 
-vemb_read_done:
     if (sample) {
         atomic_fetch_add_explicit(&ctx->stats->sample_count, 1,
                                   memory_order_relaxed);
@@ -412,13 +467,17 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
             completion.vector_offset = handle.offset;
             completion.vector_bytes = handle.bytes;
             completion.region_id = handle.region_id;
-            if (vemb_v16_tlc_publish_remote_meta(tlc,
-                                                 job->key,
-                                                 job->key_len,
-                                                 job->key_hash,
-                                                 &handle) != 0) {
+            completion.local_slot = handle.local_slot;
+            completion.owner_generation = handle.owner_generation;
+            if (handle.bytes > 0 &&
+                vemb_v16_tlc_publish_remote_meta_async(tlc,
+                                                       job->key,
+                                                       job->key_len,
+                                                       job->key_hash,
+                                                       &handle) != 0 &&
+                diag_should_log_req(job->req_id)) {
                 serverLog(LL_WARNING,
-                          "vemb_v16 vadd remote meta publish failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
+                          "vemb_v16 vadd remote meta publish enqueue failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
                           job->req_id,
                           (unsigned long long)job->key_hash,
                           handle.region_id,
@@ -465,6 +524,8 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                 completion.vector_offset = handle.offset;
                 completion.vector_bytes = handle.bytes;
                 completion.region_id = handle.region_id;
+                completion.local_slot = handle.local_slot;
+                completion.owner_generation = handle.owner_generation;
                 uint64_t compute_start = monotonic_ns();
                 completion.score = sve_cosine_similarity_f32(stored,
                                                              vadd_job->vector,

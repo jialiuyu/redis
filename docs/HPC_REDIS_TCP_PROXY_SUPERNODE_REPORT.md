@@ -6,9 +6,9 @@
 
 - 当前 VEMB V16 主路径已经收敛为 `proxy I/O worker pool + SuperNode worker pool` 的 pooled-only 架构。
 - TCP 接入侧由 accept/control main thread 负责 `accept`、`HELLO/WELCOME`、channel 生命周期；热路径请求处理交给固定数量的 proxy I/O workers。
-- 请求分发已从 per-channel job ring 收敛到 `proxy_worker x supernode_worker` SPSC shard queue。
-- per-channel 设计仅保留在 completion ring、TCP response backlog 和 channel lifecycle 边界上，用于保证 response ordering、慢客户端隔离和关闭协议简单。
-- TCP `vemb-supernode-read` 最佳记录为 `3,386,415.44 QPS`，参数为 server `--proxy-io-threads 16 --supernode-workers 32`，bench `threads=64`。
+- 请求分发已从 per-channel job ring 收敛到 `proxy_worker x supernode_worker` SPSC job shard queue；同一 connection 内保持 FIFO，不同 connection 之间允许交错。
+- per-channel 设计仅保留在 completion ring、TCP response backlog 和 channel lifecycle 边界上，用于保证 response 回写、慢客户端隔离和关闭协议简单；当前没有 response reorder buffer。
+- 历史 TCP `vemb-supernode-read` 最佳记录为 `3,386,415.44 QPS`，参数为 server `--proxy-io-threads 16 --supernode-workers 32`，bench `threads=64`；当前 TCP read 回归使用 bench 支持的 `vemb-inline-vector` 或 `mixed-80r20w`。
 - TCP `mixed-80r20w` 在主验证配置下稳定达到 `1,824,299.31 - 1,843,665.09 QPS`，`fail=0`。
 - bench 已支持 multi-proxy/SuperNode `--endpoints`，通过 client-side consistent hash 将 `vector_key` 路由到目标 endpoint；proxy/SuperNode 仍保持无拓扑、无二次 hash。
 - VSIM 第一阶段已落地两类链路：`VSIM key, other_vector_inline_data` 对应 `--mode vsim-inline`，`VSIM key1, key2` 对应 `--mode vsim-key-key`，响应返回 cosine score。
@@ -32,7 +32,7 @@ NOTE：当前已支持的命令形式为 `vadd key value`、`vemb key`，与 Red
   vemb <key>                         # handle / offset 语义
   vemb <key> RAW                     # 已支持 RAW 兼容语义
     - SHM/UB: --mode vemb-read-vector，由 client mmap vector region 后读取完整 vector
-    - TCP:    --mode vemb-inline-vector，由 proxy 在 RESPONSE 后追加 vector_bytes
+    - TCP:    --mode vemb-inline-vector，由 SuperNode 在 completion 中携带 vector snapshot，proxy 在 RESPONSE 后追加 vector_bytes
     - TCP:    --mode vemb-supernode-read 仅表示 SuperNode 内部读取完整 vector 参与压测，
               response 不返回完整 vector payload
   vsim <key> <other_vector_inline_data>
@@ -51,7 +51,7 @@ Redis 侧目标形态：
 
 - CLI / Redis 命令入口的 VEMB V16 multi-endpoint consistent hash 待补齐；应复用 bench 当前 ring 规则，保证同一 `vector_key` 在 bench 与 CLI 下落到同一 proxy/SuperNode。
 - 跨分片 `VSIM key1, key2` 待设计；当前 `vsim-key-key` 只保证同分片闭环，不做 proxy fanout 或 coordinator。
-- WARM 内存淘汰机制待补齐；当前 WARM region / vector table 以固定容量预分配为主，后续需要引入 capacity / high-watermark / low-watermark、clock 或 sampled LRU 淘汰策略、dirty row 落 COLD / append log 处理，以及 `warm_evict_*` / `warm_bytes_*` 观测指标。
+- WARM hash cache 淘汰机制已按第一版落地：同一 set 内选择 FREE 或可覆盖 READY slot，使用 `owner_generation + write_seq` 保护 stale handle 与半写 payload，stats 暴露 `warm_eviction_success/fail`、`warm_same_key_overwrite`、`warm_stale_handle_reject` 等观测项。COLD append / replay 仍待继续细化。
 - TLC COLD 层与容错故障恢复机制待进一步细化，包括 COLD append、故障恢复、回放边界和一致性策略。
 
 ## 3. 最新架构
@@ -63,8 +63,8 @@ Redis 侧目标形态：
 | 模块 | 当前职责 |
 | --- | --- |
 | `bench(tcp)` / CLI | 建立 TCP persistent connection；执行 HELLO/WELCOME；按 pipeline 发送 VEMB/VADD/VSIM 请求；读取 response；拉取 stats 和 close channel。bench 已支持多 endpoint consistent hash；CLI 侧需按同一规则补齐。 |
-| `proxy` | 负责接入、channel 生命周期、TCP frame parse、SHM request ring poll、job dispatch、completion drain、response write。 |
-| `SuperNode` | 消费 VEMB/VADD/VSIM shard job；执行 TLC 读写、bitmap 并发控制、向量加载和 cosine 计算；向 per-channel completion ring 发布 completion。 |
+| `proxy` | 负责接入、channel 生命周期、TCP frame parse、SHM request ring poll、统一 job dispatch、completion drain、response write。 |
+| `SuperNode` | 消费 PING/VEMB/VADD/VSIM job shard；执行 TLC 读写、bitmap 并发控制、向量加载和 cosine 计算；向 per-channel completion ring 发布 completion。 |
 | `storage` | 持有 warm provider、TLC、vector region 及元数据；提供 channel desc、stats、inline vector slice 等公共接口。 |
 
 ### bench / CLI consistent hash 规则
