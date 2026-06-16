@@ -1951,6 +1951,8 @@ struct redisServer {
     int vemb_v16_max_vectors;
     char *vemb_v16_vector_region;
     char *vemb_v16_warm_backend;
+    char *vemb_v16_warm_regions_manifest;
+    int vemb_v16_reset_warm_regions;
     size_t vemb_v16_warm_mmap_offset;
     int vemb_v16_supernode_workers;
     int vemb_v16_proxy_io_threads;

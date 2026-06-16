@@ -168,6 +168,24 @@ int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
     return 0;
 }
 
+ssize_t vemb_v16_net_writev_nonblocking(int fd, const struct iovec *iov, int iovcnt) {
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = iov_copy(local, iov, iovcnt);
+    if (nlocal < 0) {
+        return -1;
+    }
+
+    struct msghdr msg = {
+        .msg_iov = local,
+        .msg_iovlen = nlocal,
+    };
+    ssize_t r = sendmsg(fd, &msg, MSG_DONTWAIT);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+    return r;
+}
+
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr) {
     if (!hdr) return -1;
     if (vemb_v16_net_read_full(fd, hdr, sizeof(*hdr)) != 0)

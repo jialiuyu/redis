@@ -47,16 +47,65 @@ int vemb_v16_server_integration_init(void) {
               dim, max_vectors, vector_region);
 
     vemb_v16_storage_ctx_t *storage = NULL;
-    if (vemb_v16_storage_ctx_create(&storage,
-                                    dim,
-                                    dim * sizeof(float),
-                                    max_vectors,
-                                    vector_region,
-                                    0,
-                                    warm_backend,
-                                    server.vemb_v16_warm_mmap_offset) != 0) {
-        serverLog(LL_WARNING, "vemb_v16_storage_ctx_create failed");
-        return -1;
+    if (server.vemb_v16_warm_regions_manifest &&
+        server.vemb_v16_warm_regions_manifest[0]) {
+        vemb_v16_warm_regions_manifest_t manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        if (vemb_v16_parse_warm_regions_manifest(server.vemb_v16_warm_regions_manifest,
+                                                  dim * sizeof(float),
+                                                  &manifest) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_parse_warm_regions_manifest failed: %s",
+                      server.vemb_v16_warm_regions_manifest);
+            return -1;
+        }
+        if (server.vemb_v16_reset_warm_regions) {
+            if (vemb_v16_storage_reset_manifest_regions(&manifest) != 0) {
+                serverLog(LL_WARNING, "vemb_v16_storage_reset_manifest_regions failed");
+                return -1;
+            }
+        }
+        if (vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                       dim,
+                                                       dim * sizeof(float),
+                                                       max_vectors,
+                                                       &manifest) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_storage_ctx_create_from_manifest failed");
+            return -1;
+        }
+    } else {
+        vemb_v16_warm_regions_manifest_t manifest;
+        memset(&manifest, 0, sizeof(manifest));
+        manifest.local_ub_node_id = 0;
+        manifest.has_local_ub_node_id = 1;
+        manifest.local_region_weight = 4;
+        manifest.region_count = 1;
+        vemb_v16_manifest_region_t *region = &manifest.regions[0];
+        region->region_id = 1;
+        region->backend_type = warm_backend;
+        region->home_ub_node_id = 0;
+        region->is_local = 1;
+        region->has_is_local = 1;
+        region->weight = 1;
+        region->value_size = dim * sizeof(float);
+        region->mmap_offset = server.vemb_v16_warm_mmap_offset;
+        region->region_bytes = max_vectors * region->value_size;
+        strncpy(region->path, vector_region, sizeof(region->path) - 1);
+        region->path[sizeof(region->path) - 1] = '\0';
+
+        if (server.vemb_v16_reset_warm_regions) {
+            if (vemb_v16_storage_reset_manifest_regions(&manifest) != 0) {
+                serverLog(LL_WARNING, "vemb_v16_storage_reset_manifest_regions failed");
+                return -1;
+            }
+        }
+        if (vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                       dim,
+                                                       dim * sizeof(float),
+                                                       max_vectors,
+                                                       &manifest) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_storage_ctx_create_from_manifest failed");
+            return -1;
+        }
     }
 
     if (vemb_v16_proxy_create(&server.vemb_v16_proxy,

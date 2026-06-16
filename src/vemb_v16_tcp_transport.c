@@ -71,6 +71,43 @@ static int append_tcp_response_backlog(vemb_v16_channel_t *ch,
     return 0;
 }
 
+/// Copy the portion of an iovec starting at byte offset 'skip' into the backlog.
+static int append_iovec_remainder_to_backlog(vemb_v16_channel_t *ch,
+                                             const struct iovec *iov,
+                                             int iovcnt,
+                                             size_t skip) {
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++)
+        total += iov[i].iov_len;
+    if (skip >= total)
+        return 0;
+
+    size_t remain = total - skip;
+    uint8_t *buf = zmalloc(remain);
+    if (!buf)
+        return -1;
+
+    size_t off = 0;
+    size_t consumed = skip;
+    for (int i = 0; i < iovcnt && off < remain; i++) {
+        if (consumed >= iov[i].iov_len) {
+            consumed -= iov[i].iov_len;
+            continue;
+        }
+        size_t src_off = consumed;
+        consumed = 0;
+        size_t to_copy = iov[i].iov_len - src_off;
+        if (to_copy > remain - off)
+            to_copy = remain - off;
+        memcpy(buf + off, (const char *)iov[i].iov_base + src_off, to_copy);
+        off += to_copy;
+    }
+
+    int rc = append_tcp_response_backlog(ch, buf, off);
+    zfree(buf);
+    return rc;
+}
+
 static ssize_t tcp_send_nonblocking(int fd, const void *buf, size_t len) {
     if (len == 0)
         return 0;
@@ -98,25 +135,11 @@ int vemb_v16_tcp_flush_response_backlog(vemb_v16_channel_t *ch) {
     return 0;
 }
 
-/// TCP transport: compute one response frame size.
-static size_t tcp_response_wire_size(vemb_v16_resp_t *resp,
-                                     uint32_t vector_bytes) {
-    (void)resp;
-    return sizeof(vemb_v16_net_hdr_t) + sizeof(vemb_v16_resp_t) + vector_bytes;
-}
-
-/// TCP transport: encode one response frame, optionally including inline vector bytes.
-static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
-                                          vemb_v16_resp_t *resp,
-                                          size_t *out_len) {
+/// TCP transport: write one completion response to the socket.
+int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp) {
     const uint8_t *vector = NULL;
     uint32_t vector_bytes = 0;
     vemb_v16_proxy_tcp_response_vector_slice(ch, resp, &vector, &vector_bytes);
-
-    size_t bytes = tcp_response_wire_size(resp, vector_bytes);
-    uint8_t *buf = zmalloc(bytes);
-    if (!buf)
-        return NULL;
 
     vemb_v16_net_hdr_t hdr = {
         .magic = VEMB_V16_MAGIC,
@@ -127,112 +150,36 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
         .channel_id = vemb_v16_channel_id(ch),
         .req_id = resp->req_id,
     };
-    size_t off = 0;
-    memcpy(buf + off, &hdr, sizeof(hdr));
-    off += sizeof(hdr);
-    memcpy(buf + off, resp, sizeof(*resp));
-    off += sizeof(*resp);
+
+    struct iovec iov[3];
+    int iovcnt = 0;
+    iov[iovcnt++] = (struct iovec){ .iov_base = &hdr, .iov_len = sizeof(hdr) };
+    iov[iovcnt++] = (struct iovec){ .iov_base = resp, .iov_len = sizeof(*resp) };
     if (vector_bytes) {
-        memcpy(buf + off, vector, vector_bytes);
-        off += vector_bytes;
-    }
-    if (out_len) *out_len = off;
-    return buf;
-}
-
-/// TCP transport: encode a batch of response frames for nonblocking writes.
-static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
-                                          const vemb_v16_completion_t *completions,
-                                          uint32_t n,
-                                          uint32_t *published,
-                                          size_t *out_len) {
-    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-    const uint8_t *vectors[VEMB_V16_PROXY_BATCH];
-    uint32_t vector_bytes[VEMB_V16_PROXY_BATCH];
-    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
-    uint32_t out = 0;
-    size_t total_bytes = 0;
-
-    for (uint32_t i = 0; i < n; i++) {
-        if (completions[i].channel_id != vemb_v16_channel_id(ch) ||
-            !vemb_v16_channel_active(ch)) {
-            continue;
-        }
-        vemb_v16_make_response_from(&responses[out], &completions[i]);
-        vectors[out] = NULL;
-        vector_bytes[out] = 0;
-        vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out], &vectors[out], &vector_bytes[out]);
-        headers[out] = (vemb_v16_net_hdr_t){
-            .magic = VEMB_V16_MAGIC,
-            .version = VEMB_V16_VERSION,
-            .type = VEMB_V16_NET_RESPONSE,
-            .flags = vector_bytes[out] ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
-            .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes[out],
-            .channel_id = vemb_v16_channel_id(ch),
-            .req_id = responses[out].req_id,
-        };
-        total_bytes += sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes[out];
-        out++;
+        iov[iovcnt++] = (struct iovec){ .iov_base = (void *)vector,
+                                        .iov_len = vector_bytes };
     }
 
-    if (published) *published = out;
-    if (out_len) *out_len = total_bytes;
-    if (out == 0)
-        return NULL;
-
-    uint8_t *buf = zmalloc(total_bytes);
-    if (!buf)
-        return NULL;
-    size_t off = 0;
-    for (uint32_t i = 0; i < out; i++) {
-        memcpy(buf + off, &headers[i], sizeof(headers[i]));
-        off += sizeof(headers[i]);
-        memcpy(buf + off, &responses[i], sizeof(responses[i]));
-        off += sizeof(responses[i]);
-        if (vector_bytes[i]) {
-            memcpy(buf + off, vectors[i], vector_bytes[i]);
-            off += vector_bytes[i];
-        }
-    }
-    return buf;
-}
-#endif
-
-/// TCP transport: write one completion response to the socket.
-int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
-        const uint8_t *vector = NULL;
-        uint32_t vector_bytes = 0;
-        vemb_v16_proxy_tcp_response_vector_slice(ch, resp, &vector, &vector_bytes);
-        return vemb_v16_net_write_frame2(vemb_v16_channel_net_fd(ch),
-                                         VEMB_V16_NET_RESPONSE,
-                                         vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
-                                         vemb_v16_channel_id(ch),
-                                         resp->req_id,
-                                         resp,
-                                         (uint32_t)sizeof(*resp),
-                                         vector,
-                                         vector_bytes);
+        return vemb_v16_net_writev_full(vemb_v16_channel_net_fd(ch), iov, iovcnt);
     }
 
 #ifdef __linux__
-    size_t bytes = 0;
-    uint8_t *buf = encode_tcp_response_bytes(ch, resp, &bytes);
-    if (!buf)
-        return -1;
-    int rc = 0;
+    size_t total = sizeof(hdr) + sizeof(*resp) + vector_bytes;
     if (tcp_response_backlog_pending(ch)) {
-        rc = append_tcp_response_backlog(ch, buf, bytes);
-    } else {
-        ssize_t n = tcp_send_nonblocking(vemb_v16_channel_net_fd(ch), buf, bytes);
-        if (n < 0) {
-            rc = -1;
-        } else if ((size_t)n < bytes) {
-            rc = append_tcp_response_backlog(ch, buf + n, bytes - (size_t)n);
-        }
+        /* Preserve ordering: append to existing backlog. */
+        return append_iovec_remainder_to_backlog(ch, iov, iovcnt, 0);
     }
-    zfree(buf);
-    return rc;
+
+    ssize_t sent = vemb_v16_net_writev_nonblocking(vemb_v16_channel_net_fd(ch),
+                                                   iov, iovcnt);
+    if (sent < 0)
+        return -1;
+    if ((size_t)sent == total)
+        return 0;
+
+    /* Partial send or EAGAIN: queue the unsent remainder. */
+    return append_iovec_remainder_to_backlog(ch, iov, iovcnt, (size_t)sent);
 #else
     return -1;
 #endif
@@ -243,93 +190,74 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                const vemb_v16_completion_t *completions,
                                uint32_t n,
                                uint32_t *published) {
-    if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
-        vemb_v16_resp_t *responses =
-            zmalloc(sizeof(*responses) * VEMB_V16_PROXY_BATCH);
-        vemb_v16_net_hdr_t *headers =
-            zmalloc(sizeof(*headers) * VEMB_V16_PROXY_BATCH);
-        struct iovec *iov =
-            zmalloc(sizeof(*iov) * VEMB_V16_PROXY_BATCH * 3u);
-        if (!responses || !headers || !iov) {
-            zfree(responses);
-            zfree(headers);
-            zfree(iov);
-            if (published) *published = 0;
-            return -1;
-        }
-        int iovcnt = 0;
-        uint32_t out = 0;
+    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
+    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+    struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
+    int iovcnt = 0;
+    uint32_t out = 0;
+    size_t total_bytes = 0;
 
-        for (uint32_t i = 0; i < n; i++) {
-            if (completions[i].channel_id != vemb_v16_channel_id(ch) ||
-                !vemb_v16_channel_active(ch)) {
-                continue;
-            }
-
-            vemb_v16_make_response_from(&responses[out], &completions[i]);
-            const uint8_t *vector = NULL;
-            uint32_t vector_bytes = 0;
-            vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out], &vector, &vector_bytes);
-
-            headers[out] = (vemb_v16_net_hdr_t){
-                .magic = VEMB_V16_MAGIC,
-                .version = VEMB_V16_VERSION,
-                .type = VEMB_V16_NET_RESPONSE,
-                .flags = vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
-                .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes,
-                .channel_id = vemb_v16_channel_id(ch),
-                .req_id = responses[out].req_id,
-            };
-            iov[iovcnt++] = (struct iovec){ .iov_base = &headers[out], .iov_len = sizeof(headers[out]) };
-            iov[iovcnt++] = (struct iovec){ .iov_base = &responses[out], .iov_len = sizeof(responses[out]) };
-            if (vector_bytes) {
-                iov[iovcnt++] = (struct iovec){ .iov_base = (void *)vector, .iov_len = vector_bytes };
-            }
-            out++;
+    for (uint32_t i = 0; i < n; i++) {
+        if (completions[i].channel_id != vemb_v16_channel_id(ch) ||
+            !vemb_v16_channel_active(ch)) {
+            continue;
         }
 
-        if (published) *published = out;
-        if (out == 0) {
-            zfree(responses);
-            zfree(headers);
-            zfree(iov);
-            return 0;
+        vemb_v16_make_response_from(&responses[out], &completions[i]);
+        const uint8_t *vector = NULL;
+        uint32_t vector_bytes = 0;
+        vemb_v16_proxy_tcp_response_vector_slice(ch, &responses[out],
+                                                 &vector, &vector_bytes);
+
+        headers[out] = (vemb_v16_net_hdr_t){
+            .magic = VEMB_V16_MAGIC,
+            .version = VEMB_V16_VERSION,
+            .type = VEMB_V16_NET_RESPONSE,
+            .flags = vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+            .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes,
+            .channel_id = vemb_v16_channel_id(ch),
+            .req_id = responses[out].req_id,
+        };
+        iov[iovcnt++] = (struct iovec){ .iov_base = &headers[out],
+                                        .iov_len = sizeof(headers[out]) };
+        iov[iovcnt++] = (struct iovec){ .iov_base = &responses[out],
+                                        .iov_len = sizeof(responses[out]) };
+        if (vector_bytes) {
+            iov[iovcnt++] = (struct iovec){ .iov_base = (void *)vector,
+                                            .iov_len = vector_bytes };
         }
-        int rc = vemb_v16_net_writev_full(vemb_v16_channel_net_fd(ch), iov, iovcnt);
-        zfree(responses);
-        zfree(headers);
-        zfree(iov);
-        return rc;
+        total_bytes += sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes;
+        out++;
     }
 
-#ifdef __linux__
-    size_t bytes = 0;
-    uint32_t out = 0;
-    uint8_t *buf = encode_tcp_response_batch(ch, completions, n, &out, &bytes);
     if (published) *published = out;
     if (out == 0)
         return 0;
-    if (!buf)
-        return -1;
 
-    int rc = 0;
-    if (tcp_response_backlog_pending(ch)) {
-        rc = append_tcp_response_backlog(ch, buf, bytes);
-    } else {
-        ssize_t sent = tcp_send_nonblocking(vemb_v16_channel_net_fd(ch), buf, bytes);
-        if (sent < 0) {
-            rc = -1;
-        } else if ((size_t)sent < bytes) {
-            rc = append_tcp_response_backlog(ch, buf + sent, bytes - (size_t)sent);
-        }
+    if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
+        return vemb_v16_net_writev_full(vemb_v16_channel_net_fd(ch), iov, iovcnt);
     }
-    zfree(buf);
-    return rc;
+
+#ifdef __linux__
+    if (tcp_response_backlog_pending(ch)) {
+        /* Preserve ordering: append to existing backlog. */
+        return append_iovec_remainder_to_backlog(ch, iov, iovcnt, 0);
+    }
+
+    ssize_t sent = vemb_v16_net_writev_nonblocking(vemb_v16_channel_net_fd(ch),
+                                                   iov, iovcnt);
+    if (sent < 0)
+        return -1;
+    if ((size_t)sent == total_bytes)
+        return 0;
+
+    /* Partial send or EAGAIN: queue the unsent remainder. */
+    return append_iovec_remainder_to_backlog(ch, iov, iovcnt, (size_t)sent);
 #else
-    if (published) *published = 0;
     return -1;
 #endif
 }
+#endif
 
 static int tcp_poll_input(int fd) {
     if (fd < 0) return -1;

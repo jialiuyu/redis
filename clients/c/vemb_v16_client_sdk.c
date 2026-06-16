@@ -13,22 +13,55 @@
 #include <fcntl.h>
 #include <errno.h>
 
-struct vemb_v16_client {
-    int fd;
-    uint64_t channel_id;
-    uint32_t dim;
-    uint32_t req_id;
+#define VEMB_V16_SDK_MAX_ENDPOINTS 16
+/* Must match benchmark/vemb_v16_bench.c VEMB_V16_BENCH_HASH_VNODES so that
+ * multi-endpoint routing stays interoperable across tools (a set filled by
+ * redis-cli is visible to vemb_v16_bench / memtier). */
+#define VEMB_V16_SDK_HASH_VNODES  10
 
-    /* for stats re-connection */
+typedef struct {
+    int      fd;
+    uint64_t channel_id;
     char     host[64];
     uint16_t port;
-
-    /* warm region (mmap'd once at create) */
+    /* warm region (mmap'd once per backend at connect) */
     uint64_t warm_region_bytes;
     uint64_t warm_mmap_offset;
     size_t   mapping_bytes;
     uint8_t *mapping_addr;
     uint8_t *mapped_addr;
+} sdk_backend_t;
+
+typedef struct {
+    uint32_t hash_value;
+    uint32_t backend_idx;
+} sdk_hash_node_t;
+
+struct vemb_v16_client {
+    /* Routed view — fields below mirror backends[cur_idx] and are kept in
+     * sync by sdk_route(). All v*_free functions read these instead of
+     * touching backends[] directly, so they need no changes once routing
+     * has selected the right backend. */
+    int      fd;
+    uint64_t channel_id;
+    char     host[64];
+    uint16_t port;
+    uint64_t warm_region_bytes;
+    uint64_t warm_mmap_offset;
+    size_t   mapping_bytes;
+    uint8_t *mapping_addr;
+    uint8_t *mapped_addr;
+
+    uint32_t dim;
+    uint32_t req_id;
+
+    /* Multi-endpoint support. backend_count==1 means single-endpoint mode
+     * (backwards compatible); the hash ring is only built when >1. */
+    int             backend_count;
+    int             cur_idx;
+    sdk_backend_t   backends[VEMB_V16_SDK_MAX_ENDPOINTS];
+    sdk_hash_node_t hash_ring[VEMB_V16_SDK_MAX_ENDPOINTS * VEMB_V16_SDK_HASH_VNODES];
+    uint32_t        hash_node_count;
 };
 
 /* ------------------------------------------------------------------ */
@@ -65,7 +98,7 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
 
     if (desc->warm_backend_type != VEMB_V16_REGION_UB)
         return -1;
-    int fd = open(desc->vector_region_name, O_RDONLY);
+    int fd = open(desc->vector_region_name, O_RDWR | O_SYNC);
     if (fd < 0)
         return -1;
 
@@ -79,7 +112,7 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
     size_t offset_delta = (size_t)(desc->warm_mmap_offset - aligned_offset);
     size_t map_size = size + offset_delta;
 
-    void *ptr = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fd,
+    void *ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
                      (off_t)aligned_offset);
     close(fd);
     if (ptr == MAP_FAILED)
@@ -248,7 +281,7 @@ ssize_t vemb_v16_serialize_vsim_inline(void *buf, size_t buf_cap,
 /* Internal helpers for sync API                                      */
 /* ------------------------------------------------------------------ */
 
-static int sdk_open_warm_region(vemb_v16_client_t *c,
+static int sdk_open_warm_region(sdk_backend_t *b,
                                 const vemb_v16_channel_desc_t *desc)
 {
     void *mapping_addr = NULL;
@@ -261,20 +294,170 @@ static int sdk_open_warm_region(vemb_v16_client_t *c,
         return -1;
     }
 
-    c->warm_region_bytes = region_bytes;
-    c->mapping_bytes     = mapping_bytes;
-    c->mapping_addr      = (uint8_t *)mapping_addr;
-    c->mapped_addr       = (uint8_t *)mapped_addr;
+    b->warm_region_bytes = region_bytes;
+    b->mapping_bytes     = mapping_bytes;
+    b->mapping_addr      = (uint8_t *)mapping_addr;
+    b->mapped_addr       = (uint8_t *)mapped_addr;
     return 0;
 }
 
-static void sdk_close_warm_region(vemb_v16_client_t *c)
+static void sdk_close_warm_region(sdk_backend_t *b)
 {
-    if (c->mapping_addr) {
-        vemb_v16_close_warm_region(c->mapping_addr, c->mapping_bytes);
-        c->mapping_addr = NULL;
-        c->mapped_addr  = NULL;
+    if (b->mapping_addr) {
+        vemb_v16_close_warm_region(b->mapping_addr, b->mapping_bytes);
+        b->mapping_addr = NULL;
+        b->mapped_addr  = NULL;
     }
+}
+
+/* Connect one backend: TCP connect, HELLO/WELCOME, mmap warm region. */
+static int sdk_connect_backend(sdk_backend_t *b,
+                               const char *host, uint16_t port,
+                               uint32_t dim)
+{
+    int fd = -1;
+    for (int retry = 0; retry < 50; retry++) {
+        fd = vemb_v16_net_connect(host, port, 10000);
+        if (fd >= 0) break;
+        usleep(100000);
+    }
+    if (fd < 0) {
+        fprintf(stderr, "vemb_v16_client: connect %s:%u failed\n", host, port);
+        return -1;
+    }
+
+    char hello_buf[64];
+    ssize_t hello_len = vemb_v16_serialize_hello(hello_buf, sizeof(hello_buf),
+                                                  dim, 0);
+    if (hello_len < 0 ||
+        vemb_v16_net_write_full(fd, hello_buf, (size_t)hello_len) != 0) {
+        close(fd); return -1;
+    }
+
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_WELCOME ||
+        hdr.payload_len != sizeof(vemb_v16_channel_desc_t)) {
+        close(fd); return -1;
+    }
+
+    vemb_v16_channel_desc_t desc;
+    memset(&desc, 0, sizeof(desc));
+    if (vemb_v16_net_read_full(fd, &desc, sizeof(desc)) != 0 ||
+        desc.magic != VEMB_V16_MAGIC ||
+        desc.version != VEMB_V16_VERSION) {
+        close(fd); return -1;
+    }
+
+    if (sdk_open_warm_region(b, &desc) != 0) {
+        close(fd); return -1;
+    }
+
+    b->fd         = fd;
+    b->channel_id = desc.channel_id;
+    strncpy(b->host, host, sizeof(b->host) - 1);
+    b->host[sizeof(b->host) - 1] = '\0';
+    b->port = port;
+    return 0;
+}
+
+static void sdk_close_backend(sdk_backend_t *b)
+{
+    sdk_close_warm_region(b);
+    if (b->fd >= 0) {
+        char close_buf[32];
+        memset(close_buf, 0, sizeof(close_buf));
+        vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)close_buf;
+        hdr->magic = VEMB_V16_MAGIC;
+        hdr->version = VEMB_V16_VERSION;
+        hdr->type = VEMB_V16_NET_CLOSE_CHANNEL;
+        hdr->channel_id = b->channel_id;
+        vemb_v16_net_write_full(b->fd, close_buf, sizeof(vemb_v16_net_hdr_t));
+        close(b->fd);
+        b->fd = -1;
+    }
+}
+
+/* ---- Consistent-hash ring (private reimplementation, aligned with
+ *      benchmark/vemb_v16_bench.c so routing decisions interoperate) ---- */
+
+static int sdk_hash_node_cmp(const void *a, const void *b)
+{
+    const sdk_hash_node_t *ha = a;
+    const sdk_hash_node_t *hb = b;
+    if (ha->hash_value < hb->hash_value) return -1;
+    if (ha->hash_value > hb->hash_value) return 1;
+    if (ha->backend_idx < hb->backend_idx) return -1;
+    if (ha->backend_idx > hb->backend_idx) return 1;
+    return 0;
+}
+
+static void sdk_build_hash_ring(vemb_v16_client_t *c)
+{
+    if (!c || c->backend_count <= 1) { c->hash_node_count = 0; return; }
+    c->hash_node_count = 0;
+    for (uint32_t node = 0; node < (uint32_t)c->backend_count; node++) {
+        for (uint32_t vnode = 0; vnode < VEMB_V16_SDK_HASH_VNODES; vnode++) {
+            char vnode_key[64];
+            uint32_t vnode_id = c->hash_node_count;
+            snprintf(vnode_key, sizeof(vnode_key),
+                     "supernode_%u_vnode_%u", node, vnode_id);
+            c->hash_ring[c->hash_node_count++] = (sdk_hash_node_t){
+                .hash_value  = vemb_v16_murmur3(vnode_key, strlen(vnode_key)),
+                .backend_idx = node,
+            };
+        }
+    }
+    qsort(c->hash_ring, c->hash_node_count, sizeof(c->hash_ring[0]),
+          sdk_hash_node_cmp);
+}
+
+/* Pick backend for key and sync the routed view. Pass NULL/"" for the
+ * canonical "first backend" (used by ping/stats/etc). */
+static int sdk_route(vemb_v16_client_t *c, const char *key)
+{
+    if (!c || c->backend_count <= 0) return -1;
+    int idx = 0;
+    if (c->backend_count > 1 && key && key[0]) {
+        uint32_t hash = vemb_v16_murmur3(key, strlen(key));
+        uint32_t left = 0, right = c->hash_node_count;
+        while (left < right) {
+            uint32_t mid = left + (right - left) / 2;
+            if (c->hash_ring[mid].hash_value < hash) left = mid + 1;
+            else right = mid;
+        }
+        if (left >= c->hash_node_count) left = 0;
+        idx = (int)c->hash_ring[left].backend_idx;
+    }
+    sdk_backend_t *b = &c->backends[idx];
+    c->fd                = b->fd;
+    c->channel_id        = b->channel_id;
+    memcpy(c->host, b->host, sizeof(c->host));
+    c->port              = b->port;
+    c->warm_region_bytes = b->warm_region_bytes;
+    c->warm_mmap_offset  = b->warm_mmap_offset;
+    c->mapping_bytes     = b->mapping_bytes;
+    c->mapping_addr      = b->mapping_addr;
+    c->mapped_addr       = b->mapped_addr;
+    c->cur_idx           = idx;
+    return 0;
+}
+
+/* Parse "host:port" — last ':' wins (IPv6 friendly enough for our use). */
+static int sdk_parse_endpoint(const char *s, char *host, size_t host_cap,
+                              uint16_t *port)
+{
+    const char *colon = strrchr(s, ':');
+    if (!colon || colon == s) return -1;
+    size_t host_len = (size_t)(colon - s);
+    if (host_len >= host_cap) return -1;
+    memcpy(host, s, host_len);
+    host[host_len] = '\0';
+    char *end = NULL;
+    long p = strtol(colon + 1, &end, 10);
+    if (end == colon + 1 || *end != '\0' || p <= 0 || p > 65535) return -1;
+    *port = (uint16_t)p;
+    return 0;
 }
 
 static int read_response(vemb_v16_client_t *c,
@@ -285,25 +468,29 @@ static int read_response(vemb_v16_client_t *c,
 {
     if (inline_vector_bytes) *inline_vector_bytes = 0;
 
-    vemb_v16_net_hdr_t hdr;
-    if (vemb_v16_net_read_header(c->fd, &hdr) != 0 ||
-        hdr.type != VEMB_V16_NET_RESPONSE ||
-        hdr.channel_id != c->channel_id ||
-        hdr.payload_len < sizeof(*resp)) {
+    /* Read header + response body in one syscall. */
+    char hdr_resp_buf[sizeof(vemb_v16_net_hdr_t) + sizeof(vemb_v16_resp_t)];
+    if (vemb_v16_net_read_full(c->fd, hdr_resp_buf, sizeof(hdr_resp_buf)) != 0)
+        return -1;
+
+    vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)hdr_resp_buf;
+    if (hdr->magic != VEMB_V16_MAGIC || hdr->version != VEMB_V16_VERSION ||
+        hdr->type != VEMB_V16_NET_RESPONSE ||
+        hdr->channel_id != c->channel_id ||
+        hdr->payload_len < sizeof(*resp)) {
         return -1;
     }
 
-    if (vemb_v16_net_read_full(c->fd, resp, sizeof(*resp)) != 0)
-        return -1;
+    memcpy(resp, hdr_resp_buf + sizeof(*hdr), sizeof(*resp));
 
-    uint32_t extra = hdr.payload_len - (uint32_t)sizeof(*resp);
+    uint32_t extra = hdr->payload_len - (uint32_t)sizeof(*resp);
     if (extra > 0 && inline_vector && inline_vector_cap > 0) {
         uint32_t to_read = extra < inline_vector_cap ? extra : inline_vector_cap;
         if (vemb_v16_net_read_full(c->fd, inline_vector, to_read) != 0)
             return -1;
         /* drain remainder if any */
         if (to_read < extra) {
-            uint8_t discard[256];
+            uint8_t discard[8192];
             uint32_t remain = extra - to_read;
             while (remain > 0) {
                 uint32_t chunk = remain < sizeof(discard) ? remain : sizeof(discard);
@@ -314,7 +501,7 @@ static int read_response(vemb_v16_client_t *c,
         }
         if (inline_vector_bytes) *inline_vector_bytes = to_read;
     } else if (extra > 0) {
-        uint8_t discard[256];
+        uint8_t discard[8192];
         while (extra > 0) {
             uint32_t chunk = extra < sizeof(discard) ? extra : sizeof(discard);
             if (vemb_v16_net_read_full(c->fd, discard, chunk) != 0)
@@ -329,88 +516,55 @@ static int read_response(vemb_v16_client_t *c,
 /* Public Sync API                                                    */
 /* ------------------------------------------------------------------ */
 
-vemb_v16_client_t *vemb_v16_client_create(const char *host,
-                                          uint16_t port,
-                                          uint32_t dim)
+vemb_v16_client_t *vemb_v16_client_create_multi(const char *endpoints[],
+                                                 int endpoint_count,
+                                                 uint32_t dim)
 {
-    if (!host || dim == 0 || dim > VEMB_V16_MAX_DIM)
+    if (!endpoints || endpoint_count <= 0 ||
+        endpoint_count > VEMB_V16_SDK_MAX_ENDPOINTS ||
+        dim == 0 || dim > VEMB_V16_MAX_DIM)
         return NULL;
 
     vemb_v16_client_t *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
+    c->dim           = dim;
+    c->req_id        = 1;
+    c->backend_count = endpoint_count;
 
-    int fd = -1;
-    for (int retry = 0; retry < 50; retry++) {
-        fd = vemb_v16_net_connect(host, port, 10000);
-        if (fd >= 0) break;
-        usleep(100000);
-    }
-    if (fd < 0) {
-        fprintf(stderr, "vemb_v16_client: connect %s:%u failed\n", host, port);
-        free(c);
-        return NULL;
-    }
-
-    char hello_buf[64];
-    ssize_t hello_len = vemb_v16_serialize_hello(hello_buf, sizeof(hello_buf),
-                                                  dim, 0);
-    if (hello_len < 0 || vemb_v16_net_write_full(fd, hello_buf, (size_t)hello_len) != 0) {
-        close(fd);
-        free(c);
-        return NULL;
+    for (int i = 0; i < endpoint_count; i++) {
+        char host[64]; uint16_t port;
+        if (sdk_parse_endpoint(endpoints[i], host, sizeof(host), &port) != 0) {
+            fprintf(stderr, "vemb_v16_client: bad endpoint '%s'\n", endpoints[i]);
+            for (int j = 0; j < i; j++) sdk_close_backend(&c->backends[j]);
+            free(c); return NULL;
+        }
+        if (sdk_connect_backend(&c->backends[i], host, port, dim) != 0) {
+            for (int j = 0; j < i; j++) sdk_close_backend(&c->backends[j]);
+            free(c); return NULL;
+        }
     }
 
-    vemb_v16_net_hdr_t hdr;
-    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
-        hdr.type != VEMB_V16_NET_WELCOME ||
-        hdr.payload_len != sizeof(vemb_v16_channel_desc_t)) {
-        close(fd);
-        free(c);
-        return NULL;
-    }
-
-    vemb_v16_channel_desc_t desc;
-    memset(&desc, 0, sizeof(desc));
-    if (vemb_v16_net_read_full(fd, &desc, sizeof(desc)) != 0 ||
-        desc.magic != VEMB_V16_MAGIC ||
-        desc.version != VEMB_V16_VERSION) {
-        close(fd);
-        free(c);
-        return NULL;
-    }
-
-    if (sdk_open_warm_region(c, &desc) != 0) {
-        close(fd);
-        free(c);
-        return NULL;
-    }
-
-    c->fd         = fd;
-    c->channel_id = desc.channel_id;
-    c->dim        = dim;
-    c->req_id     = 1;
-    strncpy(c->host, host, sizeof(c->host) - 1);
-    c->host[sizeof(c->host) - 1] = '\0';
-    c->port = port;
+    sdk_build_hash_ring(c);
+    sdk_route(c, NULL);  /* sync view to backend[0] */
     return c;
+}
+
+vemb_v16_client_t *vemb_v16_client_create(const char *host,
+                                          uint16_t port,
+                                          uint32_t dim)
+{
+    if (!host || dim == 0 || dim > VEMB_V16_MAX_DIM) return NULL;
+    char ep[80];
+    snprintf(ep, sizeof(ep), "%s:%u", host, port);
+    const char *endpoints[1] = { ep };
+    return vemb_v16_client_create_multi(endpoints, 1, dim);
 }
 
 void vemb_v16_client_destroy(vemb_v16_client_t *c)
 {
     if (!c) return;
-    sdk_close_warm_region(c);
-    if (c->fd >= 0) {
-        char close_buf[32];
-        ssize_t close_len = sizeof(vemb_v16_net_hdr_t);
-        memset(close_buf, 0, sizeof(close_buf));
-        vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)close_buf;
-        hdr->magic = VEMB_V16_MAGIC;
-        hdr->version = VEMB_V16_VERSION;
-        hdr->type = VEMB_V16_NET_CLOSE_CHANNEL;
-        hdr->channel_id = c->channel_id;
-        vemb_v16_net_write_full(c->fd, close_buf, (size_t)close_len);
-        close(c->fd);
-    }
+    for (int i = 0; i < c->backend_count; i++)
+        sdk_close_backend(&c->backends[i]);
     free(c);
 }
 
@@ -420,7 +574,9 @@ int vemb_v16_client_vadd(vemb_v16_client_t *c,
                          const float *vector,
                          uint32_t dim)
 {
-    if (!c || c->fd < 0 || !set_name || !elem_name || !vector || dim != c->dim)
+    if (!c || !set_name || !elem_name || !vector || dim != c->dim)
+        return -1;
+    if (sdk_route(c, set_name) != 0 || c->fd < 0)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -469,7 +625,9 @@ int vemb_v16_client_vemb_handle(vemb_v16_client_t *c,
                                 uint32_t *out_dim,
                                 uint32_t *out_region_id)
 {
-    if (!c || c->fd < 0 || !set_name || !elem_name)
+    if (!c || !set_name || !elem_name)
+        return -1;
+    if (sdk_route(c, set_name) != 0 || c->fd < 0)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -480,7 +638,7 @@ int vemb_v16_client_vemb_handle(vemb_v16_client_t *c,
 
     vemb_v16_req_t req = {0};
     req.op = VEMB_V16_OP_VEMB_HANDLE;
-    req.flags = 0;
+    req.flags = 0;  /* handle-only: caller reads vector via mmap */
     req.req_id = c->req_id++;
     req.channel_id = c->channel_id;
     req.key_len = key_len;
@@ -523,18 +681,62 @@ int vemb_v16_client_vemb_vector(vemb_v16_client_t *c,
                                 uint32_t out_cap,
                                 uint32_t *out_dim)
 {
-    uint64_t offset;
-    uint32_t bytes, dim, region_id;
-    int rc = vemb_v16_client_vemb_handle(c, set_name, elem_name,
-                                         &offset, &bytes, &dim, &region_id);
-    if (rc != 0)
-        return rc;
+    if (!c || !set_name || !elem_name || !out_vector || out_cap == 0)
+        return -1;
+    if (sdk_route(c, set_name) != 0 || c->fd < 0)
+        return -1;
 
-    rc = vemb_v16_client_read_vector(c, offset, bytes,
-                                     out_vector, out_cap);
-    if (rc == 0 && out_dim)
-        *out_dim = dim;
-    return rc;
+    char combined[VEMB_V16_MAX_KEY_LEN];
+    uint32_t key_len;
+    if (vemb_v16_build_combined_key(combined, sizeof(combined),
+                                    set_name, elem_name, &key_len) != 0)
+        return -1;
+
+    vemb_v16_req_t req = {0};
+    req.op = VEMB_V16_OP_VEMB_HANDLE;
+    req.flags = VEMB_V16_REQ_F_INLINE_VECTOR;
+    req.req_id = c->req_id++;
+    req.channel_id = c->channel_id;
+    req.key_len = key_len;
+    memcpy(req.key, combined, key_len);
+    req.key_hash = vemb_v16_murmur3(req.key, key_len);
+    req.dim = c->dim;
+    req.vector_bytes = c->dim * sizeof(float);
+
+    size_t req_len = vemb_v16_req_handle_len();
+    if (vemb_v16_net_write_frame(c->fd,
+                                 VEMB_V16_NET_REQUEST,
+                                 0,
+                                 c->channel_id,
+                                 req.req_id,
+                                 &req,
+                                 (uint32_t)req_len) != 0) {
+        return -1;
+    }
+
+    vemb_v16_resp_t resp;
+    uint32_t inline_bytes = 0;
+    uint32_t inline_cap_bytes = out_cap * sizeof(float);
+    if (read_response(c, &resp,
+                      (uint8_t *)out_vector,
+                      inline_cap_bytes,
+                      &inline_bytes) != 0) {
+        return -1;
+    }
+
+    if (resp.status == VEMB_V16_STATUS_NOT_FOUND)
+        return 1;
+    if (resp.status != VEMB_V16_STATUS_OK)
+        return -1;
+
+    uint32_t expected_bytes = resp.vector_bytes;
+    if (inline_bytes != expected_bytes ||
+        (expected_bytes / sizeof(float)) > out_cap) {
+        return -1;
+    }
+    if (out_dim)
+        *out_dim = resp.dim > 0 ? resp.dim : c->dim;
+    return 0;
 }
 
 int vemb_v16_client_vsim(vemb_v16_client_t *c,
@@ -544,8 +746,10 @@ int vemb_v16_client_vsim(vemb_v16_client_t *c,
                          uint32_t dim,
                          float *out_score)
 {
-    if (!c || c->fd < 0 || !set_name || !elem_name ||
+    if (!c || !set_name || !elem_name ||
         !query_vector || dim != c->dim || !out_score)
+        return -1;
+    if (sdk_route(c, set_name) != 0 || c->fd < 0)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -600,7 +804,11 @@ int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
                                   uint32_t count,
                                   uint32_t max_inflight)
 {
-    if (!c || c->fd < 0 || count == 0 || !set_names || !elem_names || !vectors)
+    if (!c || count == 0 || !set_names || !elem_names || !vectors)
+        return -1;
+    /* Multi-endpoint: pipeline targets the backend picked by set_names[0].
+     * Caller must group by backend if keys span endpoints. */
+    if (sdk_route(c, set_names[0]) != 0 || c->fd < 0)
         return -1;
     if (max_inflight == 0) max_inflight = count; /* unlimited */
 
@@ -666,7 +874,10 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
                                   vemb_v16_pipeline_resp_t *out_resps,
                                   uint32_t max_inflight)
 {
-    if (!c || c->fd < 0 || count == 0 || !set_names || !elem_names || !out_resps)
+    if (!c || count == 0 || !set_names || !elem_names || !out_resps)
+        return -1;
+    /* Multi-endpoint: pipeline targets the backend picked by set_names[0]. */
+    if (sdk_route(c, set_names[0]) != 0 || c->fd < 0)
         return -1;
     if (max_inflight == 0) max_inflight = count; /* unlimited */
 
@@ -678,7 +889,7 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
     vemb_v16_req_t req_base;
     memset(&req_base, 0, sizeof(req_base));
     req_base.op = VEMB_V16_OP_VEMB_HANDLE;
-    req_base.flags = 0;
+    req_base.flags = VEMB_V16_REQ_F_INLINE_VECTOR;
     req_base.channel_id = c->channel_id;
     req_base.dim = c->dim;
     req_base.vector_bytes = c->dim * sizeof(float);
@@ -745,7 +956,8 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
 
 int vemb_v16_client_ping(vemb_v16_client_t *c)
 {
-    if (!c || c->fd < 0) return -1;
+    if (!c) return -1;
+    if (sdk_route(c, NULL) != 0 || c->fd < 0) return -1;
 
     vemb_v16_req_t req = {0};
     req.op = VEMB_V16_OP_PING;
@@ -779,9 +991,10 @@ int vemb_v16_client_ping(vemb_v16_client_t *c)
 int vemb_v16_client_stats(vemb_v16_client_t *c, vemb_v16_stats_t *out_stats)
 {
     if (!c || !out_stats) return -1;
+    /* STATS opens a fresh control connection. In multi-endpoint mode it
+     * queries the first backend (NULL key routes to backend[0]). */
+    if (sdk_route(c, NULL) != 0) return -1;
 
-    /* STATS must be sent on a fresh connection (proxy rejects
-     * non-REQUEST frames on established channels). */
     int fd = vemb_v16_net_connect(c->host, c->port, 10000);
     if (fd < 0) return -1;
 
@@ -861,8 +1074,11 @@ int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
                                   float *out_scores,
                                   uint32_t max_inflight)
 {
-    if (!c || c->fd < 0 || count == 0 || !set_names || !elem_names ||
+    if (!c || count == 0 || !set_names || !elem_names ||
         !query_vector || !out_scores)
+        return -1;
+    /* Multi-endpoint: pipeline targets the backend picked by set_names[0]. */
+    if (sdk_route(c, set_names[0]) != 0 || c->fd < 0)
         return -1;
     if (max_inflight == 0) max_inflight = count;
 

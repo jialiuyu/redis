@@ -1057,10 +1057,11 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 atomic_load_explicit(&ch->slot_channel_id,
                                      memory_order_acquire);
             int active = channel_id != 0 &&
-                ch->transport_type == VEMB_V16_TRANSPORT_TCP &&
                 atomic_load_explicit(&ch->active, memory_order_acquire) &&
-                ch->net_fd >= 0;
-            int fd = active ? ch->net_fd : -1;
+                ((ch->transport_type == VEMB_V16_TRANSPORT_TCP &&
+                  ch->net_fd >= 0) ||
+                 ch->transport_type == VEMB_V16_TRANSPORT_AERON);
+            int fd = (active && ch->transport_type == VEMB_V16_TRANSPORT_TCP) ? ch->net_fd : -1;
 
             if (registered_ids[i] != 0 &&
                 (!active ||

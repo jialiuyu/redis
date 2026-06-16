@@ -3363,6 +3363,8 @@ standardConfig static_configs[] = {
     createIntConfig("vemb-v16-max-vectors", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.vemb_v16_max_vectors, 131072, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("vemb-v16-vector-region", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_vector_region, NULL, NULL, NULL),
     createStringConfig("vemb-v16-warm-backend", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_warm_backend, NULL, NULL, NULL),
+    createStringConfig("vemb-v16-warm-regions-manifest", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_warm_regions_manifest, NULL, NULL, NULL),
+    createBoolConfig("vemb-v16-reset-warm-regions", NULL, MODIFIABLE_CONFIG, server.vemb_v16_reset_warm_regions, 0, NULL, NULL),
     createSizeTConfig("vemb-v16-warm-mmap-offset", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.vemb_v16_warm_mmap_offset, 0, MEMORY_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-sniff-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.vemb_v16_sniff_port, 0, INTEGER_CONFIG, NULL, NULL),

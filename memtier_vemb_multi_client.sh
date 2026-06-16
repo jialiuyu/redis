@@ -16,7 +16,7 @@ if ! ss -tlnp | grep -q ":$SNIFF_PORT"; then
     ./src/redis-server \
       --port 6379 --vemb-v16-enabled yes --vemb-v16-dim 300 \
       --vemb-v16-max-vectors 131072 --vemb-v16-vector-region /dev/obmm_shmdev2 \
-      --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 16 \
+      --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 32 \
       --vemb-v16-supernode-workers 64 \
       --vemb-v16-sniff-port 6379 \
       --daemonize yes --loglevel notice --vector-engine vemb-v16
@@ -35,7 +35,7 @@ run_test() {
     shift
     echo ""
     echo "--- $name ---"
-    ./memtier_benchmark "$@" 2>&1 | awk '
+    ./memtier_benchmark "$@" 2>&1 | tee "/tmp/memtier_vemb_${name}.log" | awk '
         /^Gets/ || /^Totals/ {
             printf "  %-22s | OPS: %12s | Avg: %8s ms | p50: %8s ms | p99: %8s ms | p99.9: %8s ms | BW: %10s KB/s\n",
                 type, $2, $5, $6, $7, $8, $9
@@ -62,6 +62,11 @@ run_test "8_conn_pipeline16" \
 run_test "16_conn_pipeline32" \
     --protocol vemb_v16 --vemb-v16-dim "$DIM" \
     -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 16 --ratio=0:1 --pipeline=32 \
+    --key-prefix="item:" --key-minimum=1 --key-maximum=64
+
+run_test "32_conn_pipeline32" \
+    --protocol vemb_v16 --vemb-v16-dim "$DIM" \
+    -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 32 --ratio=0:1 --pipeline=32 \
     --key-prefix="item:" --key-minimum=1 --key-maximum=64
 
 echo ""

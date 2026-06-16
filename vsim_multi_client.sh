@@ -10,20 +10,32 @@ DIM=${VEMB_DIM:-300}
 # 构建 query vector（逗号分隔）
 QUERY_VEC=$(seq -s ',' 1 "$DIM" | sed 's/[0-9]*/0.1/g')
 
-# 确保server在运行
-if ! ss -tlnp | grep -q ":$SNIFF_PORT"; then
-    echo "redis-server not running, starting..."
+# 确保server在运行（总是重启，避免UB warm region stale state导致VEMB dataplane fallback）
+if ss -tlnp | grep -q ":$SNIFF_PORT"; then
+    echo "Stopping existing redis-server..."
+    pkill -f redis-server 2>/dev/null || true
+    sleep 2
+fi
+if true; then
+    echo "Starting fresh redis-server..."
     pkill -f redis-server 2>/dev/null || true
     sleep 1
+    rm -rf /tmp/redis-vemb-bench
+    mkdir -p /tmp/redis-vemb-bench
+    rm -f /tmp/redis_vemb_bench_server.log
     ./src/redis-server \
-      --port 6379 --vemb-v16-enabled yes --vemb-v16-dim 300 \
+      --port 6379 --bind 0.0.0.0 --protected-mode no \
+      --dir /tmp/redis-vemb-bench --save '' --appendonly no \
+      --vemb-v16-enabled yes --vemb-v16-dim "$DIM" \
       --vemb-v16-max-vectors 131072 --vemb-v16-vector-region /dev/obmm_shmdev2 \
-      --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 16 \
+      --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 32 \
       --vemb-v16-supernode-workers 64 \
       --vemb-v16-sniff-port 6379 \
+      --vemb-v16-reset-warm-regions yes \
       --daemonize yes --loglevel notice \
+      --logfile /tmp/redis_vemb_bench_server.log \
       --vector-engine vemb-v16
-    sleep 3
+    sleep 4
 fi
 
 # 检查vector-engine
@@ -33,13 +45,18 @@ if [ "$VE" != "vemb-v16" ]; then
     ./src/redis-cli CONFIG SET vector-engine vemb-v16 >/dev/null 2>&1
 fi
 
-# 预填充（如果WARM region为空）
+# 预填充（通过 fast path 逐个写入，避免 RESP pipe 在 sniff 模式下走不通 internal stc 的问题）
 echo "Prefilling if needed..."
-VEC300=$(seq -s ' ' 1 300 | sed 's/[0-9]*/0.1/g')
+VEC_CSV=$(seq -s ',' 1 "$DIM" | sed 's/[0-9]*/0.1/g')
+rm -rf /tmp/vemb_prefill_files
+mkdir -p /tmp/vemb_prefill_files
 for k in $(seq 1 32); do
-    (for i in $(seq 1 3125); do
-        echo "VADD item:$k VALUES 300 $VEC300 elem$i"
-    done | ./src/redis-cli --pipe >/dev/null 2>&1) &
+    (
+        for i in $(seq 1 3125); do
+            echo "VADD item:$k elem$i $VEC_CSV"
+        done > /tmp/vemb_prefill_files/set_$k.txt
+        ./src/redis-cli --vemb-v16-dim "$DIM" < /tmp/vemb_prefill_files/set_$k.txt >/dev/null 2>&1
+    ) &
 done
 wait
 sleep 1

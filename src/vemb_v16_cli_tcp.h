@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+int vemb_v16_cli_tcp_init_multi(const char **endpoints,
+                                int endpoint_count,
+                                uint32_t dim);
 int vemb_v16_cli_tcp_init(const char *host, uint16_t port, uint32_t dim);
 int vemb_v16_cli_tcp_vadd(int argc, char **argv);
 int vemb_v16_cli_tcp_vemb(int argc, char **argv, int raw_output);

@@ -47,7 +47,7 @@ static int stc_open_warm_region(const vemb_v16_channel_desc_t *desc) {
     if (desc->warm_backend_type == VEMB_V16_REGION_LOCAL_SHM) {
         fd = shm_open(desc->vector_region_name, O_RDONLY, 0666);
     } else if (desc->warm_backend_type == VEMB_V16_REGION_UB) {
-        fd = open(desc->vector_region_name, O_RDONLY);
+        fd = open(desc->vector_region_name, O_RDWR | O_SYNC);
     } else {
         return -1;
     }
@@ -64,7 +64,7 @@ static int stc_open_warm_region(const vemb_v16_channel_desc_t *desc) {
     size_t offset_delta = (size_t)(desc->warm_mmap_offset - aligned_offset);
     size_t map_size = size + offset_delta;
 
-    void *ptr = mmap(NULL, map_size, PROT_READ, MAP_SHARED, fd,
+    void *ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
                      (off_t)aligned_offset);
     close(fd);
     if (ptr == MAP_FAILED)

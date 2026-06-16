@@ -19,6 +19,35 @@ typedef struct vemb_v16_client vemb_v16_client_t;
  *  Synchronous Blocking API (high-level, existing)
  * ===================================================================== */
 
+/*
+ * Multi-endpoint client — connect to N backends and route every operation
+ * by key.  'endpoints' is an NULL-terminated array of "host:port" strings.
+ * Routing uses a murmur3-based consistent-hash ring (10 vnodes per backend),
+ * interoperable with benchmark/vemb_v16_bench.c so a set filled by one tool
+ * is visible to the others.
+ *
+ * All keyed operations (vadd / vemb_vector / vsim / *_pipeline / *_repeat)
+ * select the backend internally; callers do not pick a backend.  In
+ * multi-endpoint mode the pipeline helpers route all entries in one call to
+ * the backend picked by set_names[0] — group by backend if keys span nodes.
+ *
+ * offset-based helpers (vemb_handle + read_vector) follow the last routed
+ * backend, which is correct because vemb_vector routes vemb_handle before
+ * calling read_vector synchronously.
+ */
+vemb_v16_client_t *vemb_v16_client_create_multi(const char *endpoints[],
+                                                 int endpoint_count,
+                                                 uint32_t dim);
+
+/*
+ * Route-only helper: given the same endpoint list used by
+ * vemb_v16_client_create_multi, return the backend index selected for key
+ * by the murmur3 consistent-hash ring.  This does not open any connection.
+ * Returns 0 on success, -1 on error.
+ */
+int vemb_v16_route_key(const char *endpoints[], int endpoint_count,
+                       const char *key, int *out_backend_idx);
+
 vemb_v16_client_t *vemb_v16_client_create(const char *host,
                                           uint16_t port,
                                           uint32_t dim);

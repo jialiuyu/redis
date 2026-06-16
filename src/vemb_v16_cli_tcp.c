@@ -15,41 +15,37 @@
 #include <string.h>
 #include <unistd.h>
 
-static int         g_cli_fd = -1;
-static uint64_t    g_cli_channel_id = 0;
-static uint32_t    g_cli_dim = 0;
-static uint32_t    g_cli_req_id = 1;
-static uint8_t    *g_vector_buf = NULL;
-static uint32_t    g_vector_buf_cap = 0;
+/* Single SDK client handle. Multi-endpoint routing is owned by the SDK
+ * (vemb_v16_client_create_multi builds a consistent-hash ring); redis-cli
+ * just forwards operations and does not pick a backend itself. */
+static vemb_v16_client_t *g_client  = NULL;
+static uint32_t           g_cli_dim = 0;
 
-static vemb_v16_client_t *g_client = NULL;
+int vemb_v16_cli_tcp_init_multi(const char **endpoints,
+                                int endpoint_count,
+                                uint32_t dim) {
+    if (endpoint_count <= 0 || dim == 0)
+        return -1;
 
-int vemb_v16_cli_tcp_init(const char *host, uint16_t port, uint32_t dim)
-{
-    if (g_client) return 0;
+    vemb_v16_cli_tcp_cleanup();
 
-    g_client = vemb_v16_client_create(host, port, dim);
+    g_client = vemb_v16_client_create_multi(endpoints, endpoint_count, dim);
     if (!g_client) {
-        fprintf(stderr, "vemb_v16_cli_tcp_init: connect %s:%u failed\n",
-                host, port);
+        fprintf(stderr, "vemb_v16_cli_tcp_init_multi: connect failed\n");
         return -1;
     }
-
-    g_cli_fd         = vemb_v16_client_fd(g_client);
-    g_cli_channel_id = vemb_v16_client_channel_id(g_client);
-    g_cli_dim        = dim;
-    g_cli_req_id     = 1;
-
-    if (dim > 0 && dim > g_vector_buf_cap) {
-        free(g_vector_buf);
-        g_vector_buf = malloc(dim * sizeof(float));
-        g_vector_buf_cap = dim;
-    }
+    g_cli_dim = dim;
     return 0;
 }
 
-int vemb_v16_cli_tcp_vadd(int argc, char **argv)
-{
+int vemb_v16_cli_tcp_init(const char *host, uint16_t port, uint32_t dim) {
+    char ep[80];
+    snprintf(ep, sizeof(ep), "%s:%u", host, port);
+    const char *endpoints[1] = { ep };
+    return vemb_v16_cli_tcp_init_multi(endpoints, 1, dim);
+}
+
+int vemb_v16_cli_tcp_vadd(int argc, char **argv) {
     if (!g_client || argc < 4) return -1;
 
     const char *set_name = argv[1];
@@ -74,7 +70,11 @@ int vemb_v16_cli_tcp_vadd(int argc, char **argv)
         int rc = vemb_v16_client_vadd(g_client, set_name, elem_name,
                                       vec, g_cli_dim);
         free(vec);
-        return rc == 0 ? REDIS_OK : REDIS_ERR;
+        if (rc == 0) {
+            printf("OK\n");
+            return REDIS_OK;
+        }
+        return REDIS_ERR;
     }
 
     /* Standard format: VADD set_name VALUES dim v1 v2 ... elem_name */
@@ -100,15 +100,18 @@ int vemb_v16_cli_tcp_vadd(int argc, char **argv)
         int rc = vemb_v16_client_vadd(g_client, set_name, elem_name,
                                       vec, g_cli_dim);
         free(vec);
-        return rc == 0 ? REDIS_OK : REDIS_ERR;
+        if (rc == 0) {
+            printf("OK\n");
+            return REDIS_OK;
+        }
+        return REDIS_ERR;
     }
 
     /* FP32 format not supported in fast path */
     return -1;
 }
 
-int vemb_v16_cli_tcp_vemb(int argc, char **argv, int raw_output)
-{
+int vemb_v16_cli_tcp_vemb(int argc, char **argv, int raw_output) {
     if (!g_client || argc < 3) return -1;
 
     const char *set_name  = argv[1];
@@ -142,8 +145,7 @@ int vemb_v16_cli_tcp_vemb(int argc, char **argv, int raw_output)
 }
 
 int vemb_v16_cli_tcp_vemb_pipeline(int argc, char **argv,
-                                   int raw_output, int repeat)
-{
+                                   int raw_output, int repeat) {
     if (!g_client || argc < 3 || repeat <= 0) return -1;
 
     if (vemb_v16_client_vemb_repeat(g_client, argv[1], argv[2],
@@ -157,8 +159,7 @@ int vemb_v16_cli_tcp_vemb_pipeline(int argc, char **argv,
     return REDIS_OK;
 }
 
-int vemb_v16_cli_tcp_vsim(int argc, char **argv, int raw_output)
-{
+int vemb_v16_cli_tcp_vsim(int argc, char **argv, int raw_output) {
     (void)raw_output;
     if (!g_client || argc < 4) return -1;
 
@@ -190,21 +191,7 @@ int vemb_v16_cli_tcp_vsim(int argc, char **argv, int raw_output)
     return REDIS_OK;
 }
 
-void vemb_v16_cli_tcp_cleanup(void)
-{
-    if (g_client) {
-        vemb_v16_client_destroy(g_client);
-        g_client = NULL;
-        g_cli_fd = -1;
-        g_cli_channel_id = 0;
-    }
-    free(g_vector_buf);
-    g_vector_buf = NULL;
-    g_vector_buf_cap = 0;
-}
-
-int vemb_v16_cli_tcp_vsim_pipeline(int argc, char **argv, int raw_output, int repeat)
-{
+int vemb_v16_cli_tcp_vsim_pipeline(int argc, char **argv, int raw_output, int repeat) {
     (void)raw_output;
     if (!g_client || argc < 4 || repeat <= 0) return -1;
 
@@ -237,4 +224,12 @@ int vemb_v16_cli_tcp_vsim_pipeline(int argc, char **argv, int raw_output, int re
         }
     }
     return REDIS_OK;
+}
+
+void vemb_v16_cli_tcp_cleanup(void) {
+    if (g_client) {
+        vemb_v16_client_destroy(g_client);
+        g_client = NULL;
+    }
+    g_cli_dim = 0;
 }

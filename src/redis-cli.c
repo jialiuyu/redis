@@ -277,6 +277,7 @@ static struct config {
     /* VEMB V16 TCP fast path */
     int vemb_v16_tcp_enabled;
     int vemb_v16_dim;
+    char *vemb_v16_endpoints;
 
 } config;
 
@@ -2458,7 +2459,6 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
                 int rc = vemb_v16_cli_tcp_vemb(argc, argv, 0);
                 if (rc != -1) return rc;
             }
-            return REDIS_OK;
         }
         if (!strcasecmp(command, "VSIM")) {
             if (repeat > 1) {
@@ -3067,6 +3067,8 @@ static int parseOptions(int argc, char **argv) {
             config.resp3 = 1;
         } else if (!strcmp(argv[i],"--vemb-v16-dim") && !lastarg) {
             config.vemb_v16_dim = atoi(argv[++i]);
+        } else if (!strcmp(argv[i],"--vemb-v16-endpoints") && !lastarg) {
+            config.vemb_v16_endpoints = strdup(argv[++i]);
         } else if (!strcmp(argv[i],"--show-pushes") && !lastarg) {
             char *argval = argv[++i];
             if (!strncasecmp(argval, "n", 1)) {
@@ -3250,6 +3252,9 @@ version,tls_usage);
 "  --vset-recall-ef <ef> HSNW EF (search effort) to use. Default 500.\n"
 "  --vset-recall-ele <count> Number of elements used to compose query vectors\n"
 "                            Default 1.\n"
+"  --vemb-v16-dim <dim> Enable VEMB V16 fast path with vector dimension.\n"
+"  --vemb-v16-endpoints <h1:p1,h2:p2,...> VEMB V16 server endpoints for\n"
+"                       multi-node routing (default: -h host -p port).\n"
 "  --lru-test <keys>  Simulate a cache workload with an 80-20 distribution.\n"
 "  --replica          Simulate a replica showing commands received from the master.\n"
 "  --rdb <filename>   Transfer an RDB dump from remote server to local file.\n"
@@ -11006,6 +11011,7 @@ int main(int argc, char **argv) {
     config.prefer_ipv6 = 0;
     config.vemb_v16_tcp_enabled = 0;
     config.vemb_v16_dim = 0;
+    config.vemb_v16_endpoints = NULL;
     config.cluster_manager_command.name = NULL;
     config.cluster_manager_command.argc = 0;
     config.cluster_manager_command.argv = NULL;
@@ -11047,15 +11053,33 @@ int main(int argc, char **argv) {
     /* Initialize VEMB V16 TCP fast path if --vemb-v16-dim is specified */
     if (config.vemb_v16_dim > 0) {
         config.vemb_v16_tcp_enabled = 1;
-        const char *host = "127.0.0.1";
-        uint16_t port = (uint16_t)config.conn_info.hostport;
         uint32_t dim = config.vemb_v16_dim > 0
             ? (uint32_t)config.vemb_v16_dim
             : 300;
-        if (vemb_v16_cli_tcp_init(host, port, dim) != 0) {
-            fprintf(stderr, "VEMB V16 TCP init failed: %s:%u dim=%u\n",
-                    host, port, dim);
-            config.vemb_v16_tcp_enabled = 0;
+        if (config.vemb_v16_endpoints && config.vemb_v16_endpoints[0]) {
+            const char *epv[16];
+            int ep_count = 0;
+            char *saveptr = NULL;
+            char *tmp = strdup(config.vemb_v16_endpoints);
+            char *tok = strtok_r(tmp, ",", &saveptr);
+            while (tok && ep_count < 16) {
+                epv[ep_count++] = tok;
+                tok = strtok_r(NULL, ",", &saveptr);
+            }
+            if (vemb_v16_cli_tcp_init_multi(epv, ep_count, dim) != 0) {
+                fprintf(stderr, "VEMB V16 TCP init failed: endpoints=%s dim=%u\n",
+                        config.vemb_v16_endpoints, dim);
+                config.vemb_v16_tcp_enabled = 0;
+            }
+            free(tmp);
+        } else {
+            const char *host = config.conn_info.hostip ? config.conn_info.hostip : "127.0.0.1";
+            uint16_t port = (uint16_t)config.conn_info.hostport;
+            if (vemb_v16_cli_tcp_init(host, port, dim) != 0) {
+                fprintf(stderr, "VEMB V16 TCP init failed: %s:%u dim=%u\n",
+                        host, port, dim);
+                config.vemb_v16_tcp_enabled = 0;
+            }
         }
         atexit(vemb_v16_cli_tcp_cleanup);
     }
