@@ -1,4 +1,5 @@
 #include "../src/vemb_v16_tlc.h"
+#include "../src/tlc_core.h"
 #include "../src/vemb_v16_remote_meta.h"
 #include "../src/vemb_v16_ub_rpc.h"
 
@@ -15,9 +16,11 @@ static void fill_vector(float *vector, uint32_t dim, uint32_t seed) {
         vector[i] = (float)(seed + i);
 }
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static void make_key(char *buf, size_t len, uint32_t id) {
     snprintf(buf, len, "item:%u", id);
 }
+#endif
 
 static void init_test_allocator(vemb_v16_shared_region_allocator_t *allocator,
                                 uint32_t region_id,
@@ -213,6 +216,7 @@ static void test_eviction_rejects_stale_handle(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static void test_cold_read_through_promotes_warm_handle(void) {
     enum { dim = 3, max_vectors = 4 };
     float region[dim * max_vectors];
@@ -246,6 +250,114 @@ static void test_cold_read_through_promotes_warm_handle(void) {
     assert(warm_slot == 0);
     assert(memcmp(region, vector, sizeof(vector)) == 0);
     vemb_v16_tlc_destroy(tlc);
+}
+#endif
+
+#if !TLC_CORE_ENABLE_COLD_LAYER
+static void test_disabled_cold_append_is_noop(void) {
+    enum { dim = 2, max_vectors = 4 };
+    float region[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    tlc_core_t *core = NULL;
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 42,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .value_size = sizeof(vector),
+        .region_bytes = sizeof(region),
+        .mapped_addr = (uint8_t *)region,
+        .shared_allocator = &allocator,
+    };
+    tlc_core_config_t config = {
+        .value_size = sizeof(vector),
+        .warm_capacity = max_vectors,
+        .hot_capacity = 4,
+        .cold_max_segments = 1,
+        .cold_segment_records = 2,
+        .warm_regions = &warm,
+        .warm_region_count = 1,
+        .local_region_weight = 1,
+    };
+    const char *key = "cold-disabled";
+    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    tlc_warm_location_t location = {0};
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 42, max_vectors);
+    assert(tlc_core_create(&core, &config) == 0);
+    fill_vector(vector, dim, 42);
+    assert(tlc_core_cold_append(core,
+                                key,
+                                (uint32_t)strlen(key),
+                                key_hash,
+                                vector,
+                                sizeof(vector)) == 0);
+    assert(tlc_core_get_warm_location(core,
+                                      key,
+                                      (uint32_t)strlen(key),
+                                      key_hash,
+                                      &location) != 0);
+    tlc_core_destroy(core);
+}
+#endif
+
+static void test_cold_same_key_updates_do_not_exhaust_log(void) {
+    enum { dim = 2, max_vectors = 1 };
+    float region[dim * max_vectors];
+    float vector[dim];
+    float expected[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    tlc_core_t *core = NULL;
+    tlc_core_warm_region_config_t warm = {
+        .region_id = 77,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .value_size = sizeof(vector),
+        .region_bytes = sizeof(region),
+        .mapped_addr = (uint8_t *)region,
+        .shared_allocator = &allocator,
+    };
+    tlc_core_config_t config = {
+        .value_size = sizeof(vector),
+        .warm_capacity = max_vectors,
+        .hot_capacity = 4,
+        .cold_max_segments = 1,
+        .cold_segment_records = 2,
+        .warm_regions = &warm,
+        .warm_region_count = 1,
+        .local_region_weight = 1,
+    };
+    const char *key = "hot-update";
+    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    tlc_warm_location_t location = {0};
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 77, max_vectors);
+    assert(tlc_core_create(&core, &config) == 0);
+    for (uint32_t i = 0; i < 16; i++) {
+        fill_vector(vector, dim, 1000 + i);
+        assert(tlc_core_put_location(core,
+                                     key,
+                                     (uint32_t)strlen(key),
+                                     key_hash,
+                                     vector,
+                                     sizeof(vector),
+                                     &location) == 0);
+    }
+    fill_vector(expected, dim, 1015);
+    assert(tlc_core_get_warm_location(core,
+                                      key,
+                                      (uint32_t)strlen(key),
+                                      key_hash,
+                                      &location) == 0);
+    assert(location.bytes == sizeof(expected));
+    assert(memcmp((uint8_t *)region + location.offset,
+                  expected,
+                  sizeof(expected)) == 0);
+    tlc_core_destroy(core);
 }
 
 static void test_hot_is_cache_only(void) {
@@ -291,6 +403,7 @@ static void test_hot_is_cache_only(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static void test_prefill_distribution_stays_warm(void) {
     enum { dim = 1, max_vectors = 131072, prefill = 65536 };
     float *region = calloc((size_t)dim * max_vectors, sizeof(*region));
@@ -341,6 +454,7 @@ static void test_prefill_distribution_stays_warm(void) {
     vemb_v16_tlc_destroy(tlc);
     free(region);
 }
+#endif
 
 typedef struct concurrent_arg {
     vemb_v16_tlc_t *tlc;
@@ -3038,9 +3152,16 @@ int main(void) {
     test_put_get_handle();
     test_overwrite_and_capacity();
     test_eviction_rejects_stale_handle();
+#if TLC_CORE_ENABLE_COLD_LAYER
     test_cold_read_through_promotes_warm_handle();
+#else
+    test_disabled_cold_append_is_noop();
+#endif
+    test_cold_same_key_updates_do_not_exhaust_log();
     test_hot_is_cache_only();
+#if TLC_CORE_ENABLE_COLD_LAYER
     test_prefill_distribution_stays_warm();
+#endif
     test_concurrent_distinct_keys();
     test_multi_region_local_full_fallback_and_overwrite();
     test_multi_region_all_full_evicts_committed_warm();

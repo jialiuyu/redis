@@ -25,8 +25,10 @@
 #define TLC_CORE_WARM_WAYS 8u
 #define TLC_CORE_WARM_PLACE_RETRIES 3u
 #define TLC_CORE_DIAG_STALE_LOG_LIMIT 64u
+#define TLC_CORE_DIAG_PUT_LOG_LIMIT 128u
 
 static atomic_uint_fast32_t tlc_core_stale_diag_logs;
+static atomic_uint_fast32_t tlc_core_put_diag_logs;
 
 typedef enum tlc_core_entry_state {
     TLC_CORE_ENTRY_EMPTY = 0,
@@ -183,6 +185,51 @@ static const tlc_warm_location_t tlc_invalid_location = {
     .owner_generation = 0,
 };
 
+static int tlc_core_should_log_put_diag(void) {
+    uint32_t log_index =
+        atomic_fetch_add_explicit(&tlc_core_put_diag_logs, 1,
+                                  memory_order_relaxed);
+    return log_index < TLC_CORE_DIAG_PUT_LOG_LIMIT;
+}
+
+static void tlc_core_log_put_failure(
+        const char *reason,
+        const tlc_core_t *core,
+        uint64_t key_hash,
+        uint32_t key_len,
+        uint32_t value_size,
+        uint64_t topology_epoch,
+        int enforce_epoch,
+        const tlc_core_key_meta_entry_t *meta) {
+    if (!core || !tlc_core_should_log_put_diag())
+        return;
+
+    uint64_t source_fence_count =
+        atomic_load_explicit(&core->source_fence_active_count,
+                             memory_order_acquire);
+    serverLog(LL_WARNING,
+              "tlc_core put_with_epoch failed: reason=%s key_hash=%llu key_len=%u value_size=%u expected_value_size=%u topology_epoch=%llu enforce_epoch=%d key_meta_count=%u/%u source_fence_count=%llu meta_present=%d meta_state=%u meta_epoch=%llu owner_epoch=%llu key_version=%llu source=%u target=%u tombstone=%u shard=%u",
+              reason ? reason : "unknown",
+              (unsigned long long)key_hash,
+              key_len,
+              value_size,
+              core->value_size,
+              (unsigned long long)topology_epoch,
+              enforce_epoch,
+              core->key_meta_count,
+              core->key_meta_capacity,
+              (unsigned long long)source_fence_count,
+              meta ? 1 : 0,
+              meta ? meta->migration_state : 0,
+              meta ? (unsigned long long)meta->topology_epoch : 0ULL,
+              meta ? (unsigned long long)meta->owner_epoch : 0ULL,
+              meta ? (unsigned long long)meta->key_version : 0ULL,
+              meta ? meta->source_owner : UINT32_MAX,
+              meta ? meta->target_owner : UINT32_MAX,
+              meta ? meta->tombstone : 0,
+              meta ? meta->shard_id : UINT32_MAX);
+}
+
 typedef struct tlc_core_slot_meta_registry_entry {
     vemb_v16_shared_region_allocator_t *allocator;
     vemb_v16_warm_slot_meta_t *slot_meta;
@@ -334,6 +381,7 @@ static uint32_t vnode_lower_bound(const tlc_core_warm_layer_t *warm,
     return lo == warm->vnode_count ? 0 : lo;
 }
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static void bitmap_lock_blocking(state_bitmap_t *locks, uint32_t lock_id) {
     while (bitmap_try_acquire(locks, lock_id) != 0)
         cpu_relax();
@@ -342,6 +390,7 @@ static void bitmap_lock_blocking(state_bitmap_t *locks, uint32_t lock_id) {
 static void bitmap_unlock(state_bitmap_t *locks, uint32_t lock_id) {
     bitmap_release(locks, lock_id);
 }
+#endif
 
 static int key_valid(const char *key, uint32_t key_len) {
     return key && key_len > 0 && key_len <= VEMB_V16_MAX_KEY_LEN;
@@ -1257,6 +1306,7 @@ static int warm_put(tlc_core_t *core,
     return -1;
 }
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static int cold_alloc_segment(tlc_core_t *core, uint32_t seg_id) {
     tlc_core_cold_layer_t *cold = &core->cold;
     RETURN_IF(seg_id >= cold->max_segments, -1);
@@ -1269,6 +1319,7 @@ static int cold_alloc_segment(tlc_core_t *core, uint32_t seg_id) {
     RETURN_IF(!seg->records || !seg->values, -1);
     return 0;
 }
+#endif
 
 static int cold_init(tlc_core_t *core,
                      uint32_t max_segments,
@@ -1281,6 +1332,14 @@ static int cold_init(tlc_core_t *core,
         cold->segment_capacity > TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS) {
         cold->segment_capacity = TLC_CORE_DEFAULT_COLD_SEGMENT_RECORDS;
     }
+    atomic_init(&cold->num_segments, 0);
+    atomic_init(&cold->next_offset, 0);
+    atomic_init(&cold->hits, 0);
+    atomic_init(&cold->misses, 0);
+#if !TLC_CORE_ENABLE_COLD_LAYER
+    (void)core;
+    return 0;
+#else
     cold->segments =
         zcalloc(sizeof(*cold->segments) * cold->max_segments);
     RETURN_IF(!cold->segments, -1);
@@ -1293,15 +1352,14 @@ static int cold_init(tlc_core_t *core,
     RETURN_IF(!cold->offset_index, -1);
     for (uint32_t i = 0; i < cold->offset_index_size; i++)
         atomic_init(&cold->offset_index[i], TLC_CORE_INVALID_OFFSET);
-    atomic_init(&cold->num_segments, 1);
-    atomic_init(&cold->next_offset, 0);
-    atomic_init(&cold->hits, 0);
-    atomic_init(&cold->misses, 0);
+    atomic_store_explicit(&cold->num_segments, 1, memory_order_relaxed);
     int locks_rc = bitmap_init(&cold->locks, cold->max_segments);
     RETURN_IF(locks_rc != 0, -1);
     return cold_alloc_segment(core, 0);
+#endif
 }
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static tlc_core_cold_record_t *cold_record_by_offset(tlc_core_t *core,
                                                      uint64_t offset,
                                                      const uint8_t **value) {
@@ -1329,7 +1387,9 @@ static int cold_offset_matches(tlc_core_t *core,
            key_matches(key_hash, key, key_len,
                        record->key_hash, record->key, record->key_len);
 }
+#endif
 
+#if TLC_CORE_ENABLE_COLD_LAYER
 static void cold_index_store(tlc_core_t *core,
                              const char *key,
                              uint32_t key_len,
@@ -1354,6 +1414,28 @@ static void cold_index_store(tlc_core_t *core,
                           offset,
                           memory_order_release);
 }
+#endif
+
+#if TLC_CORE_ENABLE_COLD_LAYER
+static uint64_t cold_index_find_locked(tlc_core_t *core,
+                                       const char *key,
+                                       uint32_t key_len,
+                                       uint64_t key_hash) {
+    tlc_core_cold_layer_t *cold = &core->cold;
+    uint32_t slot = hash_fast(key_hash, cold->oi_mask);
+    for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
+        uint32_t pos = (slot + i) & cold->oi_mask;
+        uint64_t offset =
+            atomic_load_explicit(&cold->offset_index[pos],
+                                 memory_order_acquire);
+        if (offset == TLC_CORE_INVALID_OFFSET)
+            break;
+        if (cold_offset_matches(core, offset, key, key_len, key_hash))
+            return offset;
+    }
+    return TLC_CORE_INVALID_OFFSET;
+}
+#endif
 
 static int cold_append(tlc_core_t *core,
                        const char *key,
@@ -1361,8 +1443,42 @@ static int cold_append(tlc_core_t *core,
                        uint64_t key_hash,
                        const void *value,
                        uint32_t value_size) {
+#if !TLC_CORE_ENABLE_COLD_LAYER
+    (void)core;
+    (void)key;
+    (void)key_len;
+    (void)key_hash;
+    (void)value;
+    (void)value_size;
+    return 0;
+#else
     tlc_core_cold_layer_t *cold = &core->cold;
     bitmap_lock_blocking(&cold->locks, 0);
+    uint64_t existing_offset =
+        cold_index_find_locked(core, key, key_len, key_hash);
+    if (existing_offset != TLC_CORE_INVALID_OFFSET) {
+        const uint8_t *ignored = NULL;
+        tlc_core_cold_record_t *existing =
+            cold_record_by_offset(core, existing_offset, &ignored);
+        if (existing) {
+            existing->key_hash = key_hash;
+            existing->offset = existing_offset;
+            existing->key_len = key_len;
+            existing->value_size = value_size;
+            memcpy(existing->key, key, key_len);
+            uint32_t seg_id =
+                (uint32_t)(existing_offset / cold->segment_capacity);
+            size_t local =
+                (size_t)(existing_offset % cold->segment_capacity);
+            memcpy(cold->segments[seg_id].values +
+                       local * core->value_size,
+                   value,
+                   value_size);
+            bitmap_unlock(&cold->locks, 0);
+            return 0;
+        }
+    }
+
     uint64_t offset =
         atomic_load_explicit(&cold->next_offset, memory_order_relaxed);
     uint32_t seg_id = (uint32_t)(offset / cold->segment_capacity);
@@ -1393,6 +1509,7 @@ static int cold_append(tlc_core_t *core,
                           memory_order_release);
     bitmap_unlock(&cold->locks, 0);
     return 0;
+#endif
 }
 
 static int cold_lookup(tlc_core_t *core,
@@ -1401,7 +1518,17 @@ static int cold_lookup(tlc_core_t *core,
                        uint64_t key_hash,
                        const uint8_t **value,
                        uint32_t *value_size) {
+#if !TLC_CORE_ENABLE_COLD_LAYER
+    (void)core;
+    (void)key;
+    (void)key_len;
+    (void)key_hash;
+    (void)value;
+    (void)value_size;
+    return -1;
+#else
     tlc_core_cold_layer_t *cold = &core->cold;
+    bitmap_lock_blocking(&cold->locks, 0);
     uint32_t slot = hash_fast(key_hash, cold->oi_mask);
     for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
         uint32_t pos = (slot + i) & cold->oi_mask;
@@ -1419,11 +1546,14 @@ static int cold_lookup(tlc_core_t *core,
             *value = cold_value;
             *value_size = record->value_size;
             atomic_fetch_add_explicit(&cold->hits, 1, memory_order_relaxed);
+            bitmap_unlock(&cold->locks, 0);
             return 0;
         }
     }
     atomic_fetch_add_explicit(&cold->misses, 1, memory_order_relaxed);
+    bitmap_unlock(&cold->locks, 0);
     return -1;
+#endif
 }
 
 static int warm_copy_location_value(tlc_core_t *core,
@@ -1637,7 +1767,18 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                        int enforce_epoch,
                                        tlc_warm_location_t *location) {
     int valid_key = key_valid(key, key_len);
-    RETURN_IF(!valid_key || value_size != core->value_size, -1);
+    if (!valid_key || value_size != core->value_size) {
+        tlc_core_log_put_failure(!valid_key ? "invalid_key" :
+                                     "value_size_mismatch",
+                                 core,
+                                 key_hash,
+                                 key_len,
+                                 value_size,
+                                 topology_epoch,
+                                 enforce_epoch,
+                                 NULL);
+        return -1;
+    }
 
     pthread_mutex_lock(&core->key_meta_lock);
     tlc_core_key_meta_entry_t *meta =
@@ -1645,20 +1786,52 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
     if (tlc_core_source_fence_active(core) &&
         meta &&
         key_meta_state_blocks_source_access(meta->migration_state)) {
+        tlc_core_log_put_failure("source_fence_blocked",
+                                 core,
+                                 key_hash,
+                                 key_len,
+                                 value_size,
+                                 topology_epoch,
+                                 enforce_epoch,
+                                 meta);
         pthread_mutex_unlock(&core->key_meta_lock);
         return -1;
     }
     if (enforce_epoch && meta && topology_epoch < meta->topology_epoch) {
+        tlc_core_log_put_failure("stale_epoch",
+                                 core,
+                                 key_hash,
+                                 key_len,
+                                 value_size,
+                                 topology_epoch,
+                                 enforce_epoch,
+                                 meta);
         pthread_mutex_unlock(&core->key_meta_lock);
         return -1;
     }
     if (!meta && core->key_meta_count >= core->key_meta_capacity) {
+        tlc_core_log_put_failure("key_meta_full",
+                                 core,
+                                 key_hash,
+                                 key_len,
+                                 value_size,
+                                 topology_epoch,
+                                 enforce_epoch,
+                                 meta);
         pthread_mutex_unlock(&core->key_meta_lock);
         return -1;
     }
     atomic_fetch_add_explicit(&core->total_writes, 1, memory_order_relaxed);
     int cold_rc = cold_append(core, key, key_len, key_hash, value, value_size);
     if (cold_rc != 0) {
+        tlc_core_log_put_failure("cold_append_failed",
+                                 core,
+                                 key_hash,
+                                 key_len,
+                                 value_size,
+                                 topology_epoch,
+                                 enforce_epoch,
+                                 meta);
         pthread_mutex_unlock(&core->key_meta_lock);
         return -1;
     }
@@ -1668,6 +1841,14 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                  value, value_size, location) == 0) {
         meta = key_meta_find_or_create_locked(core, key, key_len, key_hash);
         if (!meta) {
+            tlc_core_log_put_failure("key_meta_create_after_warm_failed",
+                                     core,
+                                     key_hash,
+                                     key_len,
+                                     value_size,
+                                     topology_epoch,
+                                     enforce_epoch,
+                                     NULL);
             pthread_mutex_unlock(&core->key_meta_lock);
             return -1;
         }
@@ -1680,11 +1861,31 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
         return 0;
     }
 
+#if !TLC_CORE_ENABLE_COLD_LAYER
+    tlc_core_log_put_failure("warm_put_failed_cold_disabled",
+                             core,
+                             key_hash,
+                             key_len,
+                             value_size,
+                             topology_epoch,
+                             enforce_epoch,
+                             meta);
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return -1;
+#else
     atomic_fetch_add_explicit(&core->warm_alloc_cold_spill, 1,
                               memory_order_relaxed);
     *location = tlc_invalid_location;
     meta = key_meta_find_or_create_locked(core, key, key_len, key_hash);
     if (!meta) {
+        tlc_core_log_put_failure("key_meta_create_after_spill_failed",
+                                 core,
+                                 key_hash,
+                                 key_len,
+                                 value_size,
+                                 topology_epoch,
+                                 enforce_epoch,
+                                 NULL);
         pthread_mutex_unlock(&core->key_meta_lock);
         return -1;
     }
@@ -1695,6 +1896,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
     meta->location = *location;
     pthread_mutex_unlock(&core->key_meta_lock);
     return 0;
+#endif
 }
 
 int tlc_core_put_location(tlc_core_t *core,
@@ -1774,7 +1976,7 @@ int tlc_core_cold_append(tlc_core_t *core,
                          const void *value,
                          uint32_t value_size) {
     int valid_key = key_valid(key, key_len);
-    RETURN_IF(!valid_key || value_size != core->value_size, -1);
+    RETURN_IF(!core || !valid_key || value_size != core->value_size, -1);
     return cold_append(core, key, key_len, key_hash, value, value_size);
 }
 

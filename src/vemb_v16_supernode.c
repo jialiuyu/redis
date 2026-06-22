@@ -575,6 +575,51 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
             } else if (job->dim != tlc->vector_dim ||
                        job->vector_bytes != tlc->value_size ||
                        put_rc != 0) {
+                if (diag_should_log_req(job->req_id)) {
+                    uint64_t current_epoch = 0;
+                    uint64_t min_write_epoch = 0;
+                    tlc_core_key_migration_info_t info = {
+                        .source_owner = UINT32_MAX,
+                        .target_owner = UINT32_MAX,
+                    };
+                    int info_rc = vemb_v16_tlc_get_migration_info(
+                        tlc,
+                        job->key,
+                        job->key_len,
+                        job->key_hash,
+                        &info);
+                    vemb_v16_storage_epoch_get(storage,
+                                               &current_epoch,
+                                               &min_write_epoch);
+                    serverLog(LL_WARNING,
+                              "vemb_v16 vadd put failed: req_id=%u key_hash=%llu key_len=%u status_reason=%s put_rc=%d dim=%u/%u vector_bytes=%u/%u request_epoch=%llu write_epoch=%llu current_epoch=%llu min_write_epoch=%llu migration_active=%d ask_redirect=%d stale_topology=%d info_rc=%d state=%u info_epoch=%llu owner_epoch=%llu source=%u target=%u shard=%u",
+                              job->req_id,
+                              (unsigned long long)job->key_hash,
+                              job->key_len,
+                              job->dim != tlc->vector_dim ?
+                                  "dim_mismatch" :
+                                  (job->vector_bytes != tlc->value_size ?
+                                      "value_size_mismatch" : "tlc_put"),
+                              put_rc,
+                              job->dim,
+                              tlc->vector_dim,
+                              job->vector_bytes,
+                              tlc->value_size,
+                              (unsigned long long)job->topology_epoch,
+                              (unsigned long long)write_topology_epoch,
+                              (unsigned long long)current_epoch,
+                              (unsigned long long)min_write_epoch,
+                              migration_active,
+                              ask_redirect,
+                              stale_topology,
+                              info_rc,
+                              info.migration_state,
+                              (unsigned long long)info.topology_epoch,
+                              (unsigned long long)info.owner_epoch,
+                              info.source_owner,
+                              info.target_owner,
+                              info.shard_id);
+                }
                 completion.status = VEMB_V16_STATUS_ERR;
             } else {
                 completion.vector_offset = handle.offset;
