@@ -489,6 +489,15 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
     char resp0_1[64];
     char resp1_0[64];
     vemb_v16_storage_ctx_t *storage = NULL;
+    float vector[dim];
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    const char *cutover_key = "manifest-cutover-key";
+    uint32_t cutover_key_len = (uint32_t)strlen(cutover_key);
+    uint64_t cutover_key_hash =
+        vemb_v16_murmur3(cutover_key, cutover_key_len);
+    tlc_core_key_migration_info_t info = {0};
+    vemb_v16_migration_outbox_stats_t outbox_stats = {0};
 
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_manifest_%ld_ub_rpc.yaml", (long)getpid());
@@ -563,6 +572,52 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
                                                      &manifest) == 0);
     assert(storage->ub_rpc != NULL);
     assert(storage->owner_hash_node_count == 20);
+    fill_vector(vector, dim, 1234);
+    assert(vemb_v16_tlc_put(storage->tlc,
+                            cutover_key,
+                            cutover_key_len,
+                            cutover_key_hash,
+                            vector,
+                            sizeof(vector),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_mark_migrating(storage->tlc,
+                                       cutover_key,
+                                       cutover_key_len,
+                                       cutover_key_hash,
+                                       40,
+                                       1,
+                                       &info) == 0);
+    assert(vemb_v16_storage_migration_mark_cutover(storage,
+                                                  cutover_key,
+                                                  cutover_key_len,
+                                                  cutover_key_hash,
+                                                  41,
+                                                  1,
+                                                  &info) != 0);
+    assert(vemb_v16_storage_migration_barrier(storage,
+                                             cutover_key,
+                                             cutover_key_len,
+                                             cutover_key_hash,
+                                             40,
+                                             1,
+                                             &info,
+                                             &outbox_stats) == 0);
+    assert(outbox_stats.state == VEMB_V16_MIGRATION_OUTBOX_OPEN);
+    assert(outbox_stats.barrier_seq == 0);
+    assert(vemb_v16_storage_migration_mark_cutover(storage,
+                                                  cutover_key,
+                                                  cutover_key_len,
+                                                  cutover_key_hash,
+                                                  41,
+                                                  1,
+                                                  &info) != 0);
+    assert(vemb_v16_tlc_get_handle(storage->tlc,
+                                   cutover_key,
+                                   cutover_key_len,
+                                   cutover_key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
     vemb_v16_storage_ctx_destroy(storage);
 
     assert(vemb_v16_storage_reset_manifest_regions(&manifest) == 0);

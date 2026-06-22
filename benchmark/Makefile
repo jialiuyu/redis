@@ -121,8 +121,8 @@ tlc_v14_bench: tlc_v14_bench.c ../src/aeron_ipc.h
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../src -o $@ $< -pthread -lm
 	@echo "✅ Built: $@"
 
-vemb_v16_bench: vemb_v16_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_client_ring.h ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+vemb_v16_bench: vemb_v16_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_client_ring.h ../src/vemb_v16_client_topology.h ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_topology.c ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"
 
 vemb_v16_slow_client_bench: vemb_v16_slow_client_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
@@ -137,12 +137,44 @@ vemb_v16_remote_meta_ut: vemb_v16_remote_meta_ut.c ../src/vemb_v16_remote_meta.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_remote_meta.c -pthread -lm
 	@echo "✅ Built: $@"
 
+vemb_v16_topology_ut: vemb_v16_topology_ut.c ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_hash.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_topology.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_migration_outbox_ut: vemb_v16_migration_outbox_ut.c ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/vemb_v16_protocol.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_migration_outbox.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_client_topology_ut: vemb_v16_client_topology_ut.c ../src/vemb_v16_client_topology.c ../src/vemb_v16_client_topology.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_net.c ../src/vemb_v16_net.h ../src/vemb_v16_hash.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/vemb_v16_net.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_topology_ctl: vemb_v16_topology_ctl.c ../src/vemb_v16_protocol.h ../src/vemb_v16_migration_outbox.h ../src/vemb_v16_topology.h ../src/vemb_v16_topology.c ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/vemb_v16_hash.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_topology.c ../src/vemb_v16_net.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_client_topology_smoke: vemb_v16_bench vemb_v16_topology_ctl
+	./vemb_v16_client_topology_smoke.sh
+
+vemb_v16_topology_ctl_coordinator_smoke: vemb_v16_topology_ctl
+	bash ./vemb_v16_topology_ctl_coordinator_smoke.sh
+
+vemb_v16_scaleout_coordinated_server_smoke: vemb_v16_bench vemb_v16_topology_ctl
+	bash ./vemb_v16_scaleout_coordinated_server_smoke.sh
+
+vemb_v16_scaleout_coordinated_live_write_smoke: vemb_v16_bench vemb_v16_topology_ctl
+	bash ./vemb_v16_scaleout_coordinated_live_write_smoke.sh
+
 vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
 	@echo "✅ Built: $@"
 
-vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
-	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_topology.c ../src/vemb_v16_migration_outbox.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_migration_control_ut: vemb_v16_migration_control_ut.c ../src/vemb_v16_proxy.c ../src/vemb_v16_proxy.h ../src/vemb_v16_tcp_transport.c ../src/vemb_v16_aeron_transport.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/vemb_v16_net.c ../src/vemb_v16_net.h ../src/vemb_v16_supernode.c ../src/vemb_v16_stats.c ../src/vemb_v16_warm_provider.c ../src/sve_operation.c ../src/sve_similarity.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_proxy.c ../src/vemb_v16_tcp_transport.c ../src/vemb_v16_aeron_transport.c ../src/vemb_v16_storage.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_topology.c ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_net.c ../src/vemb_v16_supernode.c ../src/vemb_v16_stats.c ../src/vemb_v16_warm_provider.c ../src/sve_operation.c ../src/sve_similarity.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
 	@echo "✅ Built: $@"
 
 vemb_v16_remote_vsim_smoke: vemb_v16_bench
@@ -309,7 +341,7 @@ sve_gather_ub_bench: test_runtime_shim.c $(SVE_GATHER_SRCS)
 
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_gather_ub_bench
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_gather_ub_bench vemb_v16_migration_outbox_ut
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "✅ Cleaned build artifacts"

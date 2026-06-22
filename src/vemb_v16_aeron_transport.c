@@ -5,6 +5,7 @@
 #include "vemb_v16_client_ring.h"
 #include "vemb_v16_log.h"
 #include "zmalloc.h"
+#include "macro.h"
 
 #include <stdatomic.h>
 #include <fcntl.h>
@@ -157,7 +158,7 @@ void vemb_v16_aeron_handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
         write_full(fd, &ok, sizeof(ok));
     } else if (op == VEMB_V16_CTRL_ALLOC_CHANNEL) {
         vemb_v16_alloc_req_t req;
-        if (read_full(fd, &req, sizeof(req)) != 0) goto close_fd;
+        GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
         vemb_v16_channel_desc_t desc;
         uint8_t status = vemb_v16_proxy_alloc_shm_channel(proxy, &desc) == 0 ? VEMB_V16_STATUS_OK : VEMB_V16_STATUS_ERR;
         if (status != VEMB_V16_STATUS_OK)
@@ -182,6 +183,75 @@ void vemb_v16_aeron_handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
         uint8_t status = VEMB_V16_STATUS_OK;
         write_full(fd, &status, sizeof(status));
         write_full(fd, &closed, sizeof(closed));
+    } else if (op == VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING ||
+               op == VEMB_V16_CTRL_MIGRATION_MARK_CUTOVER ||
+               op == VEMB_V16_CTRL_MIGRATION_MARK_SOURCE_GC ||
+               op == VEMB_V16_CTRL_MIGRATION_BARRIER) {
+        vemb_v16_migration_control_req_t req;
+        vemb_v16_migration_control_resp_t resp;
+        memset(&req, 0, sizeof(req));
+        memset(&resp, 0, sizeof(resp));
+        GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
+        if (op == VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING) {
+            vemb_v16_proxy_migration_mark_migrating(proxy, &req, &resp);
+        } else if (op == VEMB_V16_CTRL_MIGRATION_MARK_CUTOVER) {
+            vemb_v16_proxy_migration_mark_cutover(proxy, &req, &resp);
+        } else if (op == VEMB_V16_CTRL_MIGRATION_MARK_SOURCE_GC) {
+            vemb_v16_proxy_migration_mark_source_gc(proxy, &req, &resp);
+        } else {
+            vemb_v16_proxy_migration_barrier(proxy, &req, &resp);
+        }
+        write_full(fd, &resp, sizeof(resp));
+    } else if (op == VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING_BATCH) {
+        vemb_v16_migration_control_batch_req_t req;
+        vemb_v16_migration_control_batch_resp_t resp;
+        memset(&req, 0, sizeof(req));
+        memset(&resp, 0, sizeof(resp));
+        GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
+       vemb_v16_proxy_migration_mark_migrating_batch(proxy, &req, &resp);
+        write_full(fd, &resp, sizeof(resp));
+    } else if (op == VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER ||
+               op == VEMB_V16_CTRL_MIGRATION_RANGE_MARK_CUTOVER ||
+               op == VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC) {
+        vemb_v16_migration_range_control_req_t req;
+        vemb_v16_migration_range_control_resp_t resp;
+        memset(&req, 0, sizeof(req));
+        memset(&resp, 0, sizeof(resp));
+        GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
+        if (op == VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER) {
+           vemb_v16_proxy_migration_range_barrier(proxy, &req, &resp);
+        } else if (op == VEMB_V16_CTRL_MIGRATION_RANGE_MARK_CUTOVER) {
+           vemb_v16_proxy_migration_range_mark_cutover(proxy, &req, &resp);
+        } else {
+           vemb_v16_proxy_migration_range_mark_source_gc(proxy, &req, &resp);
+        }
+        write_full(fd, &resp, sizeof(resp));
+    } else if (op == VEMB_V16_CTRL_EPOCH_SET) {
+        vemb_v16_epoch_control_req_t req;
+        vemb_v16_epoch_control_resp_t resp;
+        memset(&req, 0, sizeof(req));
+        memset(&resp, 0, sizeof(resp));
+        GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
+       vemb_v16_proxy_epoch_set(proxy, &req, &resp);
+        write_full(fd, &resp, sizeof(resp));
+    } else if (op == VEMB_V16_CTRL_EPOCH_GET) {
+        vemb_v16_epoch_control_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+       vemb_v16_proxy_epoch_get(proxy, &resp);
+        write_full(fd, &resp, sizeof(resp));
+    } else if (op == VEMB_V16_CTRL_TOPOLOGY_SET) {
+        vemb_v16_topology_control_req_t req;
+        vemb_v16_topology_control_resp_t resp;
+        memset(&req, 0, sizeof(req));
+        memset(&resp, 0, sizeof(resp));
+        GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
+       vemb_v16_proxy_topology_set(proxy, &req, &resp);
+        write_full(fd, &resp, sizeof(resp));
+    } else if (op == VEMB_V16_CTRL_TOPOLOGY_GET) {
+        vemb_v16_topology_control_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+       vemb_v16_proxy_topology_get(proxy, &resp);
+        write_full(fd, &resp, sizeof(resp));
     }
 
 close_fd:

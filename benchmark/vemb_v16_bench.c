@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "../src/vemb_v16_client_topology.h"
 #include "../src/vemb_v16_client_ring.h"
 #include "../src/vemb_v16_net.h"
 #include "../src/vemb_v16_protocol.h"
@@ -44,6 +45,7 @@ typedef struct bench_cfg {
     uint32_t hash_node_count;
     uint32_t dim;
     uint32_t prefill;
+    uint32_t keyspace;
     uint32_t ops;
     int threads;
     const char *threads_arg;
@@ -56,6 +58,9 @@ typedef struct bench_cfg {
     uint32_t transport_type;
     uint16_t tcp_port;
     int vsim_key2_owner;
+    int client_topology_enabled;
+    int client_topology_valid;
+    vemb_v16_client_topology_t client_topology;
 } bench_cfg_t;
 
 typedef struct bench_region_map {
@@ -95,6 +100,8 @@ typedef struct worker_arg {
     uint64_t vemb_sent;
     uint64_t vadd_sent;
     uint64_t vsim_sent;
+    uint64_t dual_write_sent;
+    uint64_t stale_topology_refreshes;
     uint64_t request_publish_spins;
     uint64_t response_empty_polls;
     double score_sum;
@@ -113,6 +120,7 @@ enum {
     MODE_VEMB_INLINE_VECTOR = 6,
     MODE_VSIM_INLINE = 7,
     MODE_VSIM_KEY_KEY = 8,
+    MODE_VREM = 9,
 };
 
 enum {
@@ -132,6 +140,10 @@ typedef struct pending_req {
 } pending_req_t;
 
 static const char *mode_name(int mode);
+static int setup_node_channel(const bench_cfg_t *cfg,
+                              uint32_t node_index,
+                              int open_region,
+                              bench_node_channel_t *node);
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -405,6 +417,93 @@ static int close_all_channels(const char *socket_path, uint64_t *closed) {
     return 0;
 }
 
+static int client_topology_owners_fit_nodes(const bench_cfg_t *cfg) {
+    const vemb_v16_client_topology_t *topology = &cfg->client_topology;
+    for (uint32_t i = 0; i < topology->active_ring.owner_count; i++) {
+        if (topology->active_ring.owners[i] >= cfg->node_count)
+            return 0;
+    }
+    for (uint32_t i = 0; i < topology->standby_ring.owner_count; i++) {
+        if (topology->standby_ring.owners[i] >= cfg->node_count)
+            return 0;
+    }
+    return 1;
+}
+
+static int apply_client_topology_endpoints(bench_cfg_t *cfg) {
+    if (!cfg)
+        return -1;
+    const vemb_v16_client_topology_t *topology = &cfg->client_topology;
+    for (uint32_t i = 0; i < topology->endpoint_count; i++) {
+        const vemb_v16_topology_endpoint_t *endpoint =
+            &topology->endpoints[i];
+        uint32_t owner = endpoint->owner_id;
+        if (owner >= VEMB_V16_BENCH_MAX_NODES)
+            return -1;
+        if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
+            if (endpoint->transport_type != VEMB_V16_TRANSPORT_TCP ||
+                endpoint->host[0] == '\0' ||
+                endpoint->tcp_port == 0) {
+                return -1;
+            }
+            strncpy(cfg->tcp_hosts[owner],
+                    endpoint->host,
+                    sizeof(cfg->tcp_hosts[owner]) - 1);
+            cfg->tcp_hosts[owner][sizeof(cfg->tcp_hosts[owner]) - 1] = '\0';
+            cfg->tcp_ports[owner] = endpoint->tcp_port;
+        } else {
+            if (endpoint->transport_type != VEMB_V16_TRANSPORT_AERON ||
+                endpoint->uds_path[0] == '\0') {
+                return -1;
+            }
+            strncpy(cfg->socket_paths[owner],
+                    endpoint->uds_path,
+                    sizeof(cfg->socket_paths[owner]) - 1);
+            cfg->socket_paths[owner][sizeof(cfg->socket_paths[owner]) - 1] =
+                '\0';
+        }
+        if (owner + 1 > cfg->node_count)
+            cfg->node_count = owner + 1;
+    }
+    if (cfg->node_count > 0) {
+        cfg->socket_path = cfg->socket_paths[0];
+        cfg->tcp_host = cfg->tcp_hosts[0];
+        cfg->tcp_port = cfg->tcp_ports[0];
+    }
+    return 0;
+}
+
+static int refresh_client_topology(bench_cfg_t *cfg) {
+    if (!cfg || !cfg->client_topology_enabled)
+        return 0;
+    vemb_v16_topology_control_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    int rc;
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
+        rc = vemb_v16_client_topology_fetch_tcp(tcp_host_for_node(cfg, 0),
+                                                tcp_port_for_node(cfg, 0),
+                                                cfg->timeout_ms,
+                                                &cfg->client_topology,
+                                                &resp);
+    } else {
+        int fd = connect_uds(cfg->socket_paths[0]);
+        if (fd < 0)
+            return -1;
+        rc = vemb_v16_client_topology_fetch_uds_fd(fd,
+                                                   &cfg->client_topology,
+                                                   &resp);
+        close(fd);
+    }
+    if (rc != 0 ||
+        apply_client_topology_endpoints(cfg) != 0 ||
+        !client_topology_owners_fit_nodes(cfg)) {
+        cfg->client_topology_valid = 0;
+        return -1;
+    }
+    cfg->client_topology_valid = 1;
+    return 0;
+}
+
 static int open_ring(const char *name,
                      uint32_t slot_size,
                      vemb_v16_client_ring_t **ring) {
@@ -565,6 +664,12 @@ static int build_hash_ring(bench_cfg_t *cfg) {
 }
 
 static uint32_t route_hash(const bench_cfg_t *cfg, uint32_t hash) {
+    if (cfg && cfg->client_topology_valid) {
+        uint32_t owner =
+            vemb_v16_topology_ring_owner(&cfg->client_topology.active_ring,
+                                         hash);
+        return owner == UINT32_MAX ? 0 : owner;
+    }
     if (!cfg || cfg->node_count <= 1 || cfg->hash_node_count == 0)
         return 0;
     uint32_t left = 0;
@@ -584,15 +689,22 @@ static uint32_t route_key(const bench_cfg_t *cfg, const char *key) {
     return route_hash(cfg, vemb_v16_murmur3(key, strlen(key)));
 }
 
+static uint32_t workload_keyspace(const bench_cfg_t *cfg) {
+    if (cfg && cfg->keyspace)
+        return cfg->keyspace;
+    return cfg ? cfg->prefill : 0;
+}
+
 static uint32_t choose_vsim_key2_id(const bench_cfg_t *cfg,
                                     uint32_t key_id,
                                     uint32_t key1_node_index) {
-    if (!cfg || cfg->prefill <= 1)
+    uint32_t keyspace = workload_keyspace(cfg);
+    if (!cfg || keyspace <= 1)
         return key_id;
 
     char key2[VEMB_V16_MAX_KEY_LEN];
-    for (uint32_t step = 1; step < cfg->prefill; step++) {
-        uint32_t candidate = (key_id + step) % cfg->prefill;
+    for (uint32_t step = 1; step < keyspace; step++) {
+        uint32_t candidate = (key_id + step) % keyspace;
         make_key(key2, sizeof(key2), candidate);
         uint32_t key2_node_index = route_key(cfg, key2);
         if (cfg->vsim_key2_owner == VSIM_KEY2_OWNER_REMOTE) {
@@ -734,34 +846,235 @@ static int recv_channel_resp(bench_node_channel_t *node,
     return recv_resp(node->resp_ring, resp, empty_polls, timeout_ms);
 }
 
-static int prefill_multi(const bench_cfg_t *cfg,
+static int send_write_single_and_wait(bench_node_channel_t *node,
+                                      vemb_v16_req_t *req,
+                                      size_t req_len,
+                                      uint32_t timeout_ms,
+                                      vemb_v16_resp_t *resp) {
+    req->channel_id = node->desc.channel_id;
+    if (send_channel_req(node, req, req_len, NULL, timeout_ms) != 0)
+        return -1;
+    if (recv_channel_resp(node,
+                          resp,
+                          NULL,
+                          0,
+                          NULL,
+                          NULL,
+                          timeout_ms) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int node_channel_open(const bench_node_channel_t *node) {
+    if (!node || node->desc.channel_id == 0)
+        return 0;
+    if (node->transport_type == VEMB_V16_TRANSPORT_TCP)
+        return node->net_fd >= 0;
+    return node->req_ring != NULL && node->resp_ring != NULL;
+}
+
+static int ensure_client_topology_channels(bench_cfg_t *cfg,
+                                           bench_node_channel_t *nodes,
+                                           uint32_t *node_count,
+                                           int open_region) {
+    if (!cfg || !nodes || !node_count ||
+        cfg->node_count > VEMB_V16_BENCH_MAX_NODES) {
+        return -1;
+    }
+    for (uint32_t n = 0; n < cfg->node_count; n++) {
+        if (node_channel_open(&nodes[n]))
+            continue;
+        if (setup_node_channel(cfg, n, open_region, &nodes[n]) != 0)
+            return -1;
+        if (n + 1 > *node_count)
+            *node_count = n + 1;
+    }
+    if (*node_count < cfg->node_count)
+        *node_count = cfg->node_count;
+    return 0;
+}
+
+static int write_status_needs_topology_refresh(uint8_t status) {
+    return status == VEMB_V16_STATUS_STALE_TOPOLOGY ||
+           status == VEMB_V16_STATUS_MOVED ||
+           status == VEMB_V16_STATUS_ASK;
+}
+
+static int send_write_ask_redirect_once(
+        bench_cfg_t *cfg,
+        bench_node_channel_t *nodes,
+        uint32_t *node_count,
+        vemb_v16_req_t *req,
+        size_t req_len,
+        uint32_t redirect_owner,
+        uint64_t topology_epoch,
+        vemb_v16_resp_t *resp) {
+    if (!cfg || !nodes || !node_count || !req || !resp ||
+        redirect_owner == UINT32_MAX ||
+        redirect_owner >= VEMB_V16_BENCH_MAX_NODES) {
+        return -1;
+    }
+    if (redirect_owner >= *node_count ||
+        !node_channel_open(&nodes[redirect_owner])) {
+        if (ensure_client_topology_channels(cfg, nodes, node_count, 0) != 0)
+            return -1;
+    }
+    if (redirect_owner >= *node_count ||
+        !node_channel_open(&nodes[redirect_owner])) {
+        return -1;
+    }
+
+    uint8_t original_flags = req->flags;
+    uint64_t original_topology_epoch = req->topology_epoch;
+    req->flags = (uint8_t)(req->flags | VEMB_V16_REQ_F_ASK_REDIRECT);
+    req->topology_epoch = topology_epoch;
+    memset(resp, 0, sizeof(*resp));
+    int rc = send_write_single_and_wait(&nodes[redirect_owner],
+                                        req,
+                                        req_len,
+                                        cfg->timeout_ms,
+                                        resp);
+    req->flags = original_flags;
+    req->topology_epoch = original_topology_epoch;
+    return rc;
+}
+
+static uint8_t send_write_with_client_topology(
+        bench_cfg_t *cfg,
+        bench_node_channel_t *nodes,
+        uint32_t *node_count,
+        vemb_v16_req_t *req,
+        size_t req_len,
+        uint64_t *dual_write_sent,
+        uint64_t *stale_topology_refreshes) {
+    vemb_v16_client_write_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    if (!cfg->client_topology_valid &&
+        refresh_client_topology(cfg) != 0) {
+        return VEMB_V16_STATUS_ERR;
+    }
+    if (ensure_client_topology_channels(cfg, nodes, node_count, 0) != 0)
+        return VEMB_V16_STATUS_ERR;
+
+    for (uint32_t attempt = 0; attempt < 256; attempt++) {
+        if (vemb_v16_client_topology_plan_write(&cfg->client_topology,
+                                                req->key_hash,
+                                                &plan) != 0 ||
+            plan.active_owner >= *node_count) {
+            return VEMB_V16_STATUS_ERR;
+        }
+        req->topology_epoch = plan.topology_epoch;
+        vemb_v16_resp_t resp;
+        memset(&resp, 0, sizeof(resp));
+        if (send_write_single_and_wait(&nodes[plan.active_owner],
+                                       req,
+                                       req_len,
+                                       cfg->timeout_ms,
+                                       &resp) != 0) {
+            return VEMB_V16_STATUS_ERR;
+        }
+        if (resp.status == VEMB_V16_STATUS_ASK) {
+            vemb_v16_resp_t redirect_resp;
+            if (send_write_ask_redirect_once(cfg,
+                                             nodes,
+                                             node_count,
+                                             req,
+                                             req_len,
+                                             resp.redirect_owner,
+                                             plan.topology_epoch,
+                                             &redirect_resp) == 0) {
+                if (redirect_resp.status == VEMB_V16_STATUS_OK) {
+                    (void)dual_write_sent;
+                    return VEMB_V16_STATUS_OK;
+                }
+                if (!write_status_needs_topology_refresh(
+                        redirect_resp.status)) {
+                    return redirect_resp.status;
+                }
+            }
+            if (stale_topology_refreshes)
+                (*stale_topology_refreshes)++;
+            if (refresh_client_topology(cfg) != 0)
+                return resp.status;
+            if (ensure_client_topology_channels(cfg,
+                                                nodes,
+                                                node_count,
+                                                0) != 0) {
+                return VEMB_V16_STATUS_ERR;
+            }
+            usleep(1000);
+            continue;
+        }
+        if (write_status_needs_topology_refresh(resp.status)) {
+            if (stale_topology_refreshes)
+                (*stale_topology_refreshes)++;
+            if (refresh_client_topology(cfg) != 0)
+                return resp.status;
+            if (ensure_client_topology_channels(cfg,
+                                                nodes,
+                                                node_count,
+                                                0) != 0) {
+                return VEMB_V16_STATUS_ERR;
+            }
+            usleep(1000);
+            continue;
+        }
+        if (resp.status != VEMB_V16_STATUS_OK)
+            return resp.status;
+
+        (void)dual_write_sent;
+        return VEMB_V16_STATUS_OK;
+    }
+    return VEMB_V16_STATUS_STALE_TOPOLOGY;
+}
+
+static int prefill_multi(bench_cfg_t *cfg,
                          bench_node_channel_t *nodes,
                          uint32_t node_count) {
     vemb_v16_req_t req;
     vemb_v16_resp_t resp;
     char key[VEMB_V16_MAX_KEY_LEN];
     uint64_t start = now_ns();
+    uint32_t topology_node_count = node_count;
     for (uint32_t i = 0; i < cfg->prefill; i++) {
         make_key(key, sizeof(key), i);
         uint32_t node_index = route_key(cfg, key);
-        if (node_index >= node_count)
+        if (node_index >= topology_node_count)
             return -1;
         bench_node_channel_t *node = &nodes[node_index];
         prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1,
                     node->desc.channel_id, key, cfg->dim);
         fill_vector(req.vector, cfg->dim, i);
-        if (send_channel_req(node, &req,
-                             vemb_v16_req_inline_len(req.vector_bytes),
-                             NULL, cfg->timeout_ms) != 0) {
-            fprintf(stderr, "prefill send timeout at item=%u node=%u\n",
-                    i, node_index);
-            return -1;
-        }
-        if (recv_channel_resp(node, &resp, NULL, 0, NULL, NULL, cfg->timeout_ms) != 0 ||
-            resp.status != VEMB_V16_STATUS_OK) {
-            fprintf(stderr, "prefill response timeout/error at item=%u node=%u status=%u\n",
-                    i, node_index, resp.status);
-            return -1;
+        size_t req_len = vemb_v16_req_inline_len(req.vector_bytes);
+        if (cfg->client_topology_enabled) {
+            uint8_t status = send_write_with_client_topology(cfg,
+                                                             nodes,
+                                                             &topology_node_count,
+                                                             &req,
+                                                             req_len,
+                                                             NULL,
+                                                             NULL);
+            if (status != VEMB_V16_STATUS_OK) {
+                fprintf(stderr,
+                        "prefill topology write error at item=%u status=%u\n",
+                        i,
+                        status);
+                return -1;
+            }
+        } else {
+            if (send_channel_req(node, &req, req_len,
+                                 NULL, cfg->timeout_ms) != 0) {
+                fprintf(stderr, "prefill send timeout at item=%u node=%u\n",
+                        i, node_index);
+                return -1;
+            }
+            if (recv_channel_resp(node, &resp, NULL, 0, NULL, NULL, cfg->timeout_ms) != 0 ||
+                resp.status != VEMB_V16_STATUS_OK) {
+                fprintf(stderr, "prefill response timeout/error at item=%u node=%u status=%u\n",
+                        i, node_index, resp.status);
+                return -1;
+            }
         }
         if ((i + 1) % 10000 == 0)
             printf("[prefill] inserted=%u elapsed=%.3fs\n",
@@ -815,12 +1128,13 @@ static void *worker_main(void *arg) {
     uint32_t pending_count = 0;
     while (completed < w->cfg.ops &&
            !atomic_load_explicit(&w->stop, memory_order_acquire)) {
+        uint32_t keyspace = workload_keyspace(&w->cfg);
         while (sent < w->cfg.ops && pending_count < pipeline) {
             if (atomic_load_explicit(&w->stop, memory_order_acquire))
                 break;
             uint32_t i = sent;
             uint32_t global_id = (uint32_t)(i + (uint32_t)w->tid * w->cfg.ops);
-            uint32_t key_id = w->cfg.prefill ? global_id % w->cfg.prefill : global_id;
+            uint32_t key_id = keyspace ? global_id % keyspace : global_id;
             if (w->cfg.hot_key_enabled) key_id = w->cfg.hot_key_id;
             size_t req_len = vemb_v16_req_handle_len();
             int send_failed = 0;
@@ -843,16 +1157,55 @@ static void *worker_main(void *arg) {
                             w->tid, i);
                     send_failed = 1;
                 }
-            } else if (w->cfg.mode == MODE_VADD_INLINE || mixed_write) {
-                uint32_t write_key_id = mixed_write ? key_id : global_id + 100000000u;
+            } else if (w->cfg.mode == MODE_VADD_INLINE ||
+                       w->cfg.mode == MODE_VREM ||
+                       mixed_write) {
+                int is_vrem = w->cfg.mode == MODE_VREM;
+                uint32_t write_key_id = mixed_write ? key_id :
+                    (is_vrem ? key_id :
+                        (w->cfg.keyspace ? key_id :
+                            global_id + 100000000u));
                 make_key(key, sizeof(key), write_key_id);
                 uint32_t node_index = route_key(&w->cfg, key);
                 bench_node_channel_t *node = &w->nodes[node_index];
-                prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1,
+                prepare_req(&req,
+                            is_vrem ? VEMB_V16_OP_VREM :
+                                VEMB_V16_OP_VADD_INLINE,
+                            i + 1,
                             node->desc.channel_id, key, w->cfg.dim);
-                fill_vector(req.vector, w->cfg.dim, global_id);
-                req_len = vemb_v16_req_inline_len(req.vector_bytes);
+                if (is_vrem) {
+                    req.dim = 0;
+                    req.vector_bytes = 0;
+                    req_len = vemb_v16_req_handle_len();
+                } else {
+                    fill_vector(req.vector, w->cfg.dim, global_id);
+                    req_len = vemb_v16_req_inline_len(req.vector_bytes);
+                }
                 w->vadd_sent++;
+                if (w->cfg.client_topology_enabled) {
+                    uint8_t status = send_write_with_client_topology(
+                        &w->cfg,
+                        w->nodes,
+                        &w->node_count,
+                        &req,
+                        req_len,
+                        &w->dual_write_sent,
+                        &w->stale_topology_refreshes);
+                    if (status == VEMB_V16_STATUS_OK) {
+                        w->ok++;
+                    } else {
+                        fprintf(stderr,
+                                "worker %d topology write error at op=%u key_id=%u status=%u\n",
+                                w->tid,
+                                i,
+                                write_key_id,
+                                status);
+                        w->fail++;
+                    }
+                    sent++;
+                    completed++;
+                    continue;
+                }
                 if (send_channel_req(node, &req, req_len,
                                      &w->request_publish_spins,
                                      w->cfg.timeout_ms) != 0) {
@@ -935,6 +1288,9 @@ static void *worker_main(void *arg) {
             pending_count++;
             sent++;
         }
+
+        if (pending_count == 0)
+            continue;
 
         vemb_v16_resp_t resp;
         uint32_t inline_vector_bytes = 0;
@@ -1047,6 +1403,7 @@ static int mode_from_string(const char *s) {
     if (!strcmp(s, "vemb-inline-vector")) return MODE_VEMB_INLINE_VECTOR;
     if (!strcmp(s, "vemb-supernode-read")) return MODE_VEMB_SUPERNODE_READ;
     if (!strcmp(s, "vadd-inline")) return MODE_VADD_INLINE;
+    if (!strcmp(s, "vrem")) return MODE_VREM;
     if (!strcmp(s, "mixed-80r20w")) return MODE_MIXED_80R20W;
     if (!strcmp(s, "vsim-inline")) return MODE_VSIM_INLINE;
     if (!strcmp(s, "vsim-key-key")) return MODE_VSIM_KEY_KEY;
@@ -1061,6 +1418,7 @@ static const char *mode_name(int mode) {
     case MODE_VEMB_INLINE_VECTOR: return "vemb-inline-vector";
     case MODE_VEMB_SUPERNODE_READ: return "vemb-supernode-read";
     case MODE_VADD_INLINE: return "vadd-inline";
+    case MODE_VREM: return "vrem";
     case MODE_MIXED_80R20W: return "mixed-80r20w";
     case MODE_VSIM_INLINE: return "vsim-inline";
     case MODE_VSIM_KEY_KEY: return "vsim-key-key";
@@ -1073,6 +1431,12 @@ static int mode_is_read(int mode) {
            mode == MODE_VEMB_READ_VECTOR ||
            mode == MODE_VEMB_INLINE_VECTOR ||
            mode == MODE_VEMB_SUPERNODE_READ ||
+           mode == MODE_MIXED_80R20W;
+}
+
+static int mode_has_write(int mode) {
+    return mode == MODE_VADD_INLINE ||
+           mode == MODE_VREM ||
            mode == MODE_MIXED_80R20W;
 }
 
@@ -1232,6 +1596,20 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
     printf("[stats] supernode vemb_poll=%llu vadd_poll=%llu completion_publish=%llu\n",
            D(supernode_vemb_poll), D(supernode_vadd_poll),
            D(supernode_completion_publish));
+    printf("[stats] migration moved=%llu stale=%llu ask=%llu forward=%llu duplicate=%llu source_gc=%llu gc_safe_watermark=%llu baseline_sent=%llu baseline_skipped=%llu baseline_error=%llu baseline_retry_queued=%llu baseline_retry_sent=%llu baseline_retry_pending=%llu\n",
+           D(moved_count),
+           D(stale_count),
+           D(ask_count),
+           D(forward_count),
+           D(duplicate_request_count),
+           D(source_gc_count),
+           (unsigned long long)after->gc_safe_watermark,
+           D(migration_baseline_sent),
+           D(migration_baseline_skipped),
+           D(migration_baseline_error),
+           D(migration_baseline_retry_queued),
+           D(migration_baseline_retry_sent),
+           (unsigned long long)after->migration_baseline_retry_pending);
     printf("[stats] bitmap lock_success=%llu lock_failure=%llu\n",
            D(bitmap_lock_success), D(bitmap_lock_failure));
     printf("[stats] warm regions=%llu full=%llu alloc_local=%llu alloc_remote=%llu fallback=%llu cold_spill=%llu fail=%llu evict_ok=%llu evict_fail=%llu overwrite=%llu stale_handle=%llu remote_meta_stale=%llu local_pct=%llu\n",
@@ -1442,10 +1820,27 @@ static int run_once(bench_cfg_t cfg) {
         fprintf(stderr, "vemb-inline-vector requires --transport tcp\n");
         return 1;
     }
-    printf("[setup] transport=%s mode=%s dim=%u prefill=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
+    if (cfg.client_topology_enabled) {
+        if (mode_has_write(cfg.mode) && cfg.pipeline != 1) {
+            fprintf(stderr, "--client-topology write modes require --pipeline 1\n");
+            return 1;
+        }
+        if (refresh_client_topology(&cfg) != 0) {
+            fprintf(stderr, "failed to refresh client topology\n");
+            return 1;
+        }
+        printf("[topology] epoch=%llu min_write_epoch=%llu active_owners=%u standby_owners=%u flags=0x%x\n",
+               (unsigned long long)cfg.client_topology.current_topology_epoch,
+               (unsigned long long)cfg.client_topology.min_write_epoch,
+               cfg.client_topology.active_ring.owner_count,
+               cfg.client_topology.standby_ring.owner_count,
+               cfg.client_topology.flags);
+    }
+    printf("[setup] transport=%s mode=%s dim=%u prefill=%u keyspace=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
            vemb_v16_transport_name(cfg.transport_type),
-           mode_name(cfg.mode), cfg.dim, cfg.prefill, cfg.ops, cfg.threads,
-           cfg.pipeline, cfg.pin_threads ? "yes" : "no");
+           mode_name(cfg.mode), cfg.dim, cfg.prefill,
+           workload_keyspace(&cfg), cfg.ops, cfg.threads, cfg.pipeline,
+           cfg.pin_threads ? "yes" : "no");
     if (cfg.prefill && cfg.mode != MODE_PING) {
         for (uint32_t n = 0; n < cfg.node_count; n++) {
             if (setup_node_channel(&cfg, n, 0, &pre_nodes[n]) != 0) {
@@ -1532,6 +1927,7 @@ static int run_once(bench_cfg_t cfg) {
     uint64_t wall = now_ns() - start;
 
     uint64_t ok = 0, fail = 0, read_bytes = 0, vemb_sent = 0, vadd_sent = 0, vsim_sent = 0;
+    uint64_t dual_write_sent = 0, stale_topology_refreshes = 0;
     uint64_t request_publish_spins = 0, response_empty_polls = 0;
     double score_sum = 0.0;
     uint64_t max_ns = 0;
@@ -1542,6 +1938,8 @@ static int run_once(bench_cfg_t cfg) {
         vemb_sent += args[i].vemb_sent;
         vadd_sent += args[i].vadd_sent;
         vsim_sent += args[i].vsim_sent;
+        dual_write_sent += args[i].dual_write_sent;
+        stale_topology_refreshes += args[i].stale_topology_refreshes;
         request_publish_spins += args[i].request_publish_spins;
         response_empty_polls += args[i].response_empty_polls;
         score_sum += args[i].score_sum;
@@ -1561,6 +1959,11 @@ static int run_once(bench_cfg_t cfg) {
     printf("[client] request_publish_spins=%llu response_empty_polls=%llu\n",
            (unsigned long long)request_publish_spins,
            (unsigned long long)response_empty_polls);
+    if (cfg.client_topology_enabled) {
+        printf("[client-topology] dual_write_sent=%llu stale_refreshes=%llu\n",
+               (unsigned long long)dual_write_sent,
+               (unsigned long long)stale_topology_refreshes);
+    }
     if (vemb_sent || vadd_sent || vsim_sent) {
         printf("[client] sent_vemb=%llu sent_vadd=%llu sent_vsim=%llu write_ratio=%.2f%% score_sum=%.6f\n",
                (unsigned long long)vemb_sent,
@@ -1576,8 +1979,9 @@ static int run_once(bench_cfg_t cfg) {
             fprintf(stderr, "warning: fetch stats after run failed for node=%u\n", n);
     }
     for (int i = 0; i < cfg.threads; i++) {
-        for (uint32_t n = 0; n < cfg.node_count; n++)
-            close_node_channel(cfg.socket_paths[n], &args[i].nodes[n]);
+        for (uint32_t n = 0; n < args[i].node_count; n++)
+            close_node_channel(args[i].cfg.socket_paths[n],
+                               &args[i].nodes[n]);
     }
     zfree(args);
     zfree(threads);
@@ -1651,6 +2055,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--dim") && i + 1 < argc) cfg.dim = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--prefill") && i + 1 < argc) cfg.prefill = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--keyspace") && i + 1 < argc) cfg.keyspace = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ops") && i + 1 < argc) cfg.ops = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) cfg.timeout_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--pipeline") && i + 1 < argc) cfg.pipeline = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -1673,6 +2078,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-pin")) {
             cfg.pin_threads = 0;
         }
+        else if (!strcmp(argv[i], "--client-topology")) {
+            cfg.client_topology_enabled = 1;
+        }
+        else if (!strcmp(argv[i], "--no-client-topology")) {
+            cfg.client_topology_enabled = 0;
+            cfg.client_topology_valid = 0;
+        }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) cfg.mode = mode_from_string(argv[++i]);
         else if (!strcmp(argv[i], "--vsim-key2-owner") && i + 1 < argc) {
             const char *owner = argv[++i];
@@ -1686,7 +2098,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
             return 0;
         }
         else {
@@ -1711,6 +2123,12 @@ int main(int argc, char **argv) {
     if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
         cfg.mode == MODE_VEMB_INLINE_VECTOR) {
         fprintf(stderr, "vemb-inline-vector requires --transport tcp\n");
+        return 1;
+    }
+    if (cfg.client_topology_enabled &&
+        mode_has_write(cfg.mode) &&
+        cfg.pipeline != 1) {
+        fprintf(stderr, "--client-topology write modes require --pipeline 1\n");
         return 1;
     }
     for (uint32_t n = 0; n < cfg.node_count; n++) {

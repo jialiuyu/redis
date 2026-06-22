@@ -49,6 +49,11 @@ typedef struct vemb_v16_channel_counters {
     atomic_uint_fast64_t sample_vector_load_ns;
     atomic_uint_fast64_t sample_completion_publish_ns;
     atomic_uint_fast64_t channel_ops;
+    atomic_uint_fast64_t moved_count;
+    atomic_uint_fast64_t stale_count;
+    atomic_uint_fast64_t ask_count;
+    atomic_uint_fast64_t forward_count;
+    atomic_uint_fast64_t duplicate_request_count;
     atomic_uint_fast64_t timing_job_count;
     atomic_uint_fast64_t timing_job_total_ns;
     atomic_uint_fast64_t timing_job_total_max_ns;

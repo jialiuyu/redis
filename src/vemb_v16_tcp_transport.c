@@ -571,6 +571,155 @@ static void tcp_write_status(int fd, uint8_t status, uint64_t value) {
                              sizeof(st));
 }
 
+static void tcp_handle_migration_control(vemb_v16_proxy_t *proxy,
+                                         int fd,
+                                         uint8_t type,
+                                         uint32_t payload_len) {
+    vemb_v16_migration_control_req_t req;
+    vemb_v16_migration_control_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (payload_len != sizeof(req) ||
+        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        close(fd);
+        return;
+    }
+    if (type == VEMB_V16_NET_MIGRATION_MARK_MIGRATING) {
+        (void)vemb_v16_proxy_migration_mark_migrating(proxy, &req, &resp);
+    } else if (type == VEMB_V16_NET_MIGRATION_MARK_CUTOVER) {
+        (void)vemb_v16_proxy_migration_mark_cutover(proxy, &req, &resp);
+    } else if (type == VEMB_V16_NET_MIGRATION_MARK_SOURCE_GC) {
+        (void)vemb_v16_proxy_migration_mark_source_gc(proxy, &req, &resp);
+    } else {
+        (void)vemb_v16_proxy_migration_barrier(proxy, &req, &resp);
+    }
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_MIGRATION_CONTROL_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
+static void tcp_handle_migration_control_batch(vemb_v16_proxy_t *proxy,
+                                               int fd,
+                                               uint32_t payload_len) {
+    vemb_v16_migration_control_batch_req_t req;
+    vemb_v16_migration_control_batch_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (payload_len != sizeof(req) ||
+        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        close(fd);
+        return;
+    }
+    (void)vemb_v16_proxy_migration_mark_migrating_batch(proxy, &req, &resp);
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_MIGRATION_CONTROL_BATCH_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
+static void tcp_handle_migration_range_control(vemb_v16_proxy_t *proxy,
+                                               int fd,
+                                               uint8_t type,
+                                               uint32_t payload_len) {
+    vemb_v16_migration_range_control_req_t req;
+    vemb_v16_migration_range_control_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (payload_len != sizeof(req) ||
+        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        close(fd);
+        return;
+    }
+    if (type == VEMB_V16_NET_MIGRATION_RANGE_BARRIER) {
+        (void)vemb_v16_proxy_migration_range_barrier(proxy, &req, &resp);
+    } else if (type == VEMB_V16_NET_MIGRATION_RANGE_MARK_CUTOVER) {
+        (void)vemb_v16_proxy_migration_range_mark_cutover(proxy, &req, &resp);
+    } else {
+        (void)vemb_v16_proxy_migration_range_mark_source_gc(proxy, &req, &resp);
+    }
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_MIGRATION_RANGE_CONTROL_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
+static void tcp_handle_epoch_control(vemb_v16_proxy_t *proxy,
+                                     int fd,
+                                     uint8_t type,
+                                     uint32_t payload_len) {
+    vemb_v16_epoch_control_req_t req;
+    vemb_v16_epoch_control_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (type == VEMB_V16_NET_EPOCH_SET) {
+        if (payload_len != sizeof(req) ||
+            vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+            close(fd);
+            return;
+        }
+        (void)vemb_v16_proxy_epoch_set(proxy, &req, &resp);
+    } else {
+        if (payload_len != 0) {
+            close(fd);
+            return;
+        }
+        (void)vemb_v16_proxy_epoch_get(proxy, &resp);
+    }
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_EPOCH_CONTROL_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
+static void tcp_handle_topology_control(vemb_v16_proxy_t *proxy,
+                                        int fd,
+                                        uint8_t type,
+                                        uint32_t payload_len) {
+    vemb_v16_topology_control_req_t req;
+    vemb_v16_topology_control_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (type == VEMB_V16_NET_TOPOLOGY_SET) {
+        if (payload_len != sizeof(req) ||
+            vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+            close(fd);
+            return;
+        }
+        (void)vemb_v16_proxy_topology_set(proxy, &req, &resp);
+    } else {
+        if (payload_len != 0) {
+            close(fd);
+            return;
+        }
+        (void)vemb_v16_proxy_topology_get(proxy, &resp);
+    }
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_TOPOLOGY_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
 /// TCP control plane: process one accepted TCP control or channel setup socket.
 void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     assert(proxy != NULL);
@@ -625,6 +774,44 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
         uint64_t closed = vemb_v16_proxy_close_all_channels(proxy);
         tcp_write_status(fd, VEMB_V16_STATUS_OK, closed);
         close(fd);
+        return;
+    }
+
+    if (hdr.type == VEMB_V16_NET_MIGRATION_MARK_MIGRATING ||
+        hdr.type == VEMB_V16_NET_MIGRATION_MARK_CUTOVER ||
+        hdr.type == VEMB_V16_NET_MIGRATION_MARK_SOURCE_GC ||
+        hdr.type == VEMB_V16_NET_MIGRATION_BARRIER) {
+        tcp_handle_migration_control(proxy,
+                                     fd,
+                                     hdr.type,
+                                     hdr.payload_len);
+        return;
+    }
+
+    if (hdr.type == VEMB_V16_NET_MIGRATION_MARK_MIGRATING_BATCH) {
+        tcp_handle_migration_control_batch(proxy, fd, hdr.payload_len);
+        return;
+    }
+
+    if (hdr.type == VEMB_V16_NET_MIGRATION_RANGE_BARRIER ||
+        hdr.type == VEMB_V16_NET_MIGRATION_RANGE_MARK_CUTOVER ||
+        hdr.type == VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC) {
+        tcp_handle_migration_range_control(proxy,
+                                           fd,
+                                           hdr.type,
+                                           hdr.payload_len);
+        return;
+    }
+
+    if (hdr.type == VEMB_V16_NET_EPOCH_SET ||
+        hdr.type == VEMB_V16_NET_EPOCH_GET) {
+        tcp_handle_epoch_control(proxy, fd, hdr.type, hdr.payload_len);
+        return;
+    }
+
+    if (hdr.type == VEMB_V16_NET_TOPOLOGY_SET ||
+        hdr.type == VEMB_V16_NET_TOPOLOGY_GET) {
+        tcp_handle_topology_control(proxy, fd, hdr.type, hdr.payload_len);
         return;
     }
 

@@ -34,5 +34,13 @@ void vemb_v16_ub_rpc_destroy(vemb_v16_ub_rpc_t *rpc);
 int vemb_v16_ub_rpc_lookup(void *arg,
                            const vemb_v16_ub_lookup_rpc_req_t *req,
                            vemb_v16_ub_lookup_rpc_resp_t *resp);
+int vemb_v16_ub_rpc_migrate_request(
+    void *arg,
+    const vemb_v16_ub_migration_rpc_req_t *req,
+    vemb_v16_ub_migration_rpc_resp_t *resp);
+int vemb_v16_ub_rpc_migrate_snapshot(
+    void *arg,
+    const vemb_v16_ub_migration_rpc_req_t *req,
+    vemb_v16_ub_migration_rpc_resp_t *resp);
 
 #endif

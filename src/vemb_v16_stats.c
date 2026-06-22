@@ -112,6 +112,11 @@ void vemb_v16_stats_add_channel_counters(vemb_v16_stats_t *dst,
     dst->sample_vector_load_ns += counter_load(&src->sample_vector_load_ns);
     dst->sample_completion_publish_ns += counter_load(&src->sample_completion_publish_ns);
     dst->channel_ops += counter_load(&src->channel_ops);
+    dst->moved_count += counter_load(&src->moved_count);
+    dst->stale_count += counter_load(&src->stale_count);
+    dst->ask_count += counter_load(&src->ask_count);
+    dst->forward_count += counter_load(&src->forward_count);
+    dst->duplicate_request_count += counter_load(&src->duplicate_request_count);
     dst->timing_job_count += counter_load(&src->timing_job_count);
     dst->timing_job_total_ns += counter_load(&src->timing_job_total_ns);
     stats_set_max(&dst->timing_job_total_max_ns, counter_load(&src->timing_job_total_max_ns));
@@ -162,6 +167,22 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->sample_vector_load_ns += src->sample_vector_load_ns;
     dst->sample_completion_publish_ns += src->sample_completion_publish_ns;
     dst->channel_ops += src->channel_ops;
+    dst->moved_count += src->moved_count;
+    dst->stale_count += src->stale_count;
+    dst->ask_count += src->ask_count;
+    dst->forward_count += src->forward_count;
+    dst->duplicate_request_count += src->duplicate_request_count;
+    dst->source_gc_count += src->source_gc_count;
+    if (dst->gc_safe_watermark < src->gc_safe_watermark)
+        dst->gc_safe_watermark = src->gc_safe_watermark;
+    dst->migration_baseline_sent += src->migration_baseline_sent;
+    dst->migration_baseline_skipped += src->migration_baseline_skipped;
+    dst->migration_baseline_error += src->migration_baseline_error;
+    dst->migration_baseline_retry_queued +=
+        src->migration_baseline_retry_queued;
+    dst->migration_baseline_retry_sent += src->migration_baseline_retry_sent;
+    dst->migration_baseline_retry_pending +=
+        src->migration_baseline_retry_pending;
     dst->timing_job_count += src->timing_job_count;
     dst->timing_job_total_ns += src->timing_job_total_ns;
     stats_set_max(&dst->timing_job_total_max_ns, src->timing_job_total_max_ns);

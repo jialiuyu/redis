@@ -219,6 +219,7 @@ benchmark/write_output.txt
 SVE_OPERATION_DESIGN.md
 benchmark/*_ut
 benchmark/*_bench
+benchmark/*_ctl
 /deps/lua/src/lua
 /deps/lua/src/luac
 src/vemb_v16_server

@@ -63,6 +63,22 @@ typedef struct tlc_core_warm_entry {
     atomic_int state;
 } tlc_core_warm_entry_t;
 
+typedef struct tlc_core_key_meta_entry {
+    int occupied;
+    uint32_t key_len;
+    uint64_t key_hash;
+    uint64_t key_version;
+    uint64_t topology_epoch;
+    uint64_t owner_epoch;
+    uint32_t migration_state;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t tombstone;
+    uint32_t shard_id;
+    tlc_warm_location_t location;
+    char key[VEMB_V16_MAX_KEY_LEN];
+} tlc_core_key_meta_entry_t;
+
 typedef struct tlc_core_warm_region_runtime {
     uint32_t region_id;
     uint32_t backend_type;
@@ -149,6 +165,13 @@ struct tlc_core {
     atomic_uint_fast64_t warm_same_key_overwrite;
     atomic_uint_fast64_t warm_stale_handle_reject;
     atomic_uint_fast64_t remote_meta_stale;
+    atomic_uint_fast64_t source_fence_active_count;
+    atomic_uint_fast64_t tombstone_active_count;
+    pthread_mutex_t key_meta_lock;
+    tlc_core_key_meta_entry_t *key_meta;
+    uint32_t key_meta_capacity;
+    uint32_t key_meta_mask;
+    uint32_t key_meta_count;
 };
 
 static const tlc_warm_location_t tlc_invalid_location = {
@@ -333,6 +356,193 @@ static int key_matches(uint64_t key_hash,
     return entry_hash == key_hash &&
            entry_key_len == key_len &&
            memcmp(entry_key, key, key_len) == 0;
+}
+
+static int key_meta_init(tlc_core_t *core) {
+    uint32_t capacity =
+        pow2_ceil_u32((uint64_t)core->warm_capacity * 2u);
+    if (capacity < 1024)
+        capacity = 1024;
+    core->key_meta =
+        zcalloc(sizeof(*core->key_meta) * capacity);
+    RETURN_IF(!core->key_meta, -1);
+    core->key_meta_capacity = capacity;
+    core->key_meta_mask = capacity - 1u;
+    core->key_meta_count = 0;
+    return 0;
+}
+
+static tlc_core_key_meta_entry_t *key_meta_find_locked(
+        tlc_core_t *core,
+        const char *key,
+        uint32_t key_len,
+        uint64_t key_hash) {
+    if (!core->key_meta)
+        return NULL;
+    uint32_t slot = hash_fast(key_hash, core->key_meta_mask);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        tlc_core_key_meta_entry_t *entry =
+            &core->key_meta[(slot + i) & core->key_meta_mask];
+        if (!entry->occupied)
+            return NULL;
+        if (key_matches(key_hash, key, key_len,
+                        entry->key_hash, entry->key, entry->key_len)) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static tlc_core_key_meta_entry_t *key_meta_find_or_create_locked(
+        tlc_core_t *core,
+        const char *key,
+        uint32_t key_len,
+        uint64_t key_hash) {
+    if (!core->key_meta)
+        return NULL;
+    uint32_t slot = hash_fast(key_hash, core->key_meta_mask);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        tlc_core_key_meta_entry_t *entry =
+            &core->key_meta[(slot + i) & core->key_meta_mask];
+        if (entry->occupied) {
+            if (key_matches(key_hash, key, key_len,
+                            entry->key_hash, entry->key, entry->key_len)) {
+                return entry;
+            }
+            continue;
+        }
+        if (core->key_meta_count >= core->key_meta_capacity)
+            return NULL;
+        entry->occupied = 1;
+        entry->key_hash = key_hash;
+        entry->key_len = key_len;
+        memcpy(entry->key, key, key_len);
+        entry->key_version = 0;
+        entry->topology_epoch = 0;
+        entry->owner_epoch = 0;
+        entry->migration_state = TLC_CORE_KEY_SOURCE_ACTIVE;
+        entry->source_owner = UINT32_MAX;
+        entry->target_owner = UINT32_MAX;
+        entry->tombstone = 0;
+        entry->shard_id = 0;
+        entry->location = tlc_invalid_location;
+        core->key_meta_count++;
+        return entry;
+    }
+    return NULL;
+}
+
+static void key_meta_fill_info(const tlc_core_key_meta_entry_t *entry,
+                               tlc_core_key_migration_info_t *info) {
+    if (!info)
+        return;
+    *info = (tlc_core_key_migration_info_t){
+        .key_hash = entry->key_hash,
+        .key_version = entry->key_version,
+        .topology_epoch = entry->topology_epoch,
+        .owner_epoch = entry->owner_epoch,
+        .migration_state = entry->migration_state,
+        .source_owner = entry->source_owner,
+        .target_owner = entry->target_owner,
+        .tombstone = entry->tombstone,
+        .shard_id = entry->shard_id,
+        .location = entry->location,
+    };
+}
+
+static int incoming_snapshot_is_stale(
+        const tlc_core_key_meta_entry_t *entry,
+        const tlc_core_migration_snapshot_t *snapshot) {
+    if (!entry || !snapshot)
+        return 0;
+    if (snapshot->owner_epoch < entry->owner_epoch)
+        return 1;
+    if (snapshot->topology_epoch < entry->topology_epoch)
+        return 1;
+    if (snapshot->topology_epoch == entry->topology_epoch &&
+        snapshot->key_version < entry->key_version) {
+        return 1;
+    }
+    return 0;
+}
+
+static int incoming_snapshot_is_duplicate(
+        const tlc_core_key_meta_entry_t *entry,
+        const tlc_core_migration_snapshot_t *snapshot) {
+    return entry &&
+           snapshot &&
+           snapshot->owner_epoch == entry->owner_epoch &&
+           snapshot->topology_epoch == entry->topology_epoch &&
+           snapshot->key_version == entry->key_version;
+}
+
+static int key_meta_state_blocks_source_access(uint32_t migration_state) {
+    return migration_state == TLC_CORE_KEY_CUTOVER ||
+           migration_state == TLC_CORE_KEY_SOURCE_GC;
+}
+
+int tlc_core_source_fence_active(const tlc_core_t *core) {
+    if (!core)
+        return 0;
+    return atomic_load_explicit(&core->source_fence_active_count,
+                                memory_order_acquire) != 0;
+}
+
+static int tombstone_filter_active(const tlc_core_t *core) {
+    if (!core)
+        return 0;
+    return atomic_load_explicit(&core->tombstone_active_count,
+                                memory_order_acquire) != 0;
+}
+
+static void key_meta_note_source_fence_transition(tlc_core_t *core,
+                                                  uint32_t old_state,
+                                                  uint32_t new_state) {
+    if (!key_meta_state_blocks_source_access(old_state) &&
+        key_meta_state_blocks_source_access(new_state)) {
+        atomic_fetch_add_explicit(&core->source_fence_active_count,
+                                  1,
+                                  memory_order_release);
+    }
+}
+
+static void key_meta_set_tombstone_locked(tlc_core_t *core,
+                                          tlc_core_key_meta_entry_t *meta,
+                                          uint32_t tombstone) {
+    uint32_t new_value = tombstone ? 1u : 0u;
+    if (meta->tombstone == new_value)
+        return;
+    if (new_value) {
+        atomic_fetch_add_explicit(&core->tombstone_active_count,
+                                  1,
+                                  memory_order_release);
+        meta->tombstone = 1;
+    } else {
+        meta->tombstone = 0;
+        atomic_fetch_sub_explicit(&core->tombstone_active_count,
+                                  1,
+                                  memory_order_release);
+    }
+}
+
+static int key_meta_blocks_source_access(tlc_core_t *core,
+                                         const char *key,
+                                         uint32_t key_len,
+                                         uint64_t key_hash) {
+    int source_fence_active = tlc_core_source_fence_active(core);
+    if (!source_fence_active && !tombstone_filter_active(core))
+        return 0;
+
+    int blocked = 0;
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    blocked = meta &&
+        (meta->tombstone ||
+         (source_fence_active &&
+          key_meta_state_blocks_source_access(meta->migration_state)));
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return blocked;
 }
 
 static int entry_readable(int state) {
@@ -1216,6 +1426,52 @@ static int cold_lookup(tlc_core_t *core,
     return -1;
 }
 
+static int warm_copy_location_value(tlc_core_t *core,
+                                    uint64_t key_hash,
+                                    const tlc_warm_location_t *location,
+                                    void *value_out,
+                                    uint32_t value_out_size) {
+    RETURN_IF(!location || !value_out ||
+              location->region_id == TLC_CORE_INVALID_REGION_ID ||
+              location->local_slot == TLC_CORE_INVALID_SLOT ||
+              value_out_size < core->value_size,
+              -1);
+    tlc_core_warm_layer_t *warm = &core->warm;
+    tlc_core_warm_region_runtime_t *region = NULL;
+    uint32_t region_index = location->region_index;
+    if (region_index < warm->region_count &&
+        warm->regions[region_index].region_id == location->region_id) {
+        region = &warm->regions[region_index];
+    } else {
+        for (uint32_t i = 0; i < warm->region_count; i++) {
+            if (warm->regions[i].region_id == location->region_id) {
+                region = &warm->regions[i];
+                region_index = i;
+                break;
+            }
+        }
+    }
+    RETURN_IF(!region ||
+              location->offset !=
+                  (uint64_t)location->local_slot * region->value_size ||
+              location->bytes != region->value_size,
+              -1);
+    if (warm_slot_verify_ready(region,
+                               region_index,
+                               location->local_slot,
+                               key_hash,
+                               0,
+                               location->bytes,
+                               location->owner_generation,
+                               NULL) != 0) {
+        return -1;
+    }
+    memcpy(value_out,
+           region->mapped_addr + location->offset,
+           location->bytes);
+    return 0;
+}
+
 int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     RETURN_IF(!out || !config || config->value_size == 0 ||
               config->warm_capacity == 0 ||
@@ -1242,12 +1498,16 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     atomic_init(&core->warm_same_key_overwrite, 0);
     atomic_init(&core->warm_stale_handle_reject, 0);
     atomic_init(&core->remote_meta_stale, 0);
+    atomic_init(&core->source_fence_active_count, 0);
+    atomic_init(&core->tombstone_active_count, 0);
+    pthread_mutex_init(&core->key_meta_lock, NULL);
 
     if (hot_init(core, config->hot_capacity) != 0 ||
         warm_init(core, config) != 0 ||
         cold_init(core,
                   config->cold_max_segments,
-                  config->cold_segment_records) != 0) {
+                  config->cold_segment_records) != 0 ||
+        key_meta_init(core) != 0) {
         tlc_core_destroy(core);
         return -1;
     }
@@ -1272,6 +1532,7 @@ void tlc_core_destroy(tlc_core_t *core) {
     }
     if (core->warm.regions) zfree(core->warm.regions);
     if (core->warm.vnodes) zfree(core->warm.vnodes);
+    if (core->key_meta) zfree(core->key_meta);
     if (core->cold.segments) {
         for (uint32_t i = 0; i < core->cold.max_segments; i++) {
             if (core->cold.segments[i].records)
@@ -1282,6 +1543,7 @@ void tlc_core_destroy(tlc_core_t *core) {
     }
     if (core->cold.segments) zfree(core->cold.segments);
     if (core->cold.offset_index) zfree(core->cold.offset_index);
+    pthread_mutex_destroy(&core->key_meta_lock);
     zfree(core);
 }
 
@@ -1298,11 +1560,11 @@ int tlc_core_get_warm_slot(tlc_core_t *core,
     return rc;
 }
 
-int tlc_core_get_warm_location(tlc_core_t *core,
-                               const char *key,
-                               uint32_t key_len,
-                               uint64_t key_hash,
-                               tlc_warm_location_t *location) {
+static int tlc_core_get_warm_location_raw(tlc_core_t *core,
+                                          const char *key,
+                                          uint32_t key_len,
+                                          uint64_t key_hash,
+                                          tlc_warm_location_t *location) {
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!valid_key, -1);
 
@@ -1328,6 +1590,28 @@ int tlc_core_get_warm_location(tlc_core_t *core,
     return 0;
 }
 
+int tlc_core_get_warm_location(tlc_core_t *core,
+                               const char *key,
+                               uint32_t key_len,
+                               uint64_t key_hash,
+                               tlc_warm_location_t *location) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!valid_key, -1);
+    RETURN_IF(key_meta_blocks_source_access(core, key, key_len, key_hash),
+              -1);
+
+    int rc = tlc_core_get_warm_location_raw(core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            location);
+    if (rc == 0 &&
+        key_meta_blocks_source_access(core, key, key_len, key_hash)) {
+        return -1;
+    }
+    return rc;
+}
+
 int tlc_core_put(tlc_core_t *core,
                  const char *key,
                  uint32_t key_len,
@@ -1343,6 +1627,76 @@ int tlc_core_put(tlc_core_t *core,
     return rc;
 }
 
+static int tlc_core_put_location_epoch(tlc_core_t *core,
+                                       const char *key,
+                                       uint32_t key_len,
+                                       uint64_t key_hash,
+                                       const void *value,
+                                       uint32_t value_size,
+                                       uint64_t topology_epoch,
+                                       int enforce_epoch,
+                                       tlc_warm_location_t *location) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!valid_key || value_size != core->value_size, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (tlc_core_source_fence_active(core) &&
+        meta &&
+        key_meta_state_blocks_source_access(meta->migration_state)) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (enforce_epoch && meta && topology_epoch < meta->topology_epoch) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (!meta && core->key_meta_count >= core->key_meta_capacity) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    atomic_fetch_add_explicit(&core->total_writes, 1, memory_order_relaxed);
+    int cold_rc = cold_append(core, key, key_len, key_hash, value, value_size);
+    if (cold_rc != 0) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    atomic_fetch_add_explicit(&core->write_throughs, 1, memory_order_relaxed);
+
+    if (warm_put(core, key, key_len, key_hash,
+                 value, value_size, location) == 0) {
+        meta = key_meta_find_or_create_locked(core, key, key_len, key_hash);
+        if (!meta) {
+            pthread_mutex_unlock(&core->key_meta_lock);
+            return -1;
+        }
+        meta->key_version++;
+        if (enforce_epoch && topology_epoch > meta->topology_epoch)
+            meta->topology_epoch = topology_epoch;
+        key_meta_set_tombstone_locked(core, meta, 0);
+        meta->location = *location;
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return 0;
+    }
+
+    atomic_fetch_add_explicit(&core->warm_alloc_cold_spill, 1,
+                              memory_order_relaxed);
+    *location = tlc_invalid_location;
+    meta = key_meta_find_or_create_locked(core, key, key_len, key_hash);
+    if (!meta) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    meta->key_version++;
+    if (enforce_epoch && topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = topology_epoch;
+    key_meta_set_tombstone_locked(core, meta, 0);
+    meta->location = *location;
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
 int tlc_core_put_location(tlc_core_t *core,
                           const char *key,
                           uint32_t key_len,
@@ -1350,22 +1704,66 @@ int tlc_core_put_location(tlc_core_t *core,
                           const void *value,
                           uint32_t value_size,
                           tlc_warm_location_t *location) {
+    return tlc_core_put_location_epoch(core,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       value,
+                                       value_size,
+                                       0,
+                                       0,
+                                       location);
+}
+
+int tlc_core_put_location_with_epoch(tlc_core_t *core,
+                                     const char *key,
+                                     uint32_t key_len,
+                                     uint64_t key_hash,
+                                     const void *value,
+                                     uint32_t value_size,
+                                     uint64_t topology_epoch,
+                                     tlc_warm_location_t *location) {
+    return tlc_core_put_location_epoch(core,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       value,
+                                       value_size,
+                                       topology_epoch,
+                                       1,
+                                       location);
+}
+
+int tlc_core_delete_with_epoch(tlc_core_t *core,
+                               const char *key,
+                               uint32_t key_len,
+                               uint64_t key_hash,
+                               uint64_t topology_epoch,
+                               tlc_core_key_migration_info_t *info) {
     int valid_key = key_valid(key, key_len);
-    RETURN_IF(!valid_key || value_size != core->value_size, -1);
+    RETURN_IF(!core || !valid_key, -1);
+    if (info)
+        memset(info, 0, sizeof(*info));
 
-    atomic_fetch_add_explicit(&core->total_writes, 1, memory_order_relaxed);
-    int cold_rc = cold_append(core, key, key_len, key_hash, value, value_size);
-    RETURN_IF(cold_rc != 0, -1);
-    atomic_fetch_add_explicit(&core->write_throughs, 1, memory_order_relaxed);
-
-    if (warm_put(core, key, key_len, key_hash,
-                 value, value_size, location) == 0) {
-        return 0;
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta ||
+        meta->tombstone ||
+        (tlc_core_source_fence_active(core) &&
+         key_meta_state_blocks_source_access(meta->migration_state)) ||
+        topology_epoch < meta->topology_epoch) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
     }
 
-    atomic_fetch_add_explicit(&core->warm_alloc_cold_spill, 1,
-                              memory_order_relaxed);
-    *location = tlc_invalid_location;
+    meta->key_version++;
+    if (topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = topology_epoch;
+    key_meta_set_tombstone_locked(core, meta, 1);
+    meta->location = tlc_invalid_location;
+    key_meta_fill_info(meta, info);
+    pthread_mutex_unlock(&core->key_meta_lock);
     return 0;
 }
 
@@ -1378,6 +1776,558 @@ int tlc_core_cold_append(tlc_core_t *core,
     int valid_key = key_valid(key, key_len);
     RETURN_IF(!valid_key || value_size != core->value_size, -1);
     return cold_append(core, key, key_len, key_hash, value, value_size);
+}
+
+int tlc_core_get_migration_info(tlc_core_t *core,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                tlc_core_key_migration_info_t *info) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !info || !valid_key, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    key_meta_fill_info(meta, info);
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_mark_migrating(tlc_core_t *core,
+                            const char *key,
+                            uint32_t key_len,
+                            uint64_t key_hash,
+                            uint64_t topology_epoch,
+                            uint32_t target_owner,
+                            tlc_core_key_migration_info_t *info) {
+    return tlc_core_mark_migrating_in_shard(core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            topology_epoch,
+                                            target_owner,
+                                            0,
+                                            info);
+}
+
+int tlc_core_mark_migrating_in_shard(tlc_core_t *core,
+                                     const char *key,
+                                     uint32_t key_len,
+                                     uint64_t key_hash,
+                                     uint64_t topology_epoch,
+                                     uint32_t target_owner,
+                                     uint32_t shard_id,
+                                     tlc_core_key_migration_info_t *info) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !valid_key || target_owner == UINT32_MAX, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta || meta->tombstone) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (meta->migration_state != TLC_CORE_KEY_SOURCE_ACTIVE &&
+        meta->migration_state != TLC_CORE_KEY_MIGRATING) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (meta->migration_state == TLC_CORE_KEY_MIGRATING &&
+        (meta->target_owner != target_owner ||
+         meta->shard_id != shard_id)) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (topology_epoch < meta->topology_epoch) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    meta->migration_state = TLC_CORE_KEY_MIGRATING;
+    meta->target_owner = target_owner;
+    meta->shard_id = shard_id;
+    if (topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = topology_epoch;
+    key_meta_fill_info(meta, info);
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_mark_cutover(tlc_core_t *core,
+                          const char *key,
+                          uint32_t key_len,
+                          uint64_t key_hash,
+                          uint64_t topology_epoch,
+                          uint32_t target_owner,
+                          tlc_core_key_migration_info_t *info) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !valid_key || target_owner == UINT32_MAX, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta ||
+        (meta->migration_state != TLC_CORE_KEY_MIGRATING &&
+         meta->migration_state != TLC_CORE_KEY_CUTOVER) ||
+        meta->target_owner != target_owner ||
+        topology_epoch < meta->topology_epoch) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    key_meta_note_source_fence_transition(core,
+                                          meta->migration_state,
+                                          TLC_CORE_KEY_CUTOVER);
+    meta->migration_state = TLC_CORE_KEY_CUTOVER;
+    if (topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = topology_epoch;
+    if (topology_epoch > meta->owner_epoch)
+        meta->owner_epoch = topology_epoch;
+    key_meta_fill_info(meta, info);
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_mark_source_gc(tlc_core_t *core,
+                            const char *key,
+                            uint32_t key_len,
+                            uint64_t key_hash,
+                            uint64_t topology_epoch,
+                            uint32_t target_owner,
+                            tlc_core_key_migration_info_t *info) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !valid_key || target_owner == UINT32_MAX, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta ||
+        (meta->migration_state != TLC_CORE_KEY_CUTOVER &&
+         meta->migration_state != TLC_CORE_KEY_SOURCE_GC) ||
+        meta->target_owner != target_owner ||
+        topology_epoch < meta->topology_epoch) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    key_meta_note_source_fence_transition(core,
+                                          meta->migration_state,
+                                          TLC_CORE_KEY_SOURCE_GC);
+    meta->migration_state = TLC_CORE_KEY_SOURCE_GC;
+    if (topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = topology_epoch;
+    if (topology_epoch > meta->owner_epoch)
+        meta->owner_epoch = topology_epoch;
+    key_meta_fill_info(meta, info);
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_accept_owner_lease(tlc_core_t *core,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint64_t owner_epoch,
+                                uint32_t target_owner,
+                                tlc_core_key_migration_info_t *info) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !valid_key || target_owner == UINT32_MAX, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta ||
+        meta->migration_state != TLC_CORE_KEY_DEST_COMMITTED ||
+        meta->target_owner != target_owner ||
+        topology_epoch < meta->topology_epoch ||
+        owner_epoch < meta->owner_epoch) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (topology_epoch > meta->topology_epoch)
+        meta->topology_epoch = topology_epoch;
+    if (owner_epoch > meta->owner_epoch)
+        meta->owner_epoch = owner_epoch;
+    key_meta_fill_info(meta, info);
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_key_is_source_cutover(tlc_core_t *core,
+                                   const char *key,
+                                   uint32_t key_len,
+                                   uint64_t key_hash,
+                                   tlc_core_key_migration_info_t *info) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !valid_key, -1);
+    if (!tlc_core_source_fence_active(core))
+        return 0;
+
+    int cutover = 0;
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (meta) {
+        cutover = key_meta_state_blocks_source_access(meta->migration_state);
+        if (cutover)
+            key_meta_fill_info(meta, info);
+    }
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return cutover;
+}
+
+int tlc_core_has_uncommitted_source_migrations(tlc_core_t *core) {
+    RETURN_IF(!core, 1);
+    int has_uncommitted = 0;
+    pthread_mutex_lock(&core->key_meta_lock);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        const tlc_core_key_meta_entry_t *meta = &core->key_meta[i];
+        if (meta->occupied &&
+            meta->migration_state == TLC_CORE_KEY_MIGRATING &&
+            meta->target_owner != UINT32_MAX) {
+            has_uncommitted = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return has_uncommitted;
+}
+
+int tlc_core_collect_migration_keys(tlc_core_t *core,
+                                    uint64_t topology_epoch,
+                                    uint32_t target_owner,
+                                    uint32_t shard_id,
+                                    uint32_t migration_state,
+                                    tlc_core_migration_key_ref_t *keys,
+                                    uint32_t max_keys,
+                                    uint32_t *key_count) {
+    RETURN_IF(!core || !keys || !key_count ||
+              target_owner == UINT32_MAX,
+              -1);
+    *key_count = 0;
+    pthread_mutex_lock(&core->key_meta_lock);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        const tlc_core_key_meta_entry_t *meta = &core->key_meta[i];
+        if (!meta->occupied ||
+            meta->topology_epoch != topology_epoch ||
+            meta->target_owner != target_owner ||
+            meta->shard_id != shard_id ||
+            (migration_state != UINT32_MAX &&
+             meta->migration_state != migration_state)) {
+            continue;
+        }
+        if (*key_count >= max_keys) {
+            pthread_mutex_unlock(&core->key_meta_lock);
+            return -1;
+        }
+        tlc_core_migration_key_ref_t *entry = &keys[*key_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->key_hash = meta->key_hash;
+        entry->key_len = meta->key_len;
+        memcpy(entry->key, meta->key, meta->key_len);
+        key_meta_fill_info(meta, &entry->info);
+        (*key_count)++;
+    }
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_collect_migration_keys_page(tlc_core_t *core,
+                                         uint64_t topology_epoch,
+                                         uint32_t target_owner,
+                                         uint32_t shard_id,
+                                         uint32_t migration_state,
+                                         tlc_core_migration_key_ref_t *keys,
+                                         uint32_t max_keys,
+                                         uint32_t *key_count,
+                                         uint32_t *remaining_count) {
+    RETURN_IF(!core || !keys || !key_count || !remaining_count ||
+              target_owner == UINT32_MAX || max_keys == 0,
+              -1);
+    *key_count = 0;
+    *remaining_count = 0;
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        const tlc_core_key_meta_entry_t *meta = &core->key_meta[i];
+        if (!meta->occupied ||
+            meta->topology_epoch != topology_epoch ||
+            meta->target_owner != target_owner ||
+            meta->shard_id != shard_id ||
+            (migration_state != UINT32_MAX &&
+             meta->migration_state != migration_state)) {
+            continue;
+        }
+        if (*key_count >= max_keys) {
+            (*remaining_count)++;
+            continue;
+        }
+        tlc_core_migration_key_ref_t *entry = &keys[*key_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->key_hash = meta->key_hash;
+        entry->key_len = meta->key_len;
+        memcpy(entry->key, meta->key, meta->key_len);
+        key_meta_fill_info(meta, &entry->info);
+        (*key_count)++;
+    }
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_count_migration_keys(tlc_core_t *core,
+                                  uint64_t topology_epoch,
+                                  uint32_t target_owner,
+                                  uint32_t shard_id,
+                                  uint32_t migration_state,
+                                  uint32_t *key_count) {
+    RETURN_IF(!core || !key_count || target_owner == UINT32_MAX, -1);
+    *key_count = 0;
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        const tlc_core_key_meta_entry_t *meta = &core->key_meta[i];
+        if (!meta->occupied ||
+            meta->topology_epoch != topology_epoch ||
+            meta->target_owner != target_owner ||
+            meta->shard_id != shard_id ||
+            (migration_state != UINT32_MAX &&
+             meta->migration_state != migration_state)) {
+            continue;
+        }
+        (*key_count)++;
+    }
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_collect_migration_ranges(tlc_core_t *core,
+                                      uint64_t topology_epoch,
+                                      uint32_t migration_state,
+                                      tlc_core_migration_range_ref_t *ranges,
+                                      uint32_t max_ranges,
+                                      uint32_t *range_count) {
+    RETURN_IF(!core || !ranges || !range_count || max_ranges == 0, -1);
+    *range_count = 0;
+    pthread_mutex_lock(&core->key_meta_lock);
+    for (uint32_t i = 0; i < core->key_meta_capacity; i++) {
+        const tlc_core_key_meta_entry_t *meta = &core->key_meta[i];
+        if (!meta->occupied ||
+            meta->topology_epoch != topology_epoch ||
+            meta->target_owner == UINT32_MAX ||
+            (migration_state != UINT32_MAX &&
+             meta->migration_state != migration_state)) {
+            continue;
+        }
+
+        tlc_core_migration_range_ref_t *range = NULL;
+        for (uint32_t j = 0; j < *range_count; j++) {
+            if (ranges[j].topology_epoch == meta->topology_epoch &&
+                ranges[j].target_owner == meta->target_owner &&
+                ranges[j].shard_id == meta->shard_id) {
+                range = &ranges[j];
+                break;
+            }
+        }
+        if (!range) {
+            if (*range_count >= max_ranges) {
+                pthread_mutex_unlock(&core->key_meta_lock);
+                return -1;
+            }
+            range = &ranges[*range_count];
+            memset(range, 0, sizeof(*range));
+            range->topology_epoch = meta->topology_epoch;
+            range->target_owner = meta->target_owner;
+            range->shard_id = meta->shard_id;
+            (*range_count)++;
+        }
+        range->key_count++;
+    }
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_collect_source_active_keys(tlc_core_t *core,
+                                        uint32_t *cursor,
+                                        tlc_core_migration_key_ref_t *keys,
+                                        uint32_t max_keys,
+                                        uint32_t *key_count,
+                                        int *done) {
+    RETURN_IF(!core || !cursor || !keys || !key_count || !done ||
+              max_keys == 0,
+              -1);
+    *key_count = 0;
+    *done = 0;
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    uint32_t i = *cursor;
+    for (; i < core->key_meta_capacity; i++) {
+        const tlc_core_key_meta_entry_t *meta = &core->key_meta[i];
+        if (!meta->occupied ||
+            meta->tombstone ||
+            meta->migration_state != TLC_CORE_KEY_SOURCE_ACTIVE) {
+            continue;
+        }
+        if (*key_count >= max_keys)
+            break;
+        tlc_core_migration_key_ref_t *entry = &keys[*key_count];
+        memset(entry, 0, sizeof(*entry));
+        entry->key_hash = meta->key_hash;
+        entry->key_len = meta->key_len;
+        memcpy(entry->key, meta->key, meta->key_len);
+        key_meta_fill_info(meta, &entry->info);
+        (*key_count)++;
+    }
+    *cursor = i;
+    if (i >= core->key_meta_capacity)
+        *done = 1;
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_snapshot(tlc_core_t *core,
+                      const char *key,
+                      uint32_t key_len,
+                      uint64_t key_hash,
+                      uint32_t source_owner,
+                      uint32_t target_owner,
+                      tlc_core_migration_snapshot_t *snapshot,
+                      void *value_out,
+                      uint32_t value_out_size) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !snapshot || !valid_key, -1);
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash);
+    if (!meta) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (key_meta_state_blocks_source_access(meta->migration_state)) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->key_hash = key_hash;
+    snapshot->key_len = key_len;
+    snapshot->key_version = meta->key_version;
+    snapshot->topology_epoch = meta->topology_epoch;
+    snapshot->owner_epoch = meta->owner_epoch;
+    snapshot->migration_state = meta->migration_state;
+    snapshot->source_owner = source_owner;
+    snapshot->target_owner = target_owner;
+    snapshot->tombstone = meta->tombstone;
+    snapshot->value_size = meta->tombstone ? 0 : core->value_size;
+    snapshot->shard_id = meta->shard_id;
+    snapshot->location = meta->location;
+    memcpy(snapshot->key, key, key_len);
+
+    if (snapshot->tombstone) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return 0;
+    }
+
+    tlc_warm_location_t location = tlc_invalid_location;
+    if (tlc_core_get_warm_location_raw(core, key, key_len,
+                                       key_hash, &location) != 0) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    if (warm_copy_location_value(core,
+                                 key_hash,
+                                 &location,
+                                 value_out,
+                                 value_out_size) != 0) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        return -1;
+    }
+    snapshot->location = location;
+    meta->location = location;
+    pthread_mutex_unlock(&core->key_meta_lock);
+    return 0;
+}
+
+int tlc_core_apply_migration(tlc_core_t *core,
+                             const tlc_core_migration_snapshot_t *snapshot,
+                             const void *value,
+                             uint32_t value_size,
+                             tlc_core_migration_apply_status_t *status,
+                             tlc_warm_location_t *location) {
+    RETURN_IF(!core || !snapshot || !status ||
+              snapshot->key_len == 0 ||
+              snapshot->key_len > VEMB_V16_MAX_KEY_LEN,
+              -1);
+    if (!snapshot->tombstone &&
+        (!value || value_size != core->value_size ||
+         snapshot->value_size != core->value_size)) {
+        *status = TLC_CORE_MIGRATION_ERROR;
+        return -1;
+    }
+
+    pthread_mutex_lock(&core->key_meta_lock);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_or_create_locked(core,
+                                       snapshot->key,
+                                       snapshot->key_len,
+                                       snapshot->key_hash);
+    if (!meta) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        *status = TLC_CORE_MIGRATION_ERROR;
+        return -1;
+    }
+    if (incoming_snapshot_is_stale(meta, snapshot)) {
+        pthread_mutex_unlock(&core->key_meta_lock);
+        *status = TLC_CORE_MIGRATION_STALE_REJECTED;
+        return 0;
+    }
+    if (incoming_snapshot_is_duplicate(meta, snapshot)) {
+        if (location)
+            *location = meta->location;
+        pthread_mutex_unlock(&core->key_meta_lock);
+        *status = TLC_CORE_MIGRATION_DUPLICATE;
+        return 0;
+    }
+
+    tlc_warm_location_t new_location = tlc_invalid_location;
+    if (!snapshot->tombstone) {
+        if (cold_append(core,
+                        snapshot->key,
+                        snapshot->key_len,
+                        snapshot->key_hash,
+                        value,
+                        value_size) != 0 ||
+            warm_put(core,
+                     snapshot->key,
+                     snapshot->key_len,
+                     snapshot->key_hash,
+                     value,
+                     value_size,
+                     &new_location) != 0) {
+            pthread_mutex_unlock(&core->key_meta_lock);
+            *status = TLC_CORE_MIGRATION_RETRY;
+            return 0;
+        }
+    }
+
+    meta->key_version = snapshot->key_version;
+    meta->topology_epoch = snapshot->topology_epoch;
+    meta->owner_epoch = snapshot->owner_epoch;
+    meta->migration_state = TLC_CORE_KEY_DEST_COMMITTED;
+    meta->source_owner = snapshot->source_owner;
+    meta->target_owner = snapshot->target_owner;
+    key_meta_set_tombstone_locked(core, meta, snapshot->tombstone ? 1u : 0u);
+    meta->shard_id = snapshot->shard_id;
+    meta->location = snapshot->tombstone ? tlc_invalid_location : new_location;
+    if (location)
+        *location = meta->location;
+    pthread_mutex_unlock(&core->key_meta_lock);
+    *status = TLC_CORE_MIGRATION_APPLIED;
+    return 0;
 }
 
 int tlc_core_validate_warm_location(tlc_core_t *core,

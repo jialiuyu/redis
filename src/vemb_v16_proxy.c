@@ -25,12 +25,15 @@
 #include <sys/epoll.h>
 #endif
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #define VEMB_V16_JOB_SHARD_RING_SIZE 256u
 #define VEMB_V16_COMPLETION_RING_SIZE VEMB_V16_AERON_RING_SIZE
 #define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
+#define VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US 100000u
+#define VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS 1000u
 
 static int diag_should_log_req(uint32_t req_id) {
     return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
@@ -91,6 +94,25 @@ void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
 void vemb_v16_channel_add_channel_ops(vemb_v16_channel_t *ch, uint64_t n) {
     atomic_fetch_add_explicit(&ch->stats.channel_ops, n,
                               memory_order_relaxed);
+}
+
+static void channel_note_response_status(vemb_v16_channel_t *ch,
+                                         uint8_t status) {
+    atomic_uint_fast64_t *counter = NULL;
+    switch (status) {
+    case VEMB_V16_STATUS_MOVED:
+        counter = &ch->stats.moved_count;
+        break;
+    case VEMB_V16_STATUS_STALE_TOPOLOGY:
+        counter = &ch->stats.stale_count;
+        break;
+    case VEMB_V16_STATUS_ASK:
+        counter = &ch->stats.ask_count;
+        break;
+    default:
+        return;
+    }
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
 }
 
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy) {
@@ -249,6 +271,104 @@ static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     assert(proxy->storage != NULL);
     return proxy->storage;
+}
+
+static int migration_control_req_valid(
+        const vemb_v16_migration_control_req_t *req) {
+    return req &&
+           req->key_len > 0 &&
+           req->key_len <= VEMB_V16_MAX_KEY_LEN &&
+           req->target_owner != UINT32_MAX;
+}
+
+static void migration_control_fill_resp(
+        vemb_v16_migration_control_resp_t *resp,
+        uint8_t status,
+        const tlc_core_key_migration_info_t *info) {
+    memset(resp, 0, sizeof(*resp));
+    resp->status = status;
+    if (!info)
+        return;
+    resp->key_hash = info->key_hash;
+    resp->key_version = info->key_version;
+    resp->topology_epoch = info->topology_epoch;
+    resp->owner_epoch = info->owner_epoch;
+    resp->migration_state = info->migration_state;
+    resp->target_owner = info->target_owner;
+    resp->tombstone = info->tombstone;
+    resp->shard_id = info->shard_id;
+}
+
+static void migration_control_fill_outbox(
+        vemb_v16_migration_control_resp_t *resp,
+        const vemb_v16_migration_outbox_stats_t *stats) {
+    resp->applied_seq = stats->acked_seq;
+    resp->barrier_seq = stats->barrier_seq;
+    resp->pending_delta = stats->pending_count;
+    resp->outbox_state = stats->state;
+}
+
+static void epoch_control_fill_resp(vemb_v16_proxy_t *proxy,
+                                    vemb_v16_epoch_control_resp_t *resp,
+                                    uint8_t status) {
+    memset(resp, 0, sizeof(*resp));
+    resp->status = status;
+    vemb_v16_storage_epoch_get(proxy_storage(proxy),
+                               &resp->current_topology_epoch,
+                               &resp->min_write_epoch);
+}
+
+static void topology_resp_add_local_endpoint(
+        vemb_v16_proxy_t *proxy,
+        vemb_v16_topology_control_resp_t *resp);
+
+static void topology_control_fill_resp(
+        vemb_v16_proxy_t *proxy,
+        vemb_v16_topology_control_resp_t *resp,
+        uint8_t status) {
+    memset(resp, 0, sizeof(*resp));
+    vemb_v16_storage_topology_get(proxy_storage(proxy), resp);
+    topology_resp_add_local_endpoint(proxy, resp);
+    resp->status = status;
+}
+
+static void topology_resp_upsert_endpoint(
+        vemb_v16_topology_control_resp_t *resp,
+        const vemb_v16_topology_endpoint_t *endpoint) {
+    if (endpoint->owner_id == UINT32_MAX)
+        return;
+    for (uint32_t i = 0; i < resp->endpoint_count; i++) {
+        if (resp->endpoints[i].owner_id == endpoint->owner_id) {
+            resp->endpoints[i] = *endpoint;
+            return;
+        }
+    }
+    if (resp->endpoint_count >= VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS)
+        return;
+    resp->endpoints[resp->endpoint_count++] = *endpoint;
+}
+
+static void topology_resp_add_local_endpoint(
+        vemb_v16_proxy_t *proxy,
+        vemb_v16_topology_control_resp_t *resp) {
+    vemb_v16_topology_endpoint_t endpoint = {
+        .owner_id = proxy_storage(proxy)->local_owner_id,
+    };
+    if (proxy->tcp_enabled) {
+        endpoint.transport_type = VEMB_V16_TRANSPORT_TCP;
+        endpoint.tcp_port = proxy->tcp_port;
+        strncpy(endpoint.host, proxy->tcp_host, sizeof(endpoint.host) - 1);
+        endpoint.host[sizeof(endpoint.host) - 1] = '\0';
+    } else if (proxy->uds_enabled) {
+        endpoint.transport_type = VEMB_V16_TRANSPORT_AERON;
+        strncpy(endpoint.uds_path,
+                proxy->uds_path,
+                sizeof(endpoint.uds_path) - 1);
+        endpoint.uds_path[sizeof(endpoint.uds_path) - 1] = '\0';
+    } else {
+        return;
+    }
+    topology_resp_upsert_endpoint(resp, &endpoint);
 }
 
 /// Scheduling plane: allocate the proxy-IO -> SuperNode shard queues.
@@ -437,6 +557,7 @@ void vemb_v16_make_response_from(vemb_v16_resp_t *resp,
         .region_id = completion->region_id,
         .local_slot = completion->local_slot,
         .owner_generation = completion->owner_generation,
+        .redirect_owner = completion->redirect_owner,
         .score = completion->score,
     };
 }
@@ -462,6 +583,7 @@ static void publish_response(vemb_v16_channel_t *ch,
     }
     atomic_fetch_add_explicit(&ch->stats.proxy_response_publish, 1,
                               memory_order_relaxed);
+    channel_note_response_status(ch, completion->status);
 }
 
 static vemb_v16_completion_t make_completion(vemb_v16_channel_t *ch,
@@ -505,6 +627,12 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
         atomic_fetch_add_explicit(&ch->stats.proxy_response_publish,
                                   published,
                                   memory_order_relaxed);
+        for (uint32_t i = 0; i < n; i++) {
+            if (completions[i].channel_id == ch->channel_id &&
+                atomic_load_explicit(&ch->active, memory_order_acquire)) {
+                channel_note_response_status(ch, completions[i].status);
+            }
+        }
         for (uint32_t i = 0; i < n; i++)
             completion_release_payload(&completions[i]);
     } else {
@@ -576,6 +704,7 @@ static void fill_job_base(vemb_v16_job_base_t *base,
         .channel_id = ch->channel_id,
         .key_hash = req->key_hash,
         .key2_hash = req->key2_hash,
+        .topology_epoch = req->topology_epoch,
         .dim = req->dim,
         .vector_bytes = req->vector_bytes,
     };
@@ -590,12 +719,13 @@ static int publish_request_job(vemb_v16_channel_t *ch,
                                uint32_t proxy_io_worker_id) {
     int is_ping = req->op == VEMB_V16_OP_PING;
     int is_vadd = req->op == VEMB_V16_OP_VADD_INLINE;
+    int is_vrem = req->op == VEMB_V16_OP_VREM;
     int is_vsim = req->op == VEMB_V16_OP_VSIM_INLINE;
     int has_inline_vector = is_vadd || is_vsim;
     int is_vemb = req->op == VEMB_V16_OP_VEMB_HANDLE ||
         req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ ||
         req->op == VEMB_V16_OP_VSIM_KEY_KEY;
-    RETURN_IF(!is_ping && !has_inline_vector && !is_vemb, -1);
+    RETURN_IF(!is_ping && !is_vrem && !has_inline_vector && !is_vemb, -1);
 
     vemb_v16_vadd_job_t *job = zcalloc(sizeof(*job));
     RETURN_IF(!job, -1);
@@ -1500,6 +1630,7 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
         break;
     }
     case VEMB_V16_OP_VADD_INLINE:
+    case VEMB_V16_OP_VREM:
     case VEMB_V16_OP_VSIM_INLINE:
         apply_vadd_job(ctx, job, scratch, ch);
         break;
@@ -1725,6 +1856,187 @@ static void stop_supernode_pool(vemb_v16_proxy_t *proxy) {
     proxy->supernode_pool_started = 0;
 }
 
+static void scaleout_notify_sleep(uint32_t interval_us) {
+    struct timespec ts = {
+        .tv_sec = interval_us / 1000000u,
+        .tv_nsec = (long)(interval_us % 1000000u) * 1000L,
+    };
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+static int scaleout_notify_connect_uds(const char *path, uint32_t timeout_ms) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    vemb_v16_net_set_timeouts(fd, timeout_ms);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (!path || strlen(path) >= sizeof(addr.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    strcpy(addr.sun_path, path);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int scaleout_notify_send_tcp(
+        const vemb_v16_topology_endpoint_t *endpoint,
+        const vemb_v16_scaleout_local_done_req_t *req,
+        vemb_v16_scaleout_local_done_resp_t *resp) {
+    int fd = vemb_v16_net_connect(endpoint->host,
+                                  endpoint->tcp_port,
+                                  VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS);
+    if (fd < 0)
+        return -1;
+    if (vemb_v16_net_write_frame(fd,
+                                 VEMB_V16_NET_SCALEOUT_LOCAL_DONE,
+                                 0,
+                                 0,
+                                 0,
+                                 req,
+                                 (uint32_t)sizeof(*req)) != 0) {
+        close(fd);
+        return -1;
+    }
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE ||
+        hdr.payload_len != sizeof(*resp) ||
+        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int scaleout_notify_send_uds(
+        const vemb_v16_topology_endpoint_t *endpoint,
+        const vemb_v16_scaleout_local_done_req_t *req,
+        vemb_v16_scaleout_local_done_resp_t *resp) {
+    int fd = scaleout_notify_connect_uds(
+        endpoint->uds_path,
+        VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS);
+    if (fd < 0)
+        return -1;
+    uint8_t op = VEMB_V16_CTRL_SCALEOUT_LOCAL_DONE;
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
+        vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0 ||
+        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int scaleout_notify_send(
+        const vemb_v16_topology_endpoint_t *endpoint,
+        const vemb_v16_scaleout_local_done_req_t *req,
+        vemb_v16_scaleout_local_done_resp_t *resp) {
+    memset(resp, 0, sizeof(*resp));
+    if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP)
+        return scaleout_notify_send_tcp(endpoint, req, resp);
+    if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON)
+        return scaleout_notify_send_uds(endpoint, req, resp);
+    return -1;
+}
+
+static int scaleout_notify_resp_matches(
+        const vemb_v16_scaleout_local_done_req_t *req,
+        const vemb_v16_scaleout_local_done_resp_t *resp) {
+    return resp->status == VEMB_V16_STATUS_OK &&
+           resp->migration_topology_epoch ==
+               req->migration_topology_epoch &&
+           resp->cutover_topology_epoch ==
+               req->cutover_topology_epoch &&
+           resp->source_owner == req->source_owner &&
+           resp->notify_seq == req->notify_seq;
+}
+
+static void *scaleout_notify_main(void *arg) {
+    vemb_v16_proxy_t *proxy = arg;
+    serverLog(LL_NOTICE,
+              "vemb_v16 scaleout notify worker started: interval_us=%u",
+              proxy->scaleout_notify_interval_us);
+    while (atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
+           !atomic_load_explicit(&proxy->scaleout_notify_stop,
+                                 memory_order_acquire)) {
+        vemb_v16_storage_scaleout_auto_status_t status;
+        memset(&status, 0, sizeof(status));
+        if (vemb_v16_storage_scaleout_auto_get_status(proxy_storage(proxy),
+                                                      &status) == 0 &&
+            status.enabled &&
+            status.coordinated &&
+            status.phase == VEMB_V16_STORAGE_SCALEOUT_NOTIFY_PENDING &&
+            status.coordinator_endpoint_valid) {
+            vemb_v16_scaleout_local_done_req_t req = {
+                .migration_topology_epoch = status.migration_epoch,
+                .cutover_topology_epoch = status.cutover_epoch,
+                .notify_seq = status.notify_seq,
+                .source_owner = status.source_owner,
+                .phase = status.phase,
+                .error_code = status.last_error,
+                .pending_delta = status.pending_delta,
+                .baseline_retry_pending = status.baseline_retry_pending,
+                .migrating_key_count = status.migrating_key_count,
+                .range_count = status.range_count,
+            };
+            vemb_v16_scaleout_local_done_resp_t resp;
+            memset(&resp, 0, sizeof(resp));
+            if (scaleout_notify_send(&status.coordinator_endpoint,
+                                     &req,
+                                     &resp) == 0 &&
+                scaleout_notify_resp_matches(&req, &resp)) {
+                (void)vemb_v16_storage_scaleout_auto_mark_notified(
+                    proxy_storage(proxy),
+                    req.migration_topology_epoch,
+                    req.source_owner,
+                    req.notify_seq);
+            }
+        }
+        scaleout_notify_sleep(proxy->scaleout_notify_interval_us);
+    }
+    serverLog(LL_NOTICE, "vemb_v16 scaleout notify worker stopped");
+    return NULL;
+}
+
+static int start_scaleout_notify_worker(vemb_v16_proxy_t *proxy) {
+    if (proxy->scaleout_notify_thread_started)
+        return 0;
+    proxy->scaleout_notify_interval_us =
+        proxy->scaleout_notify_interval_us ?
+            proxy->scaleout_notify_interval_us :
+            VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US;
+    atomic_store_explicit(&proxy->scaleout_notify_stop,
+                          0,
+                          memory_order_release);
+    if (pthread_create(&proxy->scaleout_notify_thread,
+                       NULL,
+                       scaleout_notify_main,
+                       proxy) != 0) {
+        return -1;
+    }
+    proxy->scaleout_notify_thread_started = 1;
+    return 0;
+}
+
+static void stop_scaleout_notify_worker(vemb_v16_proxy_t *proxy) {
+    if (!proxy->scaleout_notify_thread_started)
+        return;
+    atomic_store_explicit(&proxy->scaleout_notify_stop,
+                          1,
+                          memory_order_release);
+    pthread_join(proxy->scaleout_notify_thread, NULL);
+    proxy->scaleout_notify_thread_started = 0;
+}
+
 /// TCP control plane: write a small status response frame.
 int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
@@ -1754,6 +2066,9 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     atomic_init(&proxy->running, 0);
     atomic_init(&proxy->next_channel_id, 1);
     atomic_init(&proxy->next_channel_index, 0);
+    atomic_init(&proxy->scaleout_notify_stop, 0);
+    proxy->scaleout_notify_interval_us =
+        VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US;
     pthread_mutex_init(&proxy->stats_lock, NULL);
     proxy->storage = storage;
 
@@ -1821,6 +2136,7 @@ int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
 void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     vemb_v16_proxy_stop(proxy);
+    stop_scaleout_notify_worker(proxy);
     stop_proxy_io_pool(proxy);
     stop_supernode_pool(proxy);
     free_job_shard_queues(proxy);
@@ -1867,6 +2183,10 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
                   proxy->proxy_io_worker_count);
         goto cleanup;
     }
+    if (start_scaleout_notify_worker(proxy) != 0) {
+        serverLog(LL_WARNING, "vemb_v16 scaleout notify worker start failed");
+        goto cleanup;
+    }
 
     serverLog(LL_NOTICE, "vemb_v16 server ready: uds_enabled=%s uds=%s tcp_enabled=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s",
               proxy->uds_enabled ? "yes" : "no",
@@ -1908,6 +2228,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
 
 cleanup:
     atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+    stop_scaleout_notify_worker(proxy);
     stop_proxy_io_pool(proxy);
     stop_supernode_pool(proxy);
     free_job_shard_queues(proxy);
@@ -1926,6 +2247,263 @@ void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy) {
                                                memory_order_relaxed);
     if (!was_running) return;
     if (proxy->listen_fd >= 0) shutdown(proxy->listen_fd, SHUT_RDWR);
+}
+
+int vemb_v16_proxy_migration_mark_migrating(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp) {
+    if (!migration_control_req_valid(req)) {
+        migration_control_fill_resp(resp, VEMB_V16_STATUS_ERR, NULL);
+        return -1;
+    }
+
+    tlc_core_key_migration_info_t info = {0};
+    int rc = vemb_v16_storage_migration_mark_migrating_in_shard(
+        proxy_storage(proxy),
+        req->key,
+        req->key_len,
+        req->key_hash,
+        req->topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        &info);
+    migration_control_fill_resp(resp,
+                                rc == 0 ? VEMB_V16_STATUS_OK :
+                                    VEMB_V16_STATUS_ERR,
+                                rc == 0 ? &info : NULL);
+    return rc;
+}
+
+int vemb_v16_proxy_migration_mark_cutover(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp) {
+    if (!migration_control_req_valid(req)) {
+        migration_control_fill_resp(resp, VEMB_V16_STATUS_ERR, NULL);
+        return -1;
+    }
+
+    tlc_core_key_migration_info_t info = {0};
+    int rc = vemb_v16_storage_migration_mark_cutover_in_shard(
+        proxy_storage(proxy),
+        req->key,
+        req->key_len,
+        req->key_hash,
+        req->topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        &info);
+    migration_control_fill_resp(resp,
+                                rc == 0 ? VEMB_V16_STATUS_OK :
+                                    VEMB_V16_STATUS_ERR,
+                                rc == 0 ? &info : NULL);
+    return rc;
+}
+
+int vemb_v16_proxy_migration_mark_source_gc(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp) {
+    if (!migration_control_req_valid(req)) {
+        migration_control_fill_resp(resp, VEMB_V16_STATUS_ERR, NULL);
+        return -1;
+    }
+
+    tlc_core_key_migration_info_t info = {0};
+    int rc = vemb_v16_storage_migration_mark_source_gc_in_shard(
+        proxy_storage(proxy),
+        req->key,
+        req->key_len,
+        req->key_hash,
+        req->topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        &info);
+    migration_control_fill_resp(resp,
+                                rc == 0 ? VEMB_V16_STATUS_OK :
+                                    VEMB_V16_STATUS_ERR,
+                                rc == 0 ? &info : NULL);
+    return rc;
+}
+
+int vemb_v16_proxy_migration_barrier(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp) {
+    if (!migration_control_req_valid(req)) {
+        migration_control_fill_resp(resp, VEMB_V16_STATUS_ERR, NULL);
+        return -1;
+    }
+
+    tlc_core_key_migration_info_t info = {0};
+    vemb_v16_migration_outbox_stats_t outbox_stats = {0};
+    int rc = vemb_v16_storage_migration_barrier_in_shard(
+        proxy_storage(proxy),
+        req->key,
+        req->key_len,
+        req->key_hash,
+        req->topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        &info,
+        &outbox_stats);
+    migration_control_fill_resp(resp,
+                                rc == 0 ? VEMB_V16_STATUS_OK :
+                                    VEMB_V16_STATUS_ERR,
+                                rc == 0 ? &info : NULL);
+    if (rc == 0)
+        migration_control_fill_outbox(resp, &outbox_stats);
+    return rc;
+}
+
+int vemb_v16_proxy_migration_mark_migrating_batch(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_batch_req_t *req,
+    vemb_v16_migration_control_batch_resp_t *resp) {
+    memset(resp, 0, sizeof(*resp));
+    resp->status = VEMB_V16_STATUS_ERR;
+
+    if (!req ||
+        req->entry_count == 0 ||
+        req->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH) {
+        return -1;
+    }
+
+    resp->entry_count = req->entry_count;
+    int rc = 0;
+    for (uint32_t i = 0; i < req->entry_count; i++) {
+        if (vemb_v16_proxy_migration_mark_migrating(proxy,
+                                                    &req->entries[i],
+                                                    &resp->entries[i]) == 0) {
+            resp->success_count++;
+        } else {
+            resp->error_count++;
+            rc = -1;
+        }
+    }
+    resp->status = rc == 0 ? VEMB_V16_STATUS_OK : VEMB_V16_STATUS_ERR;
+    return rc;
+}
+
+static void migration_range_control_fill_error(
+        vemb_v16_migration_range_control_resp_t *resp,
+        const vemb_v16_migration_range_control_req_t *req) {
+    memset(resp, 0, sizeof(*resp));
+    resp->status = VEMB_V16_STATUS_ERR;
+    if (!req)
+        return;
+    resp->migration_topology_epoch = req->migration_topology_epoch;
+    resp->cutover_topology_epoch = req->cutover_topology_epoch;
+    resp->owner_epoch = req->cutover_topology_epoch;
+    resp->target_owner = req->target_owner;
+    resp->shard_id = req->shard_id;
+    resp->page_limit = req->page_limit;
+}
+
+static int migration_range_control_req_valid(
+        const vemb_v16_migration_range_control_req_t *req,
+        int need_cutover_epoch) {
+    return req &&
+           req->migration_topology_epoch != 0 &&
+           req->target_owner != UINT32_MAX &&
+           (!need_cutover_epoch ||
+            req->cutover_topology_epoch >= req->migration_topology_epoch);
+}
+
+int vemb_v16_proxy_migration_range_barrier(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_range_control_req_t *req,
+    vemb_v16_migration_range_control_resp_t *resp) {
+    if (!migration_range_control_req_valid(req, 0)) {
+        migration_range_control_fill_error(resp, req);
+        return -1;
+    }
+    return vemb_v16_storage_migration_range_barrier(
+        proxy_storage(proxy),
+        req->migration_topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        req->page_limit,
+        resp);
+}
+
+int vemb_v16_proxy_migration_range_mark_cutover(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_range_control_req_t *req,
+    vemb_v16_migration_range_control_resp_t *resp) {
+    if (!migration_range_control_req_valid(req, 1)) {
+        migration_range_control_fill_error(resp, req);
+        return -1;
+    }
+    return vemb_v16_storage_migration_range_mark_cutover(
+        proxy_storage(proxy),
+        req->migration_topology_epoch,
+        req->cutover_topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        req->page_limit,
+        resp);
+}
+
+int vemb_v16_proxy_migration_range_mark_source_gc(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_range_control_req_t *req,
+    vemb_v16_migration_range_control_resp_t *resp) {
+    if (!migration_range_control_req_valid(req, 1)) {
+        migration_range_control_fill_error(resp, req);
+        return -1;
+    }
+    return vemb_v16_storage_migration_range_mark_source_gc(
+        proxy_storage(proxy),
+        req->migration_topology_epoch,
+        req->cutover_topology_epoch,
+        req->target_owner,
+        req->shard_id,
+        req->page_limit,
+        resp);
+}
+
+int vemb_v16_proxy_epoch_set(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_epoch_control_req_t *req,
+    vemb_v16_epoch_control_resp_t *resp) {
+    int rc = (!req || req->min_write_epoch > req->current_topology_epoch) ?
+        -1 :
+        vemb_v16_storage_epoch_set(proxy_storage(proxy),
+                                   req->current_topology_epoch,
+                                   req->min_write_epoch);
+    epoch_control_fill_resp(proxy,
+                            resp,
+                            rc == 0 ? VEMB_V16_STATUS_OK :
+                                VEMB_V16_STATUS_ERR);
+    return rc;
+}
+
+int vemb_v16_proxy_epoch_get(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_epoch_control_resp_t *resp) {
+    epoch_control_fill_resp(proxy, resp, VEMB_V16_STATUS_OK);
+    return 0;
+}
+
+int vemb_v16_proxy_topology_set(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_topology_control_req_t *req,
+    vemb_v16_topology_control_resp_t *resp) {
+    int rc = vemb_v16_storage_topology_set(proxy_storage(proxy), req);
+    topology_control_fill_resp(proxy,
+                               resp,
+                               rc == 0 ? VEMB_V16_STATUS_OK :
+                                   VEMB_V16_STATUS_ERR);
+    return rc;
+}
+
+int vemb_v16_proxy_topology_get(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_topology_control_resp_t *resp) {
+    topology_control_fill_resp(proxy, resp, VEMB_V16_STATUS_OK);
+    return 0;
 }
 
 void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) {
@@ -1963,6 +2541,33 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
     vemb_v16_tlc_get_runtime_stats(proxy_storage(proxy)->tlc,
                                    &tlc_runtime_stats);
     vemb_v16_stats_add(stats, &tlc_runtime_stats);
+    stats->source_gc_count += atomic_load_explicit(
+        &proxy_storage(proxy)->migration_source_gc_count,
+        memory_order_relaxed);
+    uint64_t gc_safe_watermark = atomic_load_explicit(
+        &proxy_storage(proxy)->migration_gc_safe_watermark,
+        memory_order_relaxed);
+    if (stats->gc_safe_watermark < gc_safe_watermark)
+        stats->gc_safe_watermark = gc_safe_watermark;
+    stats->migration_baseline_sent += atomic_load_explicit(
+        &proxy_storage(proxy)->migration_baseline_sent_count,
+        memory_order_relaxed);
+    stats->migration_baseline_skipped += atomic_load_explicit(
+        &proxy_storage(proxy)->migration_baseline_skipped_count,
+        memory_order_relaxed);
+    stats->migration_baseline_error += atomic_load_explicit(
+        &proxy_storage(proxy)->migration_baseline_error_count,
+        memory_order_relaxed);
+    stats->migration_baseline_retry_queued += atomic_load_explicit(
+        &proxy_storage(proxy)->migration_baseline_retry_queued_count,
+        memory_order_relaxed);
+    stats->migration_baseline_retry_sent += atomic_load_explicit(
+        &proxy_storage(proxy)->migration_baseline_retry_sent_count,
+        memory_order_relaxed);
+    pthread_mutex_lock(&proxy_storage(proxy)->migration_outbox_lock);
+    stats->migration_baseline_retry_pending +=
+        proxy_storage(proxy)->migration_baseline_retry_count;
+    pthread_mutex_unlock(&proxy_storage(proxy)->migration_outbox_lock);
     if (proxy->job_shard_queues) {
         uint32_t count = proxy->job_shard_proxy_count *
             proxy->job_shard_supernode_count;

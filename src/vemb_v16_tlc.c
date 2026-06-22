@@ -499,6 +499,11 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     tlc->warm_region_count = warm_region_count;
     tlc_init_counters(tlc);
     atomic_init(&tlc->remote_meta_publisher, NULL);
+    if (pthread_mutex_init(&tlc->migration_progress_lock, NULL) != 0) {
+        vemb_v16_tlc_destroy(tlc);
+        return -1;
+    }
+    tlc->migration_progress_lock_init = 1;
     tlc->warm_regions = zcalloc(sizeof(vemb_v16_tlc_warm_region_t) * warm_region_count);
     if (!tlc->warm_regions) {
         vemb_v16_tlc_destroy(tlc);
@@ -549,6 +554,8 @@ void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {
     remote_meta_publisher_stop(tlc);
     bitmap_destroy(&tlc->bitmap);
     tlc_core_destroy(tlc->core);
+    if (tlc->migration_progress_lock_init)
+        pthread_mutex_destroy(&tlc->migration_progress_lock);
     if (tlc->warm_regions) zfree(tlc->warm_regions);
     zfree(tlc);
 }
@@ -732,6 +739,581 @@ int vemb_v16_tlc_lookup_rpc_local_handler(
     resp->offset = handle.offset;
     resp->bytes = handle.bytes;
     resp->owner_generation = handle.owner_generation;
+    return 0;
+}
+
+static void migration_snapshot_to_desc(
+        const tlc_core_migration_snapshot_t *snapshot,
+        vemb_v16_ub_migration_snapshot_desc_t *desc) {
+    memset(desc, 0, sizeof(*desc));
+    desc->key_hash = snapshot->key_hash;
+    desc->key_version = snapshot->key_version;
+    desc->topology_epoch = snapshot->topology_epoch;
+    desc->owner_epoch = snapshot->owner_epoch;
+    desc->key_len = snapshot->key_len;
+    desc->migration_state = snapshot->migration_state;
+    desc->source_owner = snapshot->source_owner;
+    desc->target_owner = snapshot->target_owner;
+    desc->tombstone = snapshot->tombstone;
+    desc->value_size = snapshot->value_size;
+    desc->shard_id = snapshot->shard_id;
+    desc->region_id = snapshot->location.region_id;
+    desc->local_slot = snapshot->location.local_slot;
+    desc->bytes = snapshot->location.bytes;
+    desc->offset = snapshot->location.offset;
+    desc->owner_generation = snapshot->location.owner_generation;
+    memcpy(desc->key, snapshot->key, snapshot->key_len);
+}
+
+static void migration_snapshot_desc_to_core(
+        const vemb_v16_ub_migration_snapshot_desc_t *desc,
+        tlc_core_migration_snapshot_t *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->key_hash = desc->key_hash;
+    snapshot->key_version = desc->key_version;
+    snapshot->topology_epoch = desc->topology_epoch;
+    snapshot->owner_epoch = desc->owner_epoch;
+    snapshot->key_len = desc->key_len;
+    snapshot->migration_state = desc->migration_state;
+    snapshot->source_owner = desc->source_owner;
+    snapshot->target_owner = desc->target_owner;
+    snapshot->tombstone = desc->tombstone;
+    snapshot->value_size = desc->value_size;
+    snapshot->shard_id = desc->shard_id;
+    snapshot->location = (tlc_warm_location_t){
+        .region_id = desc->region_id,
+        .region_index = UINT32_MAX,
+        .local_slot = desc->local_slot,
+        .bytes = desc->bytes,
+        .offset = desc->offset,
+        .owner_generation = desc->owner_generation,
+    };
+    memcpy(snapshot->key, desc->key, desc->key_len);
+}
+
+static void migration_delta_to_snapshot(
+        const vemb_v16_ub_migration_delta_desc_t *delta,
+        tlc_core_migration_snapshot_t *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->key_hash = delta->key_hash;
+    snapshot->key_version = delta->key_version;
+    snapshot->topology_epoch = delta->topology_epoch;
+    snapshot->owner_epoch = delta->owner_epoch;
+    snapshot->key_len = delta->key_len;
+    snapshot->migration_state = TLC_CORE_KEY_MIGRATING;
+    snapshot->source_owner = delta->source_owner;
+    snapshot->target_owner = delta->target_owner;
+    snapshot->shard_id = delta->shard_id;
+    snapshot->tombstone =
+        delta->tombstone ||
+        delta->op == VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE;
+    snapshot->value_size = snapshot->tombstone ? 0 : delta->value_size;
+    snapshot->location = (tlc_warm_location_t){
+        .region_id = delta->region_id,
+        .region_index = UINT32_MAX,
+        .local_slot = delta->local_slot,
+        .bytes = delta->bytes,
+        .offset = delta->offset,
+        .owner_generation = delta->owner_generation,
+    };
+    memcpy(snapshot->key, delta->key, delta->key_len);
+}
+
+static uint32_t migration_apply_status_to_rpc(
+        tlc_core_migration_apply_status_t status) {
+    switch (status) {
+    case TLC_CORE_MIGRATION_APPLIED:
+        return VEMB_V16_UB_MIGRATION_RPC_OK;
+    case TLC_CORE_MIGRATION_DUPLICATE:
+        return VEMB_V16_UB_MIGRATION_RPC_DUPLICATE;
+    case TLC_CORE_MIGRATION_STALE_REJECTED:
+        return VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED;
+    case TLC_CORE_MIGRATION_RETRY:
+        return VEMB_V16_UB_MIGRATION_RPC_RETRY;
+    case TLC_CORE_MIGRATION_ERROR:
+    default:
+        return VEMB_V16_UB_MIGRATION_RPC_ERROR;
+    }
+}
+
+static int migration_rpc_status_advances_progress(uint32_t status) {
+    return status == VEMB_V16_UB_MIGRATION_RPC_OK ||
+           status == VEMB_V16_UB_MIGRATION_RPC_DUPLICATE ||
+           status == VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED;
+}
+
+static int migration_progress_matches(
+        const vemb_v16_tlc_migration_progress_t *progress,
+        uint64_t topology_epoch,
+        uint32_t source_owner,
+        uint32_t target_owner,
+        uint32_t shard_id) {
+    return progress &&
+           progress->valid &&
+           progress->topology_epoch == topology_epoch &&
+           progress->source_owner == source_owner &&
+           progress->target_owner == target_owner &&
+           progress->shard_id == shard_id;
+}
+
+static vemb_v16_tlc_migration_progress_t *migration_progress_get_locked(
+        vemb_v16_tlc_t *tlc,
+        uint64_t topology_epoch,
+        uint32_t source_owner,
+        uint32_t target_owner,
+        uint32_t shard_id,
+        int create) {
+    for (uint32_t i = 0; i < tlc->migration_progress_count; i++) {
+        if (migration_progress_matches(&tlc->migration_progress[i],
+                                       topology_epoch,
+                                       source_owner,
+                                       target_owner,
+                                       shard_id)) {
+            return &tlc->migration_progress[i];
+        }
+    }
+    if (!create ||
+        tlc->migration_progress_count >= VEMB_V16_TLC_MAX_MIGRATION_PROGRESS) {
+        return NULL;
+    }
+
+    vemb_v16_tlc_migration_progress_t *progress =
+        &tlc->migration_progress[tlc->migration_progress_count++];
+    memset(progress, 0, sizeof(*progress));
+    progress->valid = 1;
+    progress->topology_epoch = topology_epoch;
+    progress->source_owner = source_owner;
+    progress->target_owner = target_owner;
+    progress->shard_id = shard_id;
+    return progress;
+}
+
+static void migration_fill_delta_ack(
+        vemb_v16_ub_migration_delta_ack_desc_t *ack,
+        const vemb_v16_ub_migration_delta_desc_t *delta,
+        uint32_t status,
+        uint64_t applied_seq,
+        uint64_t barrier_seq) {
+    memset(ack, 0, sizeof(*ack));
+    ack->topology_epoch = delta->topology_epoch;
+    ack->applied_seq = applied_seq;
+    ack->barrier_seq = barrier_seq;
+    ack->source_owner = delta->source_owner;
+    ack->target_owner = delta->target_owner;
+    ack->shard_id = delta->shard_id;
+    ack->status = status;
+}
+
+static int migration_delta_payload(
+        vemb_v16_tlc_t *tlc,
+        const vemb_v16_ub_migration_delta_desc_t *delta,
+        const void **value,
+        uint32_t *value_size) {
+    *value = NULL;
+    *value_size = 0;
+    if (delta->tombstone ||
+        delta->op == VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE) {
+        return 0;
+    }
+    if (delta->value_size != tlc->value_size ||
+        delta->bytes != tlc->value_size ||
+        delta->local_slot == TLC_CORE_INVALID_SLOT ||
+        delta->region_id == TLC_CORE_INVALID_REGION_ID) {
+        return -1;
+    }
+
+    const vemb_v16_tlc_warm_region_t *region =
+        vemb_v16_tlc_find_region(tlc, delta->region_id);
+    if (!region || !region->mapped_addr ||
+        delta->offset > region->region_bytes ||
+        delta->bytes > region->region_bytes - delta->offset) {
+        return -1;
+    }
+    *value = (const uint8_t *)region->mapped_addr + delta->offset;
+    *value_size = delta->bytes;
+    return 0;
+}
+
+static int migration_snapshot_payload(
+        vemb_v16_tlc_t *tlc,
+        const vemb_v16_ub_migration_snapshot_desc_t *snapshot,
+        const void **value,
+        uint32_t *value_size) {
+    *value = NULL;
+    *value_size = 0;
+    if (snapshot->tombstone)
+        return 0;
+    if (snapshot->value_size != tlc->value_size ||
+        snapshot->bytes != tlc->value_size ||
+        snapshot->local_slot == TLC_CORE_INVALID_SLOT ||
+        snapshot->region_id == TLC_CORE_INVALID_REGION_ID) {
+        return -1;
+    }
+
+    const vemb_v16_tlc_warm_region_t *region =
+        vemb_v16_tlc_find_region(tlc, snapshot->region_id);
+    if (!region || !region->mapped_addr ||
+        snapshot->offset > region->region_bytes ||
+        snapshot->bytes > region->region_bytes - snapshot->offset) {
+        return -1;
+    }
+    *value = (const uint8_t *)region->mapped_addr + snapshot->offset;
+    *value_size = snapshot->bytes;
+    return 0;
+}
+
+static int migration_handle_baseline_put(
+        vemb_v16_tlc_t *owner,
+        const vemb_v16_ub_migration_rpc_req_t *req,
+        vemb_v16_ub_migration_rpc_resp_t *resp) {
+    const vemb_v16_ub_migration_snapshot_desc_t *desc = &req->snapshot;
+    if (desc->key_len == 0 ||
+        desc->key_len > VEMB_V16_MAX_KEY_LEN ||
+        desc->key_len != req->key_len ||
+        desc->key_hash != req->key_hash ||
+        desc->topology_epoch != req->topology_epoch ||
+        desc->source_owner == UINT32_MAX ||
+        desc->target_owner == UINT32_MAX ||
+        desc->source_owner != req->src_owner_id ||
+        desc->target_owner != req->dst_owner_id ||
+        req->target_owner_id != desc->target_owner ||
+        memcmp(desc->key, req->key, desc->key_len) != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    const void *value = NULL;
+    uint32_t value_size = 0;
+    if (migration_snapshot_payload(owner, desc, &value, &value_size) != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    tlc_core_migration_snapshot_t snapshot = {0};
+    migration_snapshot_desc_to_core(desc, &snapshot);
+    tlc_core_migration_apply_status_t apply_status =
+        TLC_CORE_MIGRATION_ERROR;
+    vemb_v16_vector_handle_t handle = {0};
+    if (vemb_v16_tlc_apply_migration(owner,
+                                     &snapshot,
+                                     value,
+                                     value_size,
+                                     &apply_status,
+                                     &handle) != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    resp->topology_epoch = desc->topology_epoch;
+    resp->key_version = desc->key_version;
+    resp->source_owner_id = desc->source_owner;
+    resp->target_owner_id = desc->target_owner;
+    resp->snapshot = *desc;
+    resp->status = migration_apply_status_to_rpc(apply_status);
+    return 0;
+}
+
+static int migration_handle_delta(
+        vemb_v16_tlc_t *owner,
+        const vemb_v16_ub_migration_rpc_req_t *req,
+        vemb_v16_ub_migration_rpc_resp_t *resp) {
+    const vemb_v16_ub_migration_delta_desc_t *delta = &req->delta;
+    if (delta->key_len == 0 ||
+        delta->key_len > VEMB_V16_MAX_KEY_LEN ||
+        delta->delta_seq == 0 ||
+        delta->key_hash != req->key_hash ||
+        delta->source_owner == UINT32_MAX ||
+        delta->target_owner == UINT32_MAX ||
+        (delta->op != VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT &&
+         delta->op != VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE)) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    uint64_t progress_applied_seq = 0;
+    uint64_t progress_barrier_seq = 0;
+    pthread_mutex_lock(&owner->migration_progress_lock);
+    vemb_v16_tlc_migration_progress_t *progress =
+        migration_progress_get_locked(owner,
+                                      delta->topology_epoch,
+                                      delta->source_owner,
+                                      delta->target_owner,
+                                      delta->shard_id,
+                                      1);
+    if (!progress) {
+        pthread_mutex_unlock(&owner->migration_progress_lock);
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+    progress_applied_seq = progress->applied_seq;
+    progress_barrier_seq = progress->barrier_seq;
+    if (delta->delta_seq <= progress->applied_seq) {
+        migration_fill_delta_ack(&resp->delta_ack,
+                                 delta,
+                                 VEMB_V16_UB_MIGRATION_RPC_DUPLICATE,
+                                 progress->applied_seq,
+                                 progress->barrier_seq);
+        pthread_mutex_unlock(&owner->migration_progress_lock);
+        resp->topology_epoch = delta->topology_epoch;
+        resp->key_version = delta->key_version;
+        resp->source_owner_id = delta->source_owner;
+        resp->target_owner_id = delta->target_owner;
+        resp->status = resp->delta_ack.status;
+        return 0;
+    }
+    if (progress->applied_seq != 0 &&
+        delta->delta_seq > progress->applied_seq + 1) {
+        migration_fill_delta_ack(&resp->delta_ack,
+                                 delta,
+                                 VEMB_V16_UB_MIGRATION_RPC_RETRY,
+                                 progress->applied_seq,
+                                 progress->barrier_seq);
+        pthread_mutex_unlock(&owner->migration_progress_lock);
+        resp->topology_epoch = delta->topology_epoch;
+        resp->key_version = delta->key_version;
+        resp->source_owner_id = delta->source_owner;
+        resp->target_owner_id = delta->target_owner;
+        resp->status = resp->delta_ack.status;
+        return 0;
+    }
+    pthread_mutex_unlock(&owner->migration_progress_lock);
+
+    const void *value = NULL;
+    uint32_t value_size = 0;
+    if (migration_delta_payload(owner, delta, &value, &value_size) != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    tlc_core_migration_snapshot_t snapshot = {0};
+    migration_delta_to_snapshot(delta, &snapshot);
+    tlc_core_migration_apply_status_t apply_status =
+        TLC_CORE_MIGRATION_ERROR;
+    vemb_v16_vector_handle_t handle = {0};
+    if (vemb_v16_tlc_apply_migration(owner,
+                                     &snapshot,
+                                     value,
+                                     value_size,
+                                     &apply_status,
+                                     &handle) != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+    resp->topology_epoch = delta->topology_epoch;
+    resp->key_version = delta->key_version;
+    resp->source_owner_id = delta->source_owner;
+    resp->target_owner_id = delta->target_owner;
+    uint32_t rpc_status = migration_apply_status_to_rpc(apply_status);
+    if (migration_rpc_status_advances_progress(rpc_status)) {
+        pthread_mutex_lock(&owner->migration_progress_lock);
+        progress = migration_progress_get_locked(owner,
+                                                 delta->topology_epoch,
+                                                 delta->source_owner,
+                                                 delta->target_owner,
+                                                 delta->shard_id,
+                                                 1);
+        if (progress) {
+            if (delta->delta_seq > progress->applied_seq)
+                progress->applied_seq = delta->delta_seq;
+            progress_applied_seq = progress->applied_seq;
+            progress_barrier_seq = progress->barrier_seq;
+        }
+        pthread_mutex_unlock(&owner->migration_progress_lock);
+    }
+    migration_fill_delta_ack(&resp->delta_ack,
+                             delta,
+                             rpc_status,
+                             progress_applied_seq,
+                             progress_barrier_seq);
+    resp->status = resp->delta_ack.status;
+    return 0;
+}
+
+static int migration_handle_barrier(
+        vemb_v16_tlc_t *owner,
+        const vemb_v16_ub_migration_rpc_req_t *req,
+        vemb_v16_ub_migration_rpc_resp_t *resp) {
+    const vemb_v16_ub_migration_barrier_desc_t *barrier = &req->barrier;
+    if (barrier->source_owner == UINT32_MAX ||
+        barrier->target_owner == UINT32_MAX ||
+        req->key_len > VEMB_V16_MAX_KEY_LEN) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    pthread_mutex_lock(&owner->migration_progress_lock);
+    vemb_v16_tlc_migration_progress_t *progress =
+        migration_progress_get_locked(owner,
+                                      barrier->topology_epoch,
+                                      barrier->source_owner,
+                                      barrier->target_owner,
+                                      barrier->shard_id,
+                                      1);
+    if (!progress) {
+        pthread_mutex_unlock(&owner->migration_progress_lock);
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+    if (barrier->barrier_seq > progress->barrier_seq)
+        progress->barrier_seq = barrier->barrier_seq;
+    uint64_t applied_seq = progress->applied_seq;
+    uint64_t barrier_seq = progress->barrier_seq;
+    uint32_t status = applied_seq >= barrier_seq ?
+        VEMB_V16_UB_MIGRATION_RPC_OK :
+        VEMB_V16_UB_MIGRATION_RPC_RETRY;
+    pthread_mutex_unlock(&owner->migration_progress_lock);
+
+    if (status == VEMB_V16_UB_MIGRATION_RPC_OK && req->key_len > 0) {
+        tlc_core_key_migration_info_t info = {0};
+        if (vemb_v16_tlc_get_migration_info(owner,
+                                            req->key,
+                                            req->key_len,
+                                            req->key_hash,
+                                            &info) != 0 ||
+            info.migration_state != TLC_CORE_KEY_DEST_COMMITTED ||
+            info.target_owner != barrier->target_owner ||
+            info.topology_epoch < barrier->topology_epoch) {
+            status = VEMB_V16_UB_MIGRATION_RPC_RETRY;
+        } else {
+            resp->key_hash = req->key_hash;
+            resp->key_version = info.key_version;
+        }
+    }
+
+    resp->topology_epoch = barrier->topology_epoch;
+    resp->source_owner_id = barrier->source_owner;
+    resp->target_owner_id = barrier->target_owner;
+    resp->barrier = *barrier;
+    resp->barrier.barrier_seq = barrier_seq;
+    resp->delta_ack = (vemb_v16_ub_migration_delta_ack_desc_t){
+        .topology_epoch = barrier->topology_epoch,
+        .applied_seq = applied_seq,
+        .barrier_seq = barrier_seq,
+        .source_owner = barrier->source_owner,
+        .target_owner = barrier->target_owner,
+        .shard_id = barrier->shard_id,
+        .status = status,
+    };
+    resp->status = status;
+    return 0;
+}
+
+static int migration_handle_lease_commit(
+        vemb_v16_tlc_t *owner,
+        const vemb_v16_ub_migration_rpc_req_t *req,
+        vemb_v16_ub_migration_rpc_resp_t *resp) {
+    const vemb_v16_ub_migration_lease_desc_t *lease = &req->lease;
+    if (req->key_len == 0 ||
+        req->key_len > VEMB_V16_MAX_KEY_LEN ||
+        lease->source_owner == UINT32_MAX ||
+        lease->target_owner == UINT32_MAX ||
+        lease->owner_epoch == 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    tlc_core_key_migration_info_t info = {0};
+    if (vemb_v16_tlc_accept_owner_lease(owner,
+                                        req->key,
+                                        req->key_len,
+                                        req->key_hash,
+                                        lease->topology_epoch,
+                                        lease->owner_epoch,
+                                        lease->target_owner,
+                                        &info) != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_RETRY;
+        return 0;
+    }
+
+    resp->topology_epoch = info.topology_epoch;
+    resp->key_version = info.key_version;
+    resp->source_owner_id = lease->source_owner;
+    resp->target_owner_id = lease->target_owner;
+    resp->lease = *lease;
+    resp->lease.owner_epoch = info.owner_epoch;
+    resp->status = VEMB_V16_UB_MIGRATION_RPC_OK;
+    return 0;
+}
+
+int vemb_v16_tlc_migration_rpc_local_handler(
+    void *arg,
+    const vemb_v16_ub_migration_rpc_req_t *req,
+    vemb_v16_ub_migration_rpc_resp_t *resp) {
+    vemb_v16_tlc_t *owner = arg;
+    RETURN_IF(!owner || !req || !resp, -1);
+    memset(resp, 0, sizeof(*resp));
+    resp->request_id = req->request_id;
+    resp->op = req->op;
+    resp->key_hash = req->key_hash;
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT ||
+        req->op == VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE) {
+        return migration_handle_delta(owner, req, resp);
+    }
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_BASELINE_PUT) {
+        return migration_handle_baseline_put(owner, req, resp);
+    }
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_BARRIER_REQ) {
+        return migration_handle_barrier(owner, req, resp);
+    }
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_LEASE_COMMIT_REQ) {
+        return migration_handle_lease_commit(owner, req, resp);
+    }
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_DELTA_ACK) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_OK;
+        resp->delta_ack = req->delta_ack;
+        return 0;
+    }
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_BARRIER_RESP) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_OK;
+        resp->barrier = req->barrier;
+        return 0;
+    }
+
+    if (req->op == VEMB_V16_UB_MIGRATION_RPC_LEASE_COMMIT_RESP) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_OK;
+        resp->lease = req->lease;
+        return 0;
+    }
+
+    if (req->op != VEMB_V16_UB_MIGRATION_RPC_SNAPSHOT_REQ) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+    if (req->key_len == 0 || req->key_len > VEMB_V16_MAX_KEY_LEN) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        return 0;
+    }
+
+    uint8_t snapshot_value[VEMB_V16_MAX_DIM * sizeof(float)];
+    tlc_core_migration_snapshot_t snapshot = {0};
+    uint32_t target_owner = req->target_owner_id;
+    if (target_owner == UINT32_MAX)
+        target_owner = req->src_owner_id;
+    int rc = vemb_v16_tlc_snapshot(owner,
+                                   req->key,
+                                   req->key_len,
+                                   req->key_hash,
+                                   req->dst_owner_id,
+                                   target_owner,
+                                   &snapshot,
+                                   snapshot_value,
+                                   sizeof(snapshot_value));
+    if (rc != 0) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_NOT_FOUND;
+        return 0;
+    }
+    migration_snapshot_to_desc(&snapshot, &resp->snapshot);
+    resp->topology_epoch = snapshot.topology_epoch;
+    resp->key_version = snapshot.key_version;
+    resp->source_owner_id = snapshot.source_owner;
+    resp->target_owner_id = snapshot.target_owner;
+    resp->status = VEMB_V16_UB_MIGRATION_RPC_OK;
     return 0;
 }
 
@@ -1010,6 +1592,51 @@ int vemb_v16_tlc_put(vemb_v16_tlc_t *tlc,
     return 0;
 }
 
+int vemb_v16_tlc_put_with_epoch(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const float *vector,
+                                uint32_t vector_bytes,
+                                uint64_t topology_epoch,
+                                vemb_v16_vector_handle_t *handle,
+                                uint32_t *warm_slot) {
+    tlc_warm_location_t location = {0};
+    if (tlc_core_put_location_with_epoch(tlc->core,
+                                         key,
+                                         key_len,
+                                         key_hash,
+                                         vector,
+                                         vector_bytes,
+                                         topology_epoch,
+                                         &location) != 0) {
+        return -1;
+    }
+    *warm_slot = location.local_slot;
+    if (location.local_slot == TLC_CORE_INVALID_SLOT ||
+        location.region_id == TLC_CORE_INVALID_REGION_ID) {
+        memset(handle, 0, sizeof(*handle));
+        return 0;
+    }
+    make_handle(tlc, key_hash, &location, handle);
+    return 0;
+}
+
+int vemb_v16_tlc_delete_with_epoch(vemb_v16_tlc_t *tlc,
+                                   const char *key,
+                                   uint32_t key_len,
+                                   uint64_t key_hash,
+                                   uint64_t topology_epoch,
+                                   tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_delete_with_epoch(tlc->core,
+                                      key,
+                                      key_len,
+                                      key_hash,
+                                      topology_epoch,
+                                      info);
+}
+
 int vemb_v16_tlc_cold_append(vemb_v16_tlc_t *tlc,
                              const char *key,
                              uint32_t key_len,
@@ -1018,6 +1645,313 @@ int vemb_v16_tlc_cold_append(vemb_v16_tlc_t *tlc,
                              uint32_t vector_bytes) {
     return tlc_core_cold_append(tlc->core, key, key_len, key_hash,
                                 vector, vector_bytes);
+}
+
+int vemb_v16_tlc_get_migration_info(vemb_v16_tlc_t *tlc,
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_get_migration_info(tlc->core,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       info);
+}
+
+int vemb_v16_tlc_mark_migrating(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                tlc_core_key_migration_info_t *info) {
+    return vemb_v16_tlc_mark_migrating_in_shard(tlc,
+                                                key,
+                                                key_len,
+                                                key_hash,
+                                                topology_epoch,
+                                                target_owner,
+                                                0,
+                                                info);
+}
+
+int vemb_v16_tlc_mark_migrating_in_shard(
+                                vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_mark_migrating_in_shard(tlc->core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            topology_epoch,
+                                            target_owner,
+                                            shard_id,
+                                            info);
+}
+
+int vemb_v16_tlc_mark_cutover(vemb_v16_tlc_t *tlc,
+                              const char *key,
+                              uint32_t key_len,
+                              uint64_t key_hash,
+                              uint64_t topology_epoch,
+                              uint32_t target_owner,
+                              tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_mark_cutover(tlc->core,
+                                 key,
+                                 key_len,
+                                 key_hash,
+                                 topology_epoch,
+                                 target_owner,
+                                 info);
+}
+
+int vemb_v16_tlc_mark_source_gc(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_mark_source_gc(tlc->core,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   topology_epoch,
+                                   target_owner,
+                                   info);
+}
+
+int vemb_v16_tlc_accept_owner_lease(vemb_v16_tlc_t *tlc,
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    uint64_t topology_epoch,
+                                    uint64_t owner_epoch,
+                                    uint32_t target_owner,
+                                    tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_accept_owner_lease(tlc->core,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       topology_epoch,
+                                       owner_epoch,
+                                       target_owner,
+                                       info);
+}
+
+int vemb_v16_tlc_migration_progress_ready(vemb_v16_tlc_t *tlc,
+                                          uint32_t source_owner,
+                                          uint32_t target_owner,
+                                          uint32_t shard_id,
+                                          uint64_t max_topology_epoch,
+                                          uint64_t *topology_epoch,
+                                          uint64_t *applied_seq,
+                                          uint64_t *barrier_seq) {
+    RETURN_IF(!tlc || source_owner == UINT32_MAX ||
+              target_owner == UINT32_MAX,
+              0);
+    if (topology_epoch)
+        *topology_epoch = 0;
+    if (applied_seq)
+        *applied_seq = 0;
+    if (barrier_seq)
+        *barrier_seq = 0;
+
+    uint32_t found = 0;
+    vemb_v16_tlc_migration_progress_t best;
+    memset(&best, 0, sizeof(best));
+    pthread_mutex_lock(&tlc->migration_progress_lock);
+    for (uint32_t i = 0; i < tlc->migration_progress_count; i++) {
+        const vemb_v16_tlc_migration_progress_t *progress =
+            &tlc->migration_progress[i];
+        if (!progress->valid ||
+            progress->source_owner != source_owner ||
+            progress->target_owner != target_owner ||
+            progress->shard_id != shard_id ||
+            progress->topology_epoch > max_topology_epoch) {
+            continue;
+        }
+        if (!found || progress->topology_epoch > best.topology_epoch) {
+            best = *progress;
+            found = 1;
+        }
+    }
+    pthread_mutex_unlock(&tlc->migration_progress_lock);
+    if (!found)
+        return 0;
+
+    if (topology_epoch)
+        *topology_epoch = best.topology_epoch;
+    if (applied_seq)
+        *applied_seq = best.applied_seq;
+    if (barrier_seq)
+        *barrier_seq = best.barrier_seq;
+    return best.applied_seq >= best.barrier_seq;
+}
+
+int vemb_v16_tlc_key_is_source_cutover(vemb_v16_tlc_t *tlc,
+                                       const char *key,
+                                       uint32_t key_len,
+                                       uint64_t key_hash,
+                                       tlc_core_key_migration_info_t *info) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_key_is_source_cutover(tlc->core,
+                                          key,
+                                          key_len,
+                                          key_hash,
+                                          info);
+}
+
+int vemb_v16_tlc_has_uncommitted_source_migrations(vemb_v16_tlc_t *tlc) {
+    RETURN_IF(!tlc, 1);
+    return tlc_core_has_uncommitted_source_migrations(tlc->core);
+}
+
+int vemb_v16_tlc_collect_migration_keys(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                uint32_t migration_state,
+                                tlc_core_migration_key_ref_t *keys,
+                                uint32_t max_keys,
+                                uint32_t *key_count) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_collect_migration_keys(tlc->core,
+                                           topology_epoch,
+                                           target_owner,
+                                           shard_id,
+                                           migration_state,
+                                           keys,
+                                           max_keys,
+                                           key_count);
+}
+
+int vemb_v16_tlc_collect_migration_keys_page(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                uint32_t migration_state,
+                                tlc_core_migration_key_ref_t *keys,
+                                uint32_t max_keys,
+                                uint32_t *key_count,
+                                uint32_t *remaining_count) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_collect_migration_keys_page(tlc->core,
+                                                topology_epoch,
+                                                target_owner,
+                                                shard_id,
+                                                migration_state,
+                                                keys,
+                                                max_keys,
+                                                key_count,
+                                                remaining_count);
+}
+
+int vemb_v16_tlc_count_migration_keys(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                uint32_t migration_state,
+                                uint32_t *key_count) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_count_migration_keys(tlc->core,
+                                         topology_epoch,
+                                         target_owner,
+                                         shard_id,
+                                         migration_state,
+                                         key_count);
+}
+
+int vemb_v16_tlc_collect_migration_ranges(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t migration_state,
+                                tlc_core_migration_range_ref_t *ranges,
+                                uint32_t max_ranges,
+                                uint32_t *range_count) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_collect_migration_ranges(tlc->core,
+                                             topology_epoch,
+                                             migration_state,
+                                             ranges,
+                                             max_ranges,
+                                             range_count);
+}
+
+int vemb_v16_tlc_collect_source_active_keys(
+                                vemb_v16_tlc_t *tlc,
+                                uint32_t *cursor,
+                                tlc_core_migration_key_ref_t *keys,
+                                uint32_t max_keys,
+                                uint32_t *key_count,
+                                int *done) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_collect_source_active_keys(tlc->core,
+                                               cursor,
+                                               keys,
+                                               max_keys,
+                                               key_count,
+                                               done);
+}
+
+int vemb_v16_tlc_snapshot(vemb_v16_tlc_t *tlc,
+                          const char *key,
+                          uint32_t key_len,
+                          uint64_t key_hash,
+                          uint32_t source_owner,
+                          uint32_t target_owner,
+                          tlc_core_migration_snapshot_t *snapshot,
+                          void *value_out,
+                          uint32_t value_out_size) {
+    RETURN_IF(!tlc, -1);
+    return tlc_core_snapshot(tlc->core,
+                             key,
+                             key_len,
+                             key_hash,
+                             source_owner,
+                             target_owner,
+                             snapshot,
+                             value_out,
+                             value_out_size);
+}
+
+int vemb_v16_tlc_apply_migration(vemb_v16_tlc_t *tlc,
+                                 const tlc_core_migration_snapshot_t *snapshot,
+                                 const void *value,
+                                 uint32_t value_size,
+                                 tlc_core_migration_apply_status_t *status,
+                                 vemb_v16_vector_handle_t *handle) {
+    RETURN_IF(!tlc, -1);
+    tlc_warm_location_t location = {0};
+    int rc = tlc_core_apply_migration(tlc->core,
+                                      snapshot,
+                                      value,
+                                      value_size,
+                                      status,
+                                      &location);
+    if (rc == 0 && handle &&
+        status &&
+        *status == TLC_CORE_MIGRATION_APPLIED &&
+        !snapshot->tombstone) {
+        make_handle(tlc, snapshot->key_hash, &location, handle);
+    } else if (handle) {
+        memset(handle, 0, sizeof(*handle));
+    }
+    return rc;
 }
 
 const vemb_v16_tlc_warm_region_t *vemb_v16_tlc_find_region(

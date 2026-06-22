@@ -29,13 +29,23 @@
 typedef struct vemb_v16_ub_rpc_wire_req {
     uint32_t magic;
     uint32_t version;
-    vemb_v16_ub_lookup_rpc_req_t req;
+    uint32_t kind;
+    uint32_t reserved0;
+    union {
+        vemb_v16_ub_lookup_rpc_req_t lookup;
+        vemb_v16_ub_migration_rpc_req_t migration;
+    } u;
 } vemb_v16_ub_rpc_wire_req_t;
 
 typedef struct vemb_v16_ub_rpc_wire_resp {
     uint32_t magic;
     uint32_t version;
-    vemb_v16_ub_lookup_rpc_resp_t resp;
+    uint32_t kind;
+    uint32_t reserved0;
+    union {
+        vemb_v16_ub_lookup_rpc_resp_t lookup;
+        vemb_v16_ub_migration_rpc_resp_t migration;
+    } u;
 } vemb_v16_ub_rpc_wire_resp_t;
 
 typedef struct vemb_v16_ub_rpc_ring_slot {
@@ -77,7 +87,7 @@ typedef struct vemb_v16_ub_rpc_pending {
     atomic_uint state;
     uint32_t reserved0;
     atomic_uint_fast64_t request_id;
-    vemb_v16_ub_lookup_rpc_resp_t resp;
+    vemb_v16_ub_rpc_wire_resp_t resp;
 } vemb_v16_ub_rpc_pending_t;
 
 typedef struct vemb_v16_ub_rpc_peer_state {
@@ -116,6 +126,76 @@ static uint64_t timeout_from_req_ns(const vemb_v16_ub_rpc_t *rpc,
     uint32_t timeout_ms = rpc->timeout_ms ? rpc->timeout_ms :
         VEMB_V16_UB_RPC_DEFAULT_TIMEOUT_MS;
     return (uint64_t)timeout_ms * 1000000ull;
+}
+
+static uint64_t timeout_from_migration_req_ns(
+        const vemb_v16_ub_rpc_t *rpc,
+        const vemb_v16_ub_migration_rpc_req_t *req) {
+    if (req && req->timeout_ns)
+        return req->timeout_ns;
+    uint32_t timeout_ms = rpc->timeout_ms ? rpc->timeout_ms :
+        VEMB_V16_UB_RPC_DEFAULT_TIMEOUT_MS;
+    return (uint64_t)timeout_ms * 1000000ull;
+}
+
+static uint64_t wire_req_request_id(
+        const vemb_v16_ub_rpc_wire_req_t *wire_req) {
+    if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        return wire_req->u.migration.request_id;
+    return wire_req->u.lookup.request_id;
+}
+
+static uint64_t wire_resp_request_id(
+        const vemb_v16_ub_rpc_wire_resp_t *wire_resp) {
+    if (wire_resp->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        return wire_resp->u.migration.request_id;
+    return wire_resp->u.lookup.request_id;
+}
+
+static uint64_t wire_req_key_hash(
+        const vemb_v16_ub_rpc_wire_req_t *wire_req) {
+    if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        return wire_req->u.migration.key_hash;
+    return wire_req->u.lookup.key_hash;
+}
+
+static uint64_t wire_resp_key_hash(
+        const vemb_v16_ub_rpc_wire_resp_t *wire_resp) {
+    if (wire_resp->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        return wire_resp->u.migration.key_hash;
+    return wire_resp->u.lookup.key_hash;
+}
+
+static uint32_t wire_req_src_owner(
+        const vemb_v16_ub_rpc_wire_req_t *wire_req) {
+    if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        return wire_req->u.migration.src_owner_id;
+    return wire_req->u.lookup.src_owner_id;
+}
+
+static uint32_t wire_req_dst_owner(
+        const vemb_v16_ub_rpc_wire_req_t *wire_req) {
+    if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        return wire_req->u.migration.dst_owner_id;
+    return wire_req->u.lookup.dst_owner_id;
+}
+
+static uint64_t timeout_from_wire_req_ns(
+        const vemb_v16_ub_rpc_t *rpc,
+        const vemb_v16_ub_rpc_wire_req_t *wire_req) {
+    if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION) {
+        return timeout_from_migration_req_ns(rpc,
+                                             &wire_req->u.migration);
+    }
+    return timeout_from_req_ns(rpc, &wire_req->u.lookup);
+}
+
+static void wire_resp_set_status(vemb_v16_ub_rpc_wire_resp_t *wire_resp,
+                                 uint32_t status) {
+    if (wire_resp->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        wire_resp->u.migration.status = status;
+    else
+        wire_resp->u.lookup.status = status;
 }
 
 static void tiny_pause(void) {
@@ -369,9 +449,9 @@ static vemb_v16_ub_rpc_pending_t *pending_find(
 }
 
 static int pending_complete(vemb_v16_ub_rpc_peer_state_t *peer,
-                            const vemb_v16_ub_lookup_rpc_resp_t *resp) {
+                            const vemb_v16_ub_rpc_wire_resp_t *resp) {
     vemb_v16_ub_rpc_pending_t *slot =
-        pending_find(peer, resp->request_id);
+        pending_find(peer, wire_resp_request_id(resp));
     if (!slot)
         return -1;
     uint32_t expected = VEMB_V16_UB_RPC_PENDING_WAITING;
@@ -393,8 +473,8 @@ static int pending_complete(vemb_v16_ub_rpc_peer_state_t *peer,
 static int pending_wait(vemb_v16_ub_rpc_t *rpc,
                         vemb_v16_ub_rpc_peer_state_t *peer,
                         vemb_v16_ub_rpc_pending_t *slot,
-                        const vemb_v16_ub_lookup_rpc_req_t *req,
-                        vemb_v16_ub_lookup_rpc_resp_t *resp,
+                        const vemb_v16_ub_rpc_wire_req_t *req,
+                        vemb_v16_ub_rpc_wire_resp_t *resp,
                         uint64_t deadline_ns) {
     (void)peer;
     while (atomic_load_explicit(&rpc->running, memory_order_acquire)) {
@@ -415,13 +495,29 @@ static int pending_wait(vemb_v16_ub_rpc_t *rpc,
                     VEMB_V16_UB_RPC_PENDING_EMPTY,
                     memory_order_acq_rel,
                     memory_order_relaxed)) {
-                resp->status = VEMB_V16_UB_LOOKUP_RPC_TIMEOUT;
+                resp->magic = VEMB_V16_UB_RPC_MAGIC;
+                resp->version = VEMB_V16_UB_RPC_VERSION;
+                resp->kind = req->kind;
+                if (resp->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION) {
+                    resp->u.migration.request_id =
+                        req->u.migration.request_id;
+                    resp->u.migration.key_hash = req->u.migration.key_hash;
+                    resp->u.migration.op = req->u.migration.op;
+                    wire_resp_set_status(
+                        resp,
+                        VEMB_V16_UB_MIGRATION_RPC_TIMEOUT);
+                } else {
+                    resp->u.lookup.request_id = req->u.lookup.request_id;
+                    resp->u.lookup.key_hash = req->u.lookup.key_hash;
+                    wire_resp_set_status(resp,
+                                         VEMB_V16_UB_LOOKUP_RPC_TIMEOUT);
+                }
                 log_limited(&rpc->timeout_logs,
                             LL_NOTICE,
                             "vemb_v16 ub rpc response timeout: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
-                            req->dst_owner_id,
-                            req->request_id,
-                            req->key_hash,
+                            wire_req_dst_owner(req),
+                            wire_req_request_id(req),
+                            wire_req_key_hash(req),
                             NULL,
                             ETIMEDOUT);
                 return -1;
@@ -429,7 +525,13 @@ static int pending_wait(vemb_v16_ub_rpc_t *rpc,
         }
         tiny_pause();
     }
-    resp->status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
+    resp->magic = VEMB_V16_UB_RPC_MAGIC;
+    resp->version = VEMB_V16_UB_RPC_VERSION;
+    resp->kind = req->kind;
+    wire_resp_set_status(resp,
+                         req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION ?
+                             VEMB_V16_UB_MIGRATION_RPC_ERROR :
+                             VEMB_V16_UB_LOOKUP_RPC_ERROR);
     return -1;
 }
 
@@ -532,7 +634,8 @@ int vemb_v16_ub_rpc_lookup(void *arg,
     vemb_v16_ub_rpc_wire_req_t wire_req = {
         .magic = VEMB_V16_UB_RPC_MAGIC,
         .version = VEMB_V16_UB_RPC_VERSION,
-        .req = *req,
+        .kind = VEMB_V16_UB_RPC_FRAME_LOOKUP,
+        .u.lookup = *req,
     };
     uint64_t timeout_ns = timeout_from_req_ns(rpc, req);
     uint64_t deadline_ns = rpc_now_ns() + timeout_ns;
@@ -551,32 +654,131 @@ int vemb_v16_ub_rpc_lookup(void *arg,
         return 0;
     }
 
-    (void)pending_wait(rpc, peer, pending, req, resp, deadline_ns);
+    vemb_v16_ub_rpc_wire_resp_t wire_resp;
+    memset(&wire_resp, 0, sizeof(wire_resp));
+    (void)pending_wait(rpc, peer, pending, &wire_req, &wire_resp,
+                       deadline_ns);
+    if (wire_resp.kind == VEMB_V16_UB_RPC_FRAME_LOOKUP)
+        *resp = wire_resp.u.lookup;
+    else
+        resp->status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
     return 0;
+}
+
+int vemb_v16_ub_rpc_migrate_request(
+    void *arg,
+    const vemb_v16_ub_migration_rpc_req_t *req,
+    vemb_v16_ub_migration_rpc_resp_t *resp) {
+    vemb_v16_ub_rpc_t *rpc = arg;
+    if (!rpc || !req || !resp)
+        return -1;
+    memset(resp, 0, sizeof(*resp));
+    resp->request_id = req->request_id;
+    resp->key_hash = req->key_hash;
+    resp->op = req->op;
+
+    if (req->dst_owner_id == rpc->local_owner_id) {
+        return vemb_v16_tlc_migration_rpc_local_handler(rpc->tlc,
+                                                        req,
+                                                        resp);
+    }
+
+    vemb_v16_ub_rpc_peer_state_t *peer = find_peer(rpc, req->dst_owner_id);
+    if (!peer) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        log_limited(&rpc->error_logs,
+                    LL_WARNING,
+                    "vemb_v16 ub rpc peer missing: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
+                    req->dst_owner_id,
+                    req->request_id,
+                    req->key_hash,
+                    NULL,
+                    ENOENT);
+        return 0;
+    }
+
+    vemb_v16_ub_rpc_pending_t *pending =
+        pending_claim(peer, req->request_id);
+    if (!pending) {
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_BUSY;
+        log_limited(&rpc->ring_full_logs,
+                    LL_NOTICE,
+                    "vemb_v16 ub rpc pending full: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
+                    req->dst_owner_id,
+                    req->request_id,
+                    req->key_hash,
+                    NULL,
+                    EAGAIN);
+        return 0;
+    }
+
+    vemb_v16_ub_rpc_wire_req_t wire_req = {
+        .magic = VEMB_V16_UB_RPC_MAGIC,
+        .version = VEMB_V16_UB_RPC_VERSION,
+        .kind = VEMB_V16_UB_RPC_FRAME_MIGRATION,
+        .u.migration = *req,
+    };
+    uint64_t timeout_ns = timeout_from_migration_req_ns(rpc, req);
+    uint64_t deadline_ns = rpc_now_ns() + timeout_ns;
+    uint32_t status = VEMB_V16_UB_MIGRATION_RPC_OK;
+    int rc = publish_with_deadline(rpc,
+                                   &peer->request,
+                                   &wire_req,
+                                   deadline_ns,
+                                   req->dst_owner_id,
+                                   req->request_id,
+                                   req->key_hash,
+                                   &status);
+    if (rc != 0) {
+        pending_release_waiting(pending);
+        resp->status = status == VEMB_V16_UB_LOOKUP_RPC_BUSY ?
+            VEMB_V16_UB_MIGRATION_RPC_BUSY :
+            VEMB_V16_UB_MIGRATION_RPC_TIMEOUT;
+        return 0;
+    }
+
+    vemb_v16_ub_rpc_wire_resp_t wire_resp;
+    memset(&wire_resp, 0, sizeof(wire_resp));
+    (void)pending_wait(rpc, peer, pending, &wire_req, &wire_resp,
+                       deadline_ns);
+    if (wire_resp.kind == VEMB_V16_UB_RPC_FRAME_MIGRATION)
+        *resp = wire_resp.u.migration;
+    else
+        resp->status = VEMB_V16_UB_MIGRATION_RPC_ERROR;
+    return 0;
+}
+
+int vemb_v16_ub_rpc_migrate_snapshot(
+    void *arg,
+    const vemb_v16_ub_migration_rpc_req_t *req,
+    vemb_v16_ub_migration_rpc_resp_t *resp) {
+    return vemb_v16_ub_rpc_migrate_request(arg, req, resp);
 }
 
 static void process_response(vemb_v16_ub_rpc_t *rpc,
                              vemb_v16_ub_rpc_peer_state_t *peer,
                              const vemb_v16_ub_rpc_wire_resp_t *wire_resp) {
     if (wire_resp->magic != VEMB_V16_UB_RPC_MAGIC ||
-        wire_resp->version != VEMB_V16_UB_RPC_VERSION) {
+        wire_resp->version != VEMB_V16_UB_RPC_VERSION ||
+        (wire_resp->kind != VEMB_V16_UB_RPC_FRAME_LOOKUP &&
+         wire_resp->kind != VEMB_V16_UB_RPC_FRAME_MIGRATION)) {
         log_limited(&rpc->error_logs,
                     LL_WARNING,
                     "vemb_v16 ub rpc invalid response frame: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
                     peer->owner_id,
-                    wire_resp->resp.request_id,
-                    wire_resp->resp.key_hash,
+                    wire_resp_request_id(wire_resp),
+                    wire_resp_key_hash(wire_resp),
                     peer->response.config.path,
                     EPROTO);
         return;
     }
-    if (pending_complete(peer, &wire_resp->resp) != 0) {
+    if (pending_complete(peer, wire_resp) != 0) {
         log_limited(&rpc->error_logs,
                     LL_NOTICE,
                     "vemb_v16 ub rpc unmatched response dropped: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
                     peer->owner_id,
-                    wire_resp->resp.request_id,
-                    wire_resp->resp.key_hash,
+                    wire_resp_request_id(wire_resp),
+                    wire_resp_key_hash(wire_resp),
                     peer->response.config.path,
                     EAGAIN);
     }
@@ -589,23 +791,47 @@ static void process_request(vemb_v16_ub_rpc_t *rpc,
     memset(&wire_resp, 0, sizeof(wire_resp));
     wire_resp.magic = VEMB_V16_UB_RPC_MAGIC;
     wire_resp.version = VEMB_V16_UB_RPC_VERSION;
-    wire_resp.resp.request_id = wire_req->req.request_id;
-    wire_resp.resp.key_hash = wire_req->req.key_hash;
+    wire_resp.kind = wire_req->kind;
+    if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION) {
+        wire_resp.u.migration.request_id =
+            wire_req->u.migration.request_id;
+        wire_resp.u.migration.key_hash = wire_req->u.migration.key_hash;
+        wire_resp.u.migration.op = wire_req->u.migration.op;
+    } else {
+        wire_resp.u.lookup.request_id = wire_req->u.lookup.request_id;
+        wire_resp.u.lookup.key_hash = wire_req->u.lookup.key_hash;
+    }
 
     if (wire_req->magic != VEMB_V16_UB_RPC_MAGIC ||
         wire_req->version != VEMB_V16_UB_RPC_VERSION ||
-        wire_req->req.dst_owner_id != rpc->local_owner_id ||
-        wire_req->req.src_owner_id != peer->owner_id) {
-        wire_resp.resp.status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
-        wire_resp.resp.kind = VEMB_V16_UB_LOOKUP_RPC_KIND_NONE;
-    } else if (vemb_v16_tlc_lookup_rpc_local_handler(rpc->tlc,
-                                                     &wire_req->req,
-                                                     &wire_resp.resp) != 0) {
-        wire_resp.resp.status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
-        wire_resp.resp.kind = VEMB_V16_UB_LOOKUP_RPC_KIND_NONE;
+        (wire_req->kind != VEMB_V16_UB_RPC_FRAME_LOOKUP &&
+         wire_req->kind != VEMB_V16_UB_RPC_FRAME_MIGRATION) ||
+        wire_req_dst_owner(wire_req) != rpc->local_owner_id ||
+        wire_req_src_owner(wire_req) != peer->owner_id) {
+        wire_resp_set_status(
+            &wire_resp,
+            wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION ?
+                VEMB_V16_UB_MIGRATION_RPC_ERROR :
+                VEMB_V16_UB_LOOKUP_RPC_ERROR);
+        if (wire_resp.kind == VEMB_V16_UB_RPC_FRAME_LOOKUP)
+            wire_resp.u.lookup.kind = VEMB_V16_UB_LOOKUP_RPC_KIND_NONE;
+    } else if (wire_req->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION) {
+        if (vemb_v16_tlc_migration_rpc_local_handler(
+                rpc->tlc,
+                &wire_req->u.migration,
+                &wire_resp.u.migration) != 0) {
+            wire_resp.u.migration.status =
+                VEMB_V16_UB_MIGRATION_RPC_ERROR;
+        }
+    } else if (vemb_v16_tlc_lookup_rpc_local_handler(
+                   rpc->tlc,
+                   &wire_req->u.lookup,
+                   &wire_resp.u.lookup) != 0) {
+        wire_resp.u.lookup.status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
+        wire_resp.u.lookup.kind = VEMB_V16_UB_LOOKUP_RPC_KIND_NONE;
     }
 
-    uint64_t timeout_ns = timeout_from_req_ns(rpc, &wire_req->req);
+    uint64_t timeout_ns = timeout_from_wire_req_ns(rpc, wire_req);
     uint64_t deadline_ns = rpc_now_ns() + timeout_ns;
     uint32_t status = VEMB_V16_UB_LOOKUP_RPC_OK;
     (void)publish_with_deadline(rpc,
@@ -613,8 +839,8 @@ static void process_request(vemb_v16_ub_rpc_t *rpc,
                                 &wire_resp,
                                 deadline_ns,
                                 peer->owner_id,
-                                wire_req->req.request_id,
-                                wire_req->req.key_hash,
+                                wire_req_request_id(wire_req),
+                                wire_req_key_hash(wire_req),
                                 &status);
 }
 

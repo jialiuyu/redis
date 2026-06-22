@@ -87,6 +87,10 @@ struct vemb_v16_proxy {
     uint32_t supernode_worker_count;
     int supernode_pool_started;
     vemb_v16_supernode_pool_worker_t supernode_workers[VEMB_V16_MAX_CHANNELS];
+    pthread_t scaleout_notify_thread;
+    int scaleout_notify_thread_started;
+    uint32_t scaleout_notify_interval_us;
+    atomic_int scaleout_notify_stop;
     uint32_t job_shard_proxy_count;
     uint32_t job_shard_supernode_count;
     vemb_v16_shard_queue_t *job_shard_queues;

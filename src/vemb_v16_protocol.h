@@ -25,10 +25,19 @@
 #define VEMB_V16_DEFAULT_DIM 300
 #define VEMB_V16_DEFAULT_MAX_VECTORS 131072
 #define VEMB_V16_MAX_DESC_WARM_REGIONS 16u
+#define VEMB_V16_MIGRATION_CONTROL_MAX_BATCH 16u
+#define VEMB_V16_MIGRATION_CONTROL_MAX_RANGE_KEYS 64u
+#define VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS 64u
+#define VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS 64u
+#define VEMB_V16_TOPOLOGY_ENDPOINT_HOST_LEN 64u
+#define VEMB_V16_TOPOLOGY_ENDPOINT_PATH_LEN 108u
 
 #define VEMB_V16_STATUS_OK 0u
 #define VEMB_V16_STATUS_NOT_FOUND 1u
 #define VEMB_V16_STATUS_ERR 2u
+#define VEMB_V16_STATUS_STALE_TOPOLOGY 3u
+#define VEMB_V16_STATUS_MOVED 4u
+#define VEMB_V16_STATUS_ASK 5u
 
 #define VEMB_V16_REGION_LOCAL_SHM 1u
 #define VEMB_V16_REGION_UB 2u
@@ -37,7 +46,12 @@
 #define VEMB_V16_TRANSPORT_TCP 2u
 
 #define VEMB_V16_REQ_F_INLINE_VECTOR 0x01u
+#define VEMB_V16_REQ_F_ASK_REDIRECT 0x02u
 #define VEMB_V16_NET_F_INLINE_VECTOR 0x01u
+#define VEMB_V16_TOPOLOGY_CONTROL_F_PUBLISHED 0x01u
+#define VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED 0x02u
+#define VEMB_V16_TOPOLOGY_CONTROL_F_AUTO_SCALEOUT 0x04u
+#define VEMB_V16_TOPOLOGY_CONTROL_F_COORDINATED_SCALEOUT 0x08u
 
 enum vemb_v16_ctrl_op {
     VEMB_V16_CTRL_PING = 0x01,
@@ -45,6 +59,19 @@ enum vemb_v16_ctrl_op {
     VEMB_V16_CTRL_CLOSE_CHANNEL = 0x21,
     VEMB_V16_CTRL_STATS = 0x22,
     VEMB_V16_CTRL_CLOSE_ALL_CHANNELS = 0x23,
+    VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING = 0x30,
+    VEMB_V16_CTRL_MIGRATION_MARK_CUTOVER = 0x31,
+    VEMB_V16_CTRL_MIGRATION_MARK_MIGRATING_BATCH = 0x32,
+    VEMB_V16_CTRL_MIGRATION_BARRIER = 0x33,
+    VEMB_V16_CTRL_MIGRATION_RANGE_BARRIER = 0x34,
+    VEMB_V16_CTRL_MIGRATION_RANGE_MARK_CUTOVER = 0x35,
+    VEMB_V16_CTRL_MIGRATION_MARK_SOURCE_GC = 0x36,
+    VEMB_V16_CTRL_MIGRATION_RANGE_SOURCE_GC = 0x37,
+    VEMB_V16_CTRL_EPOCH_SET = 0x40,
+    VEMB_V16_CTRL_EPOCH_GET = 0x41,
+    VEMB_V16_CTRL_TOPOLOGY_SET = 0x42,
+    VEMB_V16_CTRL_TOPOLOGY_GET = 0x43,
+    VEMB_V16_CTRL_SCALEOUT_LOCAL_DONE = 0x44,
 };
 
 enum vemb_v16_net_frame_type {
@@ -57,11 +84,31 @@ enum vemb_v16_net_frame_type {
     VEMB_V16_NET_CLOSE_CHANNEL = 0x07,
     VEMB_V16_NET_CLOSE_ALL_CHANNELS = 0x08,
     VEMB_V16_NET_CONTROL_STATUS = 0x09,
+    VEMB_V16_NET_MIGRATION_MARK_MIGRATING = 0x0a,
+    VEMB_V16_NET_MIGRATION_MARK_CUTOVER = 0x0b,
+    VEMB_V16_NET_MIGRATION_CONTROL_RESPONSE = 0x0c,
+    VEMB_V16_NET_MIGRATION_MARK_MIGRATING_BATCH = 0x0d,
+    VEMB_V16_NET_MIGRATION_CONTROL_BATCH_RESPONSE = 0x0e,
+    VEMB_V16_NET_EPOCH_SET = 0x0f,
+    VEMB_V16_NET_EPOCH_GET = 0x10,
+    VEMB_V16_NET_EPOCH_CONTROL_RESPONSE = 0x11,
+    VEMB_V16_NET_TOPOLOGY_SET = 0x12,
+    VEMB_V16_NET_TOPOLOGY_GET = 0x13,
+    VEMB_V16_NET_TOPOLOGY_RESPONSE = 0x14,
+    VEMB_V16_NET_MIGRATION_BARRIER = 0x15,
+    VEMB_V16_NET_MIGRATION_RANGE_BARRIER = 0x16,
+    VEMB_V16_NET_MIGRATION_RANGE_MARK_CUTOVER = 0x17,
+    VEMB_V16_NET_MIGRATION_RANGE_CONTROL_RESPONSE = 0x18,
+    VEMB_V16_NET_MIGRATION_MARK_SOURCE_GC = 0x19,
+    VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC = 0x1a,
+    VEMB_V16_NET_SCALEOUT_LOCAL_DONE = 0x1b,
+    VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE = 0x1c,
 };
 
 enum vemb_v16_data_op {
     VEMB_V16_OP_PING = 0x01,
     VEMB_V16_OP_VADD_INLINE = 0x10,
+    VEMB_V16_OP_VREM = 0x11,
     VEMB_V16_OP_VEMB_HANDLE = 0x20,
     VEMB_V16_OP_VEMB_SUPERNODE_READ = 0x21,
     VEMB_V16_OP_VSIM_INLINE = 0x30,
@@ -84,6 +131,34 @@ enum vemb_v16_ub_lookup_rpc_kind {
     VEMB_V16_UB_LOOKUP_RPC_KIND_NONE = 0,
     VEMB_V16_UB_LOOKUP_RPC_KIND_HANDLE = 1,
     VEMB_V16_UB_LOOKUP_RPC_KIND_SNAPSHOT = 2,
+};
+
+enum vemb_v16_ub_rpc_frame_kind {
+    VEMB_V16_UB_RPC_FRAME_LOOKUP = 1,
+    VEMB_V16_UB_RPC_FRAME_MIGRATION = 2,
+};
+
+enum vemb_v16_ub_migration_rpc_op {
+    VEMB_V16_UB_MIGRATION_RPC_SNAPSHOT_REQ = 0x01,
+    VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT = 0x02,
+    VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE = 0x03,
+    VEMB_V16_UB_MIGRATION_RPC_DELTA_ACK = 0x04,
+    VEMB_V16_UB_MIGRATION_RPC_BARRIER_REQ = 0x05,
+    VEMB_V16_UB_MIGRATION_RPC_BARRIER_RESP = 0x06,
+    VEMB_V16_UB_MIGRATION_RPC_LEASE_COMMIT_REQ = 0x07,
+    VEMB_V16_UB_MIGRATION_RPC_LEASE_COMMIT_RESP = 0x08,
+    VEMB_V16_UB_MIGRATION_RPC_BASELINE_PUT = 0x09,
+};
+
+enum vemb_v16_ub_migration_rpc_status {
+    VEMB_V16_UB_MIGRATION_RPC_OK = 0,
+    VEMB_V16_UB_MIGRATION_RPC_NOT_FOUND = 1,
+    VEMB_V16_UB_MIGRATION_RPC_ERROR = 2,
+    VEMB_V16_UB_MIGRATION_RPC_TIMEOUT = 3,
+    VEMB_V16_UB_MIGRATION_RPC_BUSY = 4,
+    VEMB_V16_UB_MIGRATION_RPC_DUPLICATE = 5,
+    VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED = 6,
+    VEMB_V16_UB_MIGRATION_RPC_RETRY = 7,
 };
 
 typedef struct vemb_v16_alloc_req {
@@ -136,6 +211,167 @@ typedef struct vemb_v16_net_status {
     uint64_t value;
 } vemb_v16_net_status_t;
 
+typedef struct vemb_v16_epoch_control_req {
+    uint64_t current_topology_epoch;
+    uint64_t min_write_epoch;
+    uint32_t flags;
+    uint32_t reserved0;
+} vemb_v16_epoch_control_req_t;
+
+typedef struct vemb_v16_epoch_control_resp {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint64_t current_topology_epoch;
+    uint64_t min_write_epoch;
+} vemb_v16_epoch_control_resp_t;
+
+typedef struct vemb_v16_topology_endpoint {
+    uint32_t owner_id;
+    uint32_t transport_type;
+    uint16_t tcp_port;
+    uint16_t reserved0;
+    char host[VEMB_V16_TOPOLOGY_ENDPOINT_HOST_LEN];
+    char uds_path[VEMB_V16_TOPOLOGY_ENDPOINT_PATH_LEN];
+} vemb_v16_topology_endpoint_t;
+
+typedef struct vemb_v16_topology_control_req {
+    uint64_t current_topology_epoch;
+    uint64_t min_write_epoch;
+    uint32_t active_owner_count;
+    uint32_t standby_owner_count;
+    uint32_t vnode_count;
+    uint32_t flags;
+    uint32_t active_owners[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    uint32_t standby_owners[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    uint32_t endpoint_count;
+    uint32_t coordinator_endpoint_valid;
+    vemb_v16_topology_endpoint_t coordinator_endpoint;
+    vemb_v16_topology_endpoint_t
+        endpoints[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
+} vemb_v16_topology_control_req_t;
+
+typedef struct vemb_v16_topology_control_resp {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint64_t current_topology_epoch;
+    uint64_t min_write_epoch;
+    uint32_t active_owner_count;
+    uint32_t standby_owner_count;
+    uint32_t vnode_count;
+    uint32_t flags;
+    uint32_t active_owners[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    uint32_t standby_owners[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    uint32_t endpoint_count;
+    uint32_t coordinator_endpoint_valid;
+    vemb_v16_topology_endpoint_t coordinator_endpoint;
+    vemb_v16_topology_endpoint_t
+        endpoints[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
+} vemb_v16_topology_control_resp_t;
+
+typedef struct vemb_v16_scaleout_local_done_req {
+    uint64_t migration_topology_epoch;
+    uint64_t cutover_topology_epoch;
+    uint64_t notify_seq;
+    uint32_t source_owner;
+    uint32_t phase;
+    uint32_t error_code;
+    uint32_t pending_delta;
+    uint32_t baseline_retry_pending;
+    uint32_t migrating_key_count;
+    uint32_t range_count;
+    uint32_t flags;
+    uint32_t reserved0;
+} vemb_v16_scaleout_local_done_req_t;
+
+typedef struct vemb_v16_scaleout_local_done_resp {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint64_t migration_topology_epoch;
+    uint64_t cutover_topology_epoch;
+    uint64_t notify_seq;
+    uint32_t source_owner;
+    uint32_t reserved1;
+} vemb_v16_scaleout_local_done_resp_t;
+
+typedef struct vemb_v16_migration_control_req {
+    uint64_t key_hash;
+    uint64_t topology_epoch;
+    uint32_t key_len;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint32_t reserved1;
+    char key[VEMB_V16_MAX_KEY_LEN];
+} vemb_v16_migration_control_req_t;
+
+typedef struct vemb_v16_migration_control_resp {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint64_t key_hash;
+    uint64_t key_version;
+    uint64_t topology_epoch;
+    uint64_t owner_epoch;
+    uint64_t applied_seq;
+    uint64_t barrier_seq;
+    uint32_t migration_state;
+    uint32_t target_owner;
+    uint32_t tombstone;
+    uint32_t pending_delta;
+    uint32_t outbox_state;
+    uint32_t shard_id;
+} vemb_v16_migration_control_resp_t;
+
+typedef struct vemb_v16_migration_control_batch_req {
+    uint32_t entry_count;
+    uint32_t reserved0;
+    vemb_v16_migration_control_req_t
+        entries[VEMB_V16_MIGRATION_CONTROL_MAX_BATCH];
+} vemb_v16_migration_control_batch_req_t;
+
+typedef struct vemb_v16_migration_control_batch_resp {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint32_t entry_count;
+    uint32_t success_count;
+    uint32_t error_count;
+    uint32_t reserved1;
+    vemb_v16_migration_control_resp_t
+        entries[VEMB_V16_MIGRATION_CONTROL_MAX_BATCH];
+} vemb_v16_migration_control_batch_resp_t;
+
+typedef struct vemb_v16_migration_range_control_req {
+    uint64_t migration_topology_epoch;
+    uint64_t cutover_topology_epoch;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint32_t flags;
+    uint32_t page_limit;
+} vemb_v16_migration_range_control_req_t;
+
+typedef struct vemb_v16_migration_range_control_resp {
+    uint8_t status;
+    uint8_t reserved0[7];
+    uint64_t migration_topology_epoch;
+    uint64_t cutover_topology_epoch;
+    uint64_t owner_epoch;
+    uint64_t applied_seq;
+    uint64_t barrier_seq;
+    uint64_t source_seq;
+    uint64_t retry_delta;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint32_t key_count;
+    uint32_t success_count;
+    uint32_t error_count;
+    uint32_t pending_delta;
+    uint32_t outbox_state;
+    uint32_t remaining_keys;
+    uint32_t page_key_count;
+    uint32_t range_done;
+    uint32_t range_ready;
+    uint32_t page_limit;
+    uint32_t reserved1;
+} vemb_v16_migration_range_control_resp_t;
+
 typedef struct vemb_v16_req {
     uint8_t op;
     uint8_t flags;
@@ -146,6 +382,7 @@ typedef struct vemb_v16_req {
     uint32_t key_len;
     uint32_t key2_len;
     uint64_t key2_hash;
+    uint64_t topology_epoch;
     uint32_t dim;
     uint32_t vector_bytes;
     uint32_t reserved1;
@@ -166,6 +403,8 @@ typedef struct vemb_v16_resp {
     uint32_t region_id;
     uint32_t local_slot;
     uint64_t owner_generation;
+    uint32_t redirect_owner;
+    uint32_t reserved2;
     float score;
 } vemb_v16_resp_t;
 
@@ -193,6 +432,112 @@ typedef struct vemb_v16_ub_lookup_rpc_resp {
     uint32_t snapshot_bytes;
     uint64_t owner_generation;
 } vemb_v16_ub_lookup_rpc_resp_t;
+
+typedef struct vemb_v16_ub_migration_delta_desc {
+    uint64_t key_hash;
+    uint64_t key_version;
+    uint64_t topology_epoch;
+    uint64_t owner_epoch;
+    uint64_t delta_seq;
+    uint32_t op;
+    uint32_t flags;
+    uint32_t shard_id;
+    uint32_t key_len;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t tombstone;
+    uint32_t value_size;
+    uint32_t region_id;
+    uint32_t local_slot;
+    uint32_t bytes;
+    uint32_t reserved0;
+    uint64_t offset;
+    uint64_t owner_generation;
+    char key[VEMB_V16_MAX_KEY_LEN];
+} vemb_v16_ub_migration_delta_desc_t;
+
+typedef struct vemb_v16_ub_migration_delta_ack_desc {
+    uint64_t topology_epoch;
+    uint64_t applied_seq;
+    uint64_t barrier_seq;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint32_t status;
+} vemb_v16_ub_migration_delta_ack_desc_t;
+
+typedef struct vemb_v16_ub_migration_barrier_desc {
+    uint64_t topology_epoch;
+    uint64_t barrier_seq;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint32_t flags;
+} vemb_v16_ub_migration_barrier_desc_t;
+
+typedef struct vemb_v16_ub_migration_lease_desc {
+    uint64_t topology_epoch;
+    uint64_t owner_epoch;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint32_t flags;
+} vemb_v16_ub_migration_lease_desc_t;
+
+typedef struct vemb_v16_ub_migration_snapshot_desc {
+    uint64_t key_hash;
+    uint64_t key_version;
+    uint64_t topology_epoch;
+    uint64_t owner_epoch;
+    uint32_t key_len;
+    uint32_t migration_state;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t tombstone;
+    uint32_t value_size;
+    uint32_t region_id;
+    uint32_t local_slot;
+    uint32_t bytes;
+    uint32_t shard_id;
+    uint64_t offset;
+    uint64_t owner_generation;
+    char key[VEMB_V16_MAX_KEY_LEN];
+} vemb_v16_ub_migration_snapshot_desc_t;
+
+typedef struct vemb_v16_ub_migration_rpc_req {
+    uint64_t request_id;
+    uint32_t src_owner_id;
+    uint32_t dst_owner_id;
+    uint32_t op;
+    uint32_t flags;
+    uint64_t key_hash;
+    uint64_t topology_epoch;
+    uint32_t key_len;
+    uint32_t timeout_ns;
+    uint32_t target_owner_id;
+    uint32_t reserved0;
+    char key[VEMB_V16_MAX_KEY_LEN];
+    vemb_v16_ub_migration_delta_desc_t delta;
+    vemb_v16_ub_migration_delta_ack_desc_t delta_ack;
+    vemb_v16_ub_migration_barrier_desc_t barrier;
+    vemb_v16_ub_migration_lease_desc_t lease;
+    vemb_v16_ub_migration_snapshot_desc_t snapshot;
+} vemb_v16_ub_migration_rpc_req_t;
+
+typedef struct vemb_v16_ub_migration_rpc_resp {
+    uint64_t request_id;
+    uint32_t status;
+    uint32_t op;
+    uint64_t key_hash;
+    uint64_t topology_epoch;
+    uint64_t key_version;
+    uint32_t source_owner_id;
+    uint32_t target_owner_id;
+    vemb_v16_ub_migration_snapshot_desc_t snapshot;
+    vemb_v16_ub_migration_delta_ack_desc_t delta_ack;
+    vemb_v16_ub_migration_barrier_desc_t barrier;
+    vemb_v16_ub_migration_lease_desc_t lease;
+} vemb_v16_ub_migration_rpc_resp_t;
 
 typedef struct vemb_v16_stats {
     uint64_t total_requests;
@@ -268,6 +613,19 @@ typedef struct vemb_v16_stats {
     uint64_t remote_meta_repair_ok;
     uint64_t remote_meta_repair_drop;
     uint64_t warm_region_hash_local_pct;
+    uint64_t moved_count;
+    uint64_t stale_count;
+    uint64_t ask_count;
+    uint64_t forward_count;
+    uint64_t duplicate_request_count;
+    uint64_t source_gc_count;
+    uint64_t gc_safe_watermark;
+    uint64_t migration_baseline_sent;
+    uint64_t migration_baseline_skipped;
+    uint64_t migration_baseline_error;
+    uint64_t migration_baseline_retry_queued;
+    uint64_t migration_baseline_retry_sent;
+    uint64_t migration_baseline_retry_pending;
     uint64_t timing_job_count;
     uint64_t timing_job_total_ns;
     uint64_t timing_job_total_max_ns;

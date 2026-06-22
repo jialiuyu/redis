@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <stdint.h>
 
 #include "sve_operation.h"
@@ -10,6 +11,7 @@
 #include "vemb_v16_protocol.h"
 
 #define VEMB_V16_TLC_MAX_REMOTE_META_VIEWS 16u
+#define VEMB_V16_TLC_MAX_MIGRATION_PROGRESS 64u
 
 typedef struct vemb_v16_remote_meta_view vemb_v16_remote_meta_view_t;
 typedef struct vemb_v16_tlc vemb_v16_tlc_t;
@@ -83,6 +85,16 @@ typedef struct vemb_v16_tlc_remote_meta_owner_view {
     vemb_v16_remote_meta_view_t *view;
 } vemb_v16_tlc_remote_meta_owner_view_t;
 
+typedef struct vemb_v16_tlc_migration_progress {
+    uint32_t valid;
+    uint32_t source_owner;
+    uint32_t target_owner;
+    uint32_t shard_id;
+    uint64_t topology_epoch;
+    uint64_t applied_seq;
+    uint64_t barrier_seq;
+} vemb_v16_tlc_migration_progress_t;
+
 struct vemb_v16_tlc {
     uint32_t vector_dim;
     uint32_t value_size;
@@ -102,6 +114,11 @@ struct vemb_v16_tlc {
     void *owner_resolver_arg;
     vemb_v16_tlc_lookup_rpc_fn lookup_rpc;
     void *lookup_rpc_arg;
+    pthread_mutex_t migration_progress_lock;
+    uint32_t migration_progress_lock_init;
+    uint32_t migration_progress_count;
+    vemb_v16_tlc_migration_progress_t
+        migration_progress[VEMB_V16_TLC_MAX_MIGRATION_PROGRESS];
     atomic_uint_fast64_t ub_lookup_rpc_next_request_id;
     _Atomic(vemb_v16_tlc_remote_meta_publisher_t *) remote_meta_publisher;
     atomic_uint_fast64_t remote_meta_lookup_hit;
@@ -181,6 +198,10 @@ int vemb_v16_tlc_lookup_rpc_local_handler(
     void *arg,
     const vemb_v16_ub_lookup_rpc_req_t *req,
     vemb_v16_ub_lookup_rpc_resp_t *resp);
+int vemb_v16_tlc_migration_rpc_local_handler(
+    void *arg,
+    const vemb_v16_ub_migration_rpc_req_t *req,
+    vemb_v16_ub_migration_rpc_resp_t *resp);
 int vemb_v16_tlc_put(vemb_v16_tlc_t *tlc,
                      const char *key,
                      uint32_t key_len,
@@ -189,12 +210,139 @@ int vemb_v16_tlc_put(vemb_v16_tlc_t *tlc,
                      uint32_t vector_bytes,
                      vemb_v16_vector_handle_t *handle,
                      uint32_t *warm_slot);
+int vemb_v16_tlc_put_with_epoch(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const float *vector,
+                                uint32_t vector_bytes,
+                                uint64_t topology_epoch,
+                                vemb_v16_vector_handle_t *handle,
+                                uint32_t *warm_slot);
+int vemb_v16_tlc_delete_with_epoch(vemb_v16_tlc_t *tlc,
+                                   const char *key,
+                                   uint32_t key_len,
+                                   uint64_t key_hash,
+                                   uint64_t topology_epoch,
+                                   tlc_core_key_migration_info_t *info);
 int vemb_v16_tlc_cold_append(vemb_v16_tlc_t *tlc,
                              const char *key,
                              uint32_t key_len,
                              uint64_t key_hash,
                              const float *vector,
                              uint32_t vector_bytes);
+int vemb_v16_tlc_get_migration_info(vemb_v16_tlc_t *tlc,
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_mark_migrating(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_mark_migrating_in_shard(
+                                vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_mark_cutover(vemb_v16_tlc_t *tlc,
+                              const char *key,
+                              uint32_t key_len,
+                              uint64_t key_hash,
+                              uint64_t topology_epoch,
+                              uint32_t target_owner,
+                              tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_mark_source_gc(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_accept_owner_lease(vemb_v16_tlc_t *tlc,
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    uint64_t topology_epoch,
+                                    uint64_t owner_epoch,
+                                    uint32_t target_owner,
+                                    tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_migration_progress_ready(vemb_v16_tlc_t *tlc,
+                                          uint32_t source_owner,
+                                          uint32_t target_owner,
+                                          uint32_t shard_id,
+                                          uint64_t max_topology_epoch,
+                                          uint64_t *topology_epoch,
+                                          uint64_t *applied_seq,
+                                          uint64_t *barrier_seq);
+int vemb_v16_tlc_key_is_source_cutover(vemb_v16_tlc_t *tlc,
+                                       const char *key,
+                                       uint32_t key_len,
+                                       uint64_t key_hash,
+                                       tlc_core_key_migration_info_t *info);
+int vemb_v16_tlc_has_uncommitted_source_migrations(vemb_v16_tlc_t *tlc);
+int vemb_v16_tlc_collect_migration_keys(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                uint32_t migration_state,
+                                tlc_core_migration_key_ref_t *keys,
+                                uint32_t max_keys,
+                                uint32_t *key_count);
+int vemb_v16_tlc_collect_migration_keys_page(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                uint32_t migration_state,
+                                tlc_core_migration_key_ref_t *keys,
+                                uint32_t max_keys,
+                                uint32_t *key_count,
+                                uint32_t *remaining_count);
+int vemb_v16_tlc_count_migration_keys(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t target_owner,
+                                uint32_t shard_id,
+                                uint32_t migration_state,
+                                uint32_t *key_count);
+int vemb_v16_tlc_collect_migration_ranges(
+                                vemb_v16_tlc_t *tlc,
+                                uint64_t topology_epoch,
+                                uint32_t migration_state,
+                                tlc_core_migration_range_ref_t *ranges,
+                                uint32_t max_ranges,
+                                uint32_t *range_count);
+int vemb_v16_tlc_collect_source_active_keys(
+                                vemb_v16_tlc_t *tlc,
+                                uint32_t *cursor,
+                                tlc_core_migration_key_ref_t *keys,
+                                uint32_t max_keys,
+                                uint32_t *key_count,
+                                int *done);
+int vemb_v16_tlc_snapshot(vemb_v16_tlc_t *tlc,
+                          const char *key,
+                          uint32_t key_len,
+                          uint64_t key_hash,
+                          uint32_t source_owner,
+                          uint32_t target_owner,
+                          tlc_core_migration_snapshot_t *snapshot,
+                          void *value_out,
+                          uint32_t value_out_size);
+int vemb_v16_tlc_apply_migration(vemb_v16_tlc_t *tlc,
+                                 const tlc_core_migration_snapshot_t *snapshot,
+                                 const void *value,
+                                 uint32_t value_size,
+                                 tlc_core_migration_apply_status_t *status,
+                                 vemb_v16_vector_handle_t *handle);
 const vemb_v16_tlc_warm_region_t *vemb_v16_tlc_find_region(
     const vemb_v16_tlc_t *tlc,
     uint32_t region_id);

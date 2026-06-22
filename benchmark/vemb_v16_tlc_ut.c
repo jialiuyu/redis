@@ -1892,6 +1892,1148 @@ static void test_shared_allocator_local_set_before_remote(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+static void test_migration_snapshot_apply_rejects_stale(void) {
+    enum { dim = 3, max_vectors = 8 };
+    float source_region[dim * max_vectors];
+    float dest_region[dim * max_vectors];
+    float v1[dim], v2[dim];
+    float snapshot_value1[dim], snapshot_value2[dim];
+    vemb_v16_shared_region_allocator_t source_allocator;
+    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_tlc_t *source = NULL;
+    vemb_v16_tlc_t *dest = NULL;
+    vemb_v16_tlc_warm_region_t source_warm = {
+        .region_id = 701,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = source_region,
+        .region_bytes = sizeof(source_region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &source_allocator,
+    };
+    vemb_v16_tlc_warm_region_t dest_warm = {
+        .region_id = 703,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = dest_region,
+        .region_bytes = sizeof(dest_region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &dest_allocator,
+    };
+    const char *key = "migration:key";
+    uint32_t key_len = (uint32_t)strlen(key);
+    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    tlc_core_key_migration_info_t info = {0};
+    tlc_core_migration_snapshot_t snap1 = {0};
+    tlc_core_migration_snapshot_t snap2 = {0};
+    tlc_core_migration_apply_status_t status =
+        TLC_CORE_MIGRATION_ERROR;
+    const uint8_t *stored = NULL;
+    uint32_t stored_len = 0;
+
+    memset(source_region, 0, sizeof(source_region));
+    memset(dest_region, 0, sizeof(dest_region));
+    init_test_allocator(&source_allocator, 701, max_vectors);
+    init_test_allocator(&dest_allocator, 703, max_vectors);
+    assert(vemb_v16_tlc_create(&source,
+                               dim,
+                               max_vectors,
+                               &source_warm,
+                               1,
+                               4) == 0);
+    assert(vemb_v16_tlc_create(&dest,
+                               dim,
+                               max_vectors,
+                               &dest_warm,
+                               1,
+                               4) == 0);
+
+    fill_vector(v1, dim, 7000);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            v1,
+                            sizeof(v1),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_get_migration_info(source,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.key_version == 1);
+    assert(info.migration_state == TLC_CORE_KEY_SOURCE_ACTIVE);
+
+    assert(vemb_v16_tlc_mark_migrating(source,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       2,
+                                       3,
+                                       &info) == 0);
+    assert(info.key_version == 1);
+    assert(info.topology_epoch == 2);
+    assert(info.migration_state == TLC_CORE_KEY_MIGRATING);
+    assert(info.target_owner == 3);
+
+    assert(vemb_v16_tlc_snapshot(source,
+                                 key,
+                                 key_len,
+                                 key_hash,
+                                 1,
+                                 3,
+                                 &snap1,
+                                 snapshot_value1,
+                                 sizeof(snapshot_value1)) == 0);
+    assert(snap1.key_version == 1);
+    assert(snap1.topology_epoch == 2);
+    assert(snap1.source_owner == 1);
+    assert(snap1.target_owner == 3);
+    assert(memcmp(snapshot_value1, v1, sizeof(v1)) == 0);
+
+    assert(vemb_v16_tlc_apply_migration(dest,
+                                        &snap1,
+                                        snapshot_value1,
+                                        sizeof(snapshot_value1),
+                                        &status,
+                                        &handle) == 0);
+    assert(status == TLC_CORE_MIGRATION_APPLIED);
+    assert(handle.region_id == 703);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v1));
+    assert(memcmp(stored, v1, sizeof(v1)) == 0);
+
+    fill_vector(v2, dim, 8000);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            v2,
+                            sizeof(v2),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_snapshot(source,
+                                 key,
+                                 key_len,
+                                 key_hash,
+                                 1,
+                                 3,
+                                 &snap2,
+                                 snapshot_value2,
+                                 sizeof(snapshot_value2)) == 0);
+    assert(snap2.key_version == 2);
+    assert(memcmp(snapshot_value2, v2, sizeof(v2)) == 0);
+
+    assert(vemb_v16_tlc_apply_migration(dest,
+                                        &snap2,
+                                        snapshot_value2,
+                                        sizeof(snapshot_value2),
+                                        &status,
+                                        &handle) == 0);
+    assert(status == TLC_CORE_MIGRATION_APPLIED);
+    assert(vemb_v16_tlc_apply_migration(dest,
+                                        &snap2,
+                                        snapshot_value2,
+                                        sizeof(snapshot_value2),
+                                        &status,
+                                        &handle) == 0);
+    assert(status == TLC_CORE_MIGRATION_DUPLICATE);
+
+    assert(vemb_v16_tlc_apply_migration(dest,
+                                        &snap1,
+                                        snapshot_value1,
+                                        sizeof(snapshot_value1),
+                                        &status,
+                                        &handle) == 0);
+    assert(status == TLC_CORE_MIGRATION_STALE_REJECTED);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v2));
+    assert(memcmp(stored, v2, sizeof(v2)) == 0);
+
+    vemb_v16_tlc_destroy(dest);
+    vemb_v16_tlc_destroy(source);
+}
+
+static void test_put_with_epoch_rejects_stale_epoch(void) {
+    enum { dim = 2, max_vectors = 4 };
+    float region[dim * max_vectors];
+    float v1[dim], v2[dim], v3[dim];
+    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t warm = {
+        .region_id = 709,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = region,
+        .region_bytes = sizeof(region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &allocator,
+    };
+    const char *key = "migration:epoch-write";
+    uint32_t key_len = (uint32_t)strlen(key);
+    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    tlc_core_key_migration_info_t info = {0};
+    const uint8_t *stored = NULL;
+    uint32_t stored_len = 0;
+
+    memset(region, 0, sizeof(region));
+    init_test_allocator(&allocator, 709, max_vectors);
+    assert(vemb_v16_tlc_create(&tlc,
+                               dim,
+                               max_vectors,
+                               &warm,
+                               1,
+                               4) == 0);
+
+    fill_vector(v1, dim, 7300);
+    assert(vemb_v16_tlc_put_with_epoch(tlc,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       v1,
+                                       sizeof(v1),
+                                       7,
+                                       &handle,
+                                       &warm_slot) == 0);
+    assert(vemb_v16_tlc_get_migration_info(tlc,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.key_version == 1);
+    assert(info.topology_epoch == 7);
+
+    fill_vector(v2, dim, 7400);
+    assert(vemb_v16_tlc_put_with_epoch(tlc,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       v2,
+                                       sizeof(v2),
+                                       6,
+                                       &handle,
+                                       &warm_slot) != 0);
+    assert(vemb_v16_tlc_get_migration_info(tlc,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.key_version == 1);
+    assert(info.topology_epoch == 7);
+    assert(vemb_v16_tlc_get_handle(tlc,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
+    assert(vemb_v16_tlc_vector_slice(tlc,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v1));
+    assert(memcmp(stored, v1, sizeof(v1)) == 0);
+
+    fill_vector(v3, dim, 7500);
+    assert(vemb_v16_tlc_put_with_epoch(tlc,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       v3,
+                                       sizeof(v3),
+                                       8,
+                                       &handle,
+                                       &warm_slot) == 0);
+    assert(vemb_v16_tlc_get_migration_info(tlc,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.key_version == 2);
+    assert(info.topology_epoch == 8);
+
+    vemb_v16_tlc_destroy(tlc);
+}
+
+static void test_migration_source_cutover_rejects_old_owner_access(void) {
+    enum { dim = 2, max_vectors = 4 };
+    float source_region[dim * max_vectors];
+    float v1[dim], v2[dim], v3[dim], snapshot_value[dim];
+    vemb_v16_shared_region_allocator_t source_allocator;
+    vemb_v16_tlc_t *source = NULL;
+    vemb_v16_tlc_warm_region_t source_warm = {
+        .region_id = 711,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = source_region,
+        .region_bytes = sizeof(source_region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &source_allocator,
+    };
+    const char *key = "migration:cutover:key";
+    uint32_t key_len = (uint32_t)strlen(key);
+    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    tlc_core_key_migration_info_t info = {0};
+    tlc_core_migration_snapshot_t snapshot = {0};
+
+    memset(source_region, 0, sizeof(source_region));
+    init_test_allocator(&source_allocator, 711, max_vectors);
+    assert(vemb_v16_tlc_create(&source,
+                               dim,
+                               max_vectors,
+                               &source_warm,
+                               1,
+                               4) == 0);
+
+    fill_vector(v1, dim, 7100);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            v1,
+                            sizeof(v1),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_mark_migrating(source,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       20,
+                                       3,
+                                       &info) == 0);
+    assert(info.migration_state == TLC_CORE_KEY_MIGRATING);
+    assert(info.owner_epoch == 0);
+
+    fill_vector(v2, dim, 7200);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            v2,
+                            sizeof(v2),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_mark_cutover(source,
+                                     key,
+                                     key_len,
+                                     key_hash,
+                                     19,
+                                     3,
+                                     &info) != 0);
+    assert(vemb_v16_tlc_mark_cutover(source,
+                                     key,
+                                     key_len,
+                                     key_hash,
+                                     21,
+                                     3,
+                                     &info) == 0);
+    assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
+    assert(info.topology_epoch == 21);
+    assert(info.owner_epoch == 21);
+    assert(info.target_owner == 3);
+    assert(vemb_v16_tlc_key_is_source_cutover(source,
+                                              key,
+                                              key_len,
+                                              key_hash,
+                                              &info) == 1);
+    assert(vemb_v16_tlc_get_handle(source,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) != 0);
+
+    fill_vector(v3, dim, 7300);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            v3,
+                            sizeof(v3),
+                            &handle,
+                            &warm_slot) != 0);
+    assert(vemb_v16_tlc_snapshot(source,
+                                 key,
+                                 key_len,
+                                 key_hash,
+                                 1,
+                                 3,
+                                 &snapshot,
+                                 snapshot_value,
+                                 sizeof(snapshot_value)) != 0);
+    assert(vemb_v16_tlc_mark_migrating(source,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       22,
+                                       3,
+                                       &info) != 0);
+
+    vemb_v16_tlc_destroy(source);
+}
+
+static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
+    enum { dim = 2, max_vectors = 8 };
+    float source_region[dim * max_vectors];
+    float dest_region[dim * max_vectors];
+    float v1[dim], v2[dim], stale[dim];
+    vemb_v16_shared_region_allocator_t source_allocator;
+    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_tlc_t *dest = NULL;
+    vemb_v16_tlc_warm_region_t regions[] = {
+        {
+            .region_id = 901,
+            .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 0,
+            .weight = 1,
+            .mapped_addr = source_region,
+            .region_bytes = sizeof(source_region),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &source_allocator,
+        },
+        {
+            .region_id = 903,
+            .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = dest_region,
+            .region_bytes = sizeof(dest_region),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &dest_allocator,
+        },
+    };
+    const char *key = "migration:delta:key";
+    uint32_t key_len = (uint32_t)strlen(key);
+    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    vemb_v16_ub_migration_rpc_req_t req = {0};
+    vemb_v16_ub_migration_rpc_req_t lease_req = {0};
+    vemb_v16_ub_migration_rpc_resp_t resp = {0};
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    const uint8_t *stored = NULL;
+    uint32_t stored_len = 0;
+    tlc_core_key_migration_info_t info = {0};
+
+    memset(source_region, 0, sizeof(source_region));
+    memset(dest_region, 0, sizeof(dest_region));
+    init_test_allocator(&source_allocator, 901, max_vectors);
+    init_test_allocator(&dest_allocator, 903, max_vectors);
+    assert(vemb_v16_tlc_create(&dest,
+                               dim,
+                               max_vectors,
+                               regions,
+                               2,
+                               4) == 0);
+
+    lease_req.request_id = 9001;
+    lease_req.src_owner_id = 1;
+    lease_req.dst_owner_id = 3;
+    lease_req.op = VEMB_V16_UB_MIGRATION_RPC_LEASE_COMMIT_REQ;
+    lease_req.key_hash = key_hash;
+    lease_req.topology_epoch = 45;
+    lease_req.key_len = key_len;
+    lease_req.target_owner_id = 3;
+    memcpy(lease_req.key, key, key_len);
+    lease_req.lease = (vemb_v16_ub_migration_lease_desc_t){
+        .topology_epoch = 45,
+        .owner_epoch = 45,
+        .source_owner = 1,
+        .target_owner = 3,
+        .shard_id = 5,
+    };
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest,
+                                                    &lease_req,
+                                                    &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
+
+    fill_vector(v1, dim, 9100);
+    memcpy(source_region, v1, sizeof(v1));
+    req.request_id = 9101;
+    req.src_owner_id = 1;
+    req.dst_owner_id = 3;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.key_hash = key_hash;
+    req.topology_epoch = 44;
+    req.key_len = key_len;
+    req.target_owner_id = 3;
+    memcpy(req.key, key, key_len);
+    req.delta = (vemb_v16_ub_migration_delta_desc_t){
+        .key_hash = key_hash,
+        .key_version = 11,
+        .topology_epoch = 44,
+        .delta_seq = 7,
+        .op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT,
+        .shard_id = 5,
+        .key_len = key_len,
+        .source_owner = 1,
+        .target_owner = 3,
+        .value_size = sizeof(v1),
+        .region_id = 901,
+        .local_slot = 0,
+        .bytes = sizeof(v1),
+        .offset = 0,
+        .owner_generation = 1,
+    };
+    memcpy(req.delta.key, key, key_len);
+
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 7);
+    assert(resp.delta_ack.source_owner == 1);
+    assert(resp.delta_ack.target_owner == 3);
+    assert(resp.delta_ack.shard_id == 5);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
+    assert(handle.region_id == 903);
+    assert(warm_slot == 0);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v1));
+    assert(memcmp(stored, v1, sizeof(v1)) == 0);
+
+    req.request_id++;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_DUPLICATE);
+    assert(resp.delta_ack.status == VEMB_V16_UB_MIGRATION_RPC_DUPLICATE);
+    assert(resp.delta_ack.applied_seq == 7);
+
+    fill_vector(stale, dim, 9050);
+    memcpy(source_region + dim, stale, sizeof(stale));
+    req.request_id++;
+    req.delta.key_version = 10;
+    req.delta.delta_seq = 8;
+    req.delta.local_slot = 1;
+    req.delta.offset = sizeof(v1);
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED);
+    assert(resp.delta_ack.status ==
+           VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v1));
+    assert(memcmp(stored, v1, sizeof(v1)) == 0);
+
+    fill_vector(v2, dim, 9200);
+    memcpy(source_region + dim * 2, v2, sizeof(v2));
+    req.request_id++;
+    req.delta.key_version = 12;
+    req.delta.delta_seq = 9;
+    req.delta.local_slot = 2;
+    req.delta.offset = sizeof(v1) * 2;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 9);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
+    assert(handle.region_id == 903);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v2));
+    assert(memcmp(stored, v2, sizeof(v2)) == 0);
+
+    req.request_id++;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE;
+    req.delta.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_DELETE;
+    req.delta.key_version = 13;
+    req.delta.delta_seq = 10;
+    req.delta.tombstone = 1;
+    req.delta.value_size = 0;
+    req.delta.region_id = TLC_CORE_INVALID_REGION_ID;
+    req.delta.local_slot = TLC_CORE_INVALID_SLOT;
+    req.delta.bytes = 0;
+    req.delta.offset = 0;
+    req.delta.owner_generation = 0;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 10);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) != 0);
+    assert(vemb_v16_tlc_get_migration_info(dest,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.key_version == 13);
+    assert(info.tombstone == 1);
+    assert(info.migration_state == TLC_CORE_KEY_DEST_COMMITTED);
+
+    req.request_id++;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.delta.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.delta.key_version = 12;
+    req.delta.delta_seq = 11;
+    req.delta.tombstone = 0;
+    req.delta.value_size = sizeof(v2);
+    req.delta.region_id = 901;
+    req.delta.local_slot = 2;
+    req.delta.bytes = sizeof(v2);
+    req.delta.offset = sizeof(v1) * 2;
+    req.delta.owner_generation = 1;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED);
+    assert(resp.delta_ack.status ==
+           VEMB_V16_UB_MIGRATION_RPC_STALE_REJECTED);
+    assert(resp.delta_ack.applied_seq == 11);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) != 0);
+
+    req.request_id++;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_BARRIER_REQ;
+    req.barrier = (vemb_v16_ub_migration_barrier_desc_t){
+        .topology_epoch = 44,
+        .barrier_seq = 11,
+        .source_owner = 1,
+        .target_owner = 3,
+        .shard_id = 5,
+    };
+    const char *missing_key = "migration:delta:missing";
+    uint32_t missing_key_len = (uint32_t)strlen(missing_key);
+    uint64_t missing_key_hash = vemb_v16_murmur3(missing_key,
+                                                 missing_key_len);
+    req.key_hash = missing_key_hash;
+    req.key_len = missing_key_len;
+    memset(req.key, 0, sizeof(req.key));
+    memcpy(req.key, missing_key, missing_key_len);
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
+    assert(resp.delta_ack.applied_seq == 11);
+    assert(resp.delta_ack.barrier_seq == 11);
+
+    req.request_id++;
+    req.key_hash = key_hash;
+    req.key_len = key_len;
+    memset(req.key, 0, sizeof(req.key));
+    memcpy(req.key, key, key_len);
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 11);
+    assert(resp.delta_ack.barrier_seq == 11);
+    assert(resp.barrier.barrier_seq == 11);
+
+    req.request_id++;
+    req.barrier.barrier_seq = 12;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
+    assert(resp.delta_ack.applied_seq == 11);
+    assert(resp.delta_ack.barrier_seq == 12);
+
+    req.request_id++;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.delta.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.delta.key_version = 14;
+    req.delta.delta_seq = 12;
+    req.delta.tombstone = 0;
+    req.delta.value_size = sizeof(v2);
+    req.delta.region_id = 901;
+    req.delta.local_slot = 2;
+    req.delta.bytes = sizeof(v2);
+    req.delta.offset = sizeof(v1) * 2;
+    req.delta.owner_generation = 1;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 12);
+    assert(resp.delta_ack.barrier_seq == 12);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &handle,
+                                   &warm_slot) == 0);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(v2));
+    assert(memcmp(stored, v2, sizeof(v2)) == 0);
+
+    req.request_id++;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_BARRIER_REQ;
+    req.barrier.barrier_seq = 12;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 12);
+    assert(resp.delta_ack.barrier_seq == 12);
+
+    req.request_id++;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.delta.delta_seq = 14;
+    req.delta.key_version = 15;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
+    assert(resp.delta_ack.applied_seq == 12);
+
+    lease_req.request_id++;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest,
+                                                    &lease_req,
+                                                    &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.lease.owner_epoch == 45);
+    assert(resp.lease.target_owner == 3);
+    assert(vemb_v16_tlc_get_migration_info(dest,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.migration_state == TLC_CORE_KEY_DEST_COMMITTED);
+    assert(info.owner_epoch == 45);
+
+    lease_req.request_id++;
+    lease_req.lease.owner_epoch = 44;
+    memset(&resp, 0, sizeof(resp));
+    assert(vemb_v16_tlc_migration_rpc_local_handler(dest,
+                                                    &lease_req,
+                                                    &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
+    assert(vemb_v16_tlc_get_migration_info(dest,
+                                           key,
+                                           key_len,
+                                           key_hash,
+                                           &info) == 0);
+    assert(info.owner_epoch == 45);
+
+    vemb_v16_tlc_destroy(dest);
+}
+
+static void test_migration_delta_ub_ring_rpc_put(void) {
+    enum { dim = 2, max_vectors = 8 };
+    float source_region[dim * max_vectors];
+    float dest_region[dim * max_vectors];
+    float vector[dim];
+    vemb_v16_shared_region_allocator_t source_allocator;
+    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_tlc_t *source = NULL;
+    vemb_v16_tlc_t *dest = NULL;
+    vemb_v16_ub_rpc_t *source_rpc = NULL;
+    vemb_v16_ub_rpc_t *dest_rpc = NULL;
+    vemb_v16_tlc_warm_region_t source_warm = {
+        .region_id = 921,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = source_region,
+        .region_bytes = sizeof(source_region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &source_allocator,
+    };
+    vemb_v16_tlc_warm_region_t dest_regions[] = {
+        {
+            .region_id = 921,
+            .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 0,
+            .weight = 1,
+            .mapped_addr = source_region,
+            .region_bytes = sizeof(source_region),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &source_allocator,
+        },
+        {
+            .region_id = 923,
+            .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+            .is_local = 1,
+            .weight = 1,
+            .mapped_addr = dest_region,
+            .region_bytes = sizeof(dest_region),
+            .value_size = dim * sizeof(float),
+            .shared_allocator = &dest_allocator,
+        },
+    };
+    vemb_v16_ub_rpc_peer_t source_peer;
+    vemb_v16_ub_rpc_peer_t dest_peer;
+    char req_source_dest[64];
+    char req_dest_source[64];
+    char resp_source_dest[64];
+    char resp_dest_source[64];
+    const char *key = "migration:delta:ring:key";
+    uint32_t key_len = (uint32_t)strlen(key);
+    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    vemb_v16_vector_handle_t source_handle = {0};
+    vemb_v16_vector_handle_t dest_handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    vemb_v16_ub_migration_rpc_req_t req = {0};
+    vemb_v16_ub_migration_rpc_resp_t resp = {0};
+    const uint8_t *stored = NULL;
+    uint32_t stored_len = 0;
+
+    snprintf(req_source_dest, sizeof(req_source_dest),
+             "/v16mig_delta_%ld_req_1_3", (long)getpid());
+    snprintf(req_dest_source, sizeof(req_dest_source),
+             "/v16mig_delta_%ld_req_3_1", (long)getpid());
+    snprintf(resp_source_dest, sizeof(resp_source_dest),
+             "/v16mig_delta_%ld_resp_1_3", (long)getpid());
+    snprintf(resp_dest_source, sizeof(resp_dest_source),
+             "/v16mig_delta_%ld_resp_3_1", (long)getpid());
+    cleanup_rpc_rings(req_source_dest,
+                      req_dest_source,
+                      resp_source_dest,
+                      resp_dest_source);
+
+    memset(source_region, 0, sizeof(source_region));
+    memset(dest_region, 0, sizeof(dest_region));
+    init_test_allocator(&source_allocator, 921, max_vectors);
+    init_test_allocator(&dest_allocator, 923, max_vectors);
+    assert(vemb_v16_tlc_create(&source,
+                               dim,
+                               max_vectors,
+                               &source_warm,
+                               1,
+                               4) == 0);
+    assert(vemb_v16_tlc_create(&dest,
+                               dim,
+                               max_vectors,
+                               dest_regions,
+                               2,
+                               4) == 0);
+    make_rpc_peers(&source_peer,
+                   3,
+                   &dest_peer,
+                   1,
+                   req_source_dest,
+                   req_dest_source,
+                   resp_source_dest,
+                   resp_dest_source);
+    assert(vemb_v16_ub_rpc_create(&source_rpc,
+                                  source,
+                                  1,
+                                  100,
+                                  &source_peer,
+                                  1) == 0);
+    assert(vemb_v16_ub_rpc_create(&dest_rpc,
+                                  dest,
+                                  3,
+                                  100,
+                                  &dest_peer,
+                                  1) == 0);
+
+    fill_vector(vector, dim, 9300);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            vector,
+                            sizeof(vector),
+                            &source_handle,
+                            &warm_slot) == 0);
+    assert(source_handle.region_id == 921);
+    assert(source_handle.bytes == sizeof(vector));
+
+    req.request_id = 9301;
+    req.src_owner_id = 1;
+    req.dst_owner_id = 3;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT;
+    req.key_hash = key_hash;
+    req.topology_epoch = 55;
+    req.key_len = key_len;
+    req.target_owner_id = 3;
+    memcpy(req.key, key, key_len);
+    req.delta = (vemb_v16_ub_migration_delta_desc_t){
+        .key_hash = key_hash,
+        .key_version = 1,
+        .topology_epoch = 55,
+        .delta_seq = 1,
+        .op = VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT,
+        .shard_id = 9,
+        .key_len = key_len,
+        .source_owner = 1,
+        .target_owner = 3,
+        .value_size = sizeof(vector),
+        .region_id = source_handle.region_id,
+        .local_slot = source_handle.local_slot,
+        .bytes = source_handle.bytes,
+        .offset = source_handle.offset,
+        .owner_generation = source_handle.owner_generation,
+    };
+    memcpy(req.delta.key, key, key_len);
+
+    assert(vemb_v16_ub_rpc_migrate_request(source_rpc, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.request_id == req.request_id);
+    assert(resp.op == VEMB_V16_UB_MIGRATION_RPC_DELTA_PUT);
+    assert(resp.delta_ack.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.delta_ack.applied_seq == 1);
+    assert(vemb_v16_tlc_get_handle(dest,
+                                   key,
+                                   key_len,
+                                   key_hash,
+                                   &dest_handle,
+                                   &warm_slot) == 0);
+    assert(dest_handle.region_id == 923);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &dest_handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(vector));
+    assert(memcmp(stored, vector, sizeof(vector)) == 0);
+
+    vemb_v16_ub_rpc_destroy(dest_rpc);
+    vemb_v16_ub_rpc_destroy(source_rpc);
+    vemb_v16_tlc_destroy(dest);
+    vemb_v16_tlc_destroy(source);
+    cleanup_rpc_rings(req_source_dest,
+                      req_dest_source,
+                      resp_source_dest,
+                      resp_dest_source);
+}
+
+static void snapshot_desc_to_core_snapshot(
+        const vemb_v16_ub_migration_snapshot_desc_t *desc,
+        tlc_core_migration_snapshot_t *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->key_hash = desc->key_hash;
+    snapshot->key_version = desc->key_version;
+    snapshot->topology_epoch = desc->topology_epoch;
+    snapshot->key_len = desc->key_len;
+    snapshot->migration_state = desc->migration_state;
+    snapshot->source_owner = desc->source_owner;
+    snapshot->target_owner = desc->target_owner;
+    snapshot->tombstone = desc->tombstone;
+    snapshot->value_size = desc->value_size;
+    snapshot->shard_id = desc->shard_id;
+    snapshot->location = (tlc_warm_location_t){
+        .region_id = desc->region_id,
+        .region_index = UINT32_MAX,
+        .local_slot = desc->local_slot,
+        .bytes = desc->bytes,
+        .offset = desc->offset,
+        .owner_generation = desc->owner_generation,
+    };
+    memcpy(snapshot->key, desc->key, desc->key_len);
+}
+
+static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
+    enum { dim = 2, max_vectors = 8 };
+    float source_region[dim * max_vectors];
+    float dest_region[dim * max_vectors];
+    float vector[dim];
+    float snapshot_value[dim];
+    vemb_v16_shared_region_allocator_t source_allocator;
+    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_tlc_t *source = NULL;
+    vemb_v16_tlc_t *dest = NULL;
+    vemb_v16_ub_rpc_t *source_rpc = NULL;
+    vemb_v16_ub_rpc_t *dest_rpc = NULL;
+    vemb_v16_tlc_warm_region_t source_warm = {
+        .region_id = 801,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = source_region,
+        .region_bytes = sizeof(source_region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &source_allocator,
+    };
+    vemb_v16_tlc_warm_region_t dest_warm = {
+        .region_id = 803,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = dest_region,
+        .region_bytes = sizeof(dest_region),
+        .value_size = dim * sizeof(float),
+        .shared_allocator = &dest_allocator,
+    };
+    vemb_v16_ub_rpc_peer_t source_peer;
+    vemb_v16_ub_rpc_peer_t dest_peer;
+    char req_source_dest[64];
+    char req_dest_source[64];
+    char resp_source_dest[64];
+    char resp_dest_source[64];
+    const char *key = "migration:ring:key";
+    uint32_t key_len = (uint32_t)strlen(key);
+    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    tlc_core_key_migration_info_t info = {0};
+    vemb_v16_ub_migration_rpc_req_t req = {0};
+    vemb_v16_ub_migration_rpc_resp_t resp = {0};
+    tlc_core_migration_snapshot_t snapshot = {0};
+    tlc_core_migration_apply_status_t status =
+        TLC_CORE_MIGRATION_ERROR;
+    const uint8_t *stored = NULL;
+    uint32_t stored_len = 0;
+
+    snprintf(req_source_dest, sizeof(req_source_dest),
+             "/v16mig_%ld_req_1_3", (long)getpid());
+    snprintf(req_dest_source, sizeof(req_dest_source),
+             "/v16mig_%ld_req_3_1", (long)getpid());
+    snprintf(resp_source_dest, sizeof(resp_source_dest),
+             "/v16mig_%ld_resp_1_3", (long)getpid());
+    snprintf(resp_dest_source, sizeof(resp_dest_source),
+             "/v16mig_%ld_resp_3_1", (long)getpid());
+    cleanup_rpc_rings(req_source_dest,
+                      req_dest_source,
+                      resp_source_dest,
+                      resp_dest_source);
+
+    memset(source_region, 0, sizeof(source_region));
+    memset(dest_region, 0, sizeof(dest_region));
+    init_test_allocator(&source_allocator, 801, max_vectors);
+    init_test_allocator(&dest_allocator, 803, max_vectors);
+    assert(vemb_v16_tlc_create(&source,
+                               dim,
+                               max_vectors,
+                               &source_warm,
+                               1,
+                               4) == 0);
+    assert(vemb_v16_tlc_create(&dest,
+                               dim,
+                               max_vectors,
+                               &dest_warm,
+                               1,
+                               4) == 0);
+    make_rpc_peers(&source_peer,
+                   3,
+                   &dest_peer,
+                   1,
+                   req_source_dest,
+                   req_dest_source,
+                   resp_source_dest,
+                   resp_dest_source);
+    assert(vemb_v16_ub_rpc_create(&source_rpc,
+                                  source,
+                                  1,
+                                  100,
+                                  &source_peer,
+                                  1) == 0);
+    assert(vemb_v16_ub_rpc_create(&dest_rpc,
+                                  dest,
+                                  3,
+                                  100,
+                                  &dest_peer,
+                                  1) == 0);
+
+    fill_vector(vector, dim, 9000);
+    assert(vemb_v16_tlc_put(source,
+                            key,
+                            key_len,
+                            key_hash,
+                            vector,
+                            sizeof(vector),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(vemb_v16_tlc_mark_migrating(source,
+                                       key,
+                                       key_len,
+                                       key_hash,
+                                       33,
+                                       3,
+                                       &info) == 0);
+
+    req.request_id = 9001;
+    req.src_owner_id = 3;
+    req.dst_owner_id = 1;
+    req.op = VEMB_V16_UB_MIGRATION_RPC_SNAPSHOT_REQ;
+    req.key_hash = key_hash;
+    req.topology_epoch = 33;
+    req.key_len = key_len;
+    req.target_owner_id = 3;
+    memcpy(req.key, key, key_len);
+    assert(vemb_v16_ub_rpc_migrate_snapshot(dest_rpc,
+                                            &req,
+                                            &resp) == 0);
+    assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
+    assert(resp.request_id == req.request_id);
+    assert(resp.snapshot.key_hash == key_hash);
+    assert(resp.snapshot.key_version == 1);
+    assert(resp.snapshot.topology_epoch == 33);
+    assert(resp.snapshot.source_owner == 1);
+    assert(resp.snapshot.target_owner == 3);
+    assert(resp.snapshot.region_id == 801);
+    assert(resp.snapshot.bytes == sizeof(vector));
+    assert(resp.snapshot.offset + resp.snapshot.bytes <=
+           sizeof(source_region));
+
+    memcpy(snapshot_value,
+           (const uint8_t *)source_region + resp.snapshot.offset,
+           resp.snapshot.bytes);
+    assert(memcmp(snapshot_value, vector, sizeof(vector)) == 0);
+    snapshot_desc_to_core_snapshot(&resp.snapshot, &snapshot);
+    assert(vemb_v16_tlc_apply_migration(dest,
+                                        &snapshot,
+                                        snapshot_value,
+                                        sizeof(snapshot_value),
+                                        &status,
+                                        &handle) == 0);
+    assert(status == TLC_CORE_MIGRATION_APPLIED);
+    assert(vemb_v16_tlc_vector_slice(dest,
+                                     &handle,
+                                     &stored,
+                                     &stored_len) == 0);
+    assert(stored_len == sizeof(vector));
+    assert(memcmp(stored, vector, sizeof(vector)) == 0);
+
+    vemb_v16_ub_rpc_destroy(dest_rpc);
+    vemb_v16_ub_rpc_destroy(source_rpc);
+    vemb_v16_tlc_destroy(dest);
+    vemb_v16_tlc_destroy(source);
+    cleanup_rpc_rings(req_source_dest,
+                      req_dest_source,
+                      resp_source_dest,
+                      resp_dest_source);
+}
+
 int main(void) {
     test_put_get_handle();
     test_overwrite_and_capacity();
@@ -1913,6 +3055,12 @@ int main(void) {
     test_vsim_key2_lookup_remote_meta_stale();
     test_vsim_key2_lookup_remote_owner_routing();
     test_shared_allocator_local_set_before_remote();
+    test_migration_snapshot_apply_rejects_stale();
+    test_put_with_epoch_rejects_stale_epoch();
+    test_migration_source_cutover_rejects_old_owner_access();
+    test_migration_delta_rpc_apply_idempotent_and_tombstone();
+    test_migration_delta_ub_ring_rpc_put();
+    test_migration_snapshot_ub_ring_rpc_descriptor();
     printf("vemb_v16_tlc_ut: all tests passed\n");
     return 0;
 }
