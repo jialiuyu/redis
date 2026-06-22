@@ -6,22 +6,34 @@ DIM=${VEMB_DIM:-300}
 HOST=${VEMB_HOST:-127.0.0.1}
 PORT=${VEMB_PORT:-$SNIFF_PORT}
 MEMTIER_DIR=/root/gqs/codespace/UnifiedBus/memtier_benchmark
+CODE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis
+NUM_KEYS=10000
+KEY_PREFIX="item:"
+MANIFEST="$CODE_DIR/examples/vemb_v16_warm_regions_111.yaml"
 
 # 确保server在运行
 if ! ss -tlnp | grep -q ":$SNIFF_PORT"; then
     echo "redis-server not running, starting..."
     pkill -f redis-server 2>/dev/null || true
     sleep 1
-    cd /root/gqs/codespace/UnifiedBus/hpc-redis
+    cd "$CODE_DIR"
     ./src/redis-server \
-      --port 6379 --vemb-v16-enabled yes --vemb-v16-dim 300 \
-      --vemb-v16-max-vectors 131072 --vemb-v16-vector-region /dev/obmm_shmdev2 \
-      --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 32 \
+      --port 6379 --bind 0.0.0.0 --protected-mode no \
+      --vemb-v16-enabled yes --vemb-v16-dim 300 \
+      --vemb-v16-max-vectors 131072 \
+      --vemb-v16-warm-regions-manifest "$MANIFEST" \
+      --vemb-v16-reset-warm-regions yes \
+      --vemb-v16-proxy-io-threads 32 \
       --vemb-v16-supernode-workers 64 \
       --vemb-v16-sniff-port 6379 \
-      --daemonize yes --loglevel notice --vector-engine vemb-v16
+      --ub-cacheable yes --ub-shm-memid 2 --ub-shm-size 1073741824 \
+      --ub-table-offset 0 --ub-table-size 1073741824 --ub-vector-stride-bytes 1200 \
+      --daemonize yes --loglevel notice
     sleep 3
 fi
+
+# 清空旧数据，保证每次测试基线一致
+"$CODE_DIR/src/redis-cli" -p "$SNIFF_PORT" FLUSHDB
 
 cd "$MEMTIER_DIR"
 
@@ -43,31 +55,31 @@ run_test() {
     ' type="$name"
 }
 
-# Prefill: write vectors first so queries can hit
-run_test "prefill_64_keys" \
+# Prefill: 按数量写入，确保 1..NUM_KEYS 都存在
+run_test "prefill_${NUM_KEYS}_keys" \
     --protocol vemb_v16 --vemb-v16-dim "$DIM" \
-    -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 1 --ratio=1:0 \
-    --key-prefix="item:" --key-minimum=1 --key-maximum=64
+    -s "$HOST" -p "$PORT" -n "$NUM_KEYS" -c 1 -t 1 --ratio=1:0 \
+    --key-pattern=S:S --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
 
 run_test "1_conn_baseline" \
     --protocol vemb_v16 --vemb-v16-dim "$DIM" \
     -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 1 --ratio=0:1 \
-    --key-prefix="item:" --key-minimum=1 --key-maximum=64
+    --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
 
 run_test "8_conn_pipeline16" \
     --protocol vemb_v16 --vemb-v16-dim "$DIM" \
     -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 8 --ratio=0:1 --pipeline=16 \
-    --key-prefix="item:" --key-minimum=1 --key-maximum=64
+    --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
 
 run_test "16_conn_pipeline32" \
     --protocol vemb_v16 --vemb-v16-dim "$DIM" \
     -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 16 --ratio=0:1 --pipeline=32 \
-    --key-prefix="item:" --key-minimum=1 --key-maximum=64
+    --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
 
 run_test "32_conn_pipeline32" \
     --protocol vemb_v16 --vemb-v16-dim "$DIM" \
     -s "$HOST" -p "$PORT" --test-time 5 -c 1 -t 32 --ratio=0:1 --pipeline=32 \
-    --key-prefix="item:" --key-minimum=1 --key-maximum=64
+    --key-prefix="$KEY_PREFIX" --key-minimum=1 --key-maximum="$NUM_KEYS"
 
 echo ""
 echo "Done"

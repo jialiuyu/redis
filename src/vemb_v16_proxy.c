@@ -602,16 +602,6 @@ static int publish_request_job(vemb_v16_channel_t *ch,
     return 0;
 }
 
-static int tcp_vemb_read_requires_inline_vector(vemb_v16_channel_t *ch,
-                                                const vemb_v16_req_t *req) {
-    if (ch->transport_type != VEMB_V16_TRANSPORT_TCP)
-        return 0;
-    if (req->op != VEMB_V16_OP_VEMB_HANDLE &&
-        req->op != VEMB_V16_OP_VEMB_SUPERNODE_READ)
-        return 0;
-    return (req->flags & VEMB_V16_REQ_F_INLINE_VECTOR) ? 0 : -1;
-}
-
 /// Request scheduling: validate protocol input and enqueue execution jobs.
 void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
                     const vemb_v16_req_t *req,
@@ -639,9 +629,6 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {
-        goto error_response;
-    }
-    if (tcp_vemb_read_requires_inline_vector(ch, req) != 0) {
         goto error_response;
     }
 

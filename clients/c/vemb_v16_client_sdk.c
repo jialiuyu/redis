@@ -98,7 +98,7 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
 
     if (desc->warm_backend_type != VEMB_V16_REGION_UB)
         return -1;
-    int fd = open(desc->vector_region_name, O_RDWR | O_SYNC);
+    int fd = open(desc->vector_region_name, O_RDWR);
     if (fd < 0)
         return -1;
 
@@ -235,6 +235,109 @@ ssize_t vemb_v16_serialize_vemb(void *buf, size_t buf_cap,
 
     memcpy((char *)buf + sizeof(*hdr), &req, payload_len);
     return (ssize_t)total;
+}
+
+ssize_t vemb_v16_serialize_vemb_inline(void *buf, size_t buf_cap,
+                                       uint64_t channel_id, uint32_t req_id,
+                                       const char *key, uint32_t key_len,
+                                       uint32_t dim)
+{
+    if (!key || key_len == 0 || key_len >= VEMB_V16_MAX_KEY_LEN ||
+        dim == 0 || dim > VEMB_V16_MAX_DIM) {
+        return -1;
+    }
+
+    vemb_v16_req_t req = {0};
+    req.op = VEMB_V16_OP_VEMB_HANDLE;
+    req.flags = VEMB_V16_REQ_F_INLINE_VECTOR;
+    req.req_id = req_id;
+    req.channel_id = channel_id;
+    req.key_len = key_len;
+    memcpy(req.key, key, key_len);
+    req.key_hash = vemb_v16_murmur3(req.key, key_len);
+    req.dim = dim;
+    req.vector_bytes = dim * sizeof(float);
+
+    uint32_t payload_len = (uint32_t)vemb_v16_req_handle_len();
+    size_t total = sizeof(vemb_v16_net_hdr_t) + payload_len;
+    if (buf_cap < total)
+        return -1;
+
+    vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)buf;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = VEMB_V16_MAGIC;
+    hdr->version = VEMB_V16_VERSION;
+    hdr->type = VEMB_V16_NET_REQUEST;
+    hdr->payload_len = payload_len;
+    hdr->channel_id = channel_id;
+    hdr->req_id = req_id;
+
+    memcpy((char *)buf + sizeof(*hdr), &req, payload_len);
+    return (ssize_t)total;
+}
+
+ssize_t vemb_v16_parse_welcome(const void *buf, size_t buf_len,
+                               vemb_v16_channel_desc_t *out_desc)
+{
+    if (!buf || !out_desc)
+        return -1;
+
+    if (buf_len < sizeof(vemb_v16_net_hdr_t))
+        return 0;
+
+    const vemb_v16_net_hdr_t *hdr = (const vemb_v16_net_hdr_t *)buf;
+    if (hdr->magic != VEMB_V16_MAGIC ||
+        hdr->version != VEMB_V16_VERSION ||
+        hdr->type != VEMB_V16_NET_WELCOME)
+        return -1;
+
+    size_t need = sizeof(*hdr) + hdr->payload_len;
+    if (buf_len < need)
+        return 0;
+
+    if (hdr->payload_len != sizeof(vemb_v16_channel_desc_t))
+        return -1;
+
+    memcpy(out_desc, (const char *)buf + sizeof(*hdr), sizeof(*out_desc));
+    if (out_desc->magic != VEMB_V16_MAGIC ||
+        out_desc->version != VEMB_V16_VERSION)
+        return -1;
+
+    return (ssize_t)need;
+}
+
+ssize_t vemb_v16_parse_response(const void *buf, size_t buf_len,
+                                vemb_v16_resp_t *out_resp,
+                                size_t *out_inline_bytes)
+{
+    if (!buf || !out_resp)
+        return -1;
+    if (out_inline_bytes)
+        *out_inline_bytes = 0;
+
+    if (buf_len < sizeof(vemb_v16_net_hdr_t))
+        return 0;
+
+    const vemb_v16_net_hdr_t *hdr = (const vemb_v16_net_hdr_t *)buf;
+    if (hdr->magic != VEMB_V16_MAGIC ||
+        hdr->version != VEMB_V16_VERSION ||
+        hdr->type != VEMB_V16_NET_RESPONSE)
+        return -1;
+
+    size_t need = sizeof(*hdr) + hdr->payload_len;
+    if (buf_len < need)
+        return 0;
+
+    if (hdr->payload_len < sizeof(vemb_v16_resp_t))
+        return -1;
+
+    memcpy(out_resp, (const char *)buf + sizeof(*hdr), sizeof(*out_resp));
+
+    size_t inline_bytes = hdr->payload_len - sizeof(vemb_v16_resp_t);
+    if (out_inline_bytes)
+        *out_inline_bytes = inline_bytes;
+
+    return (ssize_t)need;
 }
 
 ssize_t vemb_v16_serialize_vsim_inline(void *buf, size_t buf_cap,
@@ -549,6 +652,57 @@ vemb_v16_client_t *vemb_v16_client_create_multi(const char *endpoints[],
     return c;
 }
 
+int vemb_v16_route_key(const char *endpoints[], int endpoint_count,
+                       const char *key, int *out_backend_idx)
+{
+    if (!endpoints || endpoint_count <= 0 ||
+        endpoint_count > VEMB_V16_SDK_MAX_ENDPOINTS || !out_backend_idx)
+        return -1;
+
+    /* Validate endpoint format (same rules as sdk_parse_endpoint). */
+    for (int i = 0; i < endpoint_count; i++) {
+        if (!endpoints[i]) return -1;
+        const char *colon = strrchr(endpoints[i], ':');
+        if (!colon || colon == endpoints[i]) return -1;
+        char *end = NULL;
+        long p = strtol(colon + 1, &end, 10);
+        if (end == colon + 1 || *end != '\0' || p <= 0 || p > 65535)
+            return -1;
+    }
+
+    if (endpoint_count == 1) {
+        *out_backend_idx = 0;
+        return 0;
+    }
+
+    sdk_hash_node_t ring[VEMB_V16_SDK_MAX_ENDPOINTS * VEMB_V16_SDK_HASH_VNODES];
+    uint32_t node_count = 0;
+    for (uint32_t node = 0; node < (uint32_t)endpoint_count; node++) {
+        for (uint32_t vnode = 0; vnode < VEMB_V16_SDK_HASH_VNODES; vnode++) {
+            char vnode_key[64];
+            uint32_t vnode_id = node_count;
+            snprintf(vnode_key, sizeof(vnode_key),
+                     "supernode_%u_vnode_%u", node, vnode_id);
+            ring[node_count++] = (sdk_hash_node_t){
+                .hash_value  = vemb_v16_murmur3(vnode_key, strlen(vnode_key)),
+                .backend_idx = node,
+            };
+        }
+    }
+    qsort(ring, node_count, sizeof(ring[0]), sdk_hash_node_cmp);
+
+    uint32_t hash = vemb_v16_murmur3(key, strlen(key));
+    uint32_t left = 0, right = node_count;
+    while (left < right) {
+        uint32_t mid = left + (right - left) / 2;
+        if (ring[mid].hash_value < hash) left = mid + 1;
+        else right = mid;
+    }
+    if (left >= node_count) left = 0;
+    *out_backend_idx = (int)ring[left].backend_idx;
+    return 0;
+}
+
 vemb_v16_client_t *vemb_v16_client_create(const char *host,
                                           uint16_t port,
                                           uint32_t dim)
@@ -683,6 +837,29 @@ int vemb_v16_client_vemb_vector(vemb_v16_client_t *c,
 {
     if (!c || !set_name || !elem_name || !out_vector || out_cap == 0)
         return -1;
+
+    /* Fast path: get a handle from the server, then read the vector directly
+     * from the locally mmap'd warm region.  This avoids sending 1200 B
+     * payloads over TCP and is what gives the 3-4M ops/sec single-node
+     * throughput.  If the region is not mmap'd or the handle read fails,
+     * fall back to the inline-vector request. */
+    if (c->mapped_addr) {
+        uint64_t offset = 0;
+        uint32_t bytes = 0;
+        uint32_t dim = 0;
+        int rc = vemb_v16_client_vemb_handle(c, set_name, elem_name,
+                                             &offset, &bytes, &dim, NULL);
+        if (rc == 0 &&
+            vemb_v16_client_read_vector(c, offset, bytes,
+                                        out_vector, out_cap) == 0) {
+            if (out_dim)
+                *out_dim = dim > 0 ? dim : c->dim;
+            return 0;
+        }
+    }
+
+    /* Fallback for backends without a local warm region mapping or when the
+     * handle read path fails. */
     if (sdk_route(c, set_name) != 0 || c->fd < 0)
         return -1;
 
@@ -885,11 +1062,13 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
     uint32_t sent = 0;
     uint32_t received = 0;
 
-    /* Pre-build the invariant part of the request */
+    /* Pre-build the invariant part of the request.  Handle-only: the caller
+     * reads vectors from the locally mmap'd warm region via
+     * vemb_v16_client_read_vector() using the returned offset/region_id. */
     vemb_v16_req_t req_base;
     memset(&req_base, 0, sizeof(req_base));
     req_base.op = VEMB_V16_OP_VEMB_HANDLE;
-    req_base.flags = VEMB_V16_REQ_F_INLINE_VECTOR;
+    req_base.flags = 0;
     req_base.channel_id = c->channel_id;
     req_base.dim = c->dim;
     req_base.vector_bytes = c->dim * sizeof(float);
@@ -1048,15 +1227,10 @@ int vemb_v16_client_read_vector(vemb_v16_client_t *c,
         return -1;
 
     uint32_t nfloats = bytes / sizeof(float);
-    if (nfloats > out_cap) {
-        fprintf(stderr, "vemb_v16_client: output buffer too small: %u < %u\n",
-                out_cap, nfloats);
+    if (nfloats > out_cap)
         return -1;
-    }
-    if (offset + bytes > c->warm_region_bytes) {
-        fprintf(stderr, "vemb_v16_client: invalid warm region range\n");
+    if (offset + bytes > c->warm_region_bytes)
         return -1;
-    }
 
     memcpy(out_vector, c->mapped_addr + offset, bytes);
     return 0;

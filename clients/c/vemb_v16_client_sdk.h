@@ -248,6 +248,37 @@ ssize_t vemb_v16_serialize_vsim_inline(void *buf, size_t buf_cap,
                                        const float *query_vector, uint32_t dim);
 
 /*
+ * Serialize a complete VEMB_HANDLE frame with VEMB_V16_REQ_F_INLINE_VECTOR set.
+ * This produces the same frame as vemb_v16_serialize_vemb() but requests the
+ * server to return the vector inline, which is the default read path for TCP
+ * clients that do not mmap the warm region.
+ */
+ssize_t vemb_v16_serialize_vemb_inline(void *buf, size_t buf_cap,
+                                       uint64_t channel_id, uint32_t req_id,
+                                       const char *key, uint32_t key_len,
+                                       uint32_t dim);
+
+/*
+ * Parse a WELCOME frame from a caller-provided byte buffer.
+ * Returns bytes consumed (>0) on success, 0 if the frame is incomplete,
+ * and -1 on a protocol error.
+ */
+ssize_t vemb_v16_parse_welcome(const void *buf, size_t buf_len,
+                               vemb_v16_channel_desc_t *out_desc);
+
+/*
+ * Parse a RESPONSE frame from a caller-provided byte buffer.
+ * Returns bytes consumed (>0) on success, 0 if the frame is incomplete,
+ * and -1 on a protocol error.
+ * On success *out_inline_bytes receives the number of inline-vector payload
+ * bytes contained in the returned frame (the caller drains them together with
+ * the rest of the frame by removing `consumed` bytes from the buffer).
+ */
+ssize_t vemb_v16_parse_response(const void *buf, size_t buf_len,
+                                vemb_v16_resp_t *out_resp,
+                                size_t *out_inline_bytes);
+
+/*
  * Warm-region mmap helpers.
  * Standalone — no client handle required.
  */

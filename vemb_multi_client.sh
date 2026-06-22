@@ -1,11 +1,13 @@
 #!/bin/bash
 set -e
 
-cd /root/gqs/codespace/UnifiedBus/hpc-redis
-
+CODE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis
 SNIFF_PORT=6379
 VEMB_PORT=${VEMB_PORT:-$SNIFF_PORT}
 DIM=${VEMB_DIM:-300}
+MANIFEST="$CODE_DIR/examples/vemb_v16_warm_regions_111.yaml"
+
+cd "$CODE_DIR"
 
 # 确保server在运行（总是重启，避免UB warm region stale state导致VEMB dataplane fallback）
 if ss -tlnp | grep -q ":$SNIFF_PORT"; then
@@ -24,18 +26,21 @@ if true; then
       --port 6379 --bind 0.0.0.0 --protected-mode no \
       --dir /tmp/redis-vemb-bench --save '' --appendonly no \
       --vemb-v16-enabled yes --vemb-v16-dim "$DIM" \
-      --vemb-v16-max-vectors 131072 --vemb-v16-vector-region /dev/obmm_shmdev2 \
-      --vemb-v16-warm-backend ub --vemb-v16-proxy-io-threads 32 \
+      --vemb-v16-max-vectors 131072 \
+      --vemb-v16-warm-regions-manifest "$MANIFEST" \
+      --vemb-v16-reset-warm-regions yes \
+      --vemb-v16-proxy-io-threads 32 \
       --vemb-v16-supernode-workers 64 \
       --vemb-v16-sniff-port 6379 \
-      --vemb-v16-reset-warm-regions yes \
+      --ub-cacheable yes --ub-shm-memid 2 --ub-shm-size 1073741824 \
+      --ub-table-offset 0 --ub-table-size 1073741824 --ub-vector-stride-bytes 1200 \
       --daemonize yes --loglevel notice \
       --logfile /tmp/redis_vemb_bench_server.log \
       --vector-engine vemb-v16
     sleep 4
 fi
 
-# 检查vector-engine
+# 检查vector-engine（RESP VEMB路径需要）
 VE=$(./src/redis-cli CONFIG GET vector-engine 2>/dev/null | tail -1)
 if [ "$VE" != "vemb-v16" ]; then
     echo "Setting vector-engine to vemb-v16"
