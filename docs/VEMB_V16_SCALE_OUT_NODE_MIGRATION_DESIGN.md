@@ -589,6 +589,486 @@ make -C benchmark vemb_v16_scaleout_coordinated_server_smoke
 [ok] coordinated scaleout server smoke passed node2_vadd=...
 ```
 
+## 两机真实执行指令：`{0} -> {0,1}`
+
+以下步骤用于真实两机环境验证单 source 扩容：`node0 -> node0,node1`。
+
+环境约定：
+
+- `192.168.90.111` = `node0` = owner `0`
+- `192.168.90.112` = `node1` = owner `1`
+- 代码目录：`/root/szz/codespace/hpc-redis`
+- server 监听端口：`6391`
+- top_ctl coordinator 监听端口：`7391`
+- payload UB path：
+  - 本地 CC：`/dev/obmm_shmdev1`
+  - 远端 NC view：`/dev/obmm_shmdev3`
+- remote meta UB path：
+  - 本地 meta owner view：`/dev/obmm_shmdev1@268435456`
+  - 对端 meta view：`/dev/obmm_shmdev3@268435456`
+- UB RPC ring path：
+  - request/response：`/dev/obmm_shmdev5`、`/dev/obmm_shmdev6`
+
+注意：
+
+- `--tcp-host` 必须使用真实 IP，不能使用 `0.0.0.0`，否则 client topology 会返回不可路由 endpoint。
+- 当前 baseline/delta payload 仍要求 target 能看到 source warm payload，因此 manifest 中仍需同时保留 `region100` 与 `region101` 的 `warm_regions` 映射，不能把 `/dev/obmm_shmdev3` 仅配置成 meta-only。
+- 当前 `--reset-warm-regions` 会 reset manifest 中列出的 region/meta backing。实际执行时仅让 `node0` 首次启动带 `--reset-warm-regions`。
+
+### 1. 两台机器编译
+
+`192.168.90.111` 和 `192.168.90.112` 均执行：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+
+make -C src vemb_v16_server
+make -C benchmark vemb_v16_bench
+make -C benchmark vemb_v16_topology_ctl
+```
+
+### 2. 准备 node0 manifest
+
+在 `192.168.90.111` 上：
+
+```bash
+cat >/tmp/v16_node0.yaml <<'YAML'
+local_ub_node_id: 0
+local_region_weight: 4
+
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev1
+remote_meta_mmap_offset: 268435456
+remote_meta_entries: 8192
+remote_meta_buckets: 16384
+ub_rpc_timeout_ms: 200
+
+warm_regions:
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev1
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 1
+    weight: 1
+
+remote_meta_views:
+  - owner_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 268435456
+    entries: 8192
+    buckets: 16384
+
+ub_rpc_peers:
+  - owner_id: 1
+    provider: ub
+    request_path: /dev/obmm_shmdev5
+    request_mmap_offset: 8388608
+    response_path: /dev/obmm_shmdev6
+    response_mmap_offset: 16777216
+    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_mmap_offset: 8388608
+    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_mmap_offset: 16777216
+YAML
+```
+
+### 3. 准备 node1 manifest
+
+在 `192.168.90.112` 上：
+
+```bash
+cat >/tmp/v16_node1.yaml <<'YAML'
+local_ub_node_id: 1
+local_region_weight: 4
+
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev1
+remote_meta_mmap_offset: 268435456
+remote_meta_entries: 8192
+remote_meta_buckets: 16384
+ub_rpc_timeout_ms: 200
+
+warm_regions:
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev1
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 1
+    weight: 1
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 0
+    weight: 1
+
+remote_meta_views:
+  - owner_id: 0
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 268435456
+    entries: 8192
+    buckets: 16384
+
+ub_rpc_peers:
+  - owner_id: 0
+    provider: ub
+    request_path: /dev/obmm_shmdev5
+    request_mmap_offset: 8388608
+    response_path: /dev/obmm_shmdev6
+    response_mmap_offset: 16777216
+    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_mmap_offset: 8388608
+    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_mmap_offset: 16777216
+YAML
+```
+
+### 4. 启动 node0 / node1
+
+先清理旧进程，两台机器均执行：
+
+```bash
+pids=$(pgrep -f "[v]emb_v16_server|[v]emb_v16_topology_ctl|[v]emb_v16_bench" || true)
+[ -n "$pids" ] && kill $pids 2>/dev/null || true
+```
+
+在 `192.168.90.111` 上启动 `node0`：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 192.168.90.111 \
+  --tcp-port 6391 \
+  --proxy-io-threads 1 \
+  --supernode-workers 1 \
+  --warm-regions-manifest /tmp/v16_node0.yaml \
+  --reset-warm-regions \
+  --dim 16 \
+  --max-vectors 8192 \
+  --loglevel notice \
+  >/tmp/v16_node0.log 2>&1 &
+```
+
+在 `192.168.90.112` 上启动 `node1`：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 192.168.90.112 \
+  --tcp-port 6391 \
+  --proxy-io-threads 1 \
+  --supernode-workers 1 \
+  --warm-regions-manifest /tmp/v16_node1.yaml \
+  --dim 16 \
+  --max-vectors 8192 \
+  --loglevel notice \
+  >/tmp/v16_node1.log 2>&1 &
+```
+
+### 5. 发布初始 topology：`active={0}`
+
+在 `192.168.90.111` 上：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+
+./benchmark/vemb_v16_topology_ctl \
+  --set \
+  --transport tcp \
+  --host 192.168.90.111 \
+  --port 6391 \
+  --epoch 1 \
+  --min-write-epoch 1 \
+  --active 0 \
+  --standby 0 \
+  --owner-endpoints 0=192.168.90.111:6391 \
+  --timeout-ms 5000
+```
+
+校验返回应包含：
+
+```text
+status=0
+active_owners=0
+standby_owners=0
+endpoint_count=1
+endpoint[0]=owner:0 transport:tcp host:192.168.90.111 port:6391
+```
+
+### 6. prefill 业务数据
+
+在 `192.168.90.111` 上：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 192.168.90.111:6391 \
+  --dim 16 \
+  --prefill 1024 \
+  --ops 0 \
+  --threads 1 \
+  --pipeline 1 \
+  --mode vadd-inline \
+  --client-topology \
+  --timeout-ms 10000 \
+  >/tmp/v16_prefill.out 2>&1
+
+cat /tmp/v16_prefill.out
+```
+
+预期包含：
+
+```text
+[topology] epoch=1 ...
+[prefill] inserted=1024
+```
+
+### 7. 启动持续写压
+
+在 `192.168.90.111` 上：
+
+```bash
+nohup ./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 192.168.90.111:6391 \
+  --dim 16 \
+  --prefill 0 \
+  --keyspace 1024 \
+  --ops 50000 \
+  --threads 2 \
+  --pipeline 1 \
+  --mode vadd-inline \
+  --client-topology \
+  --timeout-ms 60000 \
+  >/tmp/v16_live_write.out 2>&1 &
+```
+
+### 8. 启动 coordinator
+
+在 `192.168.90.111` 上：
+
+```bash
+nohup ./benchmark/vemb_v16_topology_ctl \
+  --coordinator-listen \
+  --transport tcp \
+  --host 192.168.90.111 \
+  --port 7391 \
+  --expected-sources 1 \
+  --migration-epoch 23 \
+  --cutover-epoch 24 \
+  --standby 0,1 \
+  --owner-endpoints 0=192.168.90.111:6391,1=192.168.90.112:6391 \
+  --wait-ms 60000 \
+  --timeout-ms 5000 \
+  >/tmp/v16_coordinator.out 2>/tmp/v16_coordinator.err &
+```
+
+### 9. 发布 candidate topology：`{0} -> {0,1}`
+
+先发给 `node1`：
+
+```bash
+./benchmark/vemb_v16_topology_ctl \
+  --set \
+  --transport tcp \
+  --host 192.168.90.112 \
+  --port 6391 \
+  --epoch 23 \
+  --min-write-epoch 23 \
+  --active 0 \
+  --standby 0,1 \
+  --dual-write \
+  --auto-scaleout \
+  --coordinated-scaleout \
+  --owner-endpoints 0=192.168.90.111:6391,1=192.168.90.112:6391 \
+  --coordinator-endpoint 192.168.90.111:7391 \
+  --timeout-ms 5000
+```
+
+再发给 `node0`：
+
+```bash
+./benchmark/vemb_v16_topology_ctl \
+  --set \
+  --transport tcp \
+  --host 192.168.90.111 \
+  --port 6391 \
+  --epoch 23 \
+  --min-write-epoch 23 \
+  --active 0 \
+  --standby 0,1 \
+  --dual-write \
+  --auto-scaleout \
+  --coordinated-scaleout \
+  --owner-endpoints 0=192.168.90.111:6391,1=192.168.90.112:6391 \
+  --coordinator-endpoint 192.168.90.111:7391 \
+  --timeout-ms 5000
+```
+
+### 10. 验证 cutover 完成
+
+查看 coordinator 输出：
+
+```bash
+cat /tmp/v16_coordinator.out
+```
+
+预期包含：
+
+```text
+scaleout_all_sources_done=1
+scaleout_full_active_published=2 errors=0 targets=2
+```
+
+查看 `node0` 日志：
+
+```bash
+grep -E "migration auto plan|scaleout auto done|local done" /tmp/v16_node0.log
+```
+
+预期包含：
+
+```text
+vemb_v16 migration auto plan: local_owner=0 ...
+vemb_v16 scaleout auto done: local_owner=0 migration_epoch=23 cutover_epoch=24
+```
+
+最终两边 topology 都应为：
+
+```bash
+./benchmark/vemb_v16_topology_ctl \
+  --get \
+  --transport tcp \
+  --host 192.168.90.111 \
+  --port 6391 \
+  --timeout-ms 5000
+
+./benchmark/vemb_v16_topology_ctl \
+  --get \
+  --transport tcp \
+  --host 192.168.90.112 \
+  --port 6391 \
+  --timeout-ms 5000
+```
+
+预期包含：
+
+```text
+current_topology_epoch=24
+min_write_epoch=24
+active_owners=0,1
+standby_owners=0,1
+endpoint_count=2
+endpoint[0]=owner:0 transport:tcp host:192.168.90.111 port:6391
+endpoint[1]=owner:1 transport:tcp host:192.168.90.112 port:6391
+```
+
+### 11. cutover 后再跑一次 bench
+
+在 `192.168.90.111` 上：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 192.168.90.111:6391,192.168.90.112:6391 \
+  --dim 16 \
+  --prefill 0 \
+  --keyspace 2000 \
+  --ops 2000 \
+  --threads 2 \
+  --pipeline 1 \
+  --mode vadd-inline \
+  --client-topology \
+  --timeout-ms 10000 \
+  >/tmp/v16_post_cutover.out 2>&1
+
+cat /tmp/v16_post_cutover.out
+```
+
+预期：
+
+- `fail=0`
+- 输出中能看到 `stats node=1`，表示 node1 已接管部分写流量
+- 不要省略 `--prefill 0`；bench 默认会先 prefill `65536` 个 key，和 `--max-vectors 8192` 组合时会因为容量不匹配而返回 `status=2`
+
+### 12. cutover 后读验证
+
+在 `192.168.90.111` 上：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 192.168.90.111:6391,192.168.90.112:6391 \
+  --dim 16 \
+  --prefill 0 \
+  --keyspace 2000 \
+  --ops 2000 \
+  --threads 2 \
+  --pipeline 1 \
+  --mode vemb-supernode-read \
+  --client-topology \
+  --timeout-ms 10000 \
+  >/tmp/v16_post_read.out 2>&1
+
+cat /tmp/v16_post_read.out
+```
+
+预期：
+
+- `fail=0`
+- 输出中能看到 `stats node=0` 与 `stats node=1`
+
+### 13. 一键脚本
+
+仓库内提供了可从 `node0` 直接发起的完整脚本：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+chmod +x benchmark/vemb_v16_scaleout_real_2node.sh
+./benchmark/vemb_v16_scaleout_real_2node.sh
+```
+
+可选环境变量：
+
+- `RUN_LIVE_WRITE=1`：迁移期间开启持续写压
+- `RUN_POST_READ=0`：跳过 cutover 后读验证
+- `MAX_VECTORS=65536`：提升容量，便于更大 keyspace 压测
+- `PREFILL_KEYS=2048`：调整初始灌数
+- `NODE0_HOST` / `NODE1_HOST` / `REMOTE_DIR` / `SSH_USER`：覆盖默认双机环境
+
+### 14. 常用排查命令
+
+```bash
+tail -200 /tmp/v16_node0.log
+tail -200 /tmp/v16_node1.log
+cat /tmp/v16_prefill.out
+cat /tmp/v16_live_write.out
+cat /tmp/v16_post_cutover.out
+cat /tmp/v16_post_read.out
+cat /tmp/v16_coordinator.out
+cat /tmp/v16_coordinator.err
+```
+
 ## 手动控制命令
 
 手动命令主要用于 debug：
