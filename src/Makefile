@@ -411,6 +411,7 @@ REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet
                     vemb_v16_server_integration.o vector_engine_vemb_v16_impl.o vemb_v16_server_tcp_client.o \
                     vemb_v16_proxy.o vemb_v16_supernode.o vemb_v16_tlc.o tlc_core.o \
                     vemb_v16_net.o vemb_v16_storage.o vemb_v16_warm_provider.o vemb_v16_tcp_transport.o \
+                    vemb_v16_aeron_transport.o \
                     vemb_v16_shared_allocator.o vemb_v16_mapped_region.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)

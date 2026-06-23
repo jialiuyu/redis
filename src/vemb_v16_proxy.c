@@ -2,6 +2,7 @@
 
 #include "cpu_relax.h"
 #include "vemb_v16_proxy_types.h"
+#include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_tcp_transport.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
@@ -61,6 +62,28 @@ void vemb_v16_channel_add_proxy_request_poll(vemb_v16_channel_t *ch,
 void vemb_v16_channel_add_channel_ops(vemb_v16_channel_t *ch, uint64_t n) {
     atomic_fetch_add_explicit(&ch->stats.channel_ops, n,
                               memory_order_relaxed);
+}
+
+vemb_v16_client_ring_t *vemb_v16_channel_request_ring(vemb_v16_channel_t *ch) {
+    return ch->request_ring;
+}
+
+vemb_v16_client_ring_t *vemb_v16_channel_response_ring(vemb_v16_channel_t *ch) {
+    return ch->response_ring;
+}
+
+uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch) {
+    return ch->request_ring ? ch->request_ring->slot_size : 0;
+}
+
+void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
+                                                    uint64_t n) {
+    atomic_fetch_add_explicit(&ch->stats.proxy_response_ring_full, n,
+                              memory_order_relaxed);
+}
+
+const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy) {
+    return proxy->uds_path;
 }
 
 #ifdef __linux__
@@ -135,6 +158,7 @@ static void stats_add_channel_counters(vemb_v16_stats_t *dst,
     dst->proxy_vemb_ring_full += counter_load(&src->proxy_vemb_ring_full);
     dst->proxy_vadd_ring_full += counter_load(&src->proxy_vadd_ring_full);
     dst->proxy_response_publish += counter_load(&src->proxy_response_publish);
+    dst->proxy_response_ring_full += counter_load(&src->proxy_response_ring_full);
     dst->supernode_vemb_poll += counter_load(&src->supernode_vemb_poll);
     dst->supernode_vadd_poll += counter_load(&src->supernode_vadd_poll);
     dst->supernode_completion_publish += counter_load(&src->supernode_completion_publish);
@@ -687,6 +711,12 @@ static void fill_channel_desc(vemb_v16_proxy_t *proxy,
     desc->vector_dim = proxy->vector_dim;
     desc->vector_stride = proxy->vector_stride;
     desc->max_vectors = proxy->max_vectors;
+    desc->request_ring_slot_size = proxy->request_ring_slot_size;
+    desc->response_ring_slot_size = proxy->response_ring_slot_size;
+    strncpy(desc->request_ring_name, ch->request_ring_name,
+            sizeof(desc->request_ring_name) - 1);
+    strncpy(desc->response_ring_name, ch->response_ring_name,
+            sizeof(desc->response_ring_name) - 1);
     vemb_v16_storage_fill_channel_desc(proxy_storage(proxy), desc);
 }
 
@@ -694,6 +724,10 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
     assert(ch != NULL);
     atomic_store_explicit(&ch->slot_channel_id, 0, memory_order_release);
     atomic_store_explicit(&ch->active, 0, memory_order_release);
+    vemb_v16_aeron_destroy_shared_ring(ch->request_ring_name, ch->request_ring,
+                                       ch->request_ring_bytes);
+    vemb_v16_aeron_destroy_shared_ring(ch->response_ring_name, ch->response_ring,
+                                       ch->response_ring_bytes);
     if (ch->net_fd >= 0) {
         shutdown(ch->net_fd, SHUT_RDWR);
         close(ch->net_fd);
@@ -704,6 +738,7 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
 
 /// Control plane: allocate channel state for either TCP sockets or UB/SHM rings.
 static int alloc_channel_common(vemb_v16_proxy_t *proxy,
+                                uint32_t transport_type,
                                 int net_fd,
                                 vemb_v16_channel_desc_t *desc) {
     uint32_t idx = VEMB_V16_MAX_CHANNELS;
@@ -718,7 +753,7 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
         }
     }
     if (idx >= VEMB_V16_MAX_CHANNELS) {
-        if (net_fd >= 0)
+        if (transport_type == VEMB_V16_TRANSPORT_TCP && net_fd >= 0)
             close(net_fd);
         return -1;
     }
@@ -729,7 +764,7 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
     ch->channel_id = atomic_fetch_add_explicit(&proxy->next_channel_id, 1,
                                                memory_order_relaxed);
     ch->proxy = proxy;
-    ch->transport_type = VEMB_V16_TRANSPORT_TCP;
+    ch->transport_type = transport_type;
     ch->net_fd = net_fd;
     atomic_store_explicit(&ch->active, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
@@ -749,6 +784,30 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
         return -1;
     }
 
+    if (transport_type == VEMB_V16_TRANSPORT_AERON) {
+        snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
+                 "/%s_req_%llu", VEMB_V16_SHM_PREFIX,
+                 (unsigned long long)ch->channel_id);
+        snprintf(ch->response_ring_name, sizeof(ch->response_ring_name),
+                 "/%s_resp_%llu", VEMB_V16_SHM_PREFIX,
+                 (unsigned long long)ch->channel_id);
+
+        if (vemb_v16_aeron_create_shared_ring(ch->request_ring_name,
+                               proxy->request_ring_slot_size,
+                               &ch->request_ring,
+                               &ch->request_ring_bytes) != 0) {
+            cleanup_unstarted_channel(ch);
+            return -1;
+        }
+        if (vemb_v16_aeron_create_shared_ring(ch->response_ring_name,
+                               proxy->response_ring_slot_size,
+                               &ch->response_ring,
+                               &ch->response_ring_bytes) != 0) {
+            cleanup_unstarted_channel(ch);
+            return -1;
+        }
+    }
+
     ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
         .worker_id = ch->index,
         .channel_active = &ch->active,
@@ -764,7 +823,8 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
 
     int pooled_proxy_io = proxy->proxy_io_worker_count != 0;
 #ifdef __linux__
-    ch->tcp_backpressure_enabled = pooled_proxy_io;
+    ch->tcp_backpressure_enabled =
+        transport_type == VEMB_V16_TRANSPORT_TCP && pooled_proxy_io;
 #else
     ch->tcp_backpressure_enabled = 0;
 #endif
@@ -780,20 +840,28 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
     atomic_store_explicit(&ch->slot_channel_id, ch->channel_id,
                           memory_order_release);
 
-    serverLog(LL_VERBOSE, "vemb_v16 channel allocated: index=%u channel_id=%llu transport=%s",
+    serverLog(LL_VERBOSE, "vemb_v16 channel allocated: index=%u channel_id=%llu transport=%s req=%s resp=%s",
               ch->index,
               (unsigned long long)ch->channel_id,
-              vemb_v16_transport_name(ch->transport_type));
+              vemb_v16_transport_name(ch->transport_type),
+              ch->request_ring_name,
+              ch->response_ring_name);
 
     if (desc) fill_channel_desc(proxy, ch, desc);
     return 0;
+}
+
+/// UB/SHM control plane: allocate a shared-memory client channel.
+int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy,
+                                     vemb_v16_channel_desc_t *desc) {
+    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, desc);
 }
 
 /// TCP control plane: attach an accepted socket to a channel.
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                       int net_fd,
                       vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, net_fd, desc);
+    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_TCP, net_fd, desc);
 }
 
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
@@ -821,6 +889,10 @@ static void close_channel(vemb_v16_channel_t *ch) {
     pthread_mutex_lock(&ch->proxy->stats_lock);
     stats_add_channel_counters(&ch->proxy->closed_stats, &ch->stats);
     pthread_mutex_unlock(&ch->proxy->stats_lock);
+    vemb_v16_aeron_destroy_shared_ring(ch->request_ring_name, ch->request_ring,
+                                       ch->request_ring_bytes);
+    vemb_v16_aeron_destroy_shared_ring(ch->response_ring_name, ch->response_ring,
+                                       ch->response_ring_bytes);
     if (ch->net_fd >= 0) {
         close(ch->net_fd);
         ch->net_fd = -1;
@@ -1524,6 +1596,9 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     RETURN_IF(!proxy, -1);
     proxy->vector_dim = vector_dim;
     proxy->vector_stride = vector_dim * sizeof(float);
+    proxy->request_ring_slot_size =
+        (uint32_t)vemb_v16_req_inline_len(proxy->vector_stride);
+    proxy->response_ring_slot_size = sizeof(vemb_v16_resp_t);
     proxy->max_vectors = max_vectors;
     proxy->listen_fd = -1;
     proxy->inject_pipe_rd = -1;
@@ -1617,6 +1692,7 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++)
         close_channel(&proxy->channels[i]);
     if (proxy->listen_fd >= 0) close(proxy->listen_fd);
+    if (proxy->uds_enabled && proxy->uds_path[0]) unlink(proxy->uds_path);
     pthread_mutex_destroy(&proxy->stats_lock);
     zfree(proxy);
 }

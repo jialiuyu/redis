@@ -3,6 +3,7 @@
 
 #include "vemb_v16_proxy_internal.h"
 #include "vemb_v16_aeron_ring.h"
+#include "vemb_v16_client_ring.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_supernode.h"
 
@@ -53,6 +54,12 @@ struct vemb_v16_channel {
     size_t tcp_response_backlog_sent;
     vemb_v16_aeron_ring_t completion_ring;
     void *completion_slots;
+    char request_ring_name[64];
+    char response_ring_name[64];
+    vemb_v16_client_ring_t *request_ring;
+    vemb_v16_client_ring_t *response_ring;
+    size_t request_ring_bytes;
+    size_t response_ring_bytes;
     vemb_v16_supernode_ctx_t supernode_ctx;
     struct vemb_v16_proxy *proxy;
     vemb_v16_channel_counters_t stats;
@@ -68,6 +75,10 @@ struct vemb_v16_proxy {
     atomic_uint_fast32_t next_channel_index;
     atomic_int running;
     int listen_fd;
+    char uds_path[108];
+    uint32_t request_ring_slot_size;
+    uint32_t response_ring_slot_size;
+    int uds_enabled;
     uint32_t proxy_io_worker_count;
     int proxy_io_pool_started;
     vemb_v16_proxy_io_worker_t proxy_io_workers[VEMB_V16_MAX_CHANNELS];
