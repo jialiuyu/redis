@@ -47,10 +47,7 @@ typedef long long mstime_t; /* millisecond time type. */
 typedef long long ustime_t; /* microsecond time type. */
 
 /* Vector Engine Types */
-#define VECTOR_ENGINE_REDIS 0    /* Traditional Redis HNSW implementation */
-#define VECTOR_ENGINE_UB 1       /* UB bus + SVE high-performance implementation */
-
-typedef int vector_engine_type_t;
+#include "vector_engine_types.h"
 
 #include "ub_client.h"
 
@@ -1868,6 +1865,25 @@ typedef enum childInfoType {
 
 typedef struct hotkeyStats hotkeyStats;
 
+typedef enum proxyVembSubmitMode {
+    PROXY_VEMB_SUBMIT_MODE_BATCH = 0,
+    PROXY_VEMB_SUBMIT_MODE_DIRECT = 1,
+    PROXY_VEMB_SUBMIT_MODE_ADAPTIVE = 2,
+    PROXY_VEMB_SUBMIT_MODE_FC = 3,
+} proxyVembSubmitMode;
+
+typedef struct proxyConfig {
+    size_t batch_limit;           /* 0 means default */
+    uint64_t time_limit_us;       /* 0 means default */
+    size_t max_supernodes;        /* 0 means default */
+    int vemb_submit_mode;         /* batch | direct | adaptive | fc */
+    int vemb_adaptive;            /* auto direct/batch for VEMB */
+    uint64_t vemb_direct_gap_us;  /* direct VEMB when recent arrivals are sparse */
+    size_t vemb_fc_workers;       /* 0 means all supernode workers */
+    size_t vemb_fc_slots;         /* 0 means default */
+    size_t vemb_fc_max_scan;      /* 0 means scan all FC slots */
+} proxyConfig;
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -1922,8 +1938,10 @@ struct redisServer {
     int child_type;             /* Type of current child */
     redisAtomic int module_gil_acquring; /* Indicates whether the GIL is being acquiring by the main thread. */
     /* Vector Engine */
-    vector_engine_type_t vector_engine_type; /* Type of vector engine to use */
+    int vector_engine_type; /* Type of vector engine to use */
     int vector_engine_enabled;   /* Whether vector engine is enabled */
+    int supernode_workers;       /* SuperNode worker count, 0 means auto-detect */
+    proxyConfig proxy;           /* Proxy aggregator configuration */
     ub_mem_config_t ub;          /* UB data-plane configuration */
     /* Networking */
     int port;                   /* TCP listening port */

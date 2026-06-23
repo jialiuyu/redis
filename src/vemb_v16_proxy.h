@@ -1,0 +1,73 @@
+#ifndef __VEMB_V16_PROXY_H
+#define __VEMB_V16_PROXY_H
+
+#include "vemb_v16_protocol.h"
+#include "vemb_v16_storage.h"
+
+typedef struct vemb_v16_proxy vemb_v16_proxy_t;
+
+int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
+                          const char *uds_path,
+                          uint32_t vector_dim,
+                          uint32_t max_vectors,
+                          vemb_v16_storage_ctx_t *storage);
+int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy);
+int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
+                              const char *host,
+                              uint16_t port);
+int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
+                                        uint32_t threads);
+int vemb_v16_proxy_set_supernode_workers(vemb_v16_proxy_t *proxy,
+                                         uint32_t workers);
+void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy);
+int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy);
+void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy);
+void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats);
+int vemb_v16_proxy_migration_mark_migrating(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp);
+int vemb_v16_proxy_migration_mark_cutover(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp);
+int vemb_v16_proxy_migration_mark_source_gc(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp);
+int vemb_v16_proxy_migration_barrier(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_req_t *req,
+    vemb_v16_migration_control_resp_t *resp);
+int vemb_v16_proxy_migration_mark_migrating_batch(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_control_batch_req_t *req,
+    vemb_v16_migration_control_batch_resp_t *resp);
+int vemb_v16_proxy_migration_range_barrier(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_range_control_req_t *req,
+    vemb_v16_migration_range_control_resp_t *resp);
+int vemb_v16_proxy_migration_range_mark_cutover(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_range_control_req_t *req,
+    vemb_v16_migration_range_control_resp_t *resp);
+int vemb_v16_proxy_migration_range_mark_source_gc(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_migration_range_control_req_t *req,
+    vemb_v16_migration_range_control_resp_t *resp);
+int vemb_v16_proxy_epoch_set(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_epoch_control_req_t *req,
+    vemb_v16_epoch_control_resp_t *resp);
+int vemb_v16_proxy_epoch_get(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_epoch_control_resp_t *resp);
+int vemb_v16_proxy_topology_set(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_topology_control_req_t *req,
+    vemb_v16_topology_control_resp_t *resp);
+int vemb_v16_proxy_topology_get(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_topology_control_resp_t *resp);
+
+#endif

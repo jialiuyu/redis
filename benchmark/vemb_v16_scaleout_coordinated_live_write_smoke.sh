@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export VEMB_V16_SCALEOUT_LIVE_WRITE=1
+export VEMB_V16_SCALEOUT_LIVE_MODE="${VEMB_V16_SCALEOUT_LIVE_MODE:-vadd-inline}"
+export VEMB_V16_SCALEOUT_LIVE_OPS="${VEMB_V16_SCALEOUT_LIVE_OPS:-50000}"
+export VEMB_V16_SCALEOUT_LIVE_THREADS="${VEMB_V16_SCALEOUT_LIVE_THREADS:-2}"
+export VEMB_V16_SCALEOUT_LIVE_TIMEOUT_MS="${VEMB_V16_SCALEOUT_LIVE_TIMEOUT_MS:-60000}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$SCRIPT_DIR/vemb_v16_scaleout_coordinated_server_smoke.sh"

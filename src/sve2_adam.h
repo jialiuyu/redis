@@ -17,9 +17,7 @@
 
 #include <stddef.h>
 #include <math.h>
-#ifdef __aarch64__
-#include <arm_sve.h>
-#endif
+#include "sve_config.h"
 
 typedef struct {
     float lr;       /* Learning rate */
@@ -59,7 +57,7 @@ static inline void sve2_adam_update(
     float eps = cfg->eps;
     float wd = cfg->wd;
 
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     svfloat32_t vb1  = svdup_f32(b1);
     svfloat32_t vob1 = svdup_f32(ob1);
     svfloat32_t vb2  = svdup_f32(b2);

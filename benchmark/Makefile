@@ -5,11 +5,8 @@ CC = gcc
 CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=c11 -I../deps/hiredis
 LDFLAGS = -pthread -lm -L../deps/hiredis -lhiredis
 
-# Output directory
-OUT_DIR := ../output/benchmark
-
-# 目标文件 (all output to OUT_DIR, include new targets from HEAD)
-TARGETS = $(addprefix $(OUT_DIR)/,redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench tlc_v16_bench tlc_hash_bench)
+# 目标文件
+TARGETS = redis_traditional_benchmark supernode_benchmark compare_results supernode_real_benchmark supernode_server three_layer_benchmark_v4 supernode_benchmark_optimized tlc_aeron_bench tlc_fc_bench tlc_kcp_bench tlc_raw_bench tlc_transport_bench tlc_all_transport_bench tlc_client_bench tlc_v10_bench tlc_v13_bench tlc_v14_bench ring_buffer_ut ring_buffer_batch_bench ring_buffer_compare_bench proxy_components_ut proxy_scheduler_ut proxy_aggregator_ut vector_proxy_completion_ut monotonic_clock_bench vemb_v16_slow_client_bench
 
 # 所有目标
 all: $(TARGETS)
@@ -133,6 +130,176 @@ $(OUT_DIR)/tlc_v16_bench: tlc_v16_bench.c ../src/aeron_ipc.h | $(OUT_DIR)
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
+vemb_v16_bench: vemb_v16_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_client_ring.h ../src/vemb_v16_client_topology.h ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_topology.c ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_slow_client_bench: vemb_v16_slow_client_bench.c ../src/vemb_v16_protocol.h ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_net.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_shared_allocator_ut: vemb_v16_shared_allocator_ut.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/cpu_relax.h ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_remote_meta_ut: vemb_v16_remote_meta_ut.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_hash.h ../src/cpu_relax.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_remote_meta.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_topology_ut: vemb_v16_topology_ut.c ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_hash.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_topology.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_migration_outbox_ut: vemb_v16_migration_outbox_ut.c ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/vemb_v16_protocol.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_migration_outbox.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_client_topology_ut: vemb_v16_client_topology_ut.c ../src/vemb_v16_client_topology.c ../src/vemb_v16_client_topology.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_net.c ../src/vemb_v16_net.h ../src/vemb_v16_hash.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_client_topology.c ../src/vemb_v16_topology.c ../src/vemb_v16_net.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_topology_ctl: vemb_v16_topology_ctl.c ../src/vemb_v16_protocol.h ../src/vemb_v16_migration_outbox.h ../src/vemb_v16_topology.h ../src/vemb_v16_topology.c ../src/vemb_v16_net.h ../src/vemb_v16_net.c ../src/vemb_v16_hash.h
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_topology.c ../src/vemb_v16_net.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_client_topology_smoke: vemb_v16_bench vemb_v16_topology_ctl
+	./vemb_v16_client_topology_smoke.sh
+
+vemb_v16_topology_ctl_coordinator_smoke: vemb_v16_topology_ctl
+	bash ./vemb_v16_topology_ctl_coordinator_smoke.sh
+
+vemb_v16_scaleout_coordinated_server_smoke: vemb_v16_bench vemb_v16_topology_ctl
+	bash ./vemb_v16_scaleout_coordinated_server_smoke.sh
+
+vemb_v16_scaleout_coordinated_live_write_smoke: vemb_v16_bench vemb_v16_topology_ctl
+	bash ./vemb_v16_scaleout_coordinated_live_write_smoke.sh
+
+vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_topology.c ../src/vemb_v16_migration_outbox.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_migration_control_ut: vemb_v16_migration_control_ut.c ../src/vemb_v16_proxy.c ../src/vemb_v16_proxy.h ../src/vemb_v16_tcp_transport.c ../src/vemb_v16_aeron_transport.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/vemb_v16_net.c ../src/vemb_v16_net.h ../src/vemb_v16_supernode.c ../src/vemb_v16_stats.c ../src/vemb_v16_warm_provider.c ../src/sve_operation.c ../src/sve_similarity.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_proxy.c ../src/vemb_v16_tcp_transport.c ../src/vemb_v16_aeron_transport.c ../src/vemb_v16_storage.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_topology.c ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_net.c ../src/vemb_v16_supernode.c ../src/vemb_v16_stats.c ../src/vemb_v16_warm_provider.c ../src/sve_operation.c ../src/sve_similarity.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
+	@echo "✅ Built: $@"
+
+vemb_v16_remote_vsim_smoke: vemb_v16_bench
+	./vemb_v16_remote_vsim_smoke.sh
+
+# Ring buffer unit test
+ring_buffer_ut: ring_buffer_ut.c test_runtime_shim.c ../src/ring_buffer.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c $< ../src/ring_buffer.c -pthread -lm
+	@echo "✅ Built: $@"
+
+ring_buffer_batch_bench: ring_buffer_batch_bench.c test_runtime_shim.c ../src/ring_buffer.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/batch_latency_trace.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c $< ../src/ring_buffer.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/batch_latency_trace.c -pthread -lm
+	@echo "✅ Built: $@"
+
+ring_buffer_compare_bench: ring_buffer_compare_bench.c test_runtime_shim.c ../src/ring_buffer.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/batch_latency_trace.c
+	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c $< ../src/ring_buffer.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/batch_latency_trace.c -pthread -lm
+	@echo "✅ Built: $@"
+
+proxy_components_ut: proxy_components_ut.c test_runtime_shim.c ../src/consistent_hash.c ../src/proxy_router.c ../src/proxy_flush_scheduler.c ../src/proxy_batch_bucket.c ../src/proxy_flush_executor.c ../src/ring_buffer.c ../src/batch_latency_trace.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ \
+		test_runtime_shim.c \
+		proxy_components_ut.c \
+		../src/consistent_hash.c \
+		../src/proxy_router.c \
+		../src/proxy_flush_scheduler.c \
+		../src/proxy_batch_bucket.c \
+		../src/proxy_flush_executor.c \
+		../src/ring_buffer.c \
+		../src/batch_latency_trace.c \
+		-lpthread -lm
+	@echo "✅ Built: $@"
+
+proxy_scheduler_ut: proxy_scheduler_ut.c test_runtime_shim.c ../src/ring_buffer_mgr.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c $< ../src/ring_buffer_mgr.c -lpthread -lm
+	@echo "✅ Built: $@"
+
+proxy_aggregator_ut: proxy_aggregator_ut.c test_runtime_shim.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c proxy_aggregator_ut.c -lpthread -lm
+	@echo "✅ Built: $@"
+
+vector_proxy_completion_ut: vector_proxy_completion_ut.c test_runtime_shim.c ../src/vector_proxy_completion.c ../src/vector_proxy_request.c ../src/dict.c ../src/siphash.c ../src/mt19937-64.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ \
+		test_runtime_shim.c \
+		vector_proxy_completion_ut.c \
+		../src/vector_proxy_completion.c \
+		../src/vector_proxy_request.c \
+		../src/dict.c \
+		../src/siphash.c \
+		../src/mt19937-64.c \
+		-lpthread -lm
+	@echo "✅ Built: $@"
+
+monotonic_clock_bench: monotonic_clock_bench.c test_runtime_shim.c
+	$(CC) -O3 -Wall -Wextra -pthread -std=gnu11 -DTEST_RUNTIME_WITH_SERVER \
+		-I../src -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src \
+		-I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/xxhash \
+		-o $@ test_runtime_shim.c $< -lpthread -lm
+	@echo "✅ Built: $@"
+
+# Scatter/Gather vs Baseline benchmark
+# 独立模块，不依赖 server.h
+# 编译: make scatter_gather_bench
+# 可选: make scatter_gather_bench USE_SVE=yes (鲲鹏 920)
+SVE_BENCH_CFLAGS = -O3 -Wall -march=native -pthread -std=gnu11 -I../src
+SVE_BENCH_SRCS   = scatter_gather_bench.c ../src/sve_operation.c
+
+ifeq ($(USE_SVE),yes)
+    SVE_BENCH_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+scatter_gather_bench: $(SVE_BENCH_SRCS) ../src/sve_operation.h ../src/sve_config.h
+	$(CC) $(SVE_BENCH_CFLAGS) -o $@ $(SVE_BENCH_SRCS) -lm -lpthread
+	@echo "✅ Built: $@"
+
+.PHONY: scatter_gather_bench
+
+# SVE row copy comparison benchmark
+# 编译: make sve_row_copy_compare USE_SVE=yes
+SVE_ROW_COPY_CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=gnu11
+
+ifeq ($(USE_SVE),yes)
+    SVE_ROW_COPY_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+sve_row_copy_compare: sve_row_copy_compare.c
+ifeq ($(USE_SVE),yes)
+	$(CC) $(SVE_ROW_COPY_CFLAGS) -o $@ $< -lm -lpthread
+	@echo "✅ Built: $@"
+else
+	@echo "❌ sve_row_copy_compare requires USE_SVE=yes"
+	@exit 1
+endif
+
+.PHONY: sve_row_copy_compare
+
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
@@ -148,15 +315,43 @@ ifeq ($(USE_SVE),yes)
     UB_UT_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
 endif
 
-ub_client_ut: $(UB_UT_SRCS)
-	$(CC) $(UB_UT_CFLAGS) -o $@ $(UB_UT_SRCS) $(UB_UT_LIBS)
-	@echo "Built: $@"
+ub_client_ut: test_runtime_shim.c $(UB_UT_SRCS)
+	$(CC) $(UB_UT_CFLAGS) -o $@ test_runtime_shim.c $(UB_UT_SRCS) $(UB_UT_LIBS)
+	@echo "✅ Built: $@"
 
 .PHONY: ub_client_ut
 
+ub_cc_nc_visibility_ut: ub_cc_nc_visibility_ut.c
+	$(CC) -O2 -Wall -Wextra -std=gnu11 -o $@ $<
+	@echo "✅ Built: $@"
+
+.PHONY: ub_cc_nc_visibility_ut
+
+# SVE cross-embedding gather benchmark on UB.MEM
+# make sve_gather_ub_bench USE_SVE=yes [USE_CC_MODE=yes]
+SVE_GATHER_CFLAGS = -O3 -Wall -march=native -pthread -std=gnu11 \
+    -I../src -I../deps/libobmm -DSVE_OP_STANDALONE -DUB_CLIENT_STANDALONE
+SVE_GATHER_SRCS = sve_gather_ub_bench.c ../src/sve_operation.c ../src/ub_client.c
+SVE_GATHER_LIBS = -lm -lpthread
+
+ifeq ($(USE_CC_MODE),yes)
+    SVE_GATHER_CFLAGS += -DUSE_CC_MODE
+    SVE_GATHER_LIBS += ../deps/libobmm/libobmm_ownership.a
+endif
+ifeq ($(USE_SVE),yes)
+    SVE_GATHER_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+sve_gather_ub_bench: test_runtime_shim.c $(SVE_GATHER_SRCS)
+	$(CC) $(SVE_GATHER_CFLAGS) -o $@ test_runtime_shim.c $(SVE_GATHER_SRCS) $(SVE_GATHER_LIBS)
+	@echo "✅ Built: $@"
+
+.PHONY: sve_gather_ub_bench
+
 # 清理
 clean:
-	rm -rf $(OUT_DIR)
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_gather_ub_bench vemb_v16_migration_outbox_ut
+	rm -f *.o
 	rm -f results/*.txt
 	@echo "Cleaned build artifacts"
 
@@ -219,12 +414,27 @@ help:
 	@echo "  $(OUT_DIR)/compare_results <redis_output> <supernode_output>"
 	@echo ""
 	@echo "TLC transport benchmarks:"
-	@echo "  $(OUT_DIR)/tlc_aeron_bench / tlc_fc_bench / tlc_kcp_bench / tlc_raw_bench"
-	@echo "  $(OUT_DIR)/tlc_transport_bench / tlc_all_transport_bench / tlc_client_bench"
-	@echo "  $(OUT_DIR)/tlc_v10_bench / tlc_v13_bench / tlc_v14_bench / tlc_v16_bench"
+	@echo "  ./tlc_aeron_bench / tlc_fc_bench / tlc_kcp_bench / tlc_raw_bench"
+	@echo "  ./tlc_transport_bench / tlc_all_transport_bench / tlc_client_bench"
+	@echo "  ./tlc_v10_bench / tlc_v13_bench / tlc_v14_bench"
+	@echo "  ./vemb_v16_bench / ./vemb_v16_slow_client_bench"
 	@echo ""
 	@echo "UB cross-node validation:"
 	@echo "  make ub_client_ut [USE_CC_MODE=yes] [USE_SVE=yes]"
+	@echo "  make ub_cc_nc_visibility_ut"
+	@echo ""
+	@echo "Scatter/Gather benchmark:"
+	@echo "  make scatter_gather_bench [USE_SVE=yes]"
+	@echo "  ./scatter_gather_bench [--embeddings N] [--iters N] [--warmup N]"
+	@echo ""
+	@echo "SVE row-copy compare:"
+	@echo "  make sve_row_copy_compare USE_SVE=yes"
+	@echo "  ./sve_row_copy_compare"
+	@echo ""
+	@echo "SVE cross-embedding gather UB benchmark:"
+	@echo "  make sve_gather_ub_bench USE_SVE=yes [USE_CC_MODE=yes]"
+	@echo "  ./sve_gather_ub_bench --shm-memid <id> --shm-size 8G --vector-dimension 300"
+	@echo "  ./sve_gather_ub_bench --mock-local --verify"
 	@echo "  ./ub_client_ut selftest"
 	@echo "  ./ub_client_ut write-fixture --shm-memid <id> --shm-size <N> --vector-dimension 128 --fill-rows 1024"
 	@echo "  ./ub_client_ut gather --shm-memid <id> --shm-size <N> --vector-dimension 128 --table-name ut_vectors --gather-indices 0,1,42 --verify"

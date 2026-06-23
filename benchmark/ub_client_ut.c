@@ -7,6 +7,8 @@
  */
 
 #include "../src/ub_client.h"
+#include "../src/vemb_v16_hash.h"
+#include "../src/sve_config.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -27,6 +29,8 @@
 #ifdef USE_CC_MODE
 #include "../deps/libobmm/obmm_ownership.h"
 #endif
+
+#include "test_runtime_shim.h"
 
 typedef enum {
     UB_UT_MODE_NONE = 0,
@@ -68,101 +72,6 @@ static void ut_log(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
-}
-
-void serverLog(int level, const char *fmt, ...)
-{
-    va_list ap;
-
-    (void)level;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-}
-
-void *zcalloc(size_t size)
-{
-    return calloc(1, size);
-}
-
-void zfree(void *ptr)
-{
-    free(ptr);
-}
-
-sds sdsempty(void)
-{
-    char *buf = malloc(1);
-
-    if (buf == NULL) {
-        return NULL;
-    }
-    buf[0] = '\0';
-    return buf;
-}
-
-sds sdsnew(const char *init)
-{
-    size_t len;
-    char *buf;
-
-    if (init == NULL) {
-        init = "";
-    }
-    len = strlen(init);
-    buf = malloc(len + 1);
-    if (buf == NULL) {
-        return NULL;
-    }
-    memcpy(buf, init, len + 1);
-    return buf;
-}
-
-sds sdscat(sds s, const char *t)
-{
-    size_t slen = s ? strlen(s) : 0;
-    size_t tlen = t ? strlen(t) : 0;
-    char *buf = realloc(s, slen + tlen + 1);
-
-    if (buf == NULL) {
-        free(s);
-        return NULL;
-    }
-    if (tlen != 0) {
-        memcpy(buf + slen, t, tlen);
-    }
-    buf[slen + tlen] = '\0';
-    return buf;
-}
-
-sds sdscatprintf(sds s, const char *fmt, ...)
-{
-    va_list ap;
-    va_list ap_copy;
-    int needed;
-    size_t slen = s ? strlen(s) : 0;
-    char *buf;
-
-    va_start(ap, fmt);
-    va_copy(ap_copy, ap);
-    needed = vsnprintf(NULL, 0, fmt, ap_copy);
-    va_end(ap_copy);
-    if (needed < 0) {
-        va_end(ap);
-        free(s);
-        return NULL;
-    }
-
-    buf = realloc(s, slen + (size_t)needed + 1);
-    if (buf == NULL) {
-        va_end(ap);
-        free(s);
-        return NULL;
-    }
-    vsnprintf(buf + slen, (size_t)needed + 1, fmt, ap);
-    va_end(ap);
-    return buf;
 }
 
 static void usage(const char *prog)
@@ -329,18 +238,6 @@ static size_t capacity_rows(const ub_ut_options_t *opts)
 static float expected_value(uint64_t row, size_t dim_idx)
 {
     return (float)(row * 1000ULL + (uint64_t)dim_idx);
-}
-
-static uint64_t fnv1a64_local(const char *text)
-{
-    const unsigned char *p = (const unsigned char *)text;
-    uint64_t hash = UINT64_C(1469598103934665603);
-
-    while (*p) {
-        hash ^= (uint64_t)*p++;
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
 }
 
 static void fill_fixture_vectors(float *table,
@@ -825,7 +722,7 @@ static int run_gather(const ub_ut_options_t *opts)
         if (rc == 0) {
             sds stats = ub_client_get_stats();
             ut_log("gather OK: %zu rows, dim=%zu", num_indices, opts->vector_dimension);
-#ifdef USE_SVE
+#ifdef USE_ARM_SVE
             ut_log("  method      : SVE gather-load (sve1 contiguous ld1w/st1w)");
             ut_log("  gather_load : %.0f ns (%.3f us)", load_ns, load_ns / 1e3);
 #else
@@ -912,7 +809,7 @@ static int run_selftest(void)
 
     opts.resolver_mode = UB_ELEMENT_INDEX_HASH;
     opts.element = "hash-key";
-    hash_expected = fnv1a64_local(opts.element) % opts.fill_rows;
+    hash_expected = vemb_v16_fnv1a64(opts.element) % opts.fill_rows;
     opts.expected_index = hash_expected;
     if (run_read_verify(&opts) != 0) {
         goto cleanup;

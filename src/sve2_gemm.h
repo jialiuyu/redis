@@ -24,9 +24,7 @@
 #include <string.h>
 #include <math.h>
 
-#ifdef __aarch64__
-#include <arm_sve.h>
-#endif
+#include "sve_config.h"
 
 /* ---- Configuration ---- */
 #define SVE2_EMB_DIM          300
@@ -60,7 +58,7 @@ typedef struct {
 
 static inline void sve2_engine_init(sve2_engine_t *eng) {
     memset(eng, 0, sizeof(*eng));
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     eng->sve_vl = svcntb();
     eng->sve_floats = svcntw();
 #else
@@ -86,7 +84,7 @@ static inline void sve2_gemv_f32(
     float *y,                  /* Output vector [N] (accumulated) */
     size_t K, size_t N)
 {
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     size_t vl = svcntw();
 
     for (size_t j = 0; j < N; j += vl) {
@@ -180,7 +178,7 @@ static inline void sve2_gemm_f32(
         return;
     }
 
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     size_t vl = svcntw();
 
     /* Tile over K for L3 residency */
@@ -253,7 +251,7 @@ static inline void sve2_gemm_f32(
  * Dot product, norm, cosine similarity (unchanged from v6)
  * ============================================================ */
 static inline float sve2_dot_f32(const float *a, const float *b, size_t dim) {
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     svfloat32_t acc = svdup_f32(0.0f);
     size_t i = 0;
     while (i < dim) {
@@ -268,7 +266,7 @@ static inline float sve2_dot_f32(const float *a, const float *b, size_t dim) {
 }
 
 static inline float sve2_norm_f32(const float *a, size_t dim) {
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     svfloat32_t acc = svdup_f32(0.0f);
     size_t i = 0;
     while (i < dim) {
@@ -284,7 +282,7 @@ static inline float sve2_norm_f32(const float *a, size_t dim) {
 }
 
 static inline float sve2_cosine_similarity(const float *a, const float *b, size_t dim) {
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
     svfloat32_t da = svdup_f32(0.0f), na = svdup_f32(0.0f), nb = svdup_f32(0.0f);
     size_t i = 0;
     while (i < dim) {
@@ -317,7 +315,7 @@ static inline void sve2_fused_gather_similarity(
         const float *emb = emb_base + indices[e] * dim;
         if (e + SVE2_PREFETCH_DIST < n_emb)
             __builtin_prefetch(emb_base + indices[e+SVE2_PREFETCH_DIST]*dim, 0, 1);
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
         svfloat32_t da = svdup_f32(0.0f), en = svdup_f32(0.0f);
         size_t i = 0;
         while (i < dim) {
@@ -382,7 +380,7 @@ static inline void sve2_batch_gather_load(
         float *dst = output + e * dim;
         if (e + SVE2_PREFETCH_DIST < n_emb)
             __builtin_prefetch(emb_base + indices[e+SVE2_PREFETCH_DIST]*dim, 0, 1);
-#ifdef __aarch64__
+#ifdef USE_ARM_SVE
         size_t i = 0;
         while (i < dim) {
             svbool_t pg = svwhilelt_b32_u64(i, dim);

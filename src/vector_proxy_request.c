@@ -1,0 +1,81 @@
+#include "vector_proxy_request.h"
+
+#include "macro.h"
+#include "monotonic.h"
+#include "sds.h"
+#include "zmalloc.h"
+
+proxy_vector_request_t *proxy_vector_request_create_vemb(uint64_t request_id,
+                                                         uint64_t row_id,
+                                                         int raw_output,
+                                                         RedisModuleBlockedClient *bc,
+                                                         size_t result_capacity) {
+    size_t inline_bytes = 0;
+    if (result_capacity > 0) {
+        RETURN_IF(result_capacity > (SIZE_MAX - sizeof(proxy_vector_request_t)) /
+                                    sizeof(float), NULL);
+        inline_bytes = result_capacity * sizeof(float);
+    }
+
+    proxy_vector_request_t *req = zcalloc(sizeof(*req) + inline_bytes);
+    RETURN_IF(!req, NULL);
+
+    req->op_type = PROXY_VECTOR_OP_VEMB;
+    req->request_id = request_id;
+    req->row_id = row_id;
+    req->raw_output = raw_output;
+    req->bc = bc;
+    req->submit_time_us = getMonotonicUs();
+    req->completion_time_us = 0;
+    req->batch_id = 0;
+    req->result_capacity = result_capacity;
+    if (result_capacity > 0) {
+        req->result_vector = req->inline_result;
+        req->result_inline = 1;
+    }
+    return req;
+}
+
+proxy_vector_request_t *proxy_vector_request_create_vsim(uint64_t request_id,
+                                                         float *query_vector,
+                                                         size_t query_dim,
+                                                         uint64_t *candidate_rows,
+                                                         sds *candidate_elements,
+                                                         size_t candidate_count,
+                                                         size_t requested_count,
+                                                         int withscores,
+                                                         RedisModuleBlockedClient *bc) {
+    proxy_vector_request_t *req = zcalloc(sizeof(*req));
+    RETURN_IF(!req, NULL);
+
+    req->op_type = PROXY_VECTOR_OP_VSIM;
+    req->request_id = request_id;
+    req->query_vector = query_vector;
+    req->query_dim = query_dim;
+    req->candidate_rows = candidate_rows;
+    req->candidate_elements = candidate_elements;
+    req->candidate_count = candidate_count;
+    req->requested_count = requested_count;
+    req->withscores = withscores;
+    req->bc = bc;
+    req->submit_time_us = getMonotonicUs();
+    req->completion_time_us = 0;
+    req->batch_id = 0;
+    return req;
+}
+
+void proxy_vector_request_free(proxy_vector_request_t *req) {
+    RETURN_IF(!req);
+    if (!req->result_inline) zfree(req->result_vector);
+    zfree(req->query_vector);
+    zfree(req->candidate_rows);
+    zfree(req->result_rows);
+    zfree(req->result_scores);
+    if (req->candidate_elements) {
+        for (size_t i = 0; i < req->candidate_count; i++) {
+            sdsfree(req->candidate_elements[i]);
+        }
+        zfree(req->candidate_elements);
+    }
+    zfree(req);
+}

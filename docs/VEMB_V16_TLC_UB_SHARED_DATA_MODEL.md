@@ -1,0 +1,987 @@
+# VEMB V16 TLC WARM 共享数据模型
+
+日期：2026-05-22
+
+## 核心结论
+
+VEMB V16 中，TLC 是 SuperNode 内部的分层内存管理器。`VADD/VEMB/VSIM` 由 SuperNode 执行，CLI 通过 proxy-managed channel 与目标 SuperNode 交互，VEMB response 返回 WARM handle，CLI 再从对应 WARM data region 读取向量。
+
+```text
+CLI local config -> consistent_hash(vector_key) -> target supernode_id
+CLI/vemb_v16_bench -> Proxy channel -> SuperNode worker -> vemb_v16_tlc -> tlc_core
+VEMB response -> {region_id, offset, bytes}
+CLI read -> regions[region_id].mapped_addr + offset
+```
+
+关键约束：
+
+```text
+consistent_hash 在 CLI 中完成
+Proxy 不负责 hash/region 配置/计算
+Proxy 负责 channel 生命周期、channel_id 管理、Proxy <-> SuperNode 数据交互
+SuperNode 负责 VADD/VEMB/VSIM 和 TLC HOT/WARM/COLD
+WARM handle 永远指向 WARM data region，不直接指向 COLD
+```
+
+## 总体架构
+
+```mermaid
+flowchart LR
+    CLI[CLI or vemb_v16_bench]
+    CFG[CLI Config]
+    HR[Consistent Hash Ring in CLI]
+    CTRL[UDS Control]
+    CCH[Request and Response Rings]
+    P[Proxy channel worker]
+    JOB[VADD/VEMB Job Ring]
+    SN[SuperNode worker]
+    TLC[vemb_v16_tlc]
+    CORE[tlc_core]
+    HOT[HOT key_hash to warm_idx]
+    WMETA[WARM Metadata and bitmap lock private]
+    WP[WARM Provider shm or UB mmap]
+    WDATA[WARM Data Region shared shm or UB]
+    COLD[COLD Append Layer remote UB or SSD]
+    COMP[Completion Ring]
+
+    CLI --> CFG
+    CLI --> HR
+    CLI --> CTRL
+    CTRL --> P
+    CLI --> CCH
+    CCH --> P
+    P --> JOB
+    JOB --> SN
+    SN --> TLC
+    TLC --> CORE
+    CORE --> HOT
+    CORE --> WMETA
+    TLC --> WP
+    WP --> WDATA
+    CORE --> COLD
+    SN --> COMP
+    COMP --> P
+    P --> CCH
+    CLI --> WDATA
+
+    classDef client fill:#f8fafc,stroke:#64748b,stroke-width:1px,color:#0f172a
+    classDef proxy fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#451a03
+    classDef supernode fill:#e8f3ff,stroke:#2563eb,stroke-width:2px,color:#102a56
+    classDef tlc fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#3b0764
+
+    class CLI,CFG,HR client
+    class P,CCH,CTRL,JOB,COMP proxy
+    class SN supernode
+    class TLC,CORE,HOT,WMETA,WP,WDATA,COLD tlc
+```
+
+说明：
+
+- CLI 从本地配置读取 proxy、SuperNode、hash ring 和 WARM region。
+- CLI 本地执行 `consistent_hash(vector_key)`，选择目标 SuperNode。
+- CLI 向 proxy 申请绑定到目标 SuperNode 的 channel。
+- Proxy 管理 `channel_id`、CLI request/response ring 生命周期，以及 Proxy worker 到 SuperNode worker 的统一 job shard queue 和 per-channel completion ring。
+- Proxy 不下发拓扑/hash/region，不做 VEMB/VSIM 计算，不读写 WARM/COLD。
+- SuperNode worker 执行 VADD/VEMB，内部调用 `vemb_v16_tlc`；`tlc_core` 管理 HOT、WARM metadata、bitmap lock、COLD，WARM vector bytes 写到 `warm_provider` 映射出的 data region。
+- 当前 P0 代码中，`vemb_v16_proxy_create()` 仍负责 `vemb_v16_warm_provider_open()` 和 `vemb_v16_tlc_create()`；代码中已记录 TODO，后续要移动到 SuperNode 初始化路径，语义是 `supernode owns storage`。
+
+多 SuperNode 拓扑单独维护在：
+
+```text
+docs/VEMB_V16_MULTI_SUPERNODE_HASH_RING_DESIGN.md
+```
+
+该拓扑使用两个关键约束：
+
+```text
+consistent_hash 在 CLI 中完成
+proxy 与 SuperNode 一一对应
+```
+
+## TLC 数据模型
+
+```text
+HOT:
+  SuperNode 私有 cache/index
+  目标是 L3 cache resident
+  key -> warm_idx
+  不暴露给 CLI
+
+WARM:
+  SuperNode 私有 metadata/index:
+    key -> warm_idx
+    warm_idx -> region_id + offset + bytes
+    state / bitmap lock / access_count / eviction metadata
+  共享 data regions:
+    region_id + offset -> vector bytes
+    provider 可以是 shm，也可以是一个或多个 UB path
+    CLI 根据 {region_id, offset, bytes} 直接读取
+
+COLD:
+  append-only 冷/溢出层
+  可以是 remote UB，也可以是本地 SSD/mmap file
+  不存全量数据
+```
+
+关键澄清：
+
+```text
+WARM 不是 data region + HOT Layer。
+WARM = shared data region + SuperNode private metadata/index。
+HOT = 独立上一层 cache，只缓存 key -> warm_idx。
+```
+
+WARM data region 使用 packed vector arena：
+
+```text
+single region:
+  slot_id * value_size -> vector bytes
+  vector_slot[N][1200B]
+
+multi region:
+  region_id + local_slot * value_size -> vector bytes
+  warm metadata records key -> {region_id, local_slot, offset, bytes}
+```
+
+### 多 UB Region WARM 设计
+
+一个 SuperNode 的同一个 WARM layer 可以同时挂载多个 UB region。HOT/WARM metadata 仍保持 SuperNode 私有，UB/shared memory 只承载 vector payload。跨进程和跨节点可见的定位信息仍然只有：
+
+```text
+region_id + offset + bytes
+```
+
+新增 region runtime 元数据：
+
+```text
+region_id
+backend_type = shm | ub
+path / mmap_offset / region_bytes
+value_size
+capacity_slots = region_bytes / value_size
+next_slot
+full
+home_ub_node_id
+is_local
+weight
+mapped_addr
+```
+
+新 key 写入流程：
+
+```text
+key_hash
+-> warm_region_hash_ring.lookup(key_hash)
+-> primary region
+-> if primary has free slot: allocate local_slot and write payload
+-> if primary is full: walk next candidate region on the ring
+-> if all WARM regions are full: append COLD / return invalid warm handle
+```
+
+覆盖已有 key 时不重新选择 region。WARM metadata 中已有的 `{region_id, offset}` 是该 key 的稳定 payload 位置，overwrite 直接写回原位置，避免 handle 抖动。
+
+region 选择使用 `three_layer_cache_ub` 中的 hash + weight 思路：
+
+```text
+base_vnodes = N
+effective_weight = region.weight
+if region.is_local:
+  effective_weight *= local_region_weight
+vnodes = base_vnodes * effective_weight
+```
+
+因此本地 UB region 会拥有更多 virtual nodes，默认更容易被选中；但本地 region 满后，allocator 会沿 hash ring 选择下一个可用 UB region。需要统计：
+
+```text
+local_allocs
+remote_allocs
+fallback_allocs
+full_regions
+cold_spills
+hash_ring_local_pct
+```
+
+### 元数据 / 用户数据分离设计
+
+TLC 中 WARM 被拆成两类内存：
+
+```text
+用户数据:
+  WARM data region
+  只存 packed vector bytes
+  由 vemb_v16_warm_provider_open() mmap 出来
+  backend 可以是 POSIX SHM，也可以是 UB path
+  CLI/client 可根据 handle 直接读取
+
+元数据:
+  HOT index
+  WARM entries/hash table/bitmap lock
+  COLD append/read-through metadata
+  key_hash/key bytes/state/access_count/eviction fields
+  由 tlc_core 在 SuperNode 本地 heap 上分配
+  不暴露给 CLI/client
+```
+
+这个设计的核心是：共享/UB 区域只承载大块 vector bytes，不放 key、hash table、锁、状态位等控制信息。SuperNode 独占 TLC metadata 和一致性控制，CLI/client 只拿 `{region_id, offset, bytes}` 去读 payload。
+
+好处：
+
+1. 大 vector 数据可以通过 SHM/UB 共享给 client，避免 VEMB response 复制 1200B payload。
+2. HOT/WARM metadata 保持 SuperNode 私有，更容易做到 cache-friendly，也避免跨进程锁和 metadata ABI 约束。
+3. 后续 WARM 淘汰、slot 复用、generation、TTL 等策略只改 metadata，不需要改变 WARM data region 的 packed vector ABI。
+4. UB 模式下只要求 UB region 支持 mmap 和 payload 读写；metadata 分配不依赖 UB allocator。
+
+COLD read-through 不直接把 COLD handle 返回给 CLI：
+
+```text
+read COLD
+promote/write WARM
+return WARM handle
+```
+
+这样 CLI 永远只读 WARM region，协议保持简单。
+
+## 配置与 ABI
+
+CLI 启动配置中，`cli` 描述 CLI 自己要使用的 hash 算法和可 mmap 的 WARM region map；`nodes[]` 描述每组一一对应的 Proxy 和 SuperNode 初始化资源。CLI 根据 `cli.hash` 对 `vector_key` 做 `consistent_hash` 得到 `node_id`，再连接对应 node 的 `proxy.endpoint` 申请 channel。
+
+SuperNode 内部还会为自己的 WARM regions 构建第二层 hash ring。两层 hash 的边界不同：
+
+```text
+CLI hash:
+  vector_key -> supernode_id
+  只负责跨 SuperNode 路由
+
+SuperNode WARM region hash:
+  key_hash -> warm region candidate
+  只负责本 SuperNode 内部的 UB region 分配
+```
+
+```yaml
+cli:
+  id: cli-0
+  hash:
+    algorithm: consistent_hash
+  warm_regions:
+    - region_id: 0
+      node_id: 0
+      provider: shm
+      path: /vemb_warm_0
+      mmap_offset: 0
+      bytes: 1073741824
+      value_size: 1200
+    - region_id: 1
+      node_id: 0
+      provider: ub
+      path: /dev/obmm_shmdev2
+      mmap_offset: 0
+      bytes: 1073741824
+      value_size: 1200
+    - region_id: 2
+      node_id: 0
+      provider: ub
+      path: /dev/obmm_shmdev3
+      mmap_offset: 0
+      bytes: 1073741824
+      value_size: 1200
+
+nodes:
+  - id: 0
+    proxy:
+      endpoint: /tmp/vemb_proxy_0.sock
+    supernode:
+      local_ub_node_id: 0
+      tlc:
+        warm:
+          hash:
+            algorithm: consistent_hash
+            virtual_nodes: 32
+            local_region_weight: 4
+          regions:
+            - region_id: 0
+              provider: shm
+              path: /vemb_warm_0
+              mmap_offset: 0
+              bytes: 1073741824
+              value_size: 1200
+              weight: 1
+            - region_id: 1
+              provider: ub
+              path: /dev/obmm_shmdev2
+              mmap_offset: 0
+              bytes: 1073741824
+              value_size: 1200
+              home_ub_node_id: 0
+              weight: 1
+            - region_id: 2
+              provider: ub
+              path: /dev/obmm_shmdev3
+              mmap_offset: 0
+              bytes: 1073741824
+              value_size: 1200
+              home_ub_node_id: 1
+              weight: 1
+```
+
+说明：
+
+- `cli.hash` 只给 CLI 本地路由使用，Proxy 不持有 hash ring。
+- `cli.warm_regions[]` 是 CLI 需要 mmap 的所有 SuperNode WARM data region；VEMB response 的 `region_id` 必须能在这里查到。
+- `node.id` 同时标识 Proxy 和 SuperNode 这一对实例。
+- `node.proxy.endpoint` 是 CLI 连接 Proxy、申请 channel 的地址。
+- `node.supernode.tlc.warm.regions[]` 是该 SuperNode 初始化 TLC 时使用的 WARM data region descriptors，应与 `cli.warm_regions[]` 中同 `region_id` 的条目一致。
+- 当前代码路径仍是单 region P0 形态；多 region 设计要求 `warm_layer` 映射多个 region，并在 TLC metadata 中维护 `warm_idx -> region_id + offset`。
+- `local_ub_node_id` 和 region 的 `home_ub_node_id` 用于判断本地 UB region；如果 OBMM/topology 后续提供自动查询接口，可以由 manifest 生成阶段填充这些字段。
+- SuperNode 不再单独暴露给 CLI 一个 endpoint；Proxy 和 SuperNode 一起初始化，Proxy 负责与本地对应 SuperNode 的数据交互。
+- P0 暂时不需要在 CLI 配置里暴露 `hot/cold`：HOT 是 SuperNode 私有 cache，COLD 是 SuperNode 私有 append 层；二者不被 CLI mmap 读取。
+
+关键结构：
+
+```c
+typedef enum {
+    VEMB_REGION_LOCAL_SHM = 1,
+    VEMB_REGION_UB = 2,
+} vemb_region_backend_t;
+
+typedef struct vemb_region_desc {
+    uint32_t region_id;
+    uint32_t supernode_id;
+    uint32_t storage_class;
+    uint32_t backend_type;
+    uint32_t dim;
+    uint32_t value_size;
+    uint32_t home_ub_node_id;
+    uint32_t weight;
+    uint64_t mmap_offset;
+    uint64_t region_bytes;
+    char path[256];
+} vemb_region_desc_t;
+
+typedef struct vemb_cli_region {
+    uint32_t region_id;
+    uint32_t supernode_id;
+    uint32_t backend_type;
+    uint32_t value_size;
+    uint64_t region_bytes;
+    void *mapping_addr;
+    void *mapped_addr;
+} vemb_cli_region_t;
+
+typedef struct vemb_vector_handle {
+    uint32_t region_id;
+    uint32_t bytes;
+    uint64_t offset;
+    uint64_t key_hash;           /* Optional debug/check field; not used for address lookup. */
+} vemb_vector_handle_t;
+
+typedef struct tlc_warm_region {
+    uint32_t region_id;
+    uint32_t backend_type;
+    uint32_t home_ub_node_id;
+    uint32_t is_local;
+    uint32_t weight;
+    void *mapped_addr;
+    uint64_t region_bytes;
+    uint32_t value_size;
+} tlc_warm_region_t;
+
+typedef struct tlc_warm_location {
+    uint32_t region_id;
+    uint32_t region_index;
+    uint32_t local_slot;
+    uint32_t bytes;
+    uint64_t offset;
+} tlc_warm_location_t;
+```
+
+`warm_slot/warm_idx` 可以作为 debug 字段保留，但不应该成为跨进程协议的唯一定位信息。多 region 后，`warm_idx` 是 SuperNode 私有 metadata entry index，`local_slot` 才是某个 region 内部的 payload slot。
+
+`vemb_vector_handle_t` 中真正用于定位 vector 的字段是：
+
+```text
+region_id + offset + bytes
+```
+
+`key_hash` 不参与寻址。它只用于日志、调试、请求/handle 一致性校验，以及后续 slot 复用或 stale handle 排查。
+
+## 初始化时序
+
+```mermaid
+sequenceDiagram
+    participant S as vemb_v16_server
+    participant P as Proxy
+    participant SN as SuperNode
+    participant W as WARM Backend
+    participant TLC as vemb_v16_tlc
+    participant CORE as tlc_core
+    participant CTRL as UDS Control
+    participant CLI as CLI or bench
+
+    S->>S: parse warm region config or OBMM manifest
+    S->>P: vemb_v16_proxy_create(config)
+    P->>W: vemb_v16_warm_provider_open_many(regions[])
+    loop each warm region
+        W->>W: shm_open+ftruncate+mmap or open+mmap UB path
+        W->>W: derive is_local from local_ub_node_id/home_ub_node_id
+    end
+    W-->>P: mapped_addr[], region_id[], region_bytes[]
+    P->>TLC: vemb_v16_tlc_create(warm_regions[])
+    TLC->>TLC: build warm region hash ring with local weight
+    TLC->>CORE: tlc_core_create(config, warm_regions[])
+    CORE->>CORE: zcalloc HOT/WARM/COLD metadata and bitmap lock
+    CORE-->>TLC: ready
+    TLC-->>P: ready
+    Note over P,SN: TODO move warm provider and TLC init into SuperNode. SuperNode owns storage.
+
+    CLI->>CTRL: ALLOC_CHANNEL(dim)
+    CTRL->>P: allocate channel_id and channel resources
+    P->>P: create request/response rings
+    P->>P: create per-channel completion ring
+    P->>P: bind channel to pooled proxy/supernode workers
+    Note over P,SN: request path uses proxy_io_worker -> supernode_worker shard queues
+    CTRL-->>CLI: channel descriptor and WARM region desc
+    CLI->>W: mmap/attach WARM region from descriptor/config
+    W-->>CLI: mapped_addr
+    CLI->>CLI: regions[region_id] = mapped_addr
+```
+
+初始化边界：
+
+```text
+WARM vector payload: warm_provider 映射出的 shared shm 或 UB regions
+TLC/HOT/WARM/COLD metadata: tlc_core 使用本地 zcalloc 分配
+VADD/VEMB 执行线程: SuperNode worker
+channel 生命周期和 response ring: proxy/channel worker
+```
+
+`vemb_v16_warm_provider_open()` 是当前单 WARM 用户数据区的初始化入口。多 region 形态需要增加 `open_many()` 或等价初始化层：
+
+```text
+input:
+  regions[]
+    backend_type = shm | ub
+    region_id
+    path / shm name
+    mmap_offset
+    region_bytes
+    value_size
+    home_ub_node_id / is_local / weight
+
+local shm:
+  shm_open(path)
+  ftruncate(region_bytes)
+  mmap(MAP_SHARED)
+
+ub:
+  open(path, O_RDWR)
+  mmap(MAP_SHARED, offset=mmap_offset)
+
+output:
+  provider->regions[i].region_id
+  provider->regions[i].backend_type
+  provider->regions[i].path
+  provider->regions[i].mmap_offset
+  provider->regions[i].region_bytes
+  provider->regions[i].mapped_addr
+  provider->regions[i].capacity_slots
+  provider->regions[i].is_local
+```
+
+`vemb_v16_tlc_create()` 只消费 warm provider 返回的 `mapped_addr/region_id/region_bytes/value_size`。它不会再为 vector payload 自己分配大块内存；`tlc_core_create()` 只分配 HOT/WARM/COLD metadata，并把 WARM payload writes 指向 warm provider 的 mapped regions。
+
+Linux 上默认 `shm` backend 使用普通 `MAP_SHARED`。POSIX shm 对象通常位于 tmpfs，不是 hugetlbfs 文件，隐式叠加 `MAP_HUGETLB` 会在普通部署上返回 `EINVAL`。`ub` backend 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。
+
+### OBMM UB Region 初始化与 Local 判定
+
+OBMM 的 export/import 和 UB path 创建由 `obmmctl` 在进程外完成。Redis/VEMB 进程只消费已经存在的 `/dev/obmm_shmdevX` 或等价 UB path：
+
+```text
+obmmctl create/export/import
+-> produce shmdev path and metadata
+-> vemb_v16_server open(path, O_RDWR)
+-> mmap(MAP_SHARED)
+-> register as WARM region
+```
+
+`open + mmap` 只能证明当前进程可以映射这块 UB memory，不能可靠推断这块 region 是否本地。因此 local 判定必须来自控制面：
+
+```text
+region.is_local = region.home_ub_node_id == supernode.local_ub_node_id
+```
+
+推荐由 obmmctl 部署流程生成 manifest：
+
+```yaml
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 8
+warm_regions:
+  - region_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev2
+    mmap_offset: 0
+    bytes: 1073741824
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 2
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 1073741824
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+```
+
+如果短期无法从 obmmctl 产出 `home_ub_node_id`，可以在 region descriptor 中直接配置 locality：
+
+```yaml
+is_local: true
+```
+
+不建议通过 `/dev/obmm_shmdevX` 的数字后缀推断 locality；该编号是本机 shmdev 视角的资源 id，不是稳定的物理 UB node id。
+
+## Channel 生命周期
+
+```mermaid
+sequenceDiagram
+    participant C as CLI
+    participant CTRL as UDS Control
+    participant P as Proxy
+    participant SN as SuperNode
+    participant RQ as Request Ring
+    participant JQ as Job Ring
+    participant CQ as Completion Ring
+    participant RS as Response Ring
+    participant W as WARM Region
+
+    C->>CTRL: allocate_channel(client_id, supernode_id, thread_id)
+    CTRL->>P: create proxy channel
+    P->>P: channel_id = next_monotonic_id()
+    P->>RQ: create request ring
+    P->>RS: create response ring
+    P->>JQ: allocate fixed-slot job rings
+    P->>CQ: allocate fixed-slot completion rings
+    P->>SN: start/bind SuperNode worker ctx
+    P-->>CTRL: channel descriptor(channel_id, rings, warm region)
+    CTRL-->>C: channel descriptor(channel_id, rings, warm region)
+    C->>RQ: attach request ring
+    C->>RS: attach response ring
+    C->>W: mmap/attach WARM data region
+
+    loop data path
+        C->>RQ: publish VADD/VEMB
+        P->>RQ: poll batch
+        P->>P: validate channel_id and request shape
+        P->>JQ: publish VADD/VEMB job
+        SN->>JQ: poll job
+        SN-->>CQ: publish completion(handle/status)
+        P->>CQ: drain completions
+        P->>RS: publish response
+        RS-->>C: poll response
+    end
+
+    C->>P: release_channel(channel_id)
+    P->>RQ: detach and cleanup request ring
+    P->>RS: detach and cleanup response ring
+    P->>SN: stop/bind cleanup if unused
+    P-->>C: released
+```
+
+`channel_id` 由 proxy 单调分配。Proxy 负责 CLI channel 创建、回收和异常清理，维护 channel 与 SuperNode worker 的路由关系，并把 request ring 上的 PING/VADD/VEMB/VSIM 转成统一 job shard queue 中的 job。SuperNode 只写 completion ring，不直接持有 response ring。
+
+## VEMB 时序
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI
+    participant RQ as Request Ring
+    participant P as Proxy Worker
+    participant JQ as VEMB Job Ring
+    participant SN as SuperNode Worker
+    participant TLC as vemb_v16_tlc
+    participant CORE as tlc_core
+    participant HOT as HOT key_hash index
+    participant WMETA as WARM metadata/hash/bitmap
+    participant COLD as COLD append layer
+    participant CQ as Completion Ring
+    participant RS as Response Ring
+    participant WDATA as WARM data region
+    participant R as CLI Region Map
+
+    CLI->>CLI: parse VEMB, normalize key, compute key_hash
+    CLI->>RQ: publish VEMB_HANDLE(channel_id, req_id, key_hash, key)
+    P->>RQ: poll batch and validate key_len/request len/dim
+    P->>JQ: publish vemb_v16_vemb_job_t
+    SN->>JQ: poll job
+    SN->>TLC: vemb_v16_tlc_get_handle(key, key_len, key_hash)
+    TLC->>CORE: tlc_core_get_handle(key, key_len, key_hash)
+    CORE->>HOT: hot_get(key_hash)
+    HOT-->>CORE: warm_idx or miss
+    CORE->>WMETA: validate warm_idx key_hash and key bytes
+    alt HOT miss
+        CORE->>WMETA: warm hash lookup under bitmap lock
+        WMETA-->>CORE: warm_idx or miss
+    end
+    alt WARM miss and COLD hit
+        CORE->>COLD: cold_lookup(key)
+        COLD-->>CORE: value bytes
+        CORE->>WMETA: warm_put promotes value to WARM
+        CORE->>HOT: hot_put(key_hash, warm_idx)
+    end
+    CORE-->>TLC: handle(region_id, offset, bytes)
+    opt VEMB_SUPERNODE_READ mode
+        SN->>TLC: vemb_v16_tlc_read_handle(handle)
+        TLC->>WDATA: read from regions[region_id] + offset
+    end
+    SN->>CQ: publish completion(channel_id, req_id, handle)
+    P->>CQ: drain completion
+    P->>RS: publish response(req_id, status, handle)
+    RS-->>CLI: poll response
+    CLI->>R: mapped_addr = regions[region_id]
+    CLI->>WDATA: read mapped_addr + offset
+```
+
+热路径读取逻辑：
+
+```c
+const vemb_vector_handle_t *h = &resp->handle;
+const vemb_cli_region_t *r = &cli->regions[h->region_id];
+
+if (!r->mapped_addr)
+    return VEMB_ERR;
+if ((uint64_t)h->offset + h->bytes > r->region_bytes)
+    return VEMB_ERR;
+
+const void *vector = (const uint8_t *)r->mapped_addr + h->offset;
+```
+
+P0 校验：
+
+```text
+region_id 存在
+mapped_addr 非空
+offset + bytes 不越界
+bytes == 1200
+```
+
+## VADD 时序
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI
+    participant RQ as Request Ring
+    participant P as Proxy Worker
+    participant JQ as VADD Job Ring
+    participant SN as SuperNode Worker
+    participant TLC as vemb_v16_tlc
+    participant CORE as tlc_core
+    participant WMETA as WARM metadata/hash/bitmap
+    participant WDATA as WARM data region
+    participant HOT as HOT key_hash index
+    participant COLD as COLD append layer
+    participant CQ as Completion Ring
+    participant RS as Response Ring
+
+    CLI->>CLI: parse VADD_INLINE, normalize key, compute key_hash
+    CLI->>RQ: publish VADD_INLINE(key_hash, key, vector, req_id)
+    P->>RQ: poll batch and validate channel_id/key_len/dim/vector_bytes
+    P->>JQ: publish vemb_v16_vadd_job_t with inline vector
+    SN->>JQ: poll job
+    SN->>TLC: vemb_v16_tlc_put(key, key_len, key_hash, vector)
+    TLC->>CORE: tlc_core_put(key, key_len, key_hash, value)
+    CORE->>WMETA: warm_put find existing or append new warm_idx
+    alt WARM has free slot
+        CORE->>WMETA: resolve/allocate warm location
+        CORE->>WDATA: sve_streaming_store or memcpy value bytes
+        CORE->>WMETA: publish key/key_hash/state/access_count
+        CORE->>HOT: hot_put(key_hash, warm_idx)
+        CORE-->>TLC: handle(region_id, offset, bytes)
+    else WARM full
+        CORE->>COLD: cold_append(key, value)
+        CORE-->>TLC: invalid warm slot
+    end
+    SN->>CQ: publish completion(channel_id, req_id, status, handle or zero handle)
+    P->>CQ: drain completion
+    P->>RS: publish OK/status
+    RS-->>CLI: poll response
+```
+
+当前 P0 的 `VADD` 是 inline vector payload：request ring 到 proxy 后复制进 `vemb_v16_vadd_job_t`，再由 SuperNode 写 TLC。后续如需降低大 payload 对 request ring/job ring 的压力，再引入 client-side staging buffer。
+
+## COLD Read-Through 时序
+
+```mermaid
+sequenceDiagram
+    participant CLI as CLI
+    participant RQ as Request Ring
+    participant P as Proxy Worker
+    participant JQ as VEMB Job Ring
+    participant SN as SuperNode Worker
+    participant TLC as vemb_v16_tlc
+    participant CORE as tlc_core
+    participant WMETA as WARM metadata private
+    participant WDATA as WARM data region
+    participant COLD as COLD Append Layer
+    participant HOT as HOT
+    participant CQ as Completion Ring
+    participant RS as Response Ring
+
+    CLI->>RQ: VEMB(key, key_hash) on channel_id
+    P->>JQ: publish VEMB job
+    SN->>TLC: vemb_v16_tlc_get_handle(key, key_hash)
+    TLC->>CORE: tlc_core_get_handle(key, key_hash)
+    CORE->>HOT: hot_get(key_hash)
+    HOT-->>CORE: miss
+    CORE->>WMETA: warm hash lookup
+    WMETA-->>CORE: miss
+    CORE->>COLD: cold_lookup(key)
+    COLD-->>CORE: value
+    CORE->>WMETA: warm_put allocate warm_idx
+    CORE->>WMETA: resolve/allocate warm location
+    CORE->>WDATA: copy value into regions[region_id] + offset
+    CORE->>HOT: hot_put(key_hash, warm_idx)
+    CORE-->>TLC: WARM handle
+    SN->>CQ: publish completion(handle)
+    P->>RS: publish response(handle)
+    RS-->>CLI: poll response
+```
+
+## Linux 运行命令
+
+编译：
+
+```bash
+make -C src vemb_v16_server
+make -C benchmark vemb_v16_bench
+```
+
+ARM SVE 机器可用：
+
+```bash
+make -C src vemb_v16_server USE_SVE=yes
+make -C benchmark vemb_v16_bench
+```
+
+本地 POSIX SHM 模式启动 server：
+
+```bash
+./src/vemb_v16_server \
+  --socket /tmp/vemb_v16.sock \
+  --vector-region /vemb_v16_vectors \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072 \
+  --loglevel notice
+```
+
+本地 POSIX SHM 模式 benchmark：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --socket /tmp/vemb_v16.sock \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode mixed-80r20w
+```
+
+TCP 模式启动 server。默认 TCP 端口是 `6391`，这里显式写出便于跨机器或多实例调试：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 8 \
+  --supernode-workers 16 \
+  --vector-region /vemb_v16_vectors \
+  --warm-backend shm \
+  --dim 300 \
+  --max-vectors 131072 \
+  --loglevel notice
+```
+
+Transport 当前是严格二选一，没有 `both` 语义：`--transport tcp` 表示控制面和数据面全部走 TCP，不启动 UDS listener；`--transport aeron` 表示控制面走 UDS、数据面走 SHM/Aeron ring，不启动 TCP listener。当前实现要求显式启用 `--proxy-io-threads N` 与 `--supernode-workers N`，二者均需为正数；`proxy I/O worker` 在 TCP 模式负责 TCP fd 管理，在 Aeron 模式负责 SHM request ring 轮询，Linux 下内部使用 `epoll`，非 Linux 使用 `poll`。VEMB/VADD 主路径统一走 `proxy_io_worker -> supernode_worker` SPSC shard queue，用于降低高连接数压测时的线程膨胀和 queue 扫描成本。
+
+TCP 模式 benchmark 连通性测试：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 0 \
+  --ops 100000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode ping
+```
+
+TCP 模式只返回 WARM handle 的 VEMB benchmark：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode vemb-handle
+```
+
+TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。该模式由 SuperNode 在 completion 中携带 inline vector snapshot，TCP proxy 只负责把 snapshot 编码到 response frame 后面，不再按 handle 回源读取 WARM slot。`vemb-read-vector` 依赖 client 本地 mmap WARM/vector region，不作为 TCP 跨主机读 vector 语义：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8 \
+  --pipeline 1 \
+  --mode vemb-inline-vector
+```
+
+TCP 模式线程扫描可用逗号列表；bench 会按顺序分别执行每个线程数：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --host 127.0.0.1 \
+  --port 6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,48 \
+  --pipeline 32 \
+  --mode vemb-inline-vector \
+  --timeout-ms 120000
+```
+
+多 UB region 运行应使用 manifest/config 驱动，而不是单组 `--vector-region/--warm-mmap-offset/--region-id`。下面给出一个可直接运行的 manifest 示例：
+
+```yaml
+supernode_id: 0
+local_ub_node_id: 0
+local_region_weight: 8
+warm_regions:
+  - region_id: 101
+    provider: shm
+    path: /vemb_v16_manifest_r101
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 202
+    provider: mock_ub
+    path: /vemb_v16_manifest_r202
+    mmap_offset: 0
+    bytes: 134217728
+    value_size: 1200
+    home_ub_node_id: 1
+    weight: 1
+```
+
+启动 multi-region server：
+
+```bash
+./src/vemb_v16_server \
+  --transport tcp \
+  --tcp-host 127.0.0.1 \
+  --tcp-port 6391 \
+  --proxy-io-threads 16 \
+  --supernode-workers 64 \
+  --warm-regions-manifest /tmp/vemb_v16_warm_regions.yaml \
+  --dim 300 \
+  --max-vectors 131072 \
+  --loglevel notice
+```
+
+manifest 中需要包含所有 region 的 `region_id/provider/path/mmap_offset/bytes/value_size/home_ub_node_id/weight`，以及本 SuperNode 的 `local_ub_node_id` 和可选 `local_region_weight`。server 初始化时打开并 mmap 所有 region，构建 WARM region hash ring，并按 local weight 优先把新 key 分配到本地 UB region；本地 region 满后自动 fallback 到下一个可用 region。
+
+TCP 模式下读路径当前要求 inline vector 返回，因此 benchmark 推荐使用 `vemb-inline-vector` 或 `mixed-80r20w`。bench/client 会从 server 返回的 channel descriptor 中读取 warm backend、region path、mmap offset 和 region size：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,64 \
+  --pipeline 32 \
+  --timeout-ms 3000 \
+  --mode vemb-inline-vector
+```
+
+混合读写压测可使用：
+
+```bash
+./benchmark/vemb_v16_bench \
+  --transport tcp \
+  --endpoints 127.0.0.1:6391 \
+  --dim 300 \
+  --prefill 65536 \
+  --ops 200000 \
+  --threads 8,16,24,32,64 \
+  --pipeline 32 \
+  --timeout-ms 3000 \
+  --mode mixed-80r20w
+```
+
+常用 benchmark mode：
+
+```bash
+--mode ping
+--mode vadd-inline
+--mode vemb-handle
+--mode vemb-read-vector
+--mode vemb-inline-vector
+--mode vemb-supernode-read
+--mode mixed-80r20w
+```
+
+Linux HugeTLB：默认 `--warm-backend shm` 不尝试 `MAP_HUGETLB`，直接使用普通 `MAP_SHARED`；`--warm-backend ub` 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。如需 HugeTLB 真正生效，需要预留 huge pages，例如：
+
+```bash
+sudo sysctl -w vm.nr_hugepages=512
+grep Huge /proc/meminfo
+```
+
+清理：
+
+```bash
+pkill -f vemb_v16_server
+rm -f /tmp/vemb_v16.sock
+ls /dev/shm | grep vemb_v16
+```
+
+## 当前代码状态
+
+已落地：
+
+1. `vemb_v16_warm_provider` 支持本地 POSIX SHM 和 UB path mmap，统一产出 WARM data region。
+2. `vemb_v16_tlc` 消费 warm provider，返回 `{region_id, offset, bytes, key_hash}` 形式的 WARM handle。
+3. `tlc_core` 的 HOT/WARM/COLD metadata 使用本地 heap 分配，WARM vector payload 写入 shared shm/UB region。
+4. `VADD_INLINE` 由 proxy 转成 typed job，SuperNode worker 调用 `vemb_v16_tlc_put()`。
+5. `VEMB_HANDLE` 由 SuperNode worker 调用 `vemb_v16_tlc_get_handle()`，response 返回 WARM handle；client 再按 handle 读取 WARM data region。
+6. COLD read-through 支持 `cold_lookup -> warm_put -> return WARM handle` 的 promote 路径。
+
+仍待处理：
+
+1. 当前 warm provider/TLC 初始化仍在 `vemb_v16_proxy_create()`；TODO 是迁到 SuperNode 初始化，保持 `supernode owns storage`。
+2. 内部 key 当前保留 `key_hash + key bytes`，field 附近已有 TODO 评估后续是否改成 canonical `uint64_t key_hash`。
+3. `write_ts_ns` / `ttl_ns` 暂不赋值，field 附近已有 TODO，属于后续淘汰策略。
+4. 当前 WARM append 满后 fallback 到 COLD append，还没有完整的 WARM slot 淘汰/复用/generation 机制。
+5. 默认 `shm` backend 不尝试 Linux HugeTLB；`ub` backend 会 best-effort 尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。

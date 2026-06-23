@@ -23,6 +23,7 @@ typedef uint64_t monotime;
 
 /* Retrieve counter of micro-seconds relative to an arbitrary point in time.  */
 extern monotime (*getMonotonicUs)(void);
+extern monotime (*getMonotonicNs)(void);
 
 typedef enum monotonic_clock_type {
     MONOTONIC_CLOCK_POSIX,
@@ -52,6 +53,14 @@ static inline void elapsedStart(monotime *start_time) {
 
 static inline uint64_t elapsedUs(monotime start_time) {
     return getMonotonicUs() - start_time;
+}
+
+static inline void elapsedStartNs(monotime *start_time) {
+    *start_time = getMonotonicNs();
+}
+
+static inline uint64_t elapsedNs(monotime start_time) {
+    return getMonotonicNs() - start_time;
 }
 
 static inline uint64_t elapsedMs(monotime start_time) {

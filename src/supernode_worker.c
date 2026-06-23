@@ -1,697 +1,775 @@
 /*
  * SuperNode Worker Implementation
- * 超节点 SVE2 计算引擎 - 核心实现
+ *
+ * 只负责：真实 UB 地址空间接入、Worker 线程调度、SuperNode 生命周期。
+ * SVE 计算和 bitmap 操作全部直接调用 sve_operation 模块的 sve_* 函数。
  */
 
+#define _GNU_SOURCE
+
+#include "batch_latency_trace.h"
+#include "proxy_aggregator.h"
 #include "supernode_worker.h"
+#include "macro.h"
+#include "ring_buffer_mgr.h"
+#include "sve_compute.h"
+#include "supernode_protocol.h"
+#include "vector_proxy_request.h"
 #include "server.h"
-#include <sys/mman.h>
+#include "ub_client.h"
+
+#include <stddef.h>
+#include <time.h>
 #include <sys/time.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef __linux__
 #include <sched.h>
-
-/* 全局超节点实例 */
-supernode_t *global_supernode = NULL;
-
-/* ========== Bitmap 实现 - 高性能无锁版本 ========== */
-
-/* 创建状态 Bitmap
- * 使用对齐的原子字数组，防止伪共享
- */
-state_bitmap_t *bitmap_create(size_t num_bits) {
-    state_bitmap_t *bitmap = zmalloc(sizeof(state_bitmap_t));
-    if (!bitmap) return NULL;
-    
-    bitmap->num_words = (num_bits + BITMAP_BITS_PER_WORD - 1) / BITMAP_BITS_PER_WORD;
-    bitmap->shm_size = bitmap->num_words * sizeof(aligned_atomic_word_t);
-    
-    /* 使用共享内存（跨 Worker 共享）*/
-    char shm_name[256];
-    snprintf(shm_name, sizeof(shm_name), "/redis_ub_bitmap_%d", getpid());
-    
-    int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) {
-        serverLog(LL_WARNING, "Failed to create bitmap shared memory: %s", strerror(errno));
-        zfree(bitmap);
-        return NULL;
-    }
-    
-    if (ftruncate(fd, bitmap->shm_size) < 0) {
-        close(fd);
-        shm_unlink(shm_name);
-        zfree(bitmap);
-        return NULL;
-    }
-    
-    bitmap->shm_addr = mmap(NULL, bitmap->shm_size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, 0);
-    close(fd);
-    
-    if (bitmap->shm_addr == MAP_FAILED) {
-        shm_unlink(shm_name);
-        zfree(bitmap);
-        return NULL;
-    }
-    
-    bitmap->bits = (aligned_atomic_word_t *)bitmap->shm_addr;
-    
-    /* 初始化所有原子字为 0（使用 relaxed 内存序，因为是单线程初始化）*/
-    for (size_t i = 0; i < bitmap->num_words; i++) {
-        atomic_init(&bitmap->bits[i].word, 0);
-    }
-    
-    serverLog(LL_NOTICE, "Bitmap created: %zu bits, %zu words (aligned to 64 bytes)", 
-              num_bits, bitmap->num_words);
-    return bitmap;
-}
-
-/* 销毁 Bitmap */
-void bitmap_destroy(state_bitmap_t *bitmap) {
-    if (!bitmap) return;
-    
-    if (bitmap->shm_addr && bitmap->shm_addr != MAP_FAILED) {
-        munmap(bitmap->shm_addr, bitmap->shm_size);
-    }
-    
-    zfree(bitmap);
-}
-
-/* 测试位状态（非原子快照，仅用于调试或非严格检查）
- * 使用 relaxed 内存序，因为这只是一个快照
- */
-int bitmap_test_bit(state_bitmap_t *bitmap, uint64_t bit_index) {
-    if (!bitmap) return 0;
-    
-    uint64_t word_index = bit_index / BITMAP_BITS_PER_WORD;
-    uint64_t bit_offset = bit_index % BITMAP_BITS_PER_WORD;
-    
-    if (word_index >= bitmap->num_words) return 0;
-    
-    uint64_t word = atomic_load_explicit(&bitmap->bits[word_index].word, 
-                                        memory_order_relaxed);
-    return (word & (1ULL << bit_offset)) != 0;
-}
-
-/* 尝试获取（占用）资源位：0 -> 1
- * 
- * 核心设计：
- * 1. 使用 CAS 循环，对整个 64-bit Word 进行原子操作
- * 2. 如果目标位已经是 1，立即返回失败
- * 3. 使用 compare_exchange_weak 在循环中性能更好
- * 4. 成功时使用 memory_order_acquire，确保后续操作不会被重排到获取之前
- * 5. 失败时使用 memory_order_relaxed，因为只是重试，不需要同步
- * 
- * @return C_OK 成功获取；C_ERR 已被占用
- */
-int bitmap_try_acquire(state_bitmap_t *bitmap, uint64_t bit_index) {
-    if (!bitmap) return C_ERR;
-    
-    uint64_t word_index = bit_index / BITMAP_BITS_PER_WORD;
-    uint64_t bit_offset = bit_index % BITMAP_BITS_PER_WORD;
-    
-    if (word_index >= bitmap->num_words) return C_ERR;
-    
-    const uint64_t mask = 1ULL << bit_offset;
-    atomic_uint_fast64_t *target_word = &bitmap->bits[word_index].word;
-    
-    /* 步骤 1: 读取当前值（使用 relaxed，因为后续 CAS 会负责同步）*/
-    uint64_t old_val = atomic_load_explicit(target_word, memory_order_relaxed);
-    
-    /* CAS 循环 */
-    do {
-        /* 步骤 2: 检查目标位是否已被占用 */
-        if ((old_val & mask) != 0) {
-            /* 已被占用，立即返回失败 */
-            return C_ERR;
-        }
-        
-        /* 步骤 3: 计算新值（将目标位设置为 1）*/
-        uint64_t new_val = old_val | mask;
-        
-        /* 步骤 4: CAS 操作
-         * 
-         * compare_exchange_weak 尝试原子地将 target_word 从 old_val 更新为 new_val
-         * 
-         * 成功时：
-         *   - 返回 true，内存被更新
-         *   - 使用 memory_order_acquire，确保后续对资源的操作不会被重排到获取之前
-         * 
-         * 失败时：
-         *   - 返回 false，old_val 被自动更新为 target_word 的最新值
-         *   - 使用 memory_order_relaxed，因为失败只需要重试，不需要同步
-         * 
-         * 注：在循环中使用 weak 版本性能更好，因为它允许虚假失败（spurious failure）
-         *     而我们本来就在循环中处理重试
-         */
-        if (atomic_compare_exchange_weak_explicit(target_word, &old_val, new_val,
-                                                  memory_order_acquire,
-                                                  memory_order_relaxed)) {
-            return C_OK; /* 获取成功 */
-        }
-        
-        /* CAS 失败：说明在读取 old_val 和 CAS 之间，有其他线程修改了这个 64-bit Word
-         * 此时 old_val 已被自动更新为最新值，循环继续重试
-         * 
-         * 优化点：在极度竞争的环境下，可以在这里加入 CPU pause 指令
-         * 如 x86 的 _mm_pause()，以减少总线竞争
-         */
-#if defined(__x86_64__) || defined(__i386__)
-        /* x86/x64: 使用 PAUSE 指令减少总线竞争 */
-        __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-        /* ARM: 使用 YIELD 指令 */
-        __asm__ __volatile__("yield" ::: "memory");
 #endif
-        
-    } while (1);
-}
 
-/* 释放资源位：1 -> 0
- * 
- * 核心设计：
- * 1. 使用 fetch_and 原子操作，比 CAS 循环更高效
- * 2. 不需要检查旧值，直接清零目标位
- * 3. 使用 memory_order_release，确保在释放之前的操作对其他线程可见
- * 
- * 注：这个操作不会失败，因为我们只关心把 bit 清零，不关心其他 bit 的状态
- */
-void bitmap_release(state_bitmap_t *bitmap, uint64_t bit_index) {
-    if (!bitmap) return;
-    
-    uint64_t word_index = bit_index / BITMAP_BITS_PER_WORD;
-    uint64_t bit_offset = bit_index % BITMAP_BITS_PER_WORD;
-    
-    if (word_index >= bitmap->num_words) return;
-    
-    /* 创建反掩码：目标位为 0，其他位为 1 */
-    const uint64_t mask_complement = ~(1ULL << bit_offset);
-    atomic_uint_fast64_t *target_word = &bitmap->bits[word_index].word;
-    
-    /* 原子地执行按位与操作
-     * 使用 memory_order_release，确保在释放之前的对资源的操作：
-     * 1. 已经完成
-     * 2. 对其他线程可见
-     * 然后才标记资源为释放状态
-     */
-    atomic_fetch_and_explicit(target_word, mask_complement, memory_order_release);
-}
+int RM_UnblockClient(RedisModuleBlockedClient *bc, void *privdata);
 
-/* ========== UB.mem 实现 ========== */
+typedef struct supernode {
+    int node_id;
+    int num_workers;
+    sve_worker_context_t *workers;
 
-/* 初始化 UB.mem 地址空间 */
-ub_memory_space_t *ub_mem_init(uint64_t physical_base, size_t size) {
-    ub_memory_space_t *ub_mem = zmalloc(sizeof(ub_memory_space_t));
-    if (!ub_mem) return NULL;
-    
-    ub_mem->physical_base = physical_base;
-    ub_mem->size = size;
-    ub_mem->token_id = 0x12345678; /* 访问令牌 */
-    ub_mem->numa_node = 0;
-    
-    /* 映射 UB.mem 到本地地址空间 */
-    /* 在实际实现中，这里会调用 UB 固件 API */
-    /* 现在使用模拟的 mmap */
-    
-    ub_mem->base_addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    
-    if (ub_mem->base_addr == MAP_FAILED) {
-        serverLog(LL_WARNING, "Failed to mmap UB.mem: %s", strerror(errno));
-        
-        /* 回退到普通 mmap */
-        ub_mem->base_addr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        
-        if (ub_mem->base_addr == MAP_FAILED) {
-            zfree(ub_mem);
-            return NULL;
-        }
+    ub_address_space_t *ubas;
+    state_bitmap_t *global_bitmap;
+    int ub_client_owned;
+
+    int running;
+} supernode_t;
+
+static supernode_t *global_supernode = NULL;
+
+typedef struct supernode_batch_stage_times {
+    uint64_t bitmap_lock_latency_ns;
+    uint64_t bitmap_unlock_latency_ns;
+    uint64_t vector_load_latency_ns;
+    uint64_t compute_latency_ns;
+    uint64_t response_latency_ns;
+} supernode_batch_stage_times_t;
+
+/* ========== Worker 线程 ========== */
+
+#define SVE_WORKER_SPIN_PHASE1 64U
+#define SVE_WORKER_SPIN_PHASE2 256U
+
+static int supernode_write_vemb_response(sve_worker_context_t *ctx,
+                                         uint64_t batch_id,
+                                         uint64_t request_id,
+                                         const float *vector,
+                                         size_t dim,
+                                         int status) {
+    size_t payload_len = sizeof(batch_result_packet_t) + sizeof(float) * dim;
+    batch_result_packet_t *resp = NULL;
+
+    RETURN_IF(!ctx || !ctx->output_rb || !vector || dim == 0, C_ERR);
+    RETURN_IF(ring_buffer_reserve(ctx->output_rb, payload_len, (void **)&resp) != C_OK, C_ERR);
+
+    resp->magic = BATCH_PACKET_MAGIC;
+    resp->packet_size = (uint32_t)payload_len;
+    resp->op_type = BATCH_PACKET_OP_VEMB;
+    resp->status = (uint32_t)status;
+    resp->batch_id = batch_id;
+    resp->request_id = request_id;
+    resp->dim = (uint32_t)dim;
+    resp->reserved = 0;
+    memcpy(resp->data, vector, sizeof(float) * dim);
+
+    if (ring_buffer_commit_write(ctx->output_rb, payload_len) != C_OK) {
+        ring_buffer_cancel_write(ctx->output_rb);
+        return C_ERR;
     }
-    
-    serverLog(LL_NOTICE, "UB.mem initialized: base=0x%llx, size=%zu GB",
-              (unsigned long long)physical_base, size / (1024 * 1024 * 1024));
-    
-    return ub_mem;
-}
-
-/* 清理 UB.mem */
-void ub_mem_cleanup(ub_memory_space_t *ub_mem) {
-    if (!ub_mem) return;
-    
-    if (ub_mem->base_addr && ub_mem->base_addr != MAP_FAILED) {
-        munmap(ub_mem->base_addr, ub_mem->size);
-    }
-    
-    zfree(ub_mem);
-}
-
-/* 获取 Embedding 地址 */
-void *ub_mem_get_embedding_addr(ub_memory_space_t *ub_mem, uint64_t emb_id) {
-    if (!ub_mem || !ub_mem->base_addr) return NULL;
-    
-    /* 计算 Embedding 在 UB.mem 中的偏移 */
-    size_t offset = emb_id * sizeof(embedding_entry_t);
-    
-    if (offset >= ub_mem->size) {
-        return NULL; /* 越界 */
-    }
-    
-    return (uint8_t *)ub_mem->base_addr + offset;
-}
-
-/* ========== SVE2 批量操作 ========== */
-
-/* SVE2 Gather Load with Bitmap Check
- * 这是核心函数：结合 Bitmap 检查和 SVE2 Gather Load
- * 
- * 核心设计：
- * 1. 先尝试获取锁（bitmap_try_acquire）
- * 2. 如果获取失败（正在写入），跳过该请求，避免流水线停顿
- * 3. 如果获取成功，执行 SVE2 Gather Load
- * 4. 读取完成后立即释放锁（bitmap_release）
- */
-int sve2_gather_with_bitmap_check(sve_worker_context_t *ctx,
-                                  uint64_t *emb_ids,
-                                  size_t num_ids,
-                                  float *results,
-                                  uint8_t *valid_mask) {
-    if (!ctx || !emb_ids || !results || num_ids == 0) return C_ERR;
-    
-    state_bitmap_t *bitmap = ctx->bitmap;
-    ub_memory_space_t *ub_mem = ctx->ub_mem;
-    
-    /* 处理每个 Embedding ID */
-    for (size_t i = 0; i < num_ids; i++) {
-        uint64_t emb_id = emb_ids[i];
-        
-        /* 步骤 1: 尝试获取锁（CAS 0 -> 1）
-         * 
-         * 关键设计：使用 try_acquire 而不是 test_bit
-         * 原因：
-         * 1. 避免 TOCTOU（Time-of-Check-Time-of-Use）竞态条件
-         * 2. 如果先 test 再 acquire，在两次操作之间可能被其他线程占用
-         * 3. try_acquire 是原子的，一次操作完成检查和获取
-         */
-        int lock_acquired = bitmap_try_acquire(bitmap, emb_id);
-        
-        if (lock_acquired != C_OK) {
-            /* 正在写入，跳过该请求
-             * 
-             * Lock-Free 策略：遇锁不等待
-             * 优点：
-             * 1. 避免流水线停顿
-             * 2. 保持 SVE 流水线满载
-             * 3. 最大化吞吐量
-             * 
-             * 处理方式：
-             * - 返回默认值（全零）
-             * - 或者标记为重试（由上层决定）
-             */
-            valid_mask[i] = 0;
-            atomic_fetch_add(&ctx->locked_skips, 1);
-            
-            /* 填充默认值（全零）*/
-            memset(&results[i * SUPERNODE_EMBEDDING_DIM], 0,
-                   SUPERNODE_EMBEDDING_DIM * sizeof(float));
-            continue;
-        }
-        
-        /* 步骤 2: 获取 Embedding 地址 */
-        embedding_entry_t *emb_addr = ub_mem_get_embedding_addr(ub_mem, emb_id);
-        
-        if (!emb_addr) {
-            valid_mask[i] = 0;
-            /* 释放锁 */
-            bitmap_release(bitmap, emb_id);
-            continue;
-        }
-        
-        /* 步骤 3: SVE2 Gather Load（批量并行读取）
-         * 
-         * 使用非临时加载，避免污染 L3 Cache
-         * 
-         * 内存序说明：
-         * - 我们已经通过 bitmap_try_acquire 获取了锁（memory_order_acquire）
-         * - 这保证了在锁获取之后的所有内存操作都不会被重排到锁获取之前
-         * - 因此这里的 memcpy/SVE load 是安全的
-         */
-        
-#ifdef __ARM_FEATURE_SVE
-        /* SVE2 实现 */
-        svbool_t pg = svptrue_b32();
-        
-        /* 分批加载（每次 SVE_ELEMENTS_PER_VECTOR 个 float）*/
-        size_t offset = 0;
-        while (offset < SUPERNODE_EMBEDDING_DIM) {
-            size_t remaining = SUPERNODE_EMBEDDING_DIM - offset;
-            size_t count = remaining < SVE_ELEMENTS_PER_VECTOR ? remaining : SVE_ELEMENTS_PER_VECTOR;
-            
-            /* SVE Gather Load（非临时访问）
-             * 
-             * 注：ARM SVE 的 svld1_f32 默认就是非临时的（streaming load）
-             *     数据不会进入 L3 Cache，只在寄存器中短暂驻留
-             */
-            svfloat32_t vec = svld1_f32(pg, &emb_addr->data[offset]);
-            
-            /* 存储到结果 */
-            svst1_f32(pg, &results[i * SUPERNODE_EMBEDDING_DIM + offset], vec);
-            
-            offset += count;
-        }
-#else
-        /* 标量回退实现 */
-        memcpy(&results[i * SUPERNODE_EMBEDDING_DIM], emb_addr->data,
-               SUPERNODE_EMBEDDING_DIM * sizeof(float));
-#endif
-        
-        /* 步骤 4: 释放锁（CAS 1 -> 0）
-         * 
-         * 使用 bitmap_release（内部使用 fetch_and + memory_order_release）
-         * 这保证了：
-         * 1. 在释放锁之前的所有内存操作已经完成
-         * 2. 这些操作对其他线程可见
-         * 3. 然后才标记资源为释放状态
-         */
-        bitmap_release(bitmap, emb_id);
-        
-        valid_mask[i] = 1;
-        atomic_fetch_add(&ctx->sve_operations, 1);
-    }
-    
     return C_OK;
 }
 
-/* SVE2 批量 Gather Load（简化版）*/
-int sve2_batch_gather_load(sve_worker_context_t *ctx,
-                           uint64_t *emb_ids,
-                           size_t num_ids,
-                           float *results) {
-    uint8_t *valid_mask = zmalloc(num_ids);
-    int ret = sve2_gather_with_bitmap_check(ctx, emb_ids, num_ids, results, valid_mask);
-    zfree(valid_mask);
+static int supernode_write_vsim_response(sve_worker_context_t *ctx,
+                                         uint64_t batch_id,
+                                         uint64_t request_id,
+                                         const uint64_t *rows,
+                                         const float *scores,
+                                         size_t result_count,
+                                         int status) {
+    size_t payload_len = sizeof(batch_vsim_result_packet_t) +
+                         sizeof(batch_vsim_result_entry_t) * result_count;
+    batch_vsim_result_packet_t *resp = NULL;
+
+    RETURN_IF(!ctx || !ctx->output_rb, C_ERR);
+    RETURN_IF(result_count > 0 && (!rows || !scores), C_ERR);
+    RETURN_IF(ring_buffer_reserve(ctx->output_rb, payload_len, (void **)&resp) != C_OK, C_ERR);
+
+    resp->magic = BATCH_PACKET_MAGIC;
+    resp->packet_size = (uint32_t)payload_len;
+    resp->op_type = BATCH_PACKET_OP_VSIM;
+    resp->status = (uint32_t)status;
+    resp->batch_id = batch_id;
+    resp->request_id = request_id;
+    resp->num_results = (uint32_t)result_count;
+    resp->reserved = 0;
+
+    for (size_t i = 0; i < result_count; i++) {
+        resp->results[i].row_id = rows[i];
+        resp->results[i].score = scores[i];
+    }
+
+    if (ring_buffer_commit_write(ctx->output_rb, payload_len) != C_OK) {
+        ring_buffer_cancel_write(ctx->output_rb);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+static float *supernode_alloc_candidate_vectors(size_t row_count, size_t dim) {
+    RETURN_IF(row_count == 0 || dim == 0, NULL);
+    return zmalloc(sizeof(float) * row_count * dim);
+}
+
+static int supernode_load_candidate_vectors(sve_worker_context_t *ctx,
+                                            uint64_t *rows,
+                                            size_t row_count,
+                                            size_t dim,
+                                            float **vectors_out,
+                                            uint64_t *bitmap_lock_latency_ns,
+                                            uint64_t *bitmap_unlock_latency_ns,
+                                            uint64_t *vector_load_latency_ns) {
+    RETURN_IF(!ctx || !rows || row_count == 0 || dim == 0 || !vectors_out, C_ERR);
+    *vectors_out = NULL;
+    float *vectors = supernode_alloc_candidate_vectors(row_count, dim);
+    RETURN_IF(!vectors, C_ERR);
+
+    int ret = sve_serial_contiguous_read_traced(&ctx->gather_ctx,
+                                                rows,
+                                                row_count,
+                                                vectors,
+                                                bitmap_lock_latency_ns,
+                                                bitmap_unlock_latency_ns,
+                                                vector_load_latency_ns);
+    if (ret != C_OK) {
+        zfree(vectors);
+        return C_ERR;
+    }
+
+    *vectors_out = vectors;
+    return C_OK;
+}
+
+static int supernode_load_candidate_vectors_into(sve_worker_context_t *ctx,
+                                                 uint64_t *rows,
+                                                 size_t row_count,
+                                                 size_t dim,
+                                                 float *vectors,
+                                                 uint64_t *bitmap_lock_latency_ns,
+                                                 uint64_t *bitmap_unlock_latency_ns,
+                                                 uint64_t *vector_load_latency_ns) {
+    RETURN_IF(!ctx || !rows || row_count == 0 || dim == 0 || !vectors, C_ERR);
+    RETURN_IF(dim != ctx->gather_ctx.vector_dim, C_ERR);
+
+    return sve_serial_contiguous_read_traced(&ctx->gather_ctx,
+                                             rows,
+                                             row_count,
+                                             vectors,
+                                             bitmap_lock_latency_ns,
+                                             bitmap_unlock_latency_ns,
+                                             vector_load_latency_ns);
+}
+
+static int supernode_vemb_ensure_scratch(sve_worker_context_t *ctx,
+                                         size_t rows) {
+    RETURN_IF(!ctx || rows == 0 || ctx->gather_ctx.vector_dim == 0, C_ERR);
+    if (rows <= ctx->vemb_scratch_capacity) return C_OK;
+    RETURN_IF(rows > SIZE_MAX / ctx->gather_ctx.vector_dim, C_ERR);
+
+    uint64_t *row_scratch = zrealloc(ctx->vemb_row_scratch,
+                                     sizeof(uint64_t) * rows);
+    RETURN_IF(!row_scratch, C_ERR);
+    ctx->vemb_row_scratch = row_scratch;
+
+    float *vector_scratch = zrealloc(ctx->vemb_vector_scratch,
+                                     sizeof(float) * rows * ctx->gather_ctx.vector_dim);
+    RETURN_IF(!vector_scratch, C_ERR);
+    ctx->vemb_vector_scratch = vector_scratch;
+    ctx->vemb_scratch_capacity = rows;
+    atomic_fetch_add_explicit(&ctx->vemb_scratch_grows, 1, memory_order_relaxed);
+    atomic_store_explicit(&ctx->vemb_scratch_rows, rows, memory_order_relaxed);
+    return C_OK;
+}
+
+static void supernode_worker_cleanup_scratch(sve_worker_context_t *ctx) {
+    RETURN_IF(!ctx);
+
+    zfree(ctx->vemb_row_scratch);
+    zfree(ctx->vemb_vector_scratch);
+    ctx->vemb_row_scratch = NULL;
+    ctx->vemb_vector_scratch = NULL;
+    ctx->vemb_scratch_capacity = 0;
+}
+
+static int supernode_process_vsim_batch(sve_worker_context_t *ctx,
+                                        batch_vsim_packet_t *vsim,
+                                        supernode_batch_stage_times_t *times) {
+    RETURN_IF(!ctx || !vsim, C_ERR);
+    RETURN_IF(vsim->query_dim == 0 || vsim->candidate_count == 0, C_ERR);
+
+    const float *query = vsim->payload;
+    const uint64_t *rows = (const uint64_t *)((const uint8_t *)(vsim->payload + vsim->query_dim));
+    float *candidates = NULL;
+    float *scores = NULL;
+    uint64_t bitmap_lock_latency_ns = 0;
+    uint64_t bitmap_unlock_latency_ns = 0;
+    uint64_t vector_load_latency_ns = 0;
+    uint64_t compute_latency_ns = 0;
+    uint64_t response_latency_ns = 0;
+    int ret = C_ERR;
+
+    ret = supernode_load_candidate_vectors(ctx,
+                                           (uint64_t *)rows,
+                                           vsim->candidate_count,
+                                           vsim->query_dim,
+                                           &candidates,
+                                           &bitmap_lock_latency_ns,
+                                           &bitmap_unlock_latency_ns,
+                                           &vector_load_latency_ns);
+    if (ret != C_OK) return C_ERR;
+
+    scores = zmalloc(sizeof(float) * vsim->candidate_count);
+    if (!scores) goto cleanup;
+
+    monotime compute_start;
+    elapsedStartNs(&compute_start);
+    for (size_t i = 0; i < vsim->candidate_count; i++) {
+        const float *cand = candidates + i * vsim->query_dim;
+        scores[i] = sve_cosine_similarity_f32(query, cand, vsim->query_dim);
+    }
+    compute_latency_ns = elapsedNs(compute_start);
+
+    monotime response_start;
+    elapsedStartNs(&response_start);
+    ret = supernode_write_vsim_response(ctx,
+                                        vsim->hdr.batch_id,
+                                        vsim->request_id,
+                                        rows,
+                                        scores,
+                                        vsim->candidate_count,
+                                        C_OK);
+    response_latency_ns = elapsedNs(response_start);
+    atomic_fetch_add_explicit(&ctx->sve_operations, vsim->candidate_count, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_gather_latency_us, vector_load_latency_ns / 1000ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_compute_latency_us, compute_latency_ns / 1000ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_response_latency_us, response_latency_ns / 1000ULL, memory_order_relaxed);
+    if (times) {
+        times->bitmap_lock_latency_ns = bitmap_lock_latency_ns;
+        times->bitmap_unlock_latency_ns = bitmap_unlock_latency_ns;
+        times->vector_load_latency_ns = vector_load_latency_ns;
+        times->compute_latency_ns = compute_latency_ns;
+        times->response_latency_ns = response_latency_ns;
+    }
+
+cleanup:
+    zfree(candidates);
+    zfree(scores);
     return ret;
 }
 
-/* 非临时内存访问（Streaming Load）*/
-void sve_streaming_load(const void *src, void *dst, size_t size) {
-#ifdef __ARM_FEATURE_SVE
-    /* 使用 SVE 非临时加载指令 */
-    const uint8_t *s = (const uint8_t *)src;
-    uint8_t *d = (uint8_t *)dst;
-    
-    svbool_t pg = svptrue_b8();
-    size_t offset = 0;
-    
-    while (offset < size) {
-        svuint8_t vec = svld1_u8(pg, &s[offset]);
-        svst1_u8(pg, &d[offset], vec);
-        offset += svcntb(); /* SVE 向量字节数 */
-    }
-#else
-    memcpy(dst, src, size);
-#endif
-}
+static int supernode_process_vemb_batch(sve_worker_context_t *ctx,
+                                        batch_packet_t *packet,
+                                        supernode_batch_stage_times_t *times) {
+    RETURN_IF(!ctx || !packet, C_ERR);
+    RETURN_IF(packet->hdr.num_requests == 0, C_ERR);
 
-/* 非临时内存访问（Streaming Store）*/
-void sve_streaming_store(const void *src, void *dst, size_t size) {
-    sve_streaming_load(src, dst, size); /* 实现相同 */
-}
+    uint64_t bitmap_lock_latency_ns = 0;
+    uint64_t bitmap_unlock_latency_ns = 0;
+    uint64_t vector_load_latency_ns = 0;
+    uint64_t response_latency_ns = 0;
+    int ret = C_ERR;
 
-/* ========== SVE Worker 线程 ========== */
-
-/* 处理批量请求 */
-int sve_worker_process_batch(sve_worker_context_t *ctx, batch_packet_t *packet) {
-    if (!ctx || !packet) return C_ERR;
-    
-    uint64_t start_time = get_time_us();
-    
-    /* 验证魔数 */
-    if (packet->magic != 0xCAC0BEEF) {
-        serverLog(LL_WARNING, "Invalid batch packet magic: 0x%x", packet->magic);
+    if (supernode_vemb_ensure_scratch(ctx, packet->hdr.num_requests) != C_OK) {
         return C_ERR;
     }
-    
+    uint64_t *emb_ids = ctx->vemb_row_scratch;
+    float *results = ctx->vemb_vector_scratch;
+
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++)
+        emb_ids[i] = packet->requests[i].row_id;
+
+    ret = supernode_load_candidate_vectors_into(ctx,
+                                                emb_ids,
+                                                packet->hdr.num_requests,
+                                                ctx->gather_ctx.vector_dim,
+                                                results,
+                                                &bitmap_lock_latency_ns,
+                                                &bitmap_unlock_latency_ns,
+                                                &vector_load_latency_ns);
+    if (ret != C_OK) return C_ERR;
+
+    monotime response_start;
+    elapsedStartNs(&response_start);
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++) {
+        ret = supernode_write_vemb_response(ctx,
+                                            packet->hdr.batch_id,
+                                            packet->requests[i].request_id,
+                                            results + ((size_t)i * ctx->gather_ctx.vector_dim),
+                                            ctx->gather_ctx.vector_dim,
+                                            C_OK);
+        if (ret != C_OK) break;
+    }
+    response_latency_ns = elapsedNs(response_start);
+    atomic_fetch_add_explicit(&ctx->total_gather_latency_us, vector_load_latency_ns / 1000ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_response_latency_us, response_latency_ns / 1000ULL, memory_order_relaxed);
+    if (times) {
+        times->bitmap_lock_latency_ns = bitmap_lock_latency_ns;
+        times->bitmap_unlock_latency_ns = bitmap_unlock_latency_ns;
+        times->vector_load_latency_ns = vector_load_latency_ns;
+        times->compute_latency_ns = 0;
+        times->response_latency_ns = response_latency_ns;
+    }
+
+    return ret;
+}
+
+static int supernode_process_fc_vemb_batch(sve_worker_context_t *ctx,
+                                           fc_vemb_packet_t *packet,
+                                           supernode_batch_stage_times_t *times) {
+    RETURN_IF(!ctx || !packet, C_ERR);
+    RETURN_IF(packet->hdr.num_requests == 0, C_ERR);
+
+    uint64_t bitmap_lock_latency_ns = 0;
+    uint64_t bitmap_unlock_latency_ns = 0;
+    uint64_t vector_load_latency_ns = 0;
+    uint64_t response_latency_ns = 0;
+
+    if (supernode_vemb_ensure_scratch(ctx, packet->hdr.num_requests) != C_OK) {
+        return C_ERR;
+    }
+    uint64_t *emb_ids = ctx->vemb_row_scratch;
+    float *results = ctx->vemb_vector_scratch;
+
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++)
+        emb_ids[i] = packet->requests[i].row_id;
+
+    int ret = supernode_load_candidate_vectors_into(ctx,
+                                                    emb_ids,
+                                                    packet->hdr.num_requests,
+                                                    ctx->gather_ctx.vector_dim,
+                                                    results,
+                                                    &bitmap_lock_latency_ns,
+                                                    &bitmap_unlock_latency_ns,
+                                                    &vector_load_latency_ns);
+    monotime response_start;
+    elapsedStartNs(&response_start);
+    for (uint32_t i = 0; i < packet->hdr.num_requests; i++) {
+        proxy_vector_request_t *req = packet->requests[i].owner;
+        if (!req) continue;
+
+        if (ret == C_OK) {
+            size_t bytes = sizeof(float) * ctx->gather_ctx.vector_dim;
+            if (!req->result_vector ||
+                (!req->result_inline && req->result_capacity < ctx->gather_ctx.vector_dim)) {
+                if (!req->result_inline) zfree(req->result_vector);
+                req->result_vector = zmalloc(bytes);
+                req->result_capacity = req->result_vector ?
+                    ctx->gather_ctx.vector_dim : 0;
+            }
+            if (req->result_vector) {
+                memcpy(req->result_vector,
+                       results + ((size_t)i * ctx->gather_ctx.vector_dim),
+                       bytes);
+                req->result_dim = ctx->gather_ctx.vector_dim;
+                req->error_code = C_OK;
+            } else {
+                req->result_dim = 0;
+                req->error_code = C_ERR;
+            }
+        } else {
+            req->result_dim = 0;
+            req->error_code = C_ERR;
+        }
+        req->completion_time_us = getMonotonicUs();
+        req->completed = 1;
+        if (req->batch_id != 0) {
+            uint64_t result_queue_us = req->completion_time_us > req->submit_time_us ?
+                (uint64_t)(req->completion_time_us - req->submit_time_us) : 0;
+            (void)batch_latency_trace_record_request_completion(req->batch_id,
+                                                                result_queue_us,
+                                                                result_queue_us);
+        }
+        if (req->bc) RM_UnblockClient(req->bc, req);
+    }
+    response_latency_ns = elapsedNs(response_start);
+
+    atomic_fetch_add_explicit(&ctx->total_gather_latency_us,
+                              vector_load_latency_ns / 1000ULL,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_response_latency_us,
+                              response_latency_ns / 1000ULL,
+                              memory_order_relaxed);
+    if (times) {
+        times->bitmap_lock_latency_ns = bitmap_lock_latency_ns;
+        times->bitmap_unlock_latency_ns = bitmap_unlock_latency_ns;
+        times->vector_load_latency_ns = vector_load_latency_ns;
+        times->compute_latency_ns = 0;
+        times->response_latency_ns = response_latency_ns;
+    }
+
+    return ret;
+}
+
+static int sve_worker_process_batch(sve_worker_context_t *ctx, batch_request_header_t *hdr) {
+    RETURN_IF(!ctx || !hdr, C_ERR);
+
+    uint64_t worker_start_us = getMonotonicUs();
+    monotime start_time;
+    start_time = worker_start_us;
+    int ret = C_ERR;
+    supernode_batch_stage_times_t times = {0};
+
+    if (hdr->magic != BATCH_PACKET_MAGIC) {
+        serverLog(LL_WARNING, "Invalid batch packet magic: 0x%x", hdr->magic);
+        return C_ERR;
+    }
+
     serverLog(LL_DEBUG, "Worker %d processing batch: %u requests, batch_id=%llu",
-              ctx->worker_id, packet->num_requests, 
-              (unsigned long long)packet->batch_id);
-    
-    /* 提取 Embedding IDs */
-    uint64_t *emb_ids = zmalloc(packet->num_requests * sizeof(uint64_t));
-    if (!emb_ids) return C_ERR;
-    
-    for (uint32_t i = 0; i < packet->num_requests; i++) {
-        /* 使用 key_hash 作为 embedding ID（简化）*/
-        emb_ids[i] = packet->requests[i].key_hash % SUPERNODE_MAX_EMBEDDINGS;
-    }
-    
-    /* 分配结果缓冲区 */
-    float *results = zmalloc(packet->num_requests * SUPERNODE_EMBEDDING_DIM * sizeof(float));
-    if (!results) {
-        zfree(emb_ids);
+              ctx->worker_id, hdr->num_requests,
+              (unsigned long long)hdr->batch_id);
+
+    uint32_t base_op = hdr->op_type & ~BATCH_PACKET_FLAG_FC_POINTERS;
+    int is_fc_packet = (hdr->op_type & BATCH_PACKET_FLAG_FC_POINTERS) != 0;
+
+    if (base_op == BATCH_PACKET_OP_VSIM) {
+        ret = supernode_process_vsim_batch(ctx, (batch_vsim_packet_t *)hdr, &times);
+    } else if (base_op == BATCH_PACKET_OP_VEMB) {
+        if (is_fc_packet) {
+            ret = supernode_process_fc_vemb_batch(ctx, (fc_vemb_packet_t *)hdr, &times);
+        } else {
+            ret = supernode_process_vemb_batch(ctx, (batch_packet_t *)hdr, &times);
+        }
+    } else {
+        serverLog(LL_WARNING, "Unsupported batch packet op_type: %u", hdr->op_type);
         return C_ERR;
     }
-    
-    /* SVE2 批量 Gather Load */
-    int ret = sve2_batch_gather_load(ctx, emb_ids, packet->num_requests, results);
-    
-    /* 清理 */
-    zfree(results);
-    zfree(emb_ids);
-    
-    uint64_t end_time = get_time_us();
-    uint64_t latency = end_time - start_time;
-    
-    atomic_fetch_add(&ctx->total_batches, 1);
-    atomic_fetch_add(&ctx->total_requests, packet->num_requests);
-    atomic_fetch_add(&ctx->total_latency_us, latency);
-    
+
+    uint64_t latency = elapsedUs(start_time);
+    uint64_t queue_latency_us = 0;
+    if (hdr->timestamp_us > 0) {
+        if (worker_start_us > hdr->timestamp_us) queue_latency_us = worker_start_us - hdr->timestamp_us;
+    }
+    atomic_fetch_add_explicit(&ctx->total_batches, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_requests, hdr->num_requests, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_latency_us, latency, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->total_queue_latency_us, queue_latency_us, memory_order_relaxed);
+
+    (void)batch_latency_trace_record_supernode(hdr->batch_id,
+                                               queue_latency_us,
+                                               times.bitmap_lock_latency_ns,
+                                               times.bitmap_unlock_latency_ns,
+                                               times.vector_load_latency_ns,
+                                               times.compute_latency_ns,
+                                               times.response_latency_ns);
+
     serverLog(LL_DEBUG, "Worker %d completed batch in %llu μs",
               ctx->worker_id, (unsigned long long)latency);
-    
     return ret;
 }
 
-/* SVE Worker 线程主函数 */
+static inline void sve_worker_idle_wait(unsigned int *idle_iters) {
+    if (*idle_iters < SVE_WORKER_SPIN_PHASE1) {
+        /* Pure spin first to catch the next batch without a syscall. */
+        __asm__ volatile("" ::: "memory");
+    } else if (*idle_iters < SVE_WORKER_SPIN_PHASE2) {
+#if defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+        __asm__ volatile("pause" ::: "memory");
+#else
+        __asm__ volatile("" ::: "memory");
+#endif
+    } else {
+        struct timespec ts = {0, 1000}; /* 1 microsecond */
+        nanosleep(&ts, NULL);
+    }
+
+    (*idle_iters)++;
+}
+
 void *sve_worker_thread(void *arg) {
     sve_worker_context_t *ctx = (sve_worker_context_t *)arg;
-    
+    unsigned int idle_iters = 0;
+
     serverLog(LL_NOTICE, "SVE Worker %d started", ctx->worker_id);
-    
-    /* 设置 CPU 亲和性（可选）*/
+
+#ifdef __linux__
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(ctx->worker_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    
-    /* 主循环：轮询 Ring Buffer */
+#endif
+
     while (ctx->running) {
-        /* 从 Ring Buffer 读取批量 */
-        uint8_t buffer[RING_BUFFER_BATCH_SIZE];
-        size_t actual_len = 0;
-        
-        int ret = ring_buffer_pop(ctx->input_rb, buffer, sizeof(buffer), &actual_len);
-        
-        if (ret == C_OK && actual_len > 0) {
-            batch_packet_t *packet = (batch_packet_t *)buffer;
-            sve_worker_process_batch(ctx, packet);
+        void *payload = NULL;
+        size_t payload_len = 0;
+
+        int ret = ring_buffer_peek(ctx->input_rb, &payload, &payload_len);
+        if (ret == C_OK && payload_len > 0) {
+            idle_iters = 0;
+            if (sve_worker_process_batch(ctx, (batch_request_header_t *)payload) == C_OK) {
+                ring_buffer_commit_read(ctx->input_rb, payload_len);
+            }
         } else {
-            /* 没有数据，短暂休眠 */
-            usleep(10); /* 10 微秒 */
+            uint64_t now_us = getMonotonicUs();
+            if (proxy_aggregator_drain_worker(ctx->worker_id, now_us) == C_OK &&
+                ring_buffer_peek(ctx->input_rb, &payload, &payload_len) == C_OK &&
+                payload_len > 0) {
+                idle_iters = 0;
+                if (sve_worker_process_batch(ctx, (batch_request_header_t *)payload) == C_OK) {
+                    ring_buffer_commit_read(ctx->input_rb, payload_len);
+                }
+                continue;
+            }
+            sve_worker_idle_wait(&idle_iters);
         }
     }
-    
+
     serverLog(LL_NOTICE, "SVE Worker %d stopped", ctx->worker_id);
     return NULL;
 }
 
-/* ========== SuperNode API ========== */
+/* ========== SuperNode 生命周期 ========== */
 
-/* 初始化超节点 */
 int supernode_init(int node_id, int num_workers) {
-    if (global_supernode) return C_OK;
-    
-    if (num_workers <= 0 || num_workers > SUPERNODE_MAX_WORKERS) {
-        serverLog(LL_WARNING, "Invalid number of workers: %d", num_workers);
-        return C_ERR;
+    RETURN_IF(global_supernode, C_OK);
+    num_workers = server.supernode_workers;
+    if (num_workers <= 0) {
+        int detected_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        num_workers = max(detected_cpus, 1);
     }
-    
+
     global_supernode = zcalloc(sizeof(supernode_t));
-    if (!global_supernode) return C_ERR;
-    
+    if (!global_supernode) goto failed;
+
     global_supernode->node_id = node_id;
     global_supernode->num_workers = num_workers;
-    
-    /* 初始化 UB.mem */
-    global_supernode->ub_mem = ub_mem_init(UB_MEM_BASE_ADDR, UB_MEM_SIZE);
-    if (!global_supernode->ub_mem) {
-        supernode_shutdown();
-        return C_ERR;
+    global_supernode->ub_client_owned = 0;
+
+    if (server.ub.vector_dimension <= 0) {
+        serverLog(LL_WARNING, "Invalid UB vector dimension: %d", server.ub.vector_dimension);
+        goto failed;
     }
-    
-    /* 初始化全局 Bitmap */
-    global_supernode->global_bitmap = bitmap_create(SUPERNODE_MAX_EMBEDDINGS);
-    if (!global_supernode->global_bitmap) {
-        supernode_shutdown();
-        return C_ERR;
+
+    if (ub_client_init(&server.ub) != C_OK) {
+        serverLog(LL_WARNING, "Failed to initialize UB client for SuperNode");
+        goto failed;
     }
-    
-    /* 创建 Ring Buffer */
-    char rb_name[64];
-    snprintf(rb_name, sizeof(rb_name), "supernode_%d_input", node_id);
-    global_supernode->input_rb = ring_buffer_create(RING_BUFFER_SIZE, rb_name);
-    
-    if (!global_supernode->input_rb) {
-        supernode_shutdown();
-        return C_ERR;
+
+    if (ub_client_load_embedding_table(server.ub.table_name, &global_supernode->ubas) != C_OK ||
+        !global_supernode->ubas) {
+        serverLog(LL_WARNING, "Failed to attach UB table for SuperNode");
+        goto failed;
     }
-    
-    /* 初始化 Workers */
+
+    size_t vector_dim = (size_t)server.ub.vector_dimension;
+    size_t vector_stride_bytes = global_supernode->ubas->vector_stride_bytes;
+    if (vector_stride_bytes < vector_dim * sizeof(float)) {
+        serverLog(LL_WARNING,
+                  "Invalid UB vector stride: %zu for vector dimension %zu",
+                  vector_stride_bytes, vector_dim);
+        goto failed;
+    }
+
+    size_t table_row_capacity = vector_stride_bytes == 0 ? 0 :
+        (uint64_t)(global_supernode->ubas->size / vector_stride_bytes);
+    if (table_row_capacity == 0) {
+        serverLog(LL_WARNING, "UB table capacity is zero");
+        goto failed;
+    }
+
+    /* Bitmap — 直接调用 bitmap_init */
+    global_supernode->global_bitmap = zmalloc(sizeof(state_bitmap_t));
+    if (!global_supernode->global_bitmap ||
+        bitmap_init(global_supernode->global_bitmap, table_row_capacity) != 0) {
+        goto failed;
+    }
+
+    /* Workers */
     global_supernode->workers = zcalloc(sizeof(sve_worker_context_t) * num_workers);
-    
+    if (!global_supernode->workers) goto failed;
+
+    if (ring_buffer_mgr_init((size_t)num_workers, RING_BUFFER_SIZE) != C_OK) {
+        goto failed;
+    }
+    batch_latency_trace_init();
+    if (ring_buffer_mgr_ensure_supernodes((size_t)node_id + 1) != C_OK) {
+        goto failed;
+    }
+
     for (int i = 0; i < num_workers; i++) {
-        sve_worker_context_t *ctx = &global_supernode->workers[i];
+        ring_buffer_t *req_rb = ring_buffer_mgr_get_request(node_id, i);
+        ring_buffer_t *resp_rb = ring_buffer_mgr_get_response(node_id, i);
+        if (!req_rb || !resp_rb) goto failed;
         
+        sve_worker_context_t *ctx = &global_supernode->workers[i];
         ctx->worker_id = i;
         ctx->running = 1;
-        ctx->input_rb = global_supernode->input_rb;
-        ctx->ub_mem = global_supernode->ub_mem;
-        ctx->bitmap = global_supernode->global_bitmap;
-        ctx->sve_vl = SVE_VECTOR_BITS / 8;
-        
+        ctx->input_rb = req_rb;
+        ctx->output_rb = resp_rb;
+
         atomic_init(&ctx->total_batches, 0);
         atomic_init(&ctx->total_requests, 0);
-        atomic_init(&ctx->locked_skips, 0);
         atomic_init(&ctx->sve_operations, 0);
         atomic_init(&ctx->total_latency_us, 0);
-        
-        /* 启动 Worker 线程 */
+        atomic_init(&ctx->total_queue_latency_us, 0);
+        atomic_init(&ctx->max_queue_latency_us, 0);
+        atomic_init(&ctx->total_gather_latency_us, 0);
+        atomic_init(&ctx->max_gather_latency_us, 0);
+        atomic_init(&ctx->total_compute_latency_us, 0);
+        atomic_init(&ctx->max_compute_latency_us, 0);
+        atomic_init(&ctx->total_response_latency_us, 0);
+        atomic_init(&ctx->max_response_latency_us, 0);
+        atomic_init(&ctx->vemb_scratch_grows, 0);
+        atomic_init(&ctx->vemb_scratch_rows, 0);
+        atomic_init(&ctx->op_stats.lock_success, 0);
+        atomic_init(&ctx->op_stats.lock_failure, 0);
+        sve_gather_ctx_init(&ctx->gather_ctx,
+                            global_supernode->ubas,
+                            global_supernode->global_bitmap,
+                            vector_dim,
+                            vector_stride_bytes,
+                            table_row_capacity,
+                            &ctx->op_stats);
+
         if (pthread_create(&ctx->thread, NULL, sve_worker_thread, ctx) != 0) {
             serverLog(LL_WARNING, "Failed to create SVE worker %d", i);
-            supernode_shutdown();
-            return C_ERR;
+            goto failed;
         }
     }
-    
+
     global_supernode->running = 1;
-    
     serverLog(LL_NOTICE, "SuperNode %d initialized with %d workers", node_id, num_workers);
     return C_OK;
+
+failed:
+    supernode_shutdown();
+    return C_ERR;
 }
 
-/* 关闭超节点 */
 void supernode_shutdown(void) {
-    if (!global_supernode) return;
-    
+    RETURN_IF(!global_supernode);
+
     global_supernode->running = 0;
-    
-    /* 停止所有 Workers */
+
     if (global_supernode->workers) {
         for (int i = 0; i < global_supernode->num_workers; i++) {
             sve_worker_context_t *ctx = &global_supernode->workers[i];
-            
             if (ctx->running) {
                 ctx->running = 0;
                 pthread_join(ctx->thread, NULL);
             }
+            supernode_worker_cleanup_scratch(ctx);
         }
-        
         zfree(global_supernode->workers);
     }
-    
-    /* 清理 Ring Buffer */
-    if (global_supernode->input_rb) {
-        ring_buffer_destroy(global_supernode->input_rb);
-    }
-    
-    /* 清理 Bitmap */
+
+    ring_buffer_mgr_shutdown();
+    batch_latency_trace_cleanup();
+
     if (global_supernode->global_bitmap) {
         bitmap_destroy(global_supernode->global_bitmap);
+        zfree(global_supernode->global_bitmap);
     }
-    
-    /* 清理 UB.mem */
-    if (global_supernode->ub_mem) {
-        ub_mem_cleanup(global_supernode->ub_mem);
-    }
-    
+
+    if (global_supernode->ub_client_owned)
+        ub_client_cleanup();
+
     zfree(global_supernode);
     global_supernode = NULL;
-    
     serverLog(LL_NOTICE, "SuperNode shutdown");
 }
 
-/* 获取统计信息 */
+/* ========== 统计 ========== */
+
 sds supernode_get_stats(void) {
     sds stats = sdsempty();
-    
+
     if (!global_supernode) {
         stats = sdscat(stats, "SuperNode: Not initialized\n");
         return stats;
     }
-    
+
     stats = sdscatprintf(stats, "SuperNode Stats (Node %d):\n", global_supernode->node_id);
     stats = sdscatprintf(stats, "  Workers: %d\n", global_supernode->num_workers);
-    stats = sdscatprintf(stats, "  UB.mem size: %zu GB\n",
-                        global_supernode->ub_mem->size / (1024 * 1024 * 1024));
-    
-    /* 汇总所有 Worker 统计 */
-    uint64_t total_batches = 0;
-    uint64_t total_requests = 0;
-    uint64_t total_locked_skips = 0;
-    uint64_t total_sve_ops = 0;
-    uint64_t total_latency = 0;
-    
+    stats = sdscatprintf(stats, "  UB table size: %zu GB\n",
+                         global_supernode->ubas->size / (1024 * 1024 * 1024));
+
+    uint64_t tb = 0, tr = 0, ts = 0, tt = 0;
+    uint64_t bls = 0, blf = 0;
+    uint64_t go = 0, so = 0, ge = 0, se = 0;
+    uint64_t vemb_scratch_grows = 0, vemb_scratch_rows = 0;
+
     for (int i = 0; i < global_supernode->num_workers; i++) {
-        sve_worker_context_t *ctx = &global_supernode->workers[i];
-        total_batches += atomic_load(&ctx->total_batches);
-        total_requests += atomic_load(&ctx->total_requests);
-        total_locked_skips += atomic_load(&ctx->locked_skips);
-        total_sve_ops += atomic_load(&ctx->sve_operations);
-        total_latency += atomic_load(&ctx->total_latency_us);
+        sve_worker_context_t *c = &global_supernode->workers[i];
+        tb += atomic_load_explicit(&c->total_batches, memory_order_relaxed);
+        tr += atomic_load_explicit(&c->total_requests, memory_order_relaxed);
+        ts += atomic_load_explicit(&c->sve_operations, memory_order_relaxed);
+        tt += atomic_load_explicit(&c->total_latency_us, memory_order_relaxed);
+        bls += atomic_load_explicit(&c->op_stats.lock_success, memory_order_relaxed);
+        blf += atomic_load_explicit(&c->op_stats.lock_failure, memory_order_relaxed);
+        vemb_scratch_grows += atomic_load_explicit(&c->vemb_scratch_grows,
+                                                   memory_order_relaxed);
+        uint64_t rows = atomic_load_explicit(&c->vemb_scratch_rows,
+                                             memory_order_relaxed);
+        if (rows > vemb_scratch_rows) vemb_scratch_rows = rows;
     }
-    
-    stats = sdscatprintf(stats, "  Total batches: %llu\n", (unsigned long long)total_batches);
-    stats = sdscatprintf(stats, "  Total requests: %llu\n", (unsigned long long)total_requests);
-    stats = sdscatprintf(stats, "  Locked skips: %llu\n", (unsigned long long)total_locked_skips);
-    stats = sdscatprintf(stats, "  SVE operations: %llu\n", (unsigned long long)total_sve_ops);
-    
-    if (total_batches > 0) {
-        double avg_latency = (double)total_latency / total_batches;
-        double avg_batch_size = (double)total_requests / total_batches;
-        stats = sdscatprintf(stats, "  Average batch latency: %.1f μs\n", avg_latency);
-        stats = sdscatprintf(stats, "  Average batch size: %.1f\n", avg_batch_size);
+
+    stats = sdscatprintf(stats, "  Total batches: %llu\n", (unsigned long long)tb);
+    stats = sdscatprintf(stats, "  Total requests: %llu\n", (unsigned long long)tr);
+    stats = sdscatprintf(stats, "  Bitmap lock success: %llu\n", (unsigned long long)bls);
+    stats = sdscatprintf(stats, "  Bitmap lock failure: %llu\n", (unsigned long long)blf);
+    stats = sdscatprintf(stats, "  SVE operations: %llu\n", (unsigned long long)ts);
+    stats = sdscatprintf(stats, "  VEMB scratch grows: %llu\n",
+                         (unsigned long long)vemb_scratch_grows);
+    stats = sdscatprintf(stats, "  VEMB scratch max rows: %llu\n",
+                         (unsigned long long)vemb_scratch_rows);
+
+    if (tb > 0) {
+        stats = sdscatprintf(stats, "  Avg batch latency: %.1f μs\n", (double)tt / tb);
+        stats = sdscatprintf(stats, "  Avg batch size: %.1f\n", (double)tr / tb);
     }
-    
+
+    if (batch_latency_trace_enabled()) {
+        sds traces = batch_latency_trace_dump_recent("  Recent batch traces", 16);
+        stats = sdscatsds(stats, traces);
+        sdsfree(traces);
+    } else {
+        stats = sdscat(stats, "  Recent batch traces: disabled unless loglevel debug\n");
+    }
+
+    stats = sdscat(stats, "  Scatter/Gather:\n");
+    stats = sdscatprintf(stats, "    Gather ops: %llu  elements: %llu\n",
+                         (unsigned long long)go, (unsigned long long)ge);
+    stats = sdscatprintf(stats, "    Scatter ops: %llu  elements: %llu\n",
+                         (unsigned long long)so, (unsigned long long)se);
+    if (go > 0)
+        stats = sdscatprintf(stats, "    Gather lane util: %.1f%%\n",
+                             100.0 * (double)ge / ((double)go * SVE_OP_VL));
+    if (so > 0)
+        stats = sdscatprintf(stats, "    Scatter lane util: %.1f%%\n",
+                             100.0 * (double)se / ((double)so * SVE_OP_VL));
+
     return stats;
 }
 
-/* 获取单个 Worker 统计 */
 sds sve_worker_get_stats(sve_worker_context_t *ctx) {
     sds stats = sdsempty();
-    
-    if (!ctx) {
-        stats = sdscat(stats, "Worker: Invalid\n");
-        return stats;
-    }
-    
-    uint64_t batches = atomic_load(&ctx->total_batches);
-    uint64_t requests = atomic_load(&ctx->total_requests);
-    uint64_t locked = atomic_load(&ctx->locked_skips);
-    uint64_t sve_ops = atomic_load(&ctx->sve_operations);
-    uint64_t latency = atomic_load(&ctx->total_latency_us);
-    
-    stats = sdscatprintf(stats, "Worker %d Stats:\n", ctx->worker_id);
-    stats = sdscatprintf(stats, "  Batches: %llu\n", (unsigned long long)batches);
-    stats = sdscatprintf(stats, "  Requests: %llu\n", (unsigned long long)requests);
-    stats = sdscatprintf(stats, "  Locked skips: %llu\n", (unsigned long long)locked);
-    stats = sdscatprintf(stats, "  SVE operations: %llu\n", (unsigned long long)sve_ops);
-    
-    if (batches > 0) {
-        double avg_latency = (double)latency / batches;
-        stats = sdscatprintf(stats, "  Average latency: %.1f μs\n", avg_latency);
-    }
-    
+    if (!ctx) { stats = sdscat(stats, "Worker: Invalid\n"); return stats; }
+
+    stats = sdscatprintf(stats, "Worker %d:\n", ctx->worker_id);
+    stats = sdscatprintf(stats, "  Batches: %llu  Requests: %llu\n",
+                         (unsigned long long)atomic_load_explicit(&ctx->total_batches, memory_order_relaxed),
+                         (unsigned long long)atomic_load_explicit(&ctx->total_requests, memory_order_relaxed));
+    stats = sdscatprintf(stats, "  Bitmap lock success: %llu\n",
+                         (unsigned long long)atomic_load_explicit(&ctx->op_stats.lock_success, memory_order_relaxed));
+    stats = sdscatprintf(stats, "  Bitmap lock failure: %llu\n",
+                         (unsigned long long)atomic_load_explicit(&ctx->op_stats.lock_failure, memory_order_relaxed));
     return stats;
 }

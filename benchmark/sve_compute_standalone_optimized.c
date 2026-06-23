@@ -5,7 +5,9 @@
 #include "sve_compute_standalone.h"
 #include <stdio.h>
 
-#ifdef __ARM_FEATURE_SVE
+/* SVE support detection */
+#if defined(__ARM_FEATURE_SVE) || defined(USE_SVE)
+#define USE_ARM_SVE 1
 #include <arm_sve.h>
 #endif
 
@@ -13,7 +15,7 @@
 int sve_detect_capabilities(sve_context_t *ctx) {
     if (!ctx) return -1;
 
-#ifdef __ARM_FEATURE_SVE
+#ifdef USE_ARM_SVE
     /* SVE is available at compile time */
     ctx->has_sve = 1;
     ctx->has_sve2 = 1;  /* Assume SVE2 if SVE is available */
@@ -55,7 +57,7 @@ int sve_batch_gather_embeddings(sve_context_t *ctx,
 
     ctx->total_gather_ops++;
 
-#ifdef __ARM_FEATURE_SVE
+#ifdef USE_ARM_SVE
     /* SVE implementation */
     if (ctx->has_sve) {
         /* Process each embedding */

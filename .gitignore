@@ -95,6 +95,7 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+docs/SUPERNODE_UB_CLIENT_TODO.md
 
 # PyBuilder
 .pybuilder/
@@ -185,7 +186,6 @@ cython_debug/
 *wandb
 *logs
 *tensorboard
-compile_commands.json
 *_ANALYSIS.md
 *_SUMMARY.md
 
@@ -193,6 +193,14 @@ compile_commands.json
 *.o
 *.d
 *.a
+*.so
+compile_commands.json
+Makefile.dep
+.make-prerequisites
+**.kiro
+
+# NFS temporary files
+.nfs*
 
 /batch_embedding_test
 /simple_ub_test
@@ -203,6 +211,8 @@ compile_commands.json
 /src/redis-check-rdb
 /src/redis-check-aof
 /src/tlc-*-server
+/src/.make-settings
+/src/release.h
 
 /benchmark/redis_traditional_benchmark
 /benchmark/supernode_benchmark
@@ -216,6 +226,13 @@ compile_commands.json
 /benchmark/three_layer_benchmark_v*
 /benchmark/bench_v*
 /benchmark/tlc_*_bench
+/benchmark/results/
+/benchmark/*REPORT*.md
+/benchmark/*RESULTS*.md
+
+!/docs/benchmark/
+!/docs/benchmark/**/*.md
+!/docs/benchmark/**/*.txt
 
 OBMM_QUICK_VALIDATION.md
 FABRIC_UB_MEM_DESIGN_GAPS.md
@@ -224,3 +241,10 @@ benchmark/read_output.txt
 benchmark/write_output.txt
 AGENTS.md
 .agents/
+SVE_OPERATION_DESIGN.md
+benchmark/*_ut
+benchmark/*_bench
+benchmark/*_ctl
+/deps/lua/src/lua
+/deps/lua/src/luac
+src/vemb_v16_server

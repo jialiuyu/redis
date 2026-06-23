@@ -6,5 +6,5 @@ USE_UB ?= no
 ifeq ($(USE_UB),yes)
     FEATURE_CFLAGS  += -DUSE_UB
     FEATURE_LDFLAGS +=
-    FEATURE_OBJS    += proxy_aggregator.o supernode_worker.o
+    FEATURE_OBJS    += ring_buffer.o ring_buffer_mgr.o proxy_aggregator.o supernode_worker.o sve_operation.o
 endif

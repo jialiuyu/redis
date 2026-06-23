@@ -121,6 +121,14 @@ configEnum ub_element_index_mode_enum[] = {
     {NULL, 0}
 };
 
+configEnum proxy_vemb_submit_mode_enum[] = {
+    {"batch", PROXY_VEMB_SUBMIT_MODE_BATCH},
+    {"direct", PROXY_VEMB_SUBMIT_MODE_DIRECT},
+    {"adaptive", PROXY_VEMB_SUBMIT_MODE_ADAPTIVE},
+    {"fc", PROXY_VEMB_SUBMIT_MODE_FC},
+    {NULL, 0}
+};
+
 configEnum tls_client_auth_user_enum[] = {
     {"CN", TLS_CLIENT_FIELD_CN},
     {"off", TLS_CLIENT_FIELD_OFF},
@@ -3208,12 +3216,22 @@ standardConfig static_configs[] = {
     createEnumConfig("shutdown-on-sigint", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigint, 0, isValidShutdownOnSigFlags, NULL),
     createEnumConfig("vector-engine", NULL, MODIFIABLE_CONFIG, vector_engine_enum, server.vector_engine_type, VECTOR_ENGINE_REDIS, NULL, updateVectorEngine),
     createEnumConfig("ub-element-index-mode", NULL, MODIFIABLE_CONFIG, ub_element_index_mode_enum, server.ub.element_index_mode, UB_ELEMENT_INDEX_SUFFIX_NUMERIC, NULL, NULL),
+    createEnumConfig("proxy-vemb-submit-mode", NULL, MODIFIABLE_CONFIG, proxy_vemb_submit_mode_enum, server.proxy.vemb_submit_mode, PROXY_VEMB_SUBMIT_MODE_ADAPTIVE, NULL, NULL),
     createEnumConfig("shutdown-on-sigterm", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigterm, 0, isValidShutdownOnSigFlags, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort), /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, 1, 128, server.io_threads_num, 1, INTEGER_CONFIG, NULL, NULL), /* Single threaded by default */
+    createIntConfig("supernode-workers", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("proxy-batch-limit", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.batch_limit, 0, INTEGER_CONFIG, NULL, NULL),
+    createULongLongConfig("proxy-time-limit-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.time_limit_us, 0, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("proxy-max-supernodes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.max_supernodes, 0, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("proxy-vemb-adaptive", NULL, MODIFIABLE_CONFIG, server.proxy.vemb_adaptive, 1, NULL, NULL),
+    createULongLongConfig("proxy-vemb-direct-gap-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.vemb_direct_gap_us, 20, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("proxy-vemb-fc-workers", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_workers, 0, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("proxy-vemb-fc-slots", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_slots, 0, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("proxy-vemb-fc-max-scan", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_max_scan, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, PREFETCH_BATCH_MAX_SIZE, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vector-dimension", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.ub.vector_dimension, 300, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),

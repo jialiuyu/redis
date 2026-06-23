@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+NODE0_HOST="${NODE0_HOST:-192.168.90.111}"
+NODE1_HOST="${NODE1_HOST:-192.168.90.112}"
+SSH_USER="${SSH_USER:-root}"
+REMOTE_DIR="${REMOTE_DIR:-/root/szz/codespace/hpc-redis}"
+
+SERVER_PORT="${SERVER_PORT:-6391}"
+COORD_PORT="${COORD_PORT:-7391}"
+
+DIM="${DIM:-16}"
+MAX_VECTORS="${MAX_VECTORS:-8192}"
+PREFILL_KEYS="${PREFILL_KEYS:-1024}"
+LIVE_WRITE_OPS="${LIVE_WRITE_OPS:-50000}"
+MIGRATION_EPOCH="${MIGRATION_EPOCH:-23}"
+CUTOVER_EPOCH="${CUTOVER_EPOCH:-24}"
+
+RUN_LIVE_WRITE="${RUN_LIVE_WRITE:-0}"
+RUN_POST_READ="${RUN_POST_READ:-1}"
+
+NODE0_MANIFEST="/tmp/v16_node0.yaml"
+NODE1_MANIFEST="/tmp/v16_node1.yaml"
+NODE0_LOG="/tmp/v16_node0.log"
+NODE1_LOG="/tmp/v16_node1.log"
+PREFILL_OUT="/tmp/v16_prefill.out"
+LIVE_WRITE_OUT="/tmp/v16_live_write.out"
+COORD_OUT="/tmp/v16_coordinator.out"
+COORD_ERR="/tmp/v16_coordinator.err"
+POST_WRITE_OUT="/tmp/v16_post_write.out"
+POST_READ_OUT="/tmp/v16_post_read.out"
+
+ssh_run() {
+    local host="$1"
+    shift
+    ssh -p 22 "${SSH_USER}@${host}" "$@"
+}
+
+step() {
+    printf '\n== %s ==\n' "$1"
+}
+
+step "Build binaries on both nodes"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && make -C src vemb_v16_server && make -C benchmark vemb_v16_bench && make -C benchmark vemb_v16_topology_ctl"
+ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && make -C src vemb_v16_server && make -C benchmark vemb_v16_bench && make -C benchmark vemb_v16_topology_ctl"
+
+step "Write node0 manifest"
+ssh_run "${NODE0_HOST}" "cat >${NODE0_MANIFEST} <<'YAML'
+local_ub_node_id: 0
+local_region_weight: 4
+
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev1
+remote_meta_mmap_offset: 268435456
+remote_meta_entries: 8192
+remote_meta_buckets: 16384
+ub_rpc_timeout_ms: 200
+
+warm_regions:
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev1
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 0
+    weight: 1
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 1
+    weight: 1
+
+remote_meta_views:
+  - owner_id: 1
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 268435456
+    entries: 8192
+    buckets: 16384
+
+ub_rpc_peers:
+  - owner_id: 1
+    provider: ub
+    request_path: /dev/obmm_shmdev5
+    request_mmap_offset: 8388608
+    response_path: /dev/obmm_shmdev6
+    response_mmap_offset: 16777216
+    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_mmap_offset: 8388608
+    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_mmap_offset: 16777216
+YAML"
+
+step "Write node1 manifest"
+ssh_run "${NODE1_HOST}" "cat >${NODE1_MANIFEST} <<'YAML'
+local_ub_node_id: 1
+local_region_weight: 4
+
+remote_meta_provider: ub
+remote_meta_path: /dev/obmm_shmdev1
+remote_meta_mmap_offset: 268435456
+remote_meta_entries: 8192
+remote_meta_buckets: 16384
+ub_rpc_timeout_ms: 200
+
+warm_regions:
+  - region_id: 101
+    provider: ub
+    path: /dev/obmm_shmdev1
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 1
+    weight: 1
+  - region_id: 100
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 0
+    bytes: 67108864
+    value_size: 64
+    home_ub_node_id: 0
+    weight: 1
+
+remote_meta_views:
+  - owner_id: 0
+    provider: ub
+    path: /dev/obmm_shmdev3
+    mmap_offset: 268435456
+    entries: 8192
+    buckets: 16384
+
+ub_rpc_peers:
+  - owner_id: 0
+    provider: ub
+    request_path: /dev/obmm_shmdev5
+    request_mmap_offset: 8388608
+    response_path: /dev/obmm_shmdev6
+    response_mmap_offset: 16777216
+    inbound_request_path: /dev/obmm_shmdev6
+    inbound_request_mmap_offset: 8388608
+    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_mmap_offset: 16777216
+YAML"
+
+step "Stop old processes"
+ssh_run "${NODE0_HOST}" "pkill -f vemb_v16_server || true; pkill -f vemb_v16_topology_ctl || true; pkill -f vemb_v16_bench || true"
+ssh_run "${NODE1_HOST}" "pkill -f vemb_v16_server || true; pkill -f vemb_v16_topology_ctl || true; pkill -f vemb_v16_bench || true"
+
+step "Start node0"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE0_LOG} ${PREFILL_OUT} ${LIVE_WRITE_OUT} ${COORD_OUT} ${COORD_ERR} ${POST_WRITE_OUT} ${POST_READ_OUT} && nohup ./src/vemb_v16_server --transport tcp --tcp-host ${NODE0_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE0_MANIFEST} --reset-warm-regions --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE0_LOG} 2>&1 &"
+
+step "Start node1"
+ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE1_LOG} && nohup ./src/vemb_v16_server --transport tcp --tcp-host ${NODE1_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE1_MANIFEST} --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE1_LOG} 2>&1 &"
+
+sleep 2
+
+step "Verify startup logs"
+ssh_run "${NODE0_HOST}" "grep -E 'remote meta ready|registered vemb_v16 remote meta owner view|ub rpc ready|server ready' ${NODE0_LOG}"
+ssh_run "${NODE1_HOST}" "grep -E 'remote meta ready|registered vemb_v16 remote meta owner view|ub rpc ready|server ready' ${NODE1_LOG}"
+
+step "Publish initial topology active={0}"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --set --transport tcp --host ${NODE0_HOST} --port ${SERVER_PORT} --epoch 1 --min-write-epoch 1 --active 0 --standby 0 --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT} --timeout-ms 5000"
+
+step "Prefill initial dataset"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill ${PREFILL_KEYS} --ops 0 --threads 1 --pipeline 1 --mode vadd-inline --client-topology --timeout-ms 10000 >${PREFILL_OUT} 2>&1 && cat ${PREFILL_OUT}"
+
+if [[ "${RUN_LIVE_WRITE}" == "1" ]]; then
+    step "Start live write pressure during scaleout"
+    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && nohup ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${PREFILL_KEYS} --ops ${LIVE_WRITE_OPS} --threads 2 --pipeline 1 --mode vadd-inline --client-topology --timeout-ms 60000 >${LIVE_WRITE_OUT} 2>&1 &"
+fi
+
+step "Start coordinator listener"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && nohup ./benchmark/vemb_v16_topology_ctl --coordinator-listen --transport tcp --host ${NODE0_HOST} --port ${COORD_PORT} --expected-sources 1 --migration-epoch ${MIGRATION_EPOCH} --cutover-epoch ${CUTOVER_EPOCH} --standby 0,1 --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --wait-ms 60000 --timeout-ms 5000 >${COORD_OUT} 2>${COORD_ERR} &"
+sleep 1
+
+step "Publish candidate topology to node1 then node0"
+ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --set --transport tcp --host ${NODE1_HOST} --port ${SERVER_PORT} --epoch ${MIGRATION_EPOCH} --min-write-epoch ${MIGRATION_EPOCH} --active 0 --standby 0,1 --dual-write --auto-scaleout --coordinated-scaleout --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --coordinator-endpoint ${NODE0_HOST}:${COORD_PORT} --timeout-ms 5000"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --set --transport tcp --host ${NODE0_HOST} --port ${SERVER_PORT} --epoch ${MIGRATION_EPOCH} --min-write-epoch ${MIGRATION_EPOCH} --active 0 --standby 0,1 --dual-write --auto-scaleout --coordinated-scaleout --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --coordinator-endpoint ${NODE0_HOST}:${COORD_PORT} --timeout-ms 5000"
+
+step "Show coordinator result"
+sleep 2
+ssh_run "${NODE0_HOST}" "cat ${COORD_OUT}; echo '---'; cat ${COORD_ERR} || true"
+
+step "Show source migration summary"
+ssh_run "${NODE0_HOST}" "grep -E 'migration auto plan|scaleout auto|local done' ${NODE0_LOG} | tail -n 20"
+
+step "Verify final topology on both nodes"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --get --transport tcp --host ${NODE0_HOST} --port ${SERVER_PORT} --timeout-ms 5000"
+ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --get --transport tcp --host ${NODE1_HOST} --port ${SERVER_PORT} --timeout-ms 5000"
+
+step "Post-cutover write validation"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vadd-inline --client-topology --timeout-ms 10000 >${POST_WRITE_OUT} 2>&1 && cat ${POST_WRITE_OUT}"
+
+if [[ "${RUN_POST_READ}" == "1" ]]; then
+    step "Post-cutover read validation"
+    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vemb-supernode-read --client-topology --timeout-ms 10000 >${POST_READ_OUT} 2>&1 && cat ${POST_READ_OUT}"
+fi
+
+step "Done"
+echo "Scaleout flow finished. Useful logs:"
+echo "  node0: ssh ${SSH_USER}@${NODE0_HOST} 'tail -200 ${NODE0_LOG}'"
+echo "  node1: ssh ${SSH_USER}@${NODE1_HOST} 'tail -200 ${NODE1_LOG}'"
+echo "  coordinator: ssh ${SSH_USER}@${NODE0_HOST} 'cat ${COORD_OUT}'"

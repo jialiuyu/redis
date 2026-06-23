@@ -4,12 +4,14 @@
  */
 
 #include "batch_processor.h"
+#include "server.h"
 #include "ub_client.h"
 #include "vector_engine.h"
 #include "sve_compute.h"
 #include <sys/time.h>
 #include <unistd.h>
 #include <time.h>
+#include <limits.h>
 
 // Global batch processor instance
 batch_processor_t *global_batch_processor = NULL;

@@ -2330,6 +2330,16 @@ void initServerConfig(void) {
     server.migrate_cached_sockets = dictCreate(&migrateCacheDictType);
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.page_size = sysconf(_SC_PAGESIZE);
+    server.supernode_workers = 0;
+    server.proxy.batch_limit = 0;
+    server.proxy.time_limit_us = 0;
+    server.proxy.max_supernodes = 0;
+    server.proxy.vemb_submit_mode = PROXY_VEMB_SUBMIT_MODE_ADAPTIVE;
+    server.proxy.vemb_adaptive = 1;
+    server.proxy.vemb_direct_gap_us = 20;
+    server.proxy.vemb_fc_workers = 0;
+    server.proxy.vemb_fc_slots = 0;
+    server.proxy.vemb_fc_max_scan = 0;
     server.pause_cron = 0;
     server.dict_resizing = 1;
 

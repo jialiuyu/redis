@@ -6,9 +6,11 @@
 #ifndef __SVE_COMPUTE_H
 #define __SVE_COMPUTE_H
 
-#include "server.h"
+#include "sds.h"
 #include <stdint.h>
-#include <arm_sve.h>  /* ARM SVE intrinsics */
+#include <pthread.h>
+#include "sve_config.h"
+#include "sve_similarity.h"
 
 /* SVE Configuration */
 #define SVE_MAX_VECTOR_LENGTH 256  /* Maximum SVE vector length in bits */
