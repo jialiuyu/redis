@@ -23,7 +23,8 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 uint32_t backend_type,
                                 const char *path,
                                 uint64_t mmap_offset,
-                                size_t requested_size);
+                                size_t requested_size,
+                                uint32_t is_local);
 void vemb_v16_mapped_region_close(vemb_v16_mapped_region_t *region);
 
 #endif

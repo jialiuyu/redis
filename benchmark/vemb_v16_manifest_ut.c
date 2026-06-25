@@ -223,7 +223,8 @@ static void test_storage_reset_clears_payload_and_allocator(void) {
                                           allocator_name,
                                           0,
                                           401,
-                                          slots) == 0);
+                                          slots,
+                                          1) == 0);
     uint32_t slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(allocator.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);
@@ -253,7 +254,8 @@ static void test_storage_reset_clears_payload_and_allocator(void) {
                                           allocator_name,
                                           0,
                                           401,
-                                          slots) == 0);
+                                          slots,
+                                          1) == 0);
     slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(allocator.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);

@@ -95,7 +95,8 @@ int vemb_v16_warm_provider_open(vemb_v16_warm_provider_t *provider,
                                     backend_type,
                                     path,
                                     mmap_offset,
-                                    requested_size) != 0) {
+                                    requested_size,
+                                    is_local) != 0) {
         serverLog(LL_WARNING,
                   "vemb_v16 warm provider open failed: region_id=%u backend=%s path=%s bytes=%zu mmap_offset=%llu",
                   region_id,

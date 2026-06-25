@@ -250,7 +250,8 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
                                                      region->path,
                                                      region->mmap_offset,
                                                      region->region_id,
-                                                     capacity_slots);
+                                                     capacity_slots,
+                                                     region->is_local);
             int reset_allocator_errno = errno;
             serverLog(LL_NOTICE,
                       "reset warm allocator ub: region_id=%u path=%s offset=%llu rc=%d status=%s",
@@ -330,7 +331,8 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                             src->path,
                                             src->mmap_offset,
                                             sizeof(vemb_v16_shared_region_allocator_t) +
-                                                (size_t)src->region_bytes) != 0) {
+                                                (size_t)src->region_bytes,
+                                            src->is_local) != 0) {
                 serverLog(LL_WARNING,
                           "failed to open warm ub backing region: region_id=%u path=%s",
                           src->region_id, src->path);
@@ -372,7 +374,8 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                             src->backend_type,
                                             src->path,
                                             src->mmap_offset,
-                                            (size_t)src->region_bytes) != 0) {
+                                            (size_t)src->region_bytes,
+                                            src->is_local) != 0) {
                 serverLog(LL_WARNING,
                           "failed to open warm shm payload region: region_id=%u path=%s",
                           src->region_id, src->path);
@@ -411,7 +414,8 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                             src->backend_type,
                                             allocator_name,
                                             0,
-                                            sizeof(vemb_v16_shared_region_allocator_t)) != 0) {
+                                            sizeof(vemb_v16_shared_region_allocator_t),
+                                            src->is_local) != 0) {
                 serverLog(LL_WARNING,
                           "failed to open warm shm allocator backing: region_id=%u path=%s allocator=%s",
                           src->region_id, src->path, allocator_name);

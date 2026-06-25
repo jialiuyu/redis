@@ -43,7 +43,8 @@ static void test_multithread_unique_slots(void) {
                                           name,
                                           0,
                                           7,
-                                          capacity) == 0);
+                                          capacity,
+                                          1) == 0);
 
     uint8_t *seen = calloc(capacity, sizeof(*seen));
     pthread_mutex_t lock;
@@ -88,7 +89,8 @@ static void test_reopen_does_not_reset_next_slot(void) {
                                           name,
                                           0,
                                           9,
-                                          4) == 0);
+                                          4,
+                                          1) == 0);
     uint32_t slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(first.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);
@@ -100,7 +102,8 @@ static void test_reopen_does_not_reset_next_slot(void) {
                                           name,
                                           0,
                                           9,
-                                          4) == 0);
+                                          4,
+                                          1) == 0);
     slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(second.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);
@@ -181,14 +184,16 @@ static void run_multiprocess_unique_slots(uint32_t backend_type,
                                                   path,
                                                   mmap_offset,
                                                   region_id,
-                                                  capacity) == 0);
+                                                  capacity,
+                                                  1) == 0);
             vemb_v16_shared_allocator_close(&initial);
         } else {
             assert(vemb_v16_shared_allocator_reset(backend_type,
                                                    path,
                                                    mmap_offset,
                                                    region_id,
-                                                   capacity) == 0);
+                                                   capacity,
+                                                   1) == 0);
         }
     }
 
@@ -204,7 +209,8 @@ static void run_multiprocess_unique_slots(uint32_t backend_type,
                                                path,
                                                mmap_offset,
                                                region_id,
-                                               capacity) != 0) {
+                                               capacity,
+                                               1) != 0) {
                 _exit(2);
             }
             uint32_t *slots = calloc(per_child, sizeof(*slots));
@@ -256,7 +262,8 @@ static void run_multiprocess_unique_slots(uint32_t backend_type,
                                           path,
                                           mmap_offset,
                                           region_id,
-                                          capacity) == 0);
+                                          capacity,
+                                          1) == 0);
     assert(vemb_v16_shared_allocator_used_slots(final.allocator) == capacity);
     uint32_t slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(final.allocator, &slot) ==
@@ -330,7 +337,8 @@ static void test_ub_provider_reopen_and_reset(void) {
                                           path,
                                           1,
                                           11,
-                                          3) != 0);
+                                          3,
+                                          1) != 0);
 
     vemb_v16_shared_allocator_mapping_t first;
     assert(vemb_v16_shared_allocator_open(&first,
@@ -338,7 +346,8 @@ static void test_ub_provider_reopen_and_reset(void) {
                                           path,
                                           128,
                                           11,
-                                          3) == 0);
+                                          3,
+                                          1) == 0);
     uint32_t slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(first.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);
@@ -351,7 +360,8 @@ static void test_ub_provider_reopen_and_reset(void) {
                                           path,
                                           128,
                                           11,
-                                          3) == 0);
+                                          3,
+                                          1) == 0);
     slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(second.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);
@@ -362,13 +372,15 @@ static void test_ub_provider_reopen_and_reset(void) {
                                            path,
                                            128,
                                            11,
-                                           3) == 0);
+                                           3,
+                                           1) == 0);
     assert(vemb_v16_shared_allocator_open(&second,
                                           VEMB_V16_REGION_UB,
                                           path,
                                           128,
                                           11,
-                                          3) == 0);
+                                          3,
+                                          1) == 0);
     slot = UINT32_MAX;
     assert(vemb_v16_shared_allocator_alloc(second.allocator, &slot) ==
            VEMB_V16_SHARED_ALLOCATOR_OK);

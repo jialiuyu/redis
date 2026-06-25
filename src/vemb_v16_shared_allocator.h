@@ -56,7 +56,8 @@ int vemb_v16_shared_allocator_open(vemb_v16_shared_allocator_mapping_t *mapping,
                                    const char *path,
                                    uint64_t mmap_offset,
                                    uint32_t region_id,
-                                   uint32_t capacity_slots);
+                                   uint32_t capacity_slots,
+                                   uint32_t is_local);
 int vemb_v16_shared_allocator_attach(vemb_v16_shared_allocator_mapping_t *mapping,
                                      const vemb_v16_mapped_region_t *region,
                                      uint64_t view_offset,
@@ -69,7 +70,8 @@ int vemb_v16_shared_allocator_reset(uint32_t backend_type,
                                     const char *path,
                                     uint64_t mmap_offset,
                                     uint32_t region_id,
-                                    uint32_t capacity_slots);
+                                    uint32_t capacity_slots,
+                                    uint32_t is_local);
 void vemb_v16_shared_allocator_close(vemb_v16_shared_allocator_mapping_t *mapping);
 int vemb_v16_shared_allocator_unlink(const char *name);
 int vemb_v16_shared_allocator_alloc(vemb_v16_shared_region_allocator_t *allocator,
