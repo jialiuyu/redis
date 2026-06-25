@@ -828,7 +828,7 @@ endpoint[0]=owner:0 transport:tcp host:192.168.90.111 port:6391
   --ops 0 \
   --threads 1 \
   --pipeline 1 \
-  --mode vadd-inline \
+  --mode vadd \
   --client-topology \
   --timeout-ms 10000 \
   >/tmp/v16_prefill.out 2>&1
@@ -857,7 +857,7 @@ nohup ./benchmark/vemb_v16_bench \
   --ops 50000 \
   --threads 2 \
   --pipeline 1 \
-  --mode vadd-inline \
+  --mode vadd \
   --client-topology \
   --timeout-ms 60000 \
   >/tmp/v16_live_write.out 2>&1 &
@@ -997,7 +997,7 @@ endpoint[1]=owner:1 transport:tcp host:192.168.90.112 port:6391
   --ops 2000 \
   --threads 2 \
   --pipeline 1 \
-  --mode vadd-inline \
+  --mode vadd \
   --client-topology \
   --timeout-ms 10000 \
   >/tmp/v16_post_cutover.out 2>&1
@@ -1178,7 +1178,7 @@ P0 仍可补强但不阻塞当前 normal-path 闭环：
    - 等 top_ctl coordinator 收齐 source0/source1 done 并发布 full active；
    - 等后台 workload 结束；
    - 断言 bench fail=0、source 完成迁移、node2 cutover 后可接 direct VADD。
-   当前默认 live mode 为 vadd-inline，VEMB_V16_SCALEOUT_LIVE_MODE 可配置；
+   当前默认 live mode 为 vadd，VEMB_V16_SCALEOUT_LIVE_MODE 可配置；
    为避免 live workload 重复 prefill，vemb_v16_bench 已增加 --keyspace N，
    将“已有 key 空间”和“本次是否 prefill”两个语义拆开。
 

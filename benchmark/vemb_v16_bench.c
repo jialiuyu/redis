@@ -113,14 +113,12 @@ typedef struct worker_arg {
 enum {
     MODE_PING = 0,
     MODE_VEMB_HANDLE = 1,
-    MODE_VEMB_READ_VECTOR = 2,
-    MODE_VADD_INLINE = 3,
-    MODE_VEMB_SUPERNODE_READ = 4,
-    MODE_MIXED_80R20W = 5,
-    MODE_VEMB_INLINE_VECTOR = 6,
-    MODE_VSIM_INLINE = 7,
-    MODE_VSIM_KEY_KEY = 8,
-    MODE_VREM = 9,
+    MODE_VADD = 2,
+    MODE_MIXED_80R20W = 3,
+    MODE_VEMB_INLINE = 4,
+    MODE_VSIM_INLINE = 5,
+    MODE_VSIM_KEY_KEY = 6,
+    MODE_VREM = 7,
 };
 
 enum {
@@ -1043,7 +1041,7 @@ static int prefill_multi(bench_cfg_t *cfg,
         if (node_index >= topology_node_count)
             return -1;
         bench_node_channel_t *node = &nodes[node_index];
-        prepare_req(&req, VEMB_V16_OP_VADD_INLINE, i + 1,
+        prepare_req(&req, VEMB_V16_OP_VADD, i + 1,
                     node->desc.channel_id, key, cfg->dim);
         fill_vector(req.vector, cfg->dim, i);
         size_t req_len = vemb_v16_req_inline_len(req.vector_bytes);
@@ -1108,7 +1106,7 @@ static void *worker_main(void *arg) {
     }
     uint32_t inline_vector_cap = w->cfg.dim * sizeof(float);
     uint8_t *inline_vector = NULL;
-    if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR ||
+    if (w->cfg.mode == MODE_VEMB_INLINE ||
         (w->cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
          w->cfg.mode == MODE_MIXED_80R20W)) {
         inline_vector = zmalloc(inline_vector_cap);
@@ -1141,9 +1139,11 @@ static void *worker_main(void *arg) {
             int mixed_write = w->cfg.mode == MODE_MIXED_80R20W &&
                               (i % 5u) == 0;
             int expect_inline_vector = 0;
-            uint8_t op = (w->cfg.mode == MODE_VEMB_SUPERNODE_READ ||
-                          w->cfg.mode == MODE_MIXED_80R20W) ?
-                VEMB_V16_OP_VEMB_SUPERNODE_READ : VEMB_V16_OP_VEMB_HANDLE;
+            uint8_t op =
+                (w->cfg.mode == MODE_VEMB_INLINE ||
+                 (w->cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
+                  w->cfg.mode == MODE_MIXED_80R20W)) ?
+                VEMB_V16_OP_VEMB_INLINE : VEMB_V16_OP_VEMB_HANDLE;
             if (w->cfg.mode == MODE_PING) {
                 bench_node_channel_t *node = &w->nodes[0];
                 memset(&req, 0, sizeof(req));
@@ -1157,7 +1157,7 @@ static void *worker_main(void *arg) {
                             w->tid, i);
                     send_failed = 1;
                 }
-            } else if (w->cfg.mode == MODE_VADD_INLINE ||
+            } else if (w->cfg.mode == MODE_VADD ||
                        w->cfg.mode == MODE_VREM ||
                        mixed_write) {
                 int is_vrem = w->cfg.mode == MODE_VREM;
@@ -1170,7 +1170,7 @@ static void *worker_main(void *arg) {
                 bench_node_channel_t *node = &w->nodes[node_index];
                 prepare_req(&req,
                             is_vrem ? VEMB_V16_OP_VREM :
-                                VEMB_V16_OP_VADD_INLINE,
+                                VEMB_V16_OP_VADD,
                             i + 1,
                             node->desc.channel_id, key, w->cfg.dim);
                 if (is_vrem) {
@@ -1257,10 +1257,7 @@ static void *worker_main(void *arg) {
                 bench_node_channel_t *node = &w->nodes[node_index];
                 prepare_req(&req, op, i + 1, node->desc.channel_id, key,
                             w->cfg.dim);
-                if (w->cfg.mode == MODE_VEMB_INLINE_VECTOR ||
-                    (w->cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
-                     w->cfg.mode == MODE_MIXED_80R20W)) {
-                    req.flags |= VEMB_V16_REQ_F_INLINE_VECTOR;
+                if (req.op == VEMB_V16_OP_VEMB_INLINE) {
                     expect_inline_vector = 1;
                 }
                 w->vemb_sent++;
@@ -1333,7 +1330,12 @@ static void *worker_main(void *arg) {
             completed++;
             continue;
         }
-        if (w->cfg.mode == MODE_VEMB_READ_VECTOR) {
+        int should_read_handle_vector =
+            w->cfg.mode == MODE_VEMB_HANDLE ||
+            (w->cfg.mode == MODE_MIXED_80R20W &&
+             w->cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
+             done_req.op == VEMB_V16_OP_VEMB_HANDLE);
+        if (should_read_handle_vector) {
             bench_region_map_t *warm_region = find_warm_region(w, resp.region_id);
             if (!warm_region ||
                 resp.vector_offset + resp.vector_bytes >
@@ -1399,10 +1401,8 @@ worker_done:
 static int mode_from_string(const char *s) {
     if (!strcmp(s, "ping")) return MODE_PING;
     if (!strcmp(s, "vemb-handle")) return MODE_VEMB_HANDLE;
-    if (!strcmp(s, "vemb-read-vector")) return MODE_VEMB_READ_VECTOR;
-    if (!strcmp(s, "vemb-inline-vector")) return MODE_VEMB_INLINE_VECTOR;
-    if (!strcmp(s, "vemb-supernode-read")) return MODE_VEMB_SUPERNODE_READ;
-    if (!strcmp(s, "vadd-inline")) return MODE_VADD_INLINE;
+    if (!strcmp(s, "vemb-inline")) return MODE_VEMB_INLINE;
+    if (!strcmp(s, "vadd")) return MODE_VADD;
     if (!strcmp(s, "vrem")) return MODE_VREM;
     if (!strcmp(s, "mixed-80r20w")) return MODE_MIXED_80R20W;
     if (!strcmp(s, "vsim-inline")) return MODE_VSIM_INLINE;
@@ -1414,10 +1414,8 @@ static const char *mode_name(int mode) {
     switch (mode) {
     case MODE_PING: return "ping";
     case MODE_VEMB_HANDLE: return "vemb-handle";
-    case MODE_VEMB_READ_VECTOR: return "vemb-read-vector";
-    case MODE_VEMB_INLINE_VECTOR: return "vemb-inline-vector";
-    case MODE_VEMB_SUPERNODE_READ: return "vemb-supernode-read";
-    case MODE_VADD_INLINE: return "vadd-inline";
+    case MODE_VEMB_INLINE: return "vemb-inline";
+    case MODE_VADD: return "vadd";
     case MODE_VREM: return "vrem";
     case MODE_MIXED_80R20W: return "mixed-80r20w";
     case MODE_VSIM_INLINE: return "vsim-inline";
@@ -1428,14 +1426,12 @@ static const char *mode_name(int mode) {
 
 static int mode_is_read(int mode) {
     return mode == MODE_VEMB_HANDLE ||
-           mode == MODE_VEMB_READ_VECTOR ||
-           mode == MODE_VEMB_INLINE_VECTOR ||
-           mode == MODE_VEMB_SUPERNODE_READ ||
+           mode == MODE_VEMB_INLINE ||
            mode == MODE_MIXED_80R20W;
 }
 
 static int mode_has_write(int mode) {
-    return mode == MODE_VADD_INLINE ||
+    return mode == MODE_VADD ||
            mode == MODE_VREM ||
            mode == MODE_MIXED_80R20W;
 }
@@ -1810,14 +1806,14 @@ static int run_once(bench_cfg_t cfg) {
     memset(pre_nodes, 0, sizeof(pre_nodes));
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
         mode_is_read(cfg.mode) &&
-        cfg.mode != MODE_VEMB_INLINE_VECTOR &&
+        cfg.mode != MODE_VEMB_INLINE &&
         cfg.mode != MODE_MIXED_80R20W) {
-        fprintf(stderr, "tcp transport read modes require --mode vemb-inline-vector or --mode mixed-80r20w\n");
+        fprintf(stderr, "tcp transport read modes require --mode vemb-inline or --mode mixed-80r20w\n");
         return 1;
     }
     if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
-        cfg.mode == MODE_VEMB_INLINE_VECTOR) {
-        fprintf(stderr, "vemb-inline-vector requires --transport tcp\n");
+        cfg.mode == MODE_VEMB_INLINE) {
+        fprintf(stderr, "vemb-inline requires --transport tcp\n");
         return 1;
     }
     if (cfg.client_topology_enabled) {
@@ -1885,7 +1881,9 @@ static int run_once(bench_cfg_t cfg) {
         for (uint32_t n = 0; n < cfg.node_count; n++) {
             if (setup_node_channel(&cfg,
                                    n,
-                                   cfg.mode == MODE_VEMB_READ_VECTOR,
+                                   cfg.mode == MODE_VEMB_HANDLE ||
+                                       (cfg.mode == MODE_MIXED_80R20W &&
+                                        cfg.transport_type != VEMB_V16_TRANSPORT_TCP),
                                    &args[i].nodes[n]) != 0) {
                 fprintf(stderr, "worker %d channel setup failed node=%u\n", i, n);
                 return 1;
@@ -2098,7 +2096,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-read-vector|vemb-inline-vector|vemb-supernode-read|vadd-inline|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
             return 0;
         }
         else {
@@ -2115,14 +2113,14 @@ int main(int argc, char **argv) {
     }
     if (cfg.transport_type == VEMB_V16_TRANSPORT_TCP &&
         mode_is_read(cfg.mode) &&
-        cfg.mode != MODE_VEMB_INLINE_VECTOR &&
+        cfg.mode != MODE_VEMB_INLINE &&
         cfg.mode != MODE_MIXED_80R20W) {
-        fprintf(stderr, "tcp transport read modes require --mode vemb-inline-vector or --mode mixed-80r20w\n");
+        fprintf(stderr, "tcp transport read modes require --mode vemb-inline or --mode mixed-80r20w\n");
         return 1;
     }
     if (cfg.transport_type != VEMB_V16_TRANSPORT_TCP &&
-        cfg.mode == MODE_VEMB_INLINE_VECTOR) {
-        fprintf(stderr, "vemb-inline-vector requires --transport tcp\n");
+        cfg.mode == MODE_VEMB_INLINE) {
+        fprintf(stderr, "vemb-inline requires --transport tcp\n");
         return 1;
     }
     if (cfg.client_topology_enabled &&

@@ -25,16 +25,12 @@ typedef struct vemb_v16_supernode_ctx {
 typedef struct vemb_v16_supernode_scratch {
     vemb_v16_vemb_job_t *vemb_jobs;
     vemb_v16_vadd_job_t *vadd_jobs;
-    float *read_result;
-    size_t read_result_bytes;
 } vemb_v16_supernode_scratch_t;
 
 int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch);
 void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch);
 void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
-                                        vemb_v16_vemb_job_t *vemb_job,
-                                        float **read_result,
-                                        size_t *read_result_bytes);
+                                        vemb_v16_vemb_job_t *vemb_job);
 void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                         vemb_v16_vadd_job_t *vadd_job);
 

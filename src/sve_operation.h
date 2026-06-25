@@ -108,5 +108,6 @@ int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,
 /* 非临时内存拷贝（SVE streaming load / 标量 memcpy）*/
 void sve_streaming_load(const void *src, void *dst, size_t size);
 void sve_streaming_store(const void *src, void *dst, size_t size);
+void sve_streaming_load_f32(const void *src, void *dst, size_t size);
 
 #endif /* __SVE_OPERATION_H */

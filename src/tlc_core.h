@@ -149,6 +149,11 @@ int tlc_core_get_warm_location(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                tlc_warm_location_t *location);
+int tlc_core_get_cached_warm_location(tlc_core_t *core,
+                                      const char *key,
+                                      uint32_t key_len,
+                                      uint64_t key_hash,
+                                      tlc_warm_location_t *location);
 int tlc_core_put(tlc_core_t *core,
                  const char *key,
                  uint32_t key_len,
@@ -284,6 +289,12 @@ int tlc_core_apply_migration(tlc_core_t *core,
 int tlc_core_validate_warm_location(tlc_core_t *core,
                                     uint64_t key_hash,
                                     const tlc_warm_location_t *location);
+int tlc_core_copy_warm_location_value(tlc_core_t *core,
+                                      uint64_t key_hash,
+                                      const tlc_warm_location_t *location,
+                                      void *value_out,
+                                      uint32_t value_out_size,
+                                      uint32_t retry_budget);
 void tlc_core_note_remote_meta_stale(tlc_core_t *core);
 void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats);
 uint32_t tlc_core_get_region_stats(tlc_core_t *core,

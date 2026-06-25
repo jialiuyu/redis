@@ -485,3 +485,49 @@ void sve_streaming_load(const void *src, void *dst, size_t size) {
 void sve_streaming_store(const void *src, void *dst, size_t size) {
     sve_streaming_load(src, dst, size);
 }
+
+void sve_streaming_load_f32(const void *src, void *dst, size_t size) {
+#ifdef USE_ARM_SVE
+    if ((((uintptr_t)src | (uintptr_t)dst | size) & (sizeof(float) - 1u)) != 0) {
+        sve_streaming_load(src, dst, size);
+        return;
+    }
+
+    const size_t vl = svcntw();
+    size_t rem = size / sizeof(float);
+    const float *srcp = (const float *)src;
+    float *dstp = (float *)dst;
+
+    svbool_t pg = svptrue_b32();
+    while (rem >= vl * 4u) {
+        __builtin_prefetch(srcp + vl * 8u, 0, 3);
+        svfloat32_t v0 = svld1_f32(pg, srcp);
+        svfloat32_t v1 = svld1_f32(pg, srcp + vl);
+        svfloat32_t v2 = svld1_f32(pg, srcp + vl * 2u);
+        svfloat32_t v3 = svld1_f32(pg, srcp + vl * 3u);
+        svst1_f32(pg, dstp, v0);
+        svst1_f32(pg, dstp + vl, v1);
+        svst1_f32(pg, dstp + vl * 2u, v2);
+        svst1_f32(pg, dstp + vl * 3u, v3);
+        srcp += vl * 4u;
+        dstp += vl * 4u;
+        rem -= vl * 4u;
+    }
+
+    while (rem >= vl) {
+        svfloat32_t v = svld1_f32(pg, srcp);
+        svst1_f32(pg, dstp, v);
+        srcp += vl;
+        dstp += vl;
+        rem -= vl;
+    }
+
+    if (rem > 0) {
+        svbool_t pg = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+        svfloat32_t v = svld1_f32(pg, srcp);
+        svst1_f32(pg, dstp, v);
+    }
+#else
+    memcpy(dst, src, size);
+#endif
+}

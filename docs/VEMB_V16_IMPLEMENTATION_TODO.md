@@ -24,7 +24,7 @@ vemb_v16_bench / future redis-cli-vemb
 - P0 已完成：bench 侧输出 client request ring publish spins 和 response empty polls，用于判断瓶颈是在 client/proxy ring 还是 SuperNode/completion。
 - P0 已完成：VEMB 在 SuperNode 内部先做 `vector_key -> row_id` lookup，再调用 `sve_serial_contiguous_read_traced()` 读取 300 dim vector；因此 baseline 会包含 bitmap acquire/release 和 SVE/标量 contiguous load 成本。
 - P1 已完成：`vemb_v16_bench` 支持统一线程列表，例如 `--threads 1,2,4,8,16`。
-- P1 已完成：`ping`、`vemb-handle`、`vemb-read-vector`、`vadd-inline` 四条模式可独立 baseline。
+- P1 已完成：`ping`、`vemb-handle`、`vadd`、`vrem` 四条模式可独立 baseline。
 - P1 已完成：`--hot-key-id N` 可让所有 worker 命中同一 row，用于制造 bitmap lock 冲突并观察 `bitmap_lock_failure`。
 - P1 已完成：bench 每轮结束会关闭 channel 后再拉 stats，`active_channels=0` 代表 channel 生命周期清理完成。
 
@@ -33,9 +33,8 @@ vemb_v16_bench / future redis-cli-vemb
 | mode | threads=1 | threads=2 | 关键校验 |
 | --- | ---: | ---: | --- |
 | `ping` | 233k QPS | 429k QPS | 不进入 SuperNode，`total/vemb/vadd=0` |
-| `vemb-handle` | 367k QPS | 521k QPS | `published=completed=vemb`，VEMB 进入 `sve_serial_contiguous_read_traced()` |
-| `vemb-read-vector` | 321k QPS | 492k QPS | 在 `vemb-handle` 上增加 client 读 vector region |
-| `vadd-inline` | 219k QPS | 368k QPS | VADD 全量传 1200B vector，进入 VADD full-vector ring |
+| `vemb-handle` | 321k QPS | 492k QPS | response 返回 handle，client 读取 vector region |
+| `vadd` | 219k QPS | 368k QPS | VADD 全量传 1200B vector，进入 VADD full-vector ring |
 
 ## 待实现
 
@@ -47,7 +46,7 @@ vemb_v16_bench / future redis-cli-vemb
 - `src/vemb_v16_protocol.h` 定义无 Redis 依赖的 channel descriptor、request、response、stats 协议。
 - `src/vemb_v16_proxy.c` 实现 standalone proxy/channel worker、SPSC job ring、SPSC completion ring、内存 vector table 和 SuperNode worker。
 - `src/vemb_v16_server.c` 是独立 main，只负责启动 proxy 和 signal 生命周期。
-- `benchmark/vemb_v16_bench.c` 直接连接 standalone server，支持 `ping`、`vemb-handle`、`vemb-read-vector`、`vadd-inline`。
+- `benchmark/vemb_v16_bench.c` 直接连接 standalone server，支持 `ping`、`vemb-handle`、`vemb-inline`、`vadd`、`vrem`。
 - 第一版用进程内 vector table 代替 UB vector table，保持 `vector_key -> handle/offset -> vector region` 模型，后续替换为 UB backend。
 - 当前版本没有 `server.h`、`RedisModuleCtx`、`RedisModule_BlockClient()`、`RedisModule_UnblockClient()` 依赖。
 
@@ -59,15 +58,14 @@ vemb_v16_bench / future redis-cli-vemb
 ./src/vemb_v16_server --dim 300 --max-vectors 65536
 ```
 
-`vadd-inline` 会向进程内 table 写入新 key。重复跑 VADD baseline 时，`--max-vectors` 需要大于本次进程生命周期内累计写入量；如果只是小容量验证，建议重启 server 清空 table。
+`vadd` 会向进程内 table 写入新 key。重复跑 VADD baseline 时，`--max-vectors` 需要大于本次进程生命周期内累计写入量；如果只是小容量验证，建议重启 server 清空 table。
 
 运行 bench：
 
 ```bash
 ./benchmark/vemb_v16_bench --mode ping --dim 300 --prefill 0 --ops 200000 --threads 1,2,4,8,16
 ./benchmark/vemb_v16_bench --mode vemb-handle --dim 300 --prefill 65536 --ops 200000 --threads 1,2,4,8,16
-./benchmark/vemb_v16_bench --mode vemb-read-vector --dim 300 --prefill 65536 --ops 200000 --threads 1,2,4,8,16
-./benchmark/vemb_v16_bench --mode vadd-inline --dim 300 --prefill 0 --ops 200000 --threads 1,2,4,8,16
+./benchmark/vemb_v16_bench --mode vadd --dim 300 --prefill 0 --ops 200000 --threads 1,2,4,8,16
 ```
 
 ## Multi-proxy / SuperNode 运行方式
@@ -119,7 +117,7 @@ bench 使用 `--endpoints` 列出所有本机 endpoint：
 ./benchmark/vemb_v16_bench \
   --transport tcp \
   --endpoints 127.0.0.1:6391,127.0.0.1:6392 \
-  --mode vemb-inline-vector \
+  --mode vemb-inline \
   --dim 300 \
   --prefill 65536 \
   --ops 200000 \
@@ -185,7 +183,7 @@ Bench 机器连接远端节点：
 ./benchmark/vemb_v16_bench \
   --transport tcp \
   --endpoints 10.0.0.11:6391,10.0.0.12:6391 \
-  --mode vemb-inline-vector \
+  --mode vemb-inline \
   --dim 300 \
   --prefill 65536 \
   --ops 200000 \
@@ -211,7 +209,7 @@ Bench 机器连接远端节点：
 
 注意事项：
 
-- TCP 下读模式只允许 `vemb-inline-vector` 或 `mixed-80r20w`；其中 `mixed-80r20w` 的读侧返回全量 vector，写侧仍为 `VADD_INLINE`。
+- TCP 下读模式只允许 `vemb-inline` 或 `mixed-80r20w`；其中 `mixed-80r20w` 的读侧发送 `VEMB_V16_OP_VEMB_INLINE` 并返回全量 vector，写侧为 `VEMB_V16_OP_VADD`。
 - 跨机器运行时需要放通 server 端 `--tcp-port`，例如 `6391`。
 - `--transport aeron` 的 multi-node 使用 `--sockets PATH[,PATH...]`，当前适合同机 UDS + SHM/Aeron ring；跨机器 Aeron 需要后续 `aeron-over-UB` 设计。
 
@@ -517,7 +515,7 @@ many bench workers / TCP connections / SHM channels
   - server 配置 `local_ub_node_id`，用 `home_ub_node_id == local_ub_node_id` 判断 local region。
   - 不通过 `/dev/obmm_shmdevX` 数字后缀推断 locality。
 - bench/client 多 region mmap：已完成 channel descriptor 多 region 暴露，bench 按 `resp.region_id` 查找 mapped region。
-- TCP read path：已明确只能 inline vector；server 会拒绝未带 `INLINE_VECTOR` flag 的 TCP VEMB read 请求，bench TCP 读模式只允许 `vemb-inline-vector` 或 `mixed-80r20w`。
+- TCP read path：已明确只能 inline vector；server 会拒绝 TCP `VEMB_HANDLE` 读请求，bench TCP 读模式只允许 `vemb-inline` 或 `mixed-80r20w`，读请求使用 `VEMB_V16_OP_VEMB_INLINE`。
 - warm region aggregate stats：已完成 server/bench 输出 `warm_region_count`、`warm_region_full_count`、`warm_alloc_local`、`warm_alloc_remote`、`warm_alloc_fallback`、`warm_alloc_cold_spill`、`warm_alloc_fail`、`warm_region_hash_local_pct`。
 - TODO：真实生产 OBMM/UB 验证。
   需要 Huawei 方提供生产环境 UB 初始化案例，明确 `obmmctl export/import`、UB path 创建、region 暴露方式，以及哪块 UB region 是 local region。

@@ -167,11 +167,11 @@ step "Publish initial topology active={0}"
 ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --set --transport tcp --host ${NODE0_HOST} --port ${SERVER_PORT} --epoch 1 --min-write-epoch 1 --active 0 --standby 0 --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT} --timeout-ms 5000"
 
 step "Prefill initial dataset"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill ${PREFILL_KEYS} --ops 0 --threads 1 --pipeline 1 --mode vadd-inline --client-topology --timeout-ms 10000 >${PREFILL_OUT} 2>&1 && cat ${PREFILL_OUT}"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill ${PREFILL_KEYS} --ops 0 --threads 1 --pipeline 1 --mode vadd --client-topology --timeout-ms 10000 >${PREFILL_OUT} 2>&1 && cat ${PREFILL_OUT}"
 
 if [[ "${RUN_LIVE_WRITE}" == "1" ]]; then
     step "Start live write pressure during scaleout"
-    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && nohup ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${PREFILL_KEYS} --ops ${LIVE_WRITE_OPS} --threads 2 --pipeline 1 --mode vadd-inline --client-topology --timeout-ms 60000 >${LIVE_WRITE_OUT} 2>&1 &"
+    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && nohup ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${PREFILL_KEYS} --ops ${LIVE_WRITE_OPS} --threads 2 --pipeline 1 --mode vadd --client-topology --timeout-ms 60000 >${LIVE_WRITE_OUT} 2>&1 &"
 fi
 
 step "Start coordinator listener"
@@ -194,11 +194,11 @@ ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl -
 ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --get --transport tcp --host ${NODE1_HOST} --port ${SERVER_PORT} --timeout-ms 5000"
 
 step "Post-cutover write validation"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vadd-inline --client-topology --timeout-ms 10000 >${POST_WRITE_OUT} 2>&1 && cat ${POST_WRITE_OUT}"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vadd --client-topology --timeout-ms 10000 >${POST_WRITE_OUT} 2>&1 && cat ${POST_WRITE_OUT}"
 
 if [[ "${RUN_POST_READ}" == "1" ]]; then
     step "Post-cutover read validation"
-    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vemb-supernode-read --client-topology --timeout-ms 10000 >${POST_READ_OUT} 2>&1 && cat ${POST_READ_OUT}"
+    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vemb-inline --client-topology --timeout-ms 10000 >${POST_READ_OUT} 2>&1 && cat ${POST_READ_OUT}"
 fi
 
 step "Done"

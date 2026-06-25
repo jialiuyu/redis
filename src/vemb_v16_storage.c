@@ -1488,7 +1488,7 @@ int vemb_v16_storage_vector_slice(vemb_v16_storage_ctx_t *storage,
 
     *vector = NULL;
     *vector_bytes = 0;
-    if (!(resp->flags & VEMB_V16_REQ_F_INLINE_VECTOR) ||
+    if (resp->op != VEMB_V16_OP_VEMB_INLINE ||
         resp->status != VEMB_V16_STATUS_OK ||
         resp->vector_bytes == 0) {
         return 0;
