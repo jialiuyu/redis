@@ -26,6 +26,24 @@ static inline uint64_t vemb_v16_fnv1a64_bytes(const void *data, size_t len) {
     return hash;
 }
 
+static inline uint64_t vemb_v16_avalanche64(uint64_t key) {
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    key *= UINT64_C(0xc4ceb9fe1a85ec53);
+    key ^= key >> 33;
+    return key;
+}
+
+static inline uint32_t vemb_v16_hash_mask_u64(uint64_t key, uint32_t mask) {
+    return (uint32_t)vemb_v16_avalanche64(key) & mask;
+}
+
+static inline uint32_t vemb_v16_mix32_u64(uint64_t key) {
+    key = vemb_v16_avalanche64(key);
+    return (uint32_t)(key ^ (key >> 32));
+}
+
 static inline uint32_t vemb_v16_murmur3_32(const char *key, size_t len) {
     const uint32_t c1 = 0xcc9e2d51u;
     const uint32_t c2 = 0x1b873593u;

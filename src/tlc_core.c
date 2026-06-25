@@ -5,13 +5,13 @@
 #include "vemb_v16_hash.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_protocol.h"
+#include "vemb_v16_util.h"
 #include "zmalloc.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #define TLC_CORE_HOT_PROBES 4u
 /*
@@ -33,6 +33,13 @@
 #define TLC_CORE_LOCATION_CACHE_MIN_CAPACITY 1024u
 #define TLC_CORE_LOCATION_CACHE_KEY_WORDS \
     ((VEMB_V16_MAX_KEY_LEN + sizeof(uint64_t) - 1u) / sizeof(uint64_t))
+
+#define SEQLOCK_STATE_STABLE UINT64_C(0)
+#define SEQLOCK_STATE_WRITING UINT64_C(1)
+#define SEQLOCK_STATE_MASK UINT64_C(1)
+#define SEQLOCK_STATE_STEP UINT64_C(1)
+#define SEQLOCK_VERSION_STEP UINT64_C(2)
+#define SEQLOCK_EMPTY UINT64_C(0)
 
 static atomic_uint_fast32_t tlc_core_stale_diag_logs;
 static atomic_uint_fast32_t tlc_core_put_diag_logs;
@@ -303,12 +310,6 @@ static pthread_mutex_t slot_meta_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static tlc_core_slot_meta_registry_entry_t
     slot_meta_registry[TLC_CORE_SLOT_META_REGISTRY_MAX];
 
-static uint64_t monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 static void init_runtime_slot_meta(vemb_v16_warm_slot_meta_t *slots,
                                    uint32_t region_id,
                                    uint32_t capacity_slots) {
@@ -318,7 +319,7 @@ static void init_runtime_slot_meta(vemb_v16_warm_slot_meta_t *slots,
         slots[i].local_slot = i;
         atomic_init(&slots[i].state, VEMB_V16_WARM_SLOT_FREE);
         atomic_init(&slots[i].owner_generation, 0);
-        atomic_init(&slots[i].write_seq, 0);
+        atomic_init(&slots[i].write_seq, SEQLOCK_STATE_STABLE);
         atomic_init(&slots[i].last_access_ns, 0);
         atomic_init(&slots[i].clock_bit, 0);
         atomic_init(&slots[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
@@ -391,29 +392,12 @@ static void fallback_slot_meta_release(vemb_v16_shared_region_allocator_t *alloc
     pthread_mutex_unlock(&slot_meta_registry_lock);
 }
 
-static uint32_t pow2_ceil_u32(uint64_t value) {
-    uint32_t p = 1;
-    while ((uint64_t)p < value && p < (1u << 30))
-        p <<= 1;
-    return p;
+static int seqlock_seq_is_writing(uint64_t seq) {
+    return (seq & SEQLOCK_STATE_MASK) == SEQLOCK_STATE_WRITING;
 }
 
-static uint32_t hash_fast(uint64_t key, uint32_t mask) {
-    key ^= key >> 33;
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33;
-    key *= 0xc4ceb9fe1a85ec53ULL;
-    key ^= key >> 33;
-    return (uint32_t)key & mask;
-}
-
-static uint32_t mix32(uint64_t key) {
-    key ^= key >> 33;
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33;
-    key *= 0xc4ceb9fe1a85ec53ULL;
-    key ^= key >> 33;
-    return (uint32_t)(key ^ (key >> 32));
+static int seqlock_seq_is_stable(uint64_t seq) {
+    return (seq & SEQLOCK_STATE_MASK) == SEQLOCK_STATE_STABLE;
 }
 
 static int vnode_compare(const void *a, const void *b) {
@@ -471,7 +455,7 @@ static int key_meta_init(tlc_core_t *core) {
     uint64_t target_capacity = (uint64_t)core->warm_capacity * 2u;
     uint64_t per_shard_target =
         (target_capacity + shard_count - 1u) / shard_count;
-    uint32_t shard_capacity = pow2_ceil_u32(per_shard_target);
+    uint32_t shard_capacity = vemb_v16_pow2_ceil_u32(per_shard_target);
     if (shard_capacity < TLC_CORE_KEY_META_MIN_SHARD_CAPACITY)
         shard_capacity = TLC_CORE_KEY_META_MIN_SHARD_CAPACITY;
 
@@ -512,7 +496,7 @@ static void key_meta_shard_unlock(tlc_core_t *core,
 
 static uint32_t key_meta_shard_index(const tlc_core_t *core,
                                      uint64_t key_hash) {
-    return mix32(key_hash) & (core->key_meta_shard_count - 1u);
+    return vemb_v16_mix32_u64(key_hash) & (core->key_meta_shard_count - 1u);
 }
 
 static tlc_core_key_meta_shard_t *key_meta_shard_for_hash(
@@ -526,7 +510,7 @@ static tlc_core_key_meta_entry_t *key_meta_find_in_shard_locked(
         const char *key,
         uint32_t key_len,
         uint64_t key_hash) {
-    uint32_t slot = hash_fast(key_hash, shard->mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
     for (uint32_t i = 0; i < shard->capacity; i++) {
         tlc_core_key_meta_entry_t *entry =
             &shard->entries[(slot + i) & shard->mask];
@@ -557,7 +541,7 @@ static tlc_core_key_meta_entry_t *key_meta_find_or_create_locked(
         uint32_t key_len,
         uint64_t key_hash) {
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
-    uint32_t slot = hash_fast(key_hash, shard->mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
     for (uint32_t i = 0; i < shard->capacity; i++) {
         tlc_core_key_meta_entry_t *entry = &shard->entries[(slot + i) & shard->mask];
         if (entry->occupied) {
@@ -704,7 +688,8 @@ static int entry_readable(int state) {
 static int hot_init(tlc_core_t *core, uint32_t requested_capacity) {
     tlc_core_hold_layer_t *hold = &core->hold;
     hold->capacity = requested_capacity ?
-        pow2_ceil_u32(requested_capacity) : TLC_CORE_DEFAULT_HOT_CAPACITY;
+        vemb_v16_pow2_ceil_u32(requested_capacity) :
+        TLC_CORE_DEFAULT_HOT_CAPACITY;
     if (hold->capacity < 2) hold->capacity = 2;
     hold->mask = hold->capacity - 1u;
     hold->table = zcalloc(sizeof(*hold->table) * hold->capacity);
@@ -720,7 +705,7 @@ static int hot_init(tlc_core_t *core, uint32_t requested_capacity) {
 
 static int32_t hot_get(tlc_core_t *core, uint64_t key_hash) {
     tlc_core_hold_layer_t *hold = &core->hold;
-    uint32_t slot = hash_fast(key_hash, hold->mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, hold->mask);
     for (uint32_t i = 0; i < TLC_CORE_HOT_PROBES; i++) {
         uint32_t pos = (slot + i) & hold->mask;
         if (i + 1 < TLC_CORE_HOT_PROBES) {
@@ -755,7 +740,7 @@ static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
     uint64_t target = requested_capacity ?
         (uint64_t)requested_capacity * 2u :
         (uint64_t)TLC_CORE_DEFAULT_HOT_CAPACITY * 2u;
-    uint32_t capacity = pow2_ceil_u32(target);
+    uint32_t capacity = vemb_v16_pow2_ceil_u32(target);
     if (capacity < TLC_CORE_LOCATION_CACHE_MIN_CAPACITY)
         capacity = TLC_CORE_LOCATION_CACHE_MIN_CAPACITY;
 
@@ -767,7 +752,7 @@ static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
 
     for (uint32_t i = 0; i < capacity; i++) {
         tlc_core_location_cache_entry_t *entry = &cache->entries[i];
-        atomic_init(&entry->seq, 0);
+        atomic_init(&entry->seq, SEQLOCK_EMPTY);
         atomic_init(&entry->key_hash, 0);
         atomic_init(&entry->key_len, 0);
         atomic_init(&entry->region_id, TLC_CORE_INVALID_REGION_ID);
@@ -817,12 +802,12 @@ static int location_cache_try_begin_write(
         tlc_core_location_cache_entry_t *entry,
         uint64_t *seq_out) {
     uint64_t seq = atomic_load_explicit(&entry->seq, memory_order_acquire);
-    if (seq & 1u)
+    if (seqlock_seq_is_writing(seq))
         return -1;
     uint64_t expected = seq;
     if (!atomic_compare_exchange_strong_explicit(&entry->seq,
                                                  &expected,
-                                                 seq + 1u,
+                                                 seq + SEQLOCK_STATE_STEP,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) {
         return -1;
@@ -836,7 +821,7 @@ static void location_cache_store_entry(tlc_core_location_cache_entry_t *entry,
                                        uint32_t key_len,
                                        uint64_t key_hash,
                                        const tlc_warm_location_t *location) {
-    uint64_t seq = 0;
+    uint64_t seq = SEQLOCK_EMPTY;
     if (location_cache_try_begin_write(entry, &seq) != 0)
         return;
 
@@ -870,7 +855,9 @@ static void location_cache_store_entry(tlc_core_location_cache_entry_t *entry,
                           memory_order_relaxed);
     atomic_store_explicit(&entry->key_hash, key_hash, memory_order_relaxed);
     atomic_store_explicit(&entry->key_len, key_len, memory_order_relaxed);
-    atomic_store_explicit(&entry->seq, seq + 2u, memory_order_release);
+    atomic_store_explicit(&entry->seq,
+                          seq + SEQLOCK_VERSION_STEP,
+                          memory_order_release);
 }
 
 static void location_cache_put(tlc_core_t *core,
@@ -885,16 +872,16 @@ static void location_cache_put(tlc_core_t *core,
         return;
     }
 
-    uint32_t slot = hash_fast(key_hash, cache->mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cache->mask);
     tlc_core_location_cache_entry_t *victim = &cache->entries[slot];
     for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_PROBES; i++) {
         tlc_core_location_cache_entry_t *entry =
             &cache->entries[(slot + i) & cache->mask];
         uint64_t seq = atomic_load_explicit(&entry->seq,
                                             memory_order_acquire);
-        if (seq & 1u)
+        if (seqlock_seq_is_writing(seq))
             continue;
-        if (seq == 0 ||
+        if (seq == SEQLOCK_EMPTY ||
             atomic_load_explicit(&entry->key_len,
                                  memory_order_relaxed) == 0 ||
             location_cache_entry_key_matches(entry, key, key_len, key_hash)) {
@@ -991,7 +978,7 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
                             ((uint64_t)i << 24) |
                             (uint64_t)v;
             warm->vnodes[vnode_pos++] = (tlc_core_warm_region_vnode_t){
-                .hash_val = mix32(seed),
+                .hash_val = vemb_v16_mix32_u64(seed),
                 .region_index = i,
             };
         }
@@ -1037,7 +1024,8 @@ static void log_warm_region_switch(const char *reason,
 static int warm_init(tlc_core_t *core, const tlc_core_config_t *config) {
     tlc_core_warm_layer_t *warm = &core->warm;
     warm->capacity = core->warm_capacity;
-    warm->hash_capacity = pow2_ceil_u32((uint64_t)core->warm_capacity * 2u);
+    warm->hash_capacity =
+        vemb_v16_pow2_ceil_u32((uint64_t)core->warm_capacity * 2u);
     if (warm->hash_capacity < 2) warm->hash_capacity = 2;
     warm->mask = warm->hash_capacity - 1u;
     warm->entries = zcalloc(sizeof(*warm->entries) * warm->capacity);
@@ -1099,7 +1087,7 @@ static void region_set_bounds(const tlc_core_warm_region_runtime_t *region,
     uint32_t ways = region_ways(region);
     uint32_t set_count =
         (region->capacity_slots + ways - 1u) / ways;
-    uint32_t set = set_count ? mix32(key_hash) % set_count : 0;
+    uint32_t set = set_count ? vemb_v16_mix32_u64(key_hash) % set_count : 0;
     *start = set * ways;
     *end = *start + ways;
     if (*end > region->capacity_slots)
@@ -1110,12 +1098,12 @@ static int slot_seq_try_begin(vemb_v16_warm_slot_meta_t *meta,
                               uint64_t *old_seq) {
     uint64_t seq = atomic_load_explicit(&meta->write_seq,
                                         memory_order_acquire);
-    if (seq & 1u)
+    if (seqlock_seq_is_writing(seq))
         return -1;
     uint64_t expected = seq;
     if (!atomic_compare_exchange_strong_explicit(&meta->write_seq,
                                                  &expected,
-                                                 seq + 1u,
+                                                 seq + SEQLOCK_STATE_STEP,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) {
         return -1;
@@ -1136,7 +1124,8 @@ static void slot_write_payload(tlc_core_warm_region_runtime_t *region,
 
 static void slot_publish_ready(vemb_v16_warm_slot_meta_t *meta,
                                uint64_t old_seq) {
-    atomic_store_explicit(&meta->write_seq, old_seq + 2u,
+    atomic_store_explicit(&meta->write_seq,
+                          old_seq + SEQLOCK_VERSION_STEP,
                           memory_order_release);
     atomic_store_explicit(&meta->state, VEMB_V16_WARM_SLOT_READY,
                           memory_order_release);
@@ -1164,7 +1153,8 @@ static void warm_slot_note_read_access(vemb_v16_warm_slot_meta_t *meta) {
         atomic_load_explicit(&meta->clock_bit, memory_order_relaxed);
     if (clock_bit != 0)
         return;
-    atomic_store_explicit(&meta->last_access_ns, monotonic_ns(), memory_order_relaxed);
+    atomic_store_explicit(&meta->last_access_ns, vemb_v16_monotonic_ns(),
+                          memory_order_relaxed);
     atomic_store_explicit(&meta->clock_bit, 1, memory_order_relaxed);
 }
 
@@ -1186,7 +1176,7 @@ static tlc_core_warm_verify_rc_t warm_slot_verify_ready_result(
         return TLC_CORE_WARM_VERIFY_MISS;
     uint64_t seq1 = atomic_load_explicit(&meta->write_seq,
                                          memory_order_acquire);
-    if (seq1 & 1u)
+    if (seqlock_seq_is_writing(seq1))
         return TLC_CORE_WARM_VERIFY_BUSY;
     uint64_t owner_generation =
         atomic_load_explicit(&meta->owner_generation,
@@ -1197,7 +1187,7 @@ static tlc_core_warm_verify_rc_t warm_slot_verify_ready_result(
     atomic_thread_fence(memory_order_acquire);
     uint64_t seq2 = atomic_load_explicit(&meta->write_seq,
                                          memory_order_acquire);
-    if (seq1 != seq2 || (seq2 & 1u))
+    if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
         return TLC_CORE_WARM_VERIFY_BUSY;
     if (slot_key_hash != key_hash || (fp != 0 && slot_fp != fp) ||
         bytes != expected_bytes ||
@@ -1312,13 +1302,14 @@ static int location_cache_get(tlc_core_t *core,
     if (!key_valid(key, key_len) || !location)
         return -1;
 
-    uint32_t slot = hash_fast(key_hash, cache->mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cache->mask);
     for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_PROBES; i++) {
         tlc_core_location_cache_entry_t *entry =
             &cache->entries[(slot + i) & cache->mask];
         uint64_t seq1 = atomic_load_explicit(&entry->seq,
                                              memory_order_acquire);
-        if (seq1 == 0 || (seq1 & 1u))
+        if (seq1 == SEQLOCK_EMPTY ||
+            seqlock_seq_is_writing(seq1))
             continue;
         if (!location_cache_entry_key_matches(entry, key, key_len, key_hash))
             continue;
@@ -1345,7 +1336,7 @@ static int location_cache_get(tlc_core_t *core,
         };
         uint64_t seq2 = atomic_load_explicit(&entry->seq,
                                              memory_order_acquire);
-        if (seq1 != seq2 || (seq2 & 1u))
+        if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
             continue;
         if (location_cache_validate_location(core,
                                              key_hash,
@@ -1367,40 +1358,28 @@ static int location_cache_peek(tlc_core_t *core,
     if (!key_valid(key, key_len) || !location)
         return -1;
 
-    uint32_t slot = hash_fast(key_hash, cache->mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cache->mask);
     for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_PROBES; i++) {
         tlc_core_location_cache_entry_t *entry =
             &cache->entries[(slot + i) & cache->mask];
         uint64_t seq1 = atomic_load_explicit(&entry->seq,
                                              memory_order_acquire);
-        if (seq1 == 0 || (seq1 & 1u))
+        if (seq1 == SEQLOCK_EMPTY ||
+            seqlock_seq_is_writing(seq1))
             continue;
         if (!location_cache_entry_key_matches(entry, key, key_len, key_hash))
             continue;
 
         tlc_warm_location_t cached = {
-            .region_id =
-                atomic_load_explicit(&entry->region_id,
-                                     memory_order_relaxed),
-            .region_index =
-                atomic_load_explicit(&entry->region_index,
-                                     memory_order_relaxed),
-            .local_slot =
-                atomic_load_explicit(&entry->local_slot,
-                                     memory_order_relaxed),
-            .bytes =
-                atomic_load_explicit(&entry->bytes,
-                                     memory_order_relaxed),
-            .offset =
-                atomic_load_explicit(&entry->offset,
-                                     memory_order_relaxed),
-            .owner_generation =
-                atomic_load_explicit(&entry->owner_generation,
-                                     memory_order_relaxed),
+            .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
+            .region_index = atomic_load_explicit(&entry->region_index, memory_order_relaxed),
+            .local_slot = atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
+            .bytes = atomic_load_explicit(&entry->bytes, memory_order_relaxed),
+            .offset = atomic_load_explicit(&entry->offset, memory_order_relaxed),
+            .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
         };
-        uint64_t seq2 = atomic_load_explicit(&entry->seq,
-                                             memory_order_acquire);
-        if (seq1 != seq2 || (seq2 & 1u))
+        uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
+        if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
             continue;
         *location = cached;
         return 0;
@@ -1458,7 +1437,7 @@ static tlc_core_warm_verify_rc_t warm_try_overwrite_same(
     }
     uint64_t seq = atomic_load_explicit(&meta->write_seq,
                                         memory_order_acquire);
-    if (seq & 1u) {
+    if (seqlock_seq_is_writing(seq)) {
         uint64_t slot_key_hash = meta->key_hash;
         uint64_t slot_fp = meta->key_fingerprint;
         atomic_thread_fence(memory_order_acquire);
@@ -1474,7 +1453,7 @@ static tlc_core_warm_verify_rc_t warm_try_overwrite_same(
                              memory_order_acquire) != expected_generation) {
         return TLC_CORE_WARM_VERIFY_MISS;
     }
-    uint64_t old_seq = 0;
+    uint64_t old_seq = SEQLOCK_EMPTY;
     if (slot_seq_try_begin(meta, &old_seq) != 0)
         return TLC_CORE_WARM_VERIFY_BUSY;
     atomic_fetch_add_explicit(&core->warm_same_key_overwrite, 1,
@@ -1484,9 +1463,11 @@ static tlc_core_warm_verify_rc_t warm_try_overwrite_same(
     atomic_store_explicit(&meta->cold_state,
                           VEMB_V16_WARM_SLOT_COLD_COMMITTED,
                           memory_order_release);
-    atomic_store_explicit(&meta->last_access_ns, monotonic_ns(), memory_order_relaxed);
+    atomic_store_explicit(&meta->last_access_ns, vemb_v16_monotonic_ns(),
+                          memory_order_relaxed);
     atomic_store_explicit(&meta->clock_bit, 1, memory_order_relaxed);
-    atomic_store_explicit(&meta->write_seq, old_seq + 2u,
+    atomic_store_explicit(&meta->write_seq,
+                          old_seq + SEQLOCK_VERSION_STEP,
                           memory_order_release);
     fill_location_from_slot(region, region_index, meta, slot, location);
     return TLC_CORE_WARM_VERIFY_OK;
@@ -1562,8 +1543,9 @@ static int warm_try_fill_free(tlc_core_warm_region_runtime_t *region,
     }
     uint64_t old_seq = atomic_load_explicit(&meta->write_seq,
                                             memory_order_relaxed);
-    if ((old_seq & 1u) == 0)
-        old_seq++;
+    if (seqlock_seq_is_stable(old_seq)) {
+        old_seq += SEQLOCK_STATE_STEP;
+    }
     atomic_store_explicit(&meta->write_seq, old_seq, memory_order_release);
     uint64_t owner_generation =
         atomic_fetch_add_explicit(&meta->owner_generation, 1,
@@ -1576,10 +1558,12 @@ static int warm_try_fill_free(tlc_core_warm_region_runtime_t *region,
     atomic_store_explicit(&meta->cold_state,
                           VEMB_V16_WARM_SLOT_COLD_COMMITTED,
                           memory_order_release);
-    atomic_store_explicit(&meta->last_access_ns, monotonic_ns(), memory_order_relaxed);
+    atomic_store_explicit(&meta->last_access_ns, vemb_v16_monotonic_ns(),
+                          memory_order_relaxed);
     atomic_store_explicit(&meta->clock_bit, 1, memory_order_relaxed);
     slot_write_payload(region, slot, value, value_size);
-    atomic_store_explicit(&meta->write_seq, old_seq + 1u,
+    atomic_store_explicit(&meta->write_seq,
+                          old_seq + SEQLOCK_STATE_STEP,
                           memory_order_release);
     atomic_store_explicit(&meta->state, VEMB_V16_WARM_SLOT_READY,
                           memory_order_release);
@@ -1611,7 +1595,7 @@ static int warm_slot_can_evict(vemb_v16_warm_slot_meta_t *meta) {
     }
     uint64_t seq = atomic_load_explicit(&meta->write_seq,
                                         memory_order_acquire);
-    return (seq & 1u) == 0;
+    return seqlock_seq_is_stable(seq);
 }
 
 static int choose_victim_slot(tlc_core_warm_region_runtime_t *region,
@@ -1674,7 +1658,7 @@ static int warm_try_evict_and_fill(tlc_core_warm_region_runtime_t *region,
                                   memory_order_relaxed);
         return -1;
     }
-    uint64_t old_seq = 0;
+    uint64_t old_seq = SEQLOCK_EMPTY;
     if (slot_seq_try_begin(meta, &old_seq) != 0) {
         atomic_store_explicit(&meta->state, VEMB_V16_WARM_SLOT_READY,
                               memory_order_release);
@@ -1695,7 +1679,8 @@ static int warm_try_evict_and_fill(tlc_core_warm_region_runtime_t *region,
     atomic_store_explicit(&meta->cold_state,
                           VEMB_V16_WARM_SLOT_COLD_COMMITTED,
                           memory_order_release);
-    atomic_store_explicit(&meta->last_access_ns, monotonic_ns(), memory_order_relaxed);
+    atomic_store_explicit(&meta->last_access_ns, vemb_v16_monotonic_ns(),
+                          memory_order_relaxed);
     atomic_store_explicit(&meta->clock_bit, 1, memory_order_relaxed);
     slot_write_payload(region, slot, value, value_size);
     slot_publish_ready(meta, old_seq);
@@ -1782,7 +1767,7 @@ static int warm_lookup(tlc_core_t *core,
     tlc_core_warm_layer_t *warm = &core->warm;
     uint64_t fp = key_fingerprint(key, key_len);
     uint8_t tried[TLC_CORE_MAX_WARM_REGIONS] = {0};
-    uint32_t start = vnode_lower_bound(warm, mix32(key_hash));
+    uint32_t start = vnode_lower_bound(warm, vemb_v16_mix32_u64(key_hash));
     for (uint32_t pass = 0; pass < 2; pass++) {
         uint32_t want_local = pass == 0 ? 1u : 0u;
         for (uint32_t i = 0; i < warm->vnode_count; i++) {
@@ -1815,7 +1800,7 @@ static int warm_put(tlc_core_t *core,
     uint64_t fp = key_fingerprint(key, key_len);
     uint8_t tried[TLC_CORE_MAX_WARM_REGIONS] = {0};
     uint32_t attempted_regions = 0;
-    uint32_t start = vnode_lower_bound(warm, mix32(key_hash));
+    uint32_t start = vnode_lower_bound(warm, vemb_v16_mix32_u64(key_hash));
     for (uint32_t pass = 0; pass < 2; pass++) {
         uint32_t want_local = pass == 0 ? 1u : 0u;
         for (uint32_t i = 0; i < warm->vnode_count; i++) {
@@ -1902,7 +1887,8 @@ static int cold_init(tlc_core_t *core,
     cold->segments =
         zcalloc(sizeof(*cold->segments) * cold->max_segments);
     RETURN_IF(!cold->segments, -1);
-    cold->offset_index_size = pow2_ceil_u32((uint64_t)core->warm_capacity * 2u);
+    cold->offset_index_size =
+        vemb_v16_pow2_ceil_u32((uint64_t)core->warm_capacity * 2u);
     if (cold->offset_index_size < 1024)
         cold->offset_index_size = 1024;
     cold->oi_mask = cold->offset_index_size - 1u;
@@ -1955,7 +1941,7 @@ static void cold_index_store(tlc_core_t *core,
                              uint64_t key_hash,
                              uint64_t offset) {
     tlc_core_cold_layer_t *cold = &core->cold;
-    uint32_t slot = hash_fast(key_hash, cold->oi_mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cold->oi_mask);
     for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
         uint32_t pos = (slot + i) & cold->oi_mask;
         uint64_t cur =
@@ -1981,7 +1967,7 @@ static uint64_t cold_index_find_locked(tlc_core_t *core,
                                        uint32_t key_len,
                                        uint64_t key_hash) {
     tlc_core_cold_layer_t *cold = &core->cold;
-    uint32_t slot = hash_fast(key_hash, cold->oi_mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cold->oi_mask);
     for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
         uint32_t pos = (slot + i) & cold->oi_mask;
         uint64_t offset =
@@ -2088,7 +2074,7 @@ static int cold_lookup(tlc_core_t *core,
 #else
     tlc_core_cold_layer_t *cold = &core->cold;
     bitmap_lock_blocking(&cold->locks, 0);
-    uint32_t slot = hash_fast(key_hash, cold->oi_mask);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cold->oi_mask);
     for (uint32_t i = 0; i < TLC_CORE_COLD_PROBES; i++) {
         uint32_t pos = (slot + i) & cold->oi_mask;
         uint64_t offset =
@@ -2156,7 +2142,7 @@ int tlc_core_copy_warm_location_value(tlc_core_t *core,
         }
 
         uint64_t seq1 = atomic_load_explicit(&meta->write_seq, memory_order_acquire);
-        if (seq1 & 1u) {
+        if (seqlock_seq_is_writing(seq1)) {
             cpu_relax();
             continue;
         }
@@ -2166,7 +2152,7 @@ int tlc_core_copy_warm_location_value(tlc_core_t *core,
         uint64_t slot_key_hash = meta->key_hash;
         atomic_thread_fence(memory_order_acquire);
         uint64_t seq_meta = atomic_load_explicit(&meta->write_seq, memory_order_acquire);
-        if (seq1 != seq_meta || (seq_meta & 1u)) {
+        if (seq1 != seq_meta || seqlock_seq_is_writing(seq_meta)) {
             cpu_relax();
             continue;
         }
@@ -2181,7 +2167,7 @@ int tlc_core_copy_warm_location_value(tlc_core_t *core,
                                location->bytes);
         atomic_thread_fence(memory_order_acquire);
         uint64_t seq2 = atomic_load_explicit(&meta->write_seq, memory_order_acquire);
-        if (seq1 == seq2 && !(seq2 & 1u)) {
+        if (seq1 == seq2 && seqlock_seq_is_stable(seq2)) {
             warm_slot_note_read_access(meta);
             return 0;
         }
@@ -3262,8 +3248,7 @@ int tlc_core_validate_warm_location(tlc_core_t *core,
             location->local_slot < region->capacity_slots) {
             vemb_v16_warm_slot_meta_t *meta =
                 &region->slot_meta[location->local_slot];
-            uint32_t state =
-                atomic_load_explicit(&meta->state, memory_order_acquire);
+            uint32_t state = atomic_load_explicit(&meta->state, memory_order_acquire);
             uint64_t owner_generation =
                 atomic_load_explicit(&meta->owner_generation,
                                      memory_order_acquire);
@@ -3313,26 +3298,16 @@ void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
             stats->warm_region_full_count++;
         }
     }
-    stats->warm_alloc_local =
-        atomic_load_explicit(&core->warm_alloc_local, memory_order_relaxed);
-    stats->warm_alloc_remote =
-        atomic_load_explicit(&core->warm_alloc_remote, memory_order_relaxed);
-    stats->warm_alloc_fallback =
-        atomic_load_explicit(&core->warm_alloc_fallback, memory_order_relaxed);
-    stats->warm_alloc_cold_spill =
-        atomic_load_explicit(&core->warm_alloc_cold_spill, memory_order_relaxed);
-    stats->warm_alloc_fail =
-        atomic_load_explicit(&core->warm_alloc_fail, memory_order_relaxed);
-    stats->warm_eviction_success =
-        atomic_load_explicit(&core->warm_eviction_success, memory_order_relaxed);
-    stats->warm_eviction_fail =
-        atomic_load_explicit(&core->warm_eviction_fail, memory_order_relaxed);
-    stats->warm_same_key_overwrite =
-        atomic_load_explicit(&core->warm_same_key_overwrite, memory_order_relaxed);
-    stats->warm_stale_handle_reject =
-        atomic_load_explicit(&core->warm_stale_handle_reject, memory_order_relaxed);
-    stats->remote_meta_stale =
-        atomic_load_explicit(&core->remote_meta_stale, memory_order_relaxed);
+    stats->warm_alloc_local = atomic_load_explicit(&core->warm_alloc_local, memory_order_relaxed);
+    stats->warm_alloc_remote = atomic_load_explicit(&core->warm_alloc_remote, memory_order_relaxed);
+    stats->warm_alloc_fallback = atomic_load_explicit(&core->warm_alloc_fallback, memory_order_relaxed);
+    stats->warm_alloc_cold_spill = atomic_load_explicit(&core->warm_alloc_cold_spill, memory_order_relaxed);
+    stats->warm_alloc_fail = atomic_load_explicit(&core->warm_alloc_fail, memory_order_relaxed);
+    stats->warm_eviction_success = atomic_load_explicit(&core->warm_eviction_success, memory_order_relaxed);
+    stats->warm_eviction_fail = atomic_load_explicit(&core->warm_eviction_fail, memory_order_relaxed);
+    stats->warm_same_key_overwrite = atomic_load_explicit(&core->warm_same_key_overwrite, memory_order_relaxed);
+    stats->warm_stale_handle_reject = atomic_load_explicit(&core->warm_stale_handle_reject, memory_order_relaxed);
+    stats->remote_meta_stale = atomic_load_explicit(&core->remote_meta_stale, memory_order_relaxed);
     uint64_t total = stats->warm_alloc_local + stats->warm_alloc_remote;
     if (total)
         stats->warm_region_hash_local_pct =

@@ -240,7 +240,7 @@ static void test_cold_read_through_promotes_warm_handle(void) {
     init_test_allocator(&allocator, 42, max_vectors);
     assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     fill_vector(vector, dim, 200);
-    assert(vemb_v16_tlc_cold_append(tlc, key, (uint32_t)strlen(key), key_hash,
+    assert(tlc_core_cold_append(tlc->core, key, (uint32_t)strlen(key), key_hash,
                                     vector, sizeof(vector)) == 0);
     assert(vemb_v16_tlc_get_handle(tlc, key, (uint32_t)strlen(key), key_hash,
                                    &handle, &warm_slot) == 0);
@@ -2075,7 +2075,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
                             sizeof(v1),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2083,7 +2083,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     assert(info.key_version == 1);
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_ACTIVE);
 
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -2095,7 +2095,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     assert(info.migration_state == TLC_CORE_KEY_MIGRATING);
     assert(info.target_owner == 3);
 
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  key,
                                  key_len,
                                  key_hash,
@@ -2134,7 +2134,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
                             sizeof(v2),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  key,
                                  key_len,
                                  key_hash,
@@ -2229,7 +2229,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
                                        7,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2247,7 +2247,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
                                        6,
                                        &handle,
                                        &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2277,7 +2277,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
                                        8,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2330,7 +2330,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v1),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -2349,14 +2349,14 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v2),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_cutover(source,
+    assert(tlc_core_mark_cutover(source->core,
                                      key,
                                      key_len,
                                      key_hash,
                                      19,
                                      3,
                                      &info) != 0);
-    assert(vemb_v16_tlc_mark_cutover(source,
+    assert(tlc_core_mark_cutover(source->core,
                                      key,
                                      key_len,
                                      key_hash,
@@ -2367,7 +2367,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
     assert(info.topology_epoch == 21);
     assert(info.owner_epoch == 21);
     assert(info.target_owner == 3);
-    assert(vemb_v16_tlc_key_is_source_cutover(source,
+    assert(tlc_core_key_is_source_cutover(source->core,
                                               key,
                                               key_len,
                                               key_hash,
@@ -2388,7 +2388,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v3),
                             &handle,
                             &warm_slot) != 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  key,
                                  key_len,
                                  key_hash,
@@ -2397,7 +2397,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                                  &snapshot,
                                  snapshot_value,
                                  sizeof(snapshot_value)) != 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -2613,7 +2613,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
                                    key_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2746,7 +2746,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
     assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
     assert(resp.lease.owner_epoch == 45);
     assert(resp.lease.target_owner == 3);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2761,7 +2761,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
                                                     &lease_req,
                                                     &resp) == 0);
     assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -3087,7 +3087,7 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,

@@ -5,6 +5,7 @@
 #include "cpu_relax.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_mapped_region.h"
+#include "vemb_v16_util.h"
 #include "zmalloc.h"
 
 #include <errno.h>
@@ -12,7 +13,6 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <time.h>
 
 #define VEMB_V16_UB_RPC_MAGIC 0x56315552u
 #define VEMB_V16_UB_RPC_VERSION 1u
@@ -113,12 +113,6 @@ struct vemb_v16_ub_rpc {
     atomic_uint_fast32_t error_logs;
 };
 
-static uint64_t rpc_now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 static uint64_t timeout_from_req_ns(const vemb_v16_ub_rpc_t *rpc,
                                     const vemb_v16_ub_lookup_rpc_req_t *req) {
     if (req && req->timeout_ns)
@@ -204,13 +198,9 @@ static void tiny_pause(void) {
     sched_yield();
 }
 
-static size_t align64_size(size_t value) {
-    return (value + 63u) & ~(size_t)63u;
-}
-
 static uint32_t rpc_ring_slot_stride(uint32_t slot_size) {
-    return (uint32_t)align64_size(sizeof(vemb_v16_ub_rpc_ring_slot_t) +
-                                  (size_t)slot_size);
+    return (uint32_t)vemb_v16_align64_size(
+        sizeof(vemb_v16_ub_rpc_ring_slot_t) + (size_t)slot_size);
 }
 
 static size_t rpc_ring_bytes(uint32_t slot_size) {
@@ -487,7 +477,7 @@ static int pending_wait(vemb_v16_ub_rpc_t *rpc,
                                   memory_order_release);
             return 0;
         }
-        if (rpc_now_ns() >= deadline_ns) {
+        if (vemb_v16_monotonic_ns() >= deadline_ns) {
             uint32_t expected = VEMB_V16_UB_RPC_PENDING_WAITING;
             if (atomic_compare_exchange_strong_explicit(
                     &slot->state,
@@ -546,7 +536,7 @@ static int publish_with_deadline(vemb_v16_ub_rpc_t *rpc,
     int saw_full = 0;
     while (atomic_load_explicit(&rpc->running, memory_order_acquire)) {
         if (!rpc_ring_ready(ring)) {
-            if (rpc_now_ns() >= deadline_ns) {
+            if (vemb_v16_monotonic_ns() >= deadline_ns) {
                 if (status)
                     *status = VEMB_V16_UB_LOOKUP_RPC_TIMEOUT;
                 log_limited(&rpc->timeout_logs,
@@ -567,7 +557,7 @@ static int publish_with_deadline(vemb_v16_ub_rpc_t *rpc,
         if (rc == 0)
             return 0;
         saw_full = 1;
-        if (rpc_now_ns() >= deadline_ns) {
+        if (vemb_v16_monotonic_ns() >= deadline_ns) {
             if (status)
                 *status = VEMB_V16_UB_LOOKUP_RPC_BUSY;
             log_limited(&rpc->ring_full_logs,
@@ -638,7 +628,7 @@ int vemb_v16_ub_rpc_lookup(void *arg,
         .u.lookup = *req,
     };
     uint64_t timeout_ns = timeout_from_req_ns(rpc, req);
-    uint64_t deadline_ns = rpc_now_ns() + timeout_ns;
+    uint64_t deadline_ns = vemb_v16_monotonic_ns() + timeout_ns;
     uint32_t status = VEMB_V16_UB_LOOKUP_RPC_OK;
     int rc = publish_with_deadline(rpc,
                                    &peer->request,
@@ -719,7 +709,7 @@ int vemb_v16_ub_rpc_migrate_request(
         .u.migration = *req,
     };
     uint64_t timeout_ns = timeout_from_migration_req_ns(rpc, req);
-    uint64_t deadline_ns = rpc_now_ns() + timeout_ns;
+    uint64_t deadline_ns = vemb_v16_monotonic_ns() + timeout_ns;
     uint32_t status = VEMB_V16_UB_MIGRATION_RPC_OK;
     int rc = publish_with_deadline(rpc,
                                    &peer->request,
@@ -832,7 +822,7 @@ static void process_request(vemb_v16_ub_rpc_t *rpc,
     }
 
     uint64_t timeout_ns = timeout_from_wire_req_ns(rpc, wire_req);
-    uint64_t deadline_ns = rpc_now_ns() + timeout_ns;
+    uint64_t deadline_ns = vemb_v16_monotonic_ns() + timeout_ns;
     uint32_t status = VEMB_V16_UB_LOOKUP_RPC_OK;
     (void)publish_with_deadline(rpc,
                                 &peer->outbound_response,

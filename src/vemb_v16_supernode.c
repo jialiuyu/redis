@@ -88,7 +88,7 @@ static int job_key_is_source_cutover(vemb_v16_tlc_t *tlc,
                                      uint32_t key_len,
                                      uint64_t key_hash,
                                      tlc_core_key_migration_info_t *info) {
-    int rc = vemb_v16_tlc_key_is_source_cutover(tlc,
+    int rc = tlc_core_key_is_source_cutover(tlc->core,
                                                 key,
                                                 key_len,
                                                 key_hash,
@@ -678,8 +678,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                         .source_owner = UINT32_MAX,
                         .target_owner = UINT32_MAX,
                     };
-                    int info_rc = vemb_v16_tlc_get_migration_info(
-                        tlc,
+                    int info_rc = tlc_core_get_migration_info(tlc->core,
                         job->key,
                         job->key_len,
                         job->key_hash,
