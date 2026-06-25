@@ -237,7 +237,7 @@ sequenceDiagram
     Core-->>TLC: location
     TLC-->>SN: vector_handle
     opt publish remote meta
-        SN->>RM: vemb_v16_tlc_publish_remote_meta_async()
+        SN->>RM: enqueue_remote_meta_publish()
     end
 ```
 

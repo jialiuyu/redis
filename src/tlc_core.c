@@ -2305,21 +2305,16 @@ int tlc_core_get_warm_location(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                tlc_warm_location_t *location) {
-    int valid_key = key_valid(key, key_len);
-    RETURN_IF(!valid_key, -1);
-    RETURN_IF(key_meta_blocks_source_access(core, key, key_len, key_hash),
-              -1);
-
+    RETURN_IF(!key_valid(key, key_len), -1);
+    RETURN_IF(key_meta_blocks_source_access(core, key, key_len, key_hash), -1);
     int rc = tlc_core_get_warm_location_raw(core,
                                             key,
                                             key_len,
                                             key_hash,
                                             location);
-    if (rc == 0 &&
-        key_meta_blocks_source_access(core, key, key_len, key_hash)) {
-        return -1;
-    }
-    return rc;
+    RETURN_IF(!!rc, -1);
+    RETURN_IF(key_meta_blocks_source_access(core, key, key_len, key_hash), -1);
+    return 0;
 }
 
 int tlc_core_get_cached_warm_location(tlc_core_t *core,
@@ -2327,8 +2322,7 @@ int tlc_core_get_cached_warm_location(tlc_core_t *core,
                                       uint32_t key_len,
                                       uint64_t key_hash,
                                       tlc_warm_location_t *location) {
-    int valid_key = key_valid(key, key_len);
-    RETURN_IF(!valid_key, -1);
+    RETURN_IF(!key_valid(key, key_len), -1);
     RETURN_IF(key_meta_blocks_source_access(core, key, key_len, key_hash), -1);
     int rc = location_cache_peek(core, key, key_len, key_hash, location);
     RETURN_IF(!!rc, -1);

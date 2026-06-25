@@ -193,16 +193,20 @@ int vemb_v16_tlc_set_remote_meta_owner_view(vemb_v16_tlc_t *tlc,
 void vemb_v16_tlc_set_owner_resolver(vemb_v16_tlc_t *tlc,
                                      vemb_v16_tlc_owner_resolver_fn resolver,
                                      void *arg);
-int vemb_v16_tlc_publish_remote_meta(vemb_v16_tlc_t *tlc,
-                                     const char *key,
-                                     uint32_t key_len,
-                                     uint64_t key_hash,
-                                     const vemb_v16_vector_handle_t *handle);
-int vemb_v16_tlc_publish_remote_meta_async(vemb_v16_tlc_t *tlc,
-                                           const char *key,
-                                           uint32_t key_len,
-                                           uint64_t key_hash,
-                                           const vemb_v16_vector_handle_t *handle);
+int publish_remote_meta_to_view(vemb_v16_tlc_t *tlc,
+                                vemb_v16_remote_meta_view_t *view,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const vemb_v16_vector_handle_t *handle,
+                                int is_repair);
+int enqueue_remote_meta_publish(vemb_v16_tlc_t *tlc,
+                                vemb_v16_remote_meta_view_t *target_view,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const vemb_v16_vector_handle_t *handle,
+                                int is_repair);
 uint32_t vemb_v16_tlc_flush_remote_meta_publishes(vemb_v16_tlc_t *tlc,
                                                   uint32_t budget);
 void vemb_v16_tlc_set_lookup_rpc(vemb_v16_tlc_t *tlc,
@@ -259,12 +263,7 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
                              void *dst,
                              uint32_t dst_bytes,
                              uint32_t *vector_bytes);
-void vemb_v16_tlc_get_core_stats(vemb_v16_tlc_t *tlc,
-                                 tlc_core_stats_t *stats);
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats);
-uint32_t vemb_v16_tlc_get_region_stats(vemb_v16_tlc_t *tlc,
-                                       tlc_core_region_stats_t *regions,
-                                       uint32_t max_regions);
 
 #endif

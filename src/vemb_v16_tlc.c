@@ -125,14 +125,13 @@ static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
     atomic_init(&tlc->remote_meta_repair_drop, 0);
 }
 
-static int publish_remote_meta_to_view(
-    vemb_v16_tlc_t *tlc,
-    vemb_v16_remote_meta_view_t *view,
-    const char *key,
-    uint32_t key_len,
-    uint64_t key_hash,
-    const vemb_v16_vector_handle_t *handle,
-    int is_repair) {
+int publish_remote_meta_to_view(vemb_v16_tlc_t *tlc,
+                                vemb_v16_remote_meta_view_t *view,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const vemb_v16_vector_handle_t *handle,
+                                int is_repair) {
     RETURN_IF(!tlc || !view || !key || !handle || key_len == 0 ||
               handle->bytes == 0,
               -1);
@@ -406,14 +405,13 @@ static uint32_t region_index_id_mapping(const vemb_v16_tlc_t *tlc,
     return UINT32_MAX;
 }
 
-static int enqueue_remote_meta_publish(
-    vemb_v16_tlc_t *tlc,
-    vemb_v16_remote_meta_view_t *target_view,
-    const char *key,
-    uint32_t key_len,
-    uint64_t key_hash,
-    const vemb_v16_vector_handle_t *handle,
-    int is_repair) {
+int enqueue_remote_meta_publish(vemb_v16_tlc_t *tlc,
+                                vemb_v16_remote_meta_view_t *target_view,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const vemb_v16_vector_handle_t *handle,
+                                int is_repair) {
     if (!tlc || !target_view || !key || !handle ||
         key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
         handle->bytes == 0 ||
@@ -666,35 +664,6 @@ static vemb_v16_remote_meta_view_t *remote_meta_view_for_owner(vemb_v16_tlc_t *t
             return tlc->remote_meta_views[i].view;
     }
     return NULL;
-}
-
-int vemb_v16_tlc_publish_remote_meta(vemb_v16_tlc_t *tlc,
-                                     const char *key,
-                                     uint32_t key_len,
-                                     uint64_t key_hash,
-                                     const vemb_v16_vector_handle_t *handle) {
-    return publish_remote_meta_to_view(tlc,
-                                       tlc->remote_meta_view,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       handle,
-                                       0);
-}
-
-int vemb_v16_tlc_publish_remote_meta_async(
-    vemb_v16_tlc_t *tlc,
-    const char *key,
-    uint32_t key_len,
-    uint64_t key_hash,
-    const vemb_v16_vector_handle_t *handle) {
-    return enqueue_remote_meta_publish(tlc,
-                                       tlc ? tlc->remote_meta_view : NULL,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       handle,
-                                       0);
 }
 
 uint32_t vemb_v16_tlc_flush_remote_meta_publishes(vemb_v16_tlc_t *tlc,
@@ -1791,11 +1760,6 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
     return 0;
 }
 
-void vemb_v16_tlc_get_core_stats(vemb_v16_tlc_t *tlc,
-                                 tlc_core_stats_t *stats) {
-    tlc_core_get_stats(tlc->core, stats);
-}
-
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats) {
     stats->remote_meta_lookup_hit = tlc_counter_load(&tlc->remote_meta_lookup_hit);
@@ -1824,10 +1788,4 @@ void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
     stats->remote_meta_repair_enqueue = tlc_counter_load(&tlc->remote_meta_repair_enqueue);
     stats->remote_meta_repair_ok = tlc_counter_load(&tlc->remote_meta_repair_ok);
     stats->remote_meta_repair_drop = tlc_counter_load(&tlc->remote_meta_repair_drop);
-}
-
-uint32_t vemb_v16_tlc_get_region_stats(vemb_v16_tlc_t *tlc,
-                                       tlc_core_region_stats_t *regions,
-                                       uint32_t max_regions) {
-    return tlc_core_get_region_stats(tlc->core, regions, max_regions);
 }

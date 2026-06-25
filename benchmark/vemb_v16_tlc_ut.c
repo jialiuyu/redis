@@ -161,7 +161,7 @@ static void test_overwrite_and_capacity(void) {
     assert(vemb_v16_tlc_get_handle(tlc, evicting, (uint32_t)strlen(evicting),
                                    evicting_hash, &handle, &warm_slot) == 0);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_same_key_overwrite >= 1);
     assert(stats.warm_eviction_success >= 1);
     vemb_v16_tlc_destroy(tlc);
@@ -211,7 +211,7 @@ static void test_eviction_rejects_stale_handle(void) {
     assert(len == sizeof(second));
     assert(memcmp(bytes, second, sizeof(second)) == 0);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_stale_handle_reject >= 1);
     vemb_v16_tlc_destroy(tlc);
 }
@@ -651,7 +651,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     assert(h3.offset == h1.offset);
     assert(memcmp(local_region, overwrite, sizeof(overwrite)) == 0);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_region_count == 2);
     assert(stats.warm_alloc_local >= 1);
     assert(stats.warm_region_full_count >= 1);
@@ -715,7 +715,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     assert(handle.bytes == sizeof(vector));
     assert(handle.owner_generation >= 2);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_region_count == 2);
     assert(stats.warm_region_full_count >= 1);
     assert(stats.warm_alloc_cold_spill == 0);
@@ -920,11 +920,13 @@ static void test_vsim_key2_lookup_remote_source(void) {
     fill_vector(vector, dim, 300);
     assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
                             vector, sizeof(vector), &handle, &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            key2,
-                                            (uint32_t)strlen(key2),
-                                            key2_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       key2_hash,
+                                       &handle,
+                                       0) == 0);
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          key2,
@@ -1001,11 +1003,13 @@ static void test_remote_meta_async_publish_flush(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta_async(tlc,
-                                                  key,
-                                                  (uint32_t)strlen(key),
-                                                  key_hash,
-                                                  &handle) == 0);
+    assert(enqueue_remote_meta_publish(tlc,
+                                       tlc->remote_meta_view,
+                                       key,
+                                       (uint32_t)strlen(key),
+                                       key_hash,
+                                       &handle,
+                                       0) == 0);
     (void)vemb_v16_tlc_flush_remote_meta_publishes(tlc, 0);
     assert(vemb_v16_remote_meta_lookup(&meta,
                                        key,
@@ -1618,11 +1622,13 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                             &warm_slot) == 0);
     stale_old = stale_new;
     stale_old.owner_generation++;
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            stale_key,
-                                            (uint32_t)strlen(stale_key),
-                                            stale_hash,
-                                            &stale_old) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       stale_key,
+                                       (uint32_t)strlen(stale_key),
+                                       stale_hash,
+                                       &stale_old,
+                                       0) == 0);
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          stale_key,
@@ -1646,11 +1652,13 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                             sizeof(first),
                             &evict_a_handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            evict_a,
-                                            (uint32_t)strlen(evict_a),
-                                            evict_a_hash,
-                                            &evict_a_handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       evict_a,
+                                       (uint32_t)strlen(evict_a),
+                                       evict_a_hash,
+                                       &evict_a_handle,
+                                       0) == 0);
     assert(vemb_v16_tlc_put(owner,
                             evict_b,
                             (uint32_t)strlen(evict_b),
@@ -1659,11 +1667,13 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                             sizeof(other),
                             &evict_b_handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            evict_b,
-                                            (uint32_t)strlen(evict_b),
-                                            evict_b_hash,
-                                            &evict_b_handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       evict_b,
+                                       (uint32_t)strlen(evict_b),
+                                       evict_b_hash,
+                                       &evict_b_handle,
+                                       0) == 0);
 
     memset(&remote_handle, 0, sizeof(remote_handle));
     source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
@@ -1766,11 +1776,13 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
     fill_vector(second, dim, 600);
     assert(vemb_v16_tlc_put(owner, key1, (uint32_t)strlen(key1), key1_hash,
                             first, sizeof(first), &handle, &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            key1,
-                                            (uint32_t)strlen(key1),
-                                            key1_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       key1,
+                                       (uint32_t)strlen(key1),
+                                       key1_hash,
+                                       &handle,
+                                       0) == 0);
     assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
                             second, sizeof(second), &handle, &warm_slot) == 0);
 
@@ -1783,7 +1795,7 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
                                          &timing) != 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_NONE);
     assert(timing.remote_meta_lookup_count == 1);
-    vemb_v16_tlc_get_core_stats(reader, &stats);
+    tlc_core_get_stats(reader->core, &stats);
     assert(stats.remote_meta_stale >= 1);
     assert(stats.warm_stale_handle_reject >= 1);
 
@@ -1902,11 +1914,13 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner2,
-                                            key2,
-                                            (uint32_t)strlen(key2),
-                                            key2_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(owner2,
+                                       owner2->remote_meta_view,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       key2_hash,
+                                       &handle,
+                                       0) == 0);
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          key2,

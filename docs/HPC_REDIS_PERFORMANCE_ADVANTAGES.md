@@ -185,7 +185,7 @@ job dispatch
 | --- | --- | --- | --- |
 | P0 | `publish_request_job()` 去掉每请求 heap job | 将 `zcalloc(sizeof(vemb_v16_vadd_job_t)) + zfree` 改为栈对象；`publish_shard_job()` 同步 copy 到 ring slot，栈对象生命周期安全。 | TCP inline 单轮曾从 `984,288 QPS` 到 `1,011,891 QPS`，约 `+2.80%`；mixed 单轮 `-0.56%` 且有 1 个失败，收益不稳定。 |
 | P0 | TCP full-vector inline payload pool/slab | 尝试全局固定槽池替代 `zmalloc/zfree`。 | 实测明显负收益，已回退；全局 cursor/CAS 和 5MB 槽轮转比 allocator thread-cache 更差。 |
-| P1 | VADD 单 owner fast path | 当 `remote_meta_view_count <= 1` 时，VADD 成功后跳过 `vemb_v16_tlc_publish_remote_meta_async()`。 | mixed 写入中 `remote_meta async_enqueue` 从 `6400` 降到 `0`；同轮保守收益约 `+1.97%`，另一轮为 `+6.38%`。 |
+| P1 | VADD 单 owner fast path | 当 `remote_meta_view_count <= 1` 时，VADD 成功后跳过 `enqueue_remote_meta_publish()`。 | mixed 写入中 `remote_meta async_enqueue` 从 `6400` 降到 `0`；同轮保守收益约 `+1.97%`，另一轮为 `+6.38%`。 |
 | 测试修复 | Aeron epoll worker 过滤条件 | epoll proxy I/O worker 原先只把 TCP channel 视为 active，导致 Aeron channel 分配后不 poll SHM request ring。修复后 Aeron `vemb-handle` 可跑通。 | Aeron 从 prefill 第 0 条超时变为可完成 `32000` 请求；这是本轮 Aeron 数据的前置修复。 |
 
 ### 8.2 具体数据

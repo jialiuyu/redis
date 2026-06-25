@@ -2520,7 +2520,7 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
             atomic_load_explicit(&sve_stats->lock_failure, memory_order_relaxed);
     }
     tlc_core_stats_t core_stats;
-    vemb_v16_tlc_get_core_stats(proxy_storage(proxy)->tlc, &core_stats);
+    tlc_core_get_stats(proxy_storage(proxy)->tlc->core, &core_stats);
     stats->warm_region_count = core_stats.warm_region_count;
     stats->warm_region_full_count = core_stats.warm_region_full_count;
     stats->warm_alloc_local = core_stats.warm_alloc_local;

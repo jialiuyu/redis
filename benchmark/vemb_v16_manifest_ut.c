@@ -186,11 +186,13 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
                                      &slice_bytes) == 0);
     assert(slice_bytes == sizeof(vector));
     assert(memcmp(slice, vector, sizeof(vector)) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(storage->tlc,
-                                            key,
-                                            (uint32_t)strlen(key),
-                                            key_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(storage->tlc,
+                                       storage->tlc->remote_meta_view,
+                                       key,
+                                       (uint32_t)strlen(key),
+                                       key_hash,
+                                       &handle,
+                                       0) == 0);
     vemb_v16_remote_meta_handle_t remote_handle = {0};
     assert(vemb_v16_remote_meta_lookup(&storage->remote_meta_view,
                                        key,
@@ -284,11 +286,13 @@ static void test_manifest_remote_meta_shm_attach_existing(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(first->tlc,
-                                            key,
-                                            (uint32_t)strlen(key),
-                                            key_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(first->tlc,
+                                       first->tlc->remote_meta_view,
+                                       key,
+                                       (uint32_t)strlen(key),
+                                       key_hash,
+                                       &handle,
+                                       0) == 0);
     vemb_v16_storage_ctx_destroy(first);
 
     assert(vemb_v16_storage_ctx_create_from_manifest(&second,
