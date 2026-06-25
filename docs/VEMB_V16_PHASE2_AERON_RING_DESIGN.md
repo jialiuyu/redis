@@ -265,7 +265,7 @@ vemb_v16_supernode.c
 4. 新增 `src/vemb_v16_supernode.c/.h`，把 SuperNode 执行内核从 proxy 文件拆出，并供 pooled supernode worker 复用。
 5. 新增 `src/vemb_v16_table.c/.h`，把进程内 vector table 从 proxy 文件拆出。
 6. 拆分 VEMB 小 descriptor job ring 和 VADD full-vector job ring。
-7. 保持 `vadd-inline` 作为当前 VADD 全量传输路径。
+7. 保持 `vadd` 作为当前 VADD 全量传输路径。
 8. 增加性能计数：
    - client request publish fail/spin
    - proxy poll count
@@ -306,7 +306,7 @@ P1: done
     ping
     vemb-handle
     vemb-read-vector
-    vadd-inline
+    vadd
 
   benchmark thread list:
     --threads 1,2,4,8,16
@@ -323,7 +323,7 @@ P1: done
 ping:             ok=100%
 vemb-handle:      ok=100%
 vemb-read-vector: ok=100%
-vadd-inline:      ok=100%
+vadd:      ok=100%
 ```
 
 结构：

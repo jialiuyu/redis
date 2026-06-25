@@ -27,7 +27,7 @@ static int diag_should_log_req(uint32_t req_id) {
 
 static int tcp_response_needs_inline_snapshot(const vemb_v16_resp_t *resp) {
     return resp->status == VEMB_V16_STATUS_OK &&
-        (resp->flags & VEMB_V16_REQ_F_INLINE_VECTOR) &&
+        resp->op == VEMB_V16_OP_VEMB_INLINE &&
         resp->vector_bytes != 0;
 }
 
@@ -63,7 +63,6 @@ static void tcp_mark_inline_snapshot_error(vemb_v16_resp_t *resp) {
     resp->status = VEMB_V16_STATUS_ERR;
     resp->vector_bytes = 0;
     resp->vector_offset = 0;
-    resp->flags &= ~VEMB_V16_REQ_F_INLINE_VECTOR;
 }
 
 int vemb_v16_tcp_listen(vemb_v16_proxy_t *proxy,
@@ -211,7 +210,7 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
         .magic = VEMB_V16_MAGIC,
         .version = VEMB_V16_VERSION,
         .type = VEMB_V16_NET_RESPONSE,
-        .flags = vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+        .flags = 0,
         .payload_len = (uint32_t)sizeof(*resp) + vector_bytes,
         .channel_id = vemb_v16_channel_id(ch),
         .req_id = resp->req_id,
@@ -259,7 +258,7 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
             .magic = VEMB_V16_MAGIC,
             .version = VEMB_V16_VERSION,
             .type = VEMB_V16_NET_RESPONSE,
-            .flags = vector_bytes[out] ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+            .flags = 0,
             .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes[out],
             .channel_id = vemb_v16_channel_id(ch),
             .req_id = responses[out].req_id,
@@ -326,7 +325,7 @@ int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp)
         }
         return vemb_v16_net_write_frame2(vemb_v16_channel_net_fd(ch),
                                          VEMB_V16_NET_RESPONSE,
-                                         vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+                                         0,
                                          vemb_v16_channel_id(ch),
                                          resp->req_id,
                                          resp,
@@ -364,19 +363,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                uint32_t n,
                                uint32_t *published) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
-        vemb_v16_resp_t *responses =
-            zmalloc(sizeof(*responses) * VEMB_V16_PROXY_BATCH);
-        vemb_v16_net_hdr_t *headers =
-            zmalloc(sizeof(*headers) * VEMB_V16_PROXY_BATCH);
-        struct iovec *iov =
-            zmalloc(sizeof(*iov) * VEMB_V16_PROXY_BATCH * 3u);
-        if (!responses || !headers || !iov) {
-            zfree(responses);
-            zfree(headers);
-            zfree(iov);
-            if (published) *published = 0;
-            return -1;
-        }
+        vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
+        vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+        struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
         int iovcnt = 0;
         uint32_t out = 0;
 
@@ -399,7 +388,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 .magic = VEMB_V16_MAGIC,
                 .version = VEMB_V16_VERSION,
                 .type = VEMB_V16_NET_RESPONSE,
-                .flags = vector_bytes ? VEMB_V16_NET_F_INLINE_VECTOR : 0,
+                .flags = 0,
                 .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes,
                 .channel_id = vemb_v16_channel_id(ch),
                 .req_id = responses[out].req_id,
@@ -432,16 +421,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
 
         if (published) *published = out;
         if (out == 0) {
-            zfree(responses);
-            zfree(headers);
-            zfree(iov);
             return 0;
         }
-        int rc = vemb_v16_net_writev_full(vemb_v16_channel_net_fd(ch), iov, iovcnt);
-        zfree(responses);
-        zfree(headers);
-        zfree(iov);
-        return rc;
+        return vemb_v16_net_writev_full(vemb_v16_channel_net_fd(ch), iov, iovcnt);
     }
 
 #ifdef __linux__

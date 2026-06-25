@@ -4,13 +4,14 @@
 
 ## 核心结论
 
-VEMB V16 中，TLC 是 SuperNode 内部的分层内存管理器。`VADD/VEMB/VSIM` 由 SuperNode 执行，CLI 通过 proxy-managed channel 与目标 SuperNode 交互，VEMB response 返回 WARM handle，CLI 再从对应 WARM data region 读取向量。
+VEMB V16 中，TLC 是 SuperNode 内部的分层内存管理器。`VADD/VEMB/VSIM` 由 SuperNode 执行，CLI 通过 proxy-managed channel 与目标 SuperNode 交互。SHM/Aeron `vemb-handle` 返回 WARM handle，CLI 再从对应 WARM data region 读取向量；TCP `vemb-inline` 发送 `VEMB_V16_OP_VEMB_INLINE`，response frame 直接追加完整 vector payload。
 
 ```text
 CLI local config -> consistent_hash(vector_key) -> target supernode_id
 CLI/vemb_v16_bench -> Proxy channel -> SuperNode worker -> vemb_v16_tlc -> tlc_core
-VEMB response -> {region_id, offset, bytes}
-CLI read -> regions[region_id].mapped_addr + offset
+SHM/Aeron VEMB response -> {region_id, offset, bytes}
+SHM/Aeron CLI read -> regions[region_id].mapped_addr + offset
+TCP VEMB response -> vemb_v16_resp_t + vector_bytes
 ```
 
 关键约束：
@@ -631,9 +632,10 @@ sequenceDiagram
         CORE->>HOT: hot_put(key_hash, warm_idx)
     end
     CORE-->>TLC: handle(region_id, offset, bytes)
-    opt VEMB_SUPERNODE_READ mode
-        SN->>TLC: vemb_v16_tlc_read_handle(handle)
-        TLC->>WDATA: read from regions[region_id] + offset
+    opt VEMB_INLINE mode
+        SN->>TLC: vemb_v16_tlc_load_vector(handle)
+        TLC->>WDATA: copy from regions[region_id] + offset
+        SN->>CQ: attach inline vector snapshot
     end
     SN->>CQ: publish completion(channel_id, req_id, handle)
     P->>CQ: drain completion
@@ -684,8 +686,8 @@ sequenceDiagram
     participant CQ as Completion Ring
     participant RS as Response Ring
 
-    CLI->>CLI: parse VADD_INLINE, normalize key, compute key_hash
-    CLI->>RQ: publish VADD_INLINE(key_hash, key, vector, req_id)
+    CLI->>CLI: parse VADD, normalize key, compute key_hash
+    CLI->>RQ: publish VADD(key_hash, key, vector, req_id)
     P->>RQ: poll batch and validate channel_id/key_len/dim/vector_bytes
     P->>JQ: publish vemb_v16_vadd_job_t with inline vector
     SN->>JQ: poll job
@@ -837,7 +839,7 @@ TCP 模式只返回 WARM handle 的 VEMB benchmark：
   --mode vemb-handle
 ```
 
-TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。该模式由 SuperNode 在 completion 中携带 inline vector snapshot，TCP proxy 只负责把 snapshot 编码到 response frame 后面，不再按 handle 回源读取 WARM slot。`vemb-read-vector` 依赖 client 本地 mmap WARM/vector region，不作为 TCP 跨主机读 vector 语义：
+TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline`。该模式发送 `VEMB_V16_OP_VEMB_INLINE`，由 SuperNode 在 completion 中携带 inline vector snapshot，TCP proxy 只负责把 snapshot 编码到 response frame 后面，不再按 handle 回源读取 WARM slot。`vemb-handle` 依赖 client 本地 mmap WARM/vector region，不作为 TCP 跨主机读 vector 语义：
 
 ```bash
 ./benchmark/vemb_v16_bench \
@@ -849,7 +851,7 @@ TCP 模式完整返回 vector 的 VEMB benchmark 使用 `vemb-inline-vector`。�
   --ops 200000 \
   --threads 8 \
   --pipeline 1 \
-  --mode vemb-inline-vector
+  --mode vemb-inline
 ```
 
 TCP 模式线程扫描可用逗号列表；bench 会按顺序分别执行每个线程数：
@@ -864,7 +866,7 @@ TCP 模式线程扫描可用逗号列表；bench 会按顺序分别执行每个�
   --ops 200000 \
   --threads 8,16,24,32,48 \
   --pipeline 32 \
-  --mode vemb-inline-vector \
+  --mode vemb-inline \
   --timeout-ms 120000
 ```
 
@@ -910,7 +912,7 @@ warm_regions:
 
 manifest 中需要包含所有 region 的 `region_id/provider/path/mmap_offset/bytes/value_size/home_ub_node_id/weight`，以及本 SuperNode 的 `local_ub_node_id` 和可选 `local_region_weight`。server 初始化时打开并 mmap 所有 region，构建 WARM region hash ring，并按 local weight 优先把新 key 分配到本地 UB region；本地 region 满后自动 fallback 到下一个可用 region。
 
-TCP 模式下读路径当前要求 inline vector 返回，因此 benchmark 推荐使用 `vemb-inline-vector` 或 `mixed-80r20w`。bench/client 会从 server 返回的 channel descriptor 中读取 warm backend、region path、mmap offset 和 region size：
+TCP 模式下读路径当前要求 inline vector 返回，因此 benchmark 推荐使用 `vemb-inline` 或 `mixed-80r20w`。bench/client 会从 server 返回的 channel descriptor 中读取 warm backend、region path、mmap offset 和 region size：
 
 ```bash
 ./benchmark/vemb_v16_bench \
@@ -922,7 +924,7 @@ TCP 模式下读路径当前要求 inline vector 返回，因此 benchmark 推�
   --threads 8,16,24,32,64 \
   --pipeline 32 \
   --timeout-ms 3000 \
-  --mode vemb-inline-vector
+  --mode vemb-inline
 ```
 
 混合读写压测可使用：
@@ -944,12 +946,13 @@ TCP 模式下读路径当前要求 inline vector 返回，因此 benchmark 推�
 
 ```bash
 --mode ping
---mode vadd-inline
+--mode vadd
 --mode vemb-handle
---mode vemb-read-vector
---mode vemb-inline-vector
---mode vemb-supernode-read
+--mode vemb-inline
 --mode mixed-80r20w
+--mode vrem
+--mode vsim-inline
+--mode vsim-key-key
 ```
 
 Linux HugeTLB：默认 `--warm-backend shm` 不尝试 `MAP_HUGETLB`，直接使用普通 `MAP_SHARED`；`--warm-backend ub` 会先尝试 `MAP_HUGETLB`，失败后 fallback 到普通 `MAP_SHARED`。如需 HugeTLB 真正生效，需要预留 huge pages，例如：
@@ -974,9 +977,10 @@ ls /dev/shm | grep vemb_v16
 1. `vemb_v16_warm_provider` 支持本地 POSIX SHM 和 UB path mmap，统一产出 WARM data region。
 2. `vemb_v16_tlc` 消费 warm provider，返回 `{region_id, offset, bytes, key_hash}` 形式的 WARM handle。
 3. `tlc_core` 的 HOT/WARM/COLD metadata 使用本地 heap 分配，WARM vector payload 写入 shared shm/UB region。
-4. `VADD_INLINE` 由 proxy 转成 typed job，SuperNode worker 调用 `vemb_v16_tlc_put()`。
+4. `VADD` 由 proxy 转成 typed job，SuperNode worker 调用 `vemb_v16_tlc_put()`。
 5. `VEMB_HANDLE` 由 SuperNode worker 调用 `vemb_v16_tlc_get_handle()`，response 返回 WARM handle；client 再按 handle 读取 WARM data region。
-6. COLD read-through 支持 `cold_lookup -> warm_put -> return WARM handle` 的 promote 路径。
+6. `VEMB_INLINE` 由 SuperNode worker 加载 payload snapshot，TCP response frame 追加完整 vector bytes。
+7. COLD read-through 支持 `cold_lookup -> warm_put -> return WARM handle` 的 promote 路径。
 
 仍待处理：
 

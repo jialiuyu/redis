@@ -13,7 +13,7 @@ OPS="${VEMB_V16_SCALEOUT_SMOKE_OPS:-96}"
 MIGRATION_EPOCH="${VEMB_V16_SCALEOUT_SMOKE_MIGRATION_EPOCH:-23}"
 CUTOVER_EPOCH=$((MIGRATION_EPOCH + 1))
 LIVE_WRITE="${VEMB_V16_SCALEOUT_LIVE_WRITE:-0}"
-LIVE_MODE="${VEMB_V16_SCALEOUT_LIVE_MODE:-vadd-inline}"
+LIVE_MODE="${VEMB_V16_SCALEOUT_LIVE_MODE:-vadd}"
 LIVE_OPS="${VEMB_V16_SCALEOUT_LIVE_OPS:-50000}"
 LIVE_THREADS="${VEMB_V16_SCALEOUT_LIVE_THREADS:-2}"
 LIVE_TIMEOUT_MS="${VEMB_V16_SCALEOUT_LIVE_TIMEOUT_MS:-60000}"
@@ -358,7 +358,7 @@ PREFILL_OUT="$TMPDIR/prefill.out"
     --ops 0 \
     --threads 1 \
     --pipeline 1 \
-    --mode vadd-inline \
+    --mode vadd \
     --client-topology \
     --timeout-ms 10000 > "$PREFILL_OUT" 2>&1
 if ! grep -q "\\[prefill\\] inserted=${PREFILL}" "$PREFILL_OUT"; then
@@ -428,7 +428,7 @@ RUN_OUT="$TMPDIR/post_cutover.out"
     --ops "$OPS" \
     --threads 1 \
     --pipeline 1 \
-    --mode vadd-inline \
+    --mode vadd \
     --client-topology \
     --timeout-ms 10000 > "$RUN_OUT" 2>&1
 

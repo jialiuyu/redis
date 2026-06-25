@@ -85,6 +85,11 @@ typedef struct vemb_v16_tlc_remote_meta_owner_view {
     vemb_v16_remote_meta_view_t *view;
 } vemb_v16_tlc_remote_meta_owner_view_t;
 
+typedef struct vemb_v16_tlc_region_index_id_mapping {
+    uint32_t region_id;
+    uint32_t region_index;
+} vemb_v16_tlc_region_index_id_mapping_t;
+
 typedef struct vemb_v16_tlc_migration_progress {
     uint32_t valid;
     uint32_t source_owner;
@@ -103,6 +108,9 @@ struct vemb_v16_tlc {
     uint32_t backend_type;
     uint32_t warm_region_count;
     vemb_v16_tlc_warm_region_t *warm_regions;
+    uint32_t region_index_id_mapping_count;
+    vemb_v16_tlc_region_index_id_mapping_t
+        region_index_id_mappings[TLC_CORE_MAX_WARM_REGIONS];
     state_bitmap_t bitmap;
     sve_operation_stats_t sve_stats;
     tlc_core_t *core;
@@ -163,6 +171,12 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
                             uint64_t key_hash,
                             vemb_v16_vector_handle_t *handle,
                             uint32_t *warm_slot);
+int vemb_v16_tlc_get_cached_handle(vemb_v16_tlc_t *tlc,
+                                   const char *key,
+                                   uint32_t key_len,
+                                   uint64_t key_hash,
+                                   vemb_v16_vector_handle_t *handle,
+                                   uint32_t *warm_slot);
 int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   const char *key2,
                                   uint32_t key2_len,
@@ -350,6 +364,11 @@ int vemb_v16_tlc_vector_slice(const vemb_v16_tlc_t *tlc,
                               const vemb_v16_vector_handle_t *handle,
                               const uint8_t **vector,
                               uint32_t *vector_bytes);
+int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
+                             const vemb_v16_vector_handle_t *handle,
+                             void *dst,
+                             uint32_t dst_bytes,
+                             uint32_t *vector_bytes);
 void vemb_v16_tlc_get_core_stats(vemb_v16_tlc_t *tlc,
                                  tlc_core_stats_t *stats);
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,

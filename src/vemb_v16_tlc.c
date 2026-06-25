@@ -15,6 +15,7 @@
 
 #define VEMB_V16_REMOTE_META_PUBLISH_QUEUE_CAP 1024u
 #define VEMB_V16_TLC_LOG_LIMIT 32u
+#define VEMB_V16_TLC_VECTOR_COPY_RETRIES 1024u
 
 typedef struct vemb_v16_remote_meta_publish_event {
     vemb_v16_remote_meta_view_t *target_view;
@@ -401,6 +402,15 @@ static void remote_meta_publisher_stop(vemb_v16_tlc_t *tlc) {
     zfree(publisher);
 }
 
+static uint32_t region_index_id_mapping(const vemb_v16_tlc_t *tlc,
+                                        uint32_t region_id) {
+    for (uint32_t i = 0; i < tlc->region_index_id_mapping_count; i++) {
+        if (tlc->region_index_id_mappings[i].region_id == region_id)
+            return tlc->region_index_id_mappings[i].region_index;
+    }
+    return UINT32_MAX;
+}
+
 static int enqueue_remote_meta_publish(
     vemb_v16_tlc_t *tlc,
     vemb_v16_remote_meta_view_t *target_view,
@@ -511,6 +521,14 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     }
     memcpy(tlc->warm_regions, warm_regions,
            sizeof(vemb_v16_tlc_warm_region_t) * warm_region_count);
+    tlc->region_index_id_mapping_count = warm_region_count;
+    for (uint32_t i = 0; i < warm_region_count; i++) {
+        tlc->region_index_id_mappings[i] =
+            (vemb_v16_tlc_region_index_id_mapping_t){
+                .region_id = warm_regions[i].region_id,
+                .region_index = i,
+            };
+    }
     atomic_init(&tlc->sve_stats.lock_success, 0);
     atomic_init(&tlc->sve_stats.lock_failure, 0);
 
@@ -549,8 +567,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
 }
 
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {
-    if (!tlc)
-        return;
     remote_meta_publisher_stop(tlc);
     bitmap_destroy(&tlc->bitmap);
     tlc_core_destroy(tlc->core);
@@ -569,6 +585,22 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
     tlc_warm_location_t location = {0};
     if (tlc_core_get_warm_location(tlc->core, key, key_len,
                                    key_hash, &location) != 0) {
+        return -1;
+    }
+    if (warm_slot) *warm_slot = location.local_slot;
+    make_handle(tlc, key_hash, &location, handle);
+    return 0;
+}
+
+int vemb_v16_tlc_get_cached_handle(vemb_v16_tlc_t *tlc,
+                                   const char *key,
+                                   uint32_t key_len,
+                                   uint64_t key_hash,
+                                   vemb_v16_vector_handle_t *handle,
+                                   uint32_t *warm_slot) {
+    tlc_warm_location_t location = {0};
+    if (tlc_core_get_cached_warm_location(tlc->core, key, key_len,
+                                          key_hash, &location) != 0) {
         return -1;
     }
     if (warm_slot) *warm_slot = location.local_slot;
@@ -672,8 +704,6 @@ int vemb_v16_tlc_publish_remote_meta_async(
 
 uint32_t vemb_v16_tlc_flush_remote_meta_publishes(vemb_v16_tlc_t *tlc,
                                                   uint32_t budget) {
-    if (!tlc)
-        return 0;
     vemb_v16_tlc_remote_meta_publisher_t *publisher =
         atomic_load_explicit(&tlc->remote_meta_publisher,
                              memory_order_acquire);
@@ -1956,10 +1986,10 @@ int vemb_v16_tlc_apply_migration(vemb_v16_tlc_t *tlc,
 
 const vemb_v16_tlc_warm_region_t *vemb_v16_tlc_find_region(
     const vemb_v16_tlc_t *tlc, uint32_t region_id) {
-    for (uint32_t i = 0; i < tlc->warm_region_count; i++) {
-        if (tlc->warm_regions[i].region_id == region_id)
-            return &tlc->warm_regions[i];
-    }
+    uint32_t region_index = region_index_id_mapping(tlc, region_id);
+    if (region_index < tlc->warm_region_count &&
+        tlc->warm_regions[region_index].region_id == region_id)
+        return &tlc->warm_regions[region_index];
     return NULL;
 }
 
@@ -1979,7 +2009,7 @@ int vemb_v16_tlc_vector_slice(const vemb_v16_tlc_t *tlc,
     }
     tlc_warm_location_t location = {
         .region_id = handle->region_id,
-        .region_index = UINT32_MAX,
+        .region_index = region_index_id_mapping(tlc, handle->region_id),
         .local_slot = handle->local_slot,
         .bytes = handle->bytes,
         .offset = handle->offset,
@@ -1991,6 +2021,36 @@ int vemb_v16_tlc_vector_slice(const vemb_v16_tlc_t *tlc,
         return -1;
     }
     *vector = (const uint8_t *)region->mapped_addr + handle->offset;
+    *vector_bytes = handle->bytes;
+    return 0;
+}
+
+int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
+                             const vemb_v16_vector_handle_t *handle,
+                             void *dst,
+                             uint32_t dst_bytes,
+                             uint32_t *vector_bytes) {
+    RETURN_IF(handle->local_slot == TLC_CORE_INVALID_SLOT ||
+              handle->region_id == TLC_CORE_INVALID_REGION_ID ||
+              handle->bytes == 0 ||
+              dst_bytes < handle->bytes,
+              -1);
+    tlc_warm_location_t location = {
+        .region_id = handle->region_id,
+        .region_index = region_index_id_mapping(tlc, handle->region_id),
+        .local_slot = handle->local_slot,
+        .bytes = handle->bytes,
+        .offset = handle->offset,
+        .owner_generation = handle->owner_generation,
+    };
+    if (tlc_core_copy_warm_location_value(tlc->core,
+                                          handle->key_hash,
+                                          &location,
+                                          dst,
+                                          dst_bytes,
+                                          VEMB_V16_TLC_VECTOR_COPY_RETRIES) != 0) {
+        return -1;
+    }
     *vector_bytes = handle->bytes;
     return 0;
 }

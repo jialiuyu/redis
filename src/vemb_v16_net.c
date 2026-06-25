@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "vemb_v16_net.h"
+#include "macro.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -103,7 +104,7 @@ int vemb_v16_net_write_full(int fd, const void *buf, size_t n) {
     return 0;
 }
 
-static int iov_copy(struct iovec *dst, const struct iovec *src, int iovcnt) {
+static int make_iov(struct iovec *dst, const struct iovec *src, int iovcnt) {
     if (iovcnt <= 0 || iovcnt > VEMB_V16_NET_MAX_IOV)
         return -1;
     int out = 0;
@@ -115,7 +116,7 @@ static int iov_copy(struct iovec *dst, const struct iovec *src, int iovcnt) {
     return out > 0 ? out : -1;
 }
 
-static void iov_advance(struct iovec **iov, int *iovcnt, size_t bytes) {
+static void advance_iov(struct iovec **iov, int *iovcnt, size_t bytes) {
     while (*iovcnt > 0 && bytes >= (*iov)->iov_len) {
         bytes -= (*iov)->iov_len;
         (*iov)++;
@@ -128,58 +129,40 @@ static void iov_advance(struct iovec **iov, int *iovcnt, size_t bytes) {
 }
 
 int vemb_v16_net_readv_full(int fd, const struct iovec *iov, int iovcnt) {
-    struct iovec *local = malloc(sizeof(*local) * VEMB_V16_NET_MAX_IOV);
-    if (!local) return -1;
-    int nlocal = iov_copy(local, iov, iovcnt);
-    if (nlocal < 0) {
-        free(local);
-        return -1;
-    }
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = make_iov(local, iov, iovcnt);
+    RETURN_IF(nlocal < 0, -1);
 
     struct iovec *cur = local;
     int curcnt = nlocal;
     while (curcnt > 0) {
         ssize_t r = readv(fd, cur, curcnt);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) {
-            free(local);
-            return -1;
-        }
-        iov_advance(&cur, &curcnt, (size_t)r);
+        RETURN_IF(r <= 0, -1);
+        advance_iov(&cur, &curcnt, (size_t)r);
     }
-    free(local);
     return 0;
 }
 
 int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
-    struct iovec *local = malloc(sizeof(*local) * VEMB_V16_NET_MAX_IOV);
-    if (!local) return -1;
-    int nlocal = iov_copy(local, iov, iovcnt);
-    if (nlocal < 0) {
-        free(local);
-        return -1;
-    }
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = make_iov(local, iov, iovcnt);
+    RETURN_IF(nlocal < 0, -1);
 
     struct iovec *cur = local;
     int curcnt = nlocal;
     while (curcnt > 0) {
         ssize_t r = writev(fd, cur, curcnt);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) {
-            free(local);
-            return -1;
-        }
-        iov_advance(&cur, &curcnt, (size_t)r);
+        RETURN_IF(r <= 0, -1);
+        advance_iov(&cur, &curcnt, (size_t)r);
     }
-    free(local);
     return 0;
 }
 
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr) {
-    if (vemb_v16_net_read_full(fd, hdr, sizeof(*hdr)) != 0)
-        return -1;
-    if (hdr->magic != VEMB_V16_MAGIC || hdr->version != VEMB_V16_VERSION)
-        return -1;
+    RETURN_IF(vemb_v16_net_read_full(fd, hdr, sizeof(*hdr)) != 0, -1);
+    RETURN_IF(hdr->magic != VEMB_V16_MAGIC || hdr->version != VEMB_V16_VERSION, -1);
     return 0;
 }
 

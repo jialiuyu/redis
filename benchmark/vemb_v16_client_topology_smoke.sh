@@ -114,7 +114,7 @@ BENCH_OUT="$TMPDIR/bench.out"
     --ops "$OPS" \
     --threads 1 \
     --pipeline 1 \
-    --mode vadd-inline \
+    --mode vadd \
     --client-topology \
     --timeout-ms 5000 > "$BENCH_OUT" 2>&1
 

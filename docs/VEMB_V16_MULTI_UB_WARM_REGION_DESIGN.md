@@ -30,7 +30,7 @@
 - manifest 路径已打通，支持 `shm`、`mock_ub`、`shm_mock_ub` 和 `ub` provider；manifest 可配置 `local_ub_node_id`、`local_region_weight`、`home_ub_node_id`、`weight`、`is_local`。
 - channel descriptor 和 bench/client 已支持多个 WARM region mmap，并按 response `region_id` 查找 region。
 - aggregate warm stats 已接入 server/bench 输出：`warm_region_count`、`warm_region_full_count`、`warm_alloc_local`、`warm_alloc_remote`、`warm_alloc_fallback`、`warm_alloc_cold_spill`、`warm_alloc_fail`、`warm_region_hash_local_pct`。
-- TCP read path 已明确为 inline vector 模式：TCP 下 `VEMB_HANDLE` / `VEMB_SUPERNODE_READ` 必须带 `INLINE_VECTOR` flag，bench 侧只允许 `vemb-inline-vector` 或 `mixed-80r20w` 读模式。
+- TCP read path 已明确为 inline vector 模式：TCP 下读请求使用 `VEMB_V16_OP_VEMB_INLINE`，bench 侧只允许 `vemb-inline` 或 `mixed-80r20w` 读模式。
 - 已补单测覆盖 local full fallback、overwrite no migration、all full cold spill、manifest `shm/mock_ub` create/put/slice/channel desc。
 
 未完成：
@@ -267,13 +267,13 @@ make -C benchmark vemb_v16_bench vemb_v16_tlc_ut vemb_v16_manifest_ut
   --loglevel notice
 ```
 
-TCP bench。TCP 模式只能 inline vector；读模式使用 `vemb-inline-vector`：
+TCP bench。TCP 模式只能 inline vector；读模式使用 `vemb-inline`：
 
 ```bash
 ./benchmark/vemb_v16_bench \
   --transport tcp \
   --endpoints 127.0.0.1:6391 \
-  --mode vemb-inline-vector \
+  --mode vemb-inline \
   --dim 300 \
   --prefill 65536 \
   --ops 200000 \
@@ -347,7 +347,7 @@ YAML
 ./benchmark/vemb_v16_bench \
   --transport tcp \
   --endpoints 127.0.0.1:6391 \
-  --mode vemb-inline-vector \
+  --mode vemb-inline \
   --dim 300 \
   --prefill 65536 \
   --ops 200000 \

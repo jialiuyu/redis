@@ -442,9 +442,9 @@ accept/control thread
 1. 文档中已移除 `0/0`、`0/16` 作为正常配置的写法，仅保留历史对照意义。
 2. stats / bench 输出口径已从早期读写分离标签收敛为 `job_shard`。
 3. pooled-only 的最小 TCP / SHM smoke 已补齐，当前已确认：
-   - TCP `vadd-inline`
+   - TCP `vadd`
    - TCP `vemb-inline-vector`
-   - SHM `vadd-inline`
+   - SHM `vadd`
    - SHM `vemb-supernode-read`
    - SHM `mixed-80r20w`
 

@@ -718,21 +718,20 @@ static int publish_request_job(vemb_v16_channel_t *ch,
                                uint32_t key_len,
                                uint32_t proxy_io_worker_id) {
     int is_ping = req->op == VEMB_V16_OP_PING;
-    int is_vadd = req->op == VEMB_V16_OP_VADD_INLINE;
+    int is_vadd = req->op == VEMB_V16_OP_VADD;
     int is_vrem = req->op == VEMB_V16_OP_VREM;
     int is_vsim = req->op == VEMB_V16_OP_VSIM_INLINE;
     int has_inline_vector = is_vadd || is_vsim;
     int is_vemb = req->op == VEMB_V16_OP_VEMB_HANDLE ||
-        req->op == VEMB_V16_OP_VEMB_SUPERNODE_READ ||
+        req->op == VEMB_V16_OP_VEMB_INLINE ||
         req->op == VEMB_V16_OP_VSIM_KEY_KEY;
     RETURN_IF(!is_ping && !is_vrem && !has_inline_vector && !is_vemb, -1);
 
-    vemb_v16_vadd_job_t *job = zcalloc(sizeof(*job));
-    RETURN_IF(!job, -1);
+    vemb_v16_vadd_job_t job = {0};
 
-    fill_job_base((vemb_v16_job_base_t *)job, ch, req, key_len);
+    fill_job_base((vemb_v16_job_base_t *)&job, ch, req, key_len);
     if (has_inline_vector) {
-        memcpy(((vemb_v16_vadd_job_t *)job)->vector,
+        memcpy(job.vector,
                req->vector,
                req->vector_bytes);
     }
@@ -765,24 +764,22 @@ static int publish_request_job(vemb_v16_channel_t *ch,
     }
 
     int rc = publish_shard_job(ch,
-                               job,
+                               &job,
                                proxy_io_worker_id,
                                queues,
                                ring_full_counter);
-    zfree(job);
     RETURN_IF(rc != 0, -1);
     atomic_fetch_add_explicit(publish_counter, 1, memory_order_relaxed);
     return 0;
 }
 
-static int tcp_vemb_read_requires_inline_vector(vemb_v16_channel_t *ch,
-                                                const vemb_v16_req_t *req) {
+static int tcp_vemb_read_requires_inline_op(vemb_v16_channel_t *ch,
+                                            const vemb_v16_req_t *req) {
     if (ch->transport_type != VEMB_V16_TRANSPORT_TCP)
         return 0;
-    if (req->op != VEMB_V16_OP_VEMB_HANDLE &&
-        req->op != VEMB_V16_OP_VEMB_SUPERNODE_READ)
+    if (req->op != VEMB_V16_OP_VEMB_HANDLE)
         return 0;
-    return (req->flags & VEMB_V16_REQ_F_INLINE_VECTOR) ? 0 : -1;
+    return -1;
 }
 
 /// Request scheduling: validate protocol input and enqueue execution jobs.
@@ -808,14 +805,14 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         goto error_response;
     }
 
-    size_t min_len = (req->op == VEMB_V16_OP_VADD_INLINE ||
+    size_t min_len = (req->op == VEMB_V16_OP_VADD ||
                       req->op == VEMB_V16_OP_VSIM_INLINE) ?
         vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {
         goto error_response;
     }
-    if (tcp_vemb_read_requires_inline_vector(ch, req) != 0) {
+    if (tcp_vemb_read_requires_inline_op(ch, req) != 0) {
         goto error_response;
     }
 
@@ -960,7 +957,6 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
         cleanup_unstarted_channel(ch);
         return -1;
     }
-
     if (transport_type == VEMB_V16_TRANSPORT_AERON) {
         snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
                  "/%s_req_%llu", VEMB_V16_SHM_PREFIX,
@@ -1303,14 +1299,18 @@ static void *proxy_io_epoll_thread_main(void *arg) {
             uint64_t channel_id =
                 atomic_load_explicit(&ch->slot_channel_id,
                                      memory_order_acquire);
-            int active = channel_id != 0 &&
+            int channel_active = channel_id != 0 &&
+                atomic_load_explicit(&ch->active, memory_order_acquire);
+            int tcp_active = channel_active &&
                 ch->transport_type == VEMB_V16_TRANSPORT_TCP &&
-                atomic_load_explicit(&ch->active, memory_order_acquire) &&
                 ch->net_fd >= 0;
-            int fd = active ? ch->net_fd : -1;
+            int aeron_active = channel_active &&
+                ch->transport_type == VEMB_V16_TRANSPORT_AERON;
+            int active = tcp_active;
+            int fd = tcp_active ? ch->net_fd : -1;
 
             if (registered_ids[i] != 0 &&
-                (!active ||
+                (!tcp_active ||
                  registered_ids[i] != channel_id ||
                  registered_fds[i] != fd)) {
                 proxy_io_epoll_unregister(ch,
@@ -1322,7 +1322,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 did_work = 1;
             }
 
-            if (!active)
+            if (!tcp_active && !aeron_active)
                 continue;
 
             if (!proxy_io_channel_acquire(ch))
@@ -1331,7 +1331,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
 
             channel_id = atomic_load_explicit(&ch->slot_channel_id,
                                               memory_order_acquire);
-            int channel_active = channel_id != 0 &&
+            channel_active = channel_id != 0 &&
                 atomic_load_explicit(&ch->active, memory_order_acquire);
             if (!channel_active) {
                 proxy_io_channel_release(ch);
@@ -1557,10 +1557,8 @@ static void apply_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                            vemb_v16_channel_t *ch) {
     atomic_fetch_add_explicit(&ch->stats.supernode_vemb_poll, 1,
                               memory_order_relaxed);
-    vemb_v16_supernode_handle_vemb_job(ctx,
-                                       job,
-                                       &scratch->read_result,
-                                       &scratch->read_result_bytes);
+    (void)scratch;
+    vemb_v16_supernode_handle_vemb_job(ctx, job);
 }
 
 /// Execution: run one VADD job on the SuperNode storage/backend path.
@@ -1629,13 +1627,13 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
         publish_synthetic_completion(ctx, &completion);
         break;
     }
-    case VEMB_V16_OP_VADD_INLINE:
+    case VEMB_V16_OP_VADD:
     case VEMB_V16_OP_VREM:
     case VEMB_V16_OP_VSIM_INLINE:
         apply_vadd_job(ctx, job, scratch, ch);
         break;
     case VEMB_V16_OP_VEMB_HANDLE:
-    case VEMB_V16_OP_VEMB_SUPERNODE_READ:
+    case VEMB_V16_OP_VEMB_INLINE:
     case VEMB_V16_OP_VSIM_KEY_KEY:
         apply_vemb_job(ctx, job, scratch, ch);
         break;

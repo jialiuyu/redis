@@ -235,7 +235,7 @@ static int prefill_vectors(const bench_cfg_t *cfg, tcp_channel_t *channel) {
     for (uint32_t i = 0; i < cfg->prefill; i++) {
         make_key(key, sizeof(key), i);
         prepare_req(&req,
-                    VEMB_V16_OP_VADD_INLINE,
+                    VEMB_V16_OP_VADD,
                     i + 1,
                     channel->desc.channel_id,
                     key,
@@ -283,12 +283,11 @@ static void *slow_thread_main(void *arg) {
 
     for (uint32_t i = 0; i < cfg->slow_ops; i++) {
         prepare_req(&req,
-                    VEMB_V16_OP_VEMB_HANDLE,
+                    VEMB_V16_OP_VEMB_INLINE,
                     i + 1,
                     channel->desc.channel_id,
                     ctx->key,
                     cfg->dim);
-        req.flags |= VEMB_V16_REQ_F_INLINE_VECTOR;
         if (send_req_tcp(channel, &req, vemb_v16_req_handle_len()) != 0) {
             ctx->fail += cfg->slow_ops - i;
             atomic_store_explicit(ctx->burst_ready, 1, memory_order_release);

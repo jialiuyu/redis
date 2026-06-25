@@ -1102,7 +1102,7 @@ Server B 使用同一份 manifest，但不能带 `--reset-warm-regions`：
 ./benchmark/vemb_v16_bench \
   --transport tcp \
   --endpoints 127.0.0.1:6410,127.0.0.1:6411 \
-  --mode vadd-inline \
+  --mode vadd \
   --dim 8 \
   --prefill 0 \
   --ops 48 \
@@ -1153,7 +1153,7 @@ read_bytes=2048
 ./benchmark/vemb_v16_bench \
   --transport tcp \
   --endpoints 127.0.0.1:6410,127.0.0.1:6411 \
-  --mode vadd-inline \
+  --mode vadd \
   --dim 8 \
   --prefill 0 \
   --ops 80 \

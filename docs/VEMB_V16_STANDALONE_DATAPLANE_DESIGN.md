@@ -264,19 +264,19 @@ CONTROL_STATUS server -> bench, payload = vemb_v16_net_status_t
 第一阶段支持：
 
 - `ping`
-- `vadd-inline`
-- `vemb-inline-vector`
+- `vadd`
+- `vemb-inline`
 - `mixed-80r20w`
 
-`vemb-inline-vector` 是 TCP transport 的跨主机完整 vector 语义。请求使用 `VEMB_V16_OP_VEMB_HANDLE` 并设置 `VEMB_V16_REQ_F_INLINE_VECTOR`；SuperNode 内部仍可使用 `{region_id, offset, bytes}` completion 定位 WARM payload，proxy 在 TCP `RESPONSE` frame 中写入：
+`vemb-inline` 是 TCP transport 的跨主机完整 vector 语义。请求使用 `VEMB_V16_OP_VEMB_INLINE`；SuperNode 内部仍可使用 `{region_id, offset, bytes}` completion 定位 WARM payload，proxy 在 TCP `RESPONSE` frame 中写入：
 
 ```text
 payload = vemb_v16_resp_t + vector_bytes
 ```
 
-其中 `vemb_v16_resp_t` 可以保留 handle/debug 字段，但 TCP client 以追加的 `vector_bytes` 为准，不 mmap WARM region。追加 payload 是从 server 本地 WARM/vector region 按 `region_id + offset` 拷贝出的 vector 内容。第一阶段 TCP 只支持这种完整 payload 返回；shared-memory/Aeron transport 才使用 `vemb-read-vector` 由客户端 mmap region 后本地读取。
+其中 `vemb_v16_resp_t` 可以保留 handle/debug 字段，但 TCP client 以追加的 `vector_bytes` 为准，不 mmap WARM region。追加 payload 是从 server 本地 WARM/vector region 按 `region_id + offset` 拷贝出的 vector 内容。第一阶段 TCP 只支持这种完整 payload 返回；shared-memory/Aeron transport 使用 `vemb-handle` 由客户端 mmap region 后本地读取。
 
-`vemb-handle` / `vemb-read-vector` / `vemb-supernode-read` 不作为 TCP 对外语义。后续如果要进一步优化跨主机完整 vector 返回，应引入 RDMA/URMA/DPDK zero-copy read path，减少 TCP 追加 1200B payload 的内核拷贝。
+`vemb-handle` 不作为 TCP 对外读 vector 语义。后续如果要进一步优化跨主机完整 vector 返回，应引入 RDMA/URMA/DPDK zero-copy read path，减少 TCP 追加 1200B payload 的内核拷贝。
 
 TCP 实现要求：
 
@@ -549,11 +549,12 @@ op 类型：
 ```c
 enum {
     VEMB_OP_PING        = 0x01,
-    VEMB_OP_VADD_INLINE = 0x10,
-    VEMB_OP_VADD_STAGE  = 0x11,
+    VEMB_OP_VADD        = 0x10,
+    VEMB_OP_VREM        = 0x11,
     VEMB_OP_VEMB_HANDLE = 0x20,
-    VEMB_OP_VEMB_RAW    = 0x21,
-    VEMB_OP_VSIM        = 0x30
+    VEMB_OP_VEMB_INLINE = 0x21,
+    VEMB_OP_VSIM_INLINE = 0x30,
+    VEMB_OP_VSIM_KEY_KEY = 0x31
 };
 ```
 
@@ -944,13 +945,6 @@ graph TD
   --rows 65536 \
   --ops 1000000 \
   --threads 8
-
-./benchmark/vemb_v16_bench \
-  --mode vemb-read-vector \
-  --dim 300 \
-  --rows 65536 \
-  --ops 1000000 \
-  --threads 8
 ```
 
 ## 预期性能模型
@@ -1021,8 +1015,7 @@ client 写 staging region
 | 模式 | 对标 TLC V16 | 预测 QPS | 预测平均延迟 | 主要差距来源 |
 |---|---:|---:|---:|---|
 | `ping` | 2.19M GET | 1.8M - 2.5M | 400ns - 650ns | ring/worker 基础成本 |
-| `vemb-handle` | 2.19M GET | 0.8M - 1.3M | 0.8us - 1.4us | SPSC job + SPSC completion |
-| `vemb-read-vector` | 2.19M GET | 0.6M - 1.0M | 1.0us - 1.8us | completion 回跳 + client 读 1200B |
+| `vemb-handle` | 2.19M GET | 0.6M - 1.0M | 1.0us - 1.8us | completion 返回 handle + client 读 1200B |
 | `vadd-stage` | 2.15M PUT | 0.8M - 1.3M | 0.8us - 1.5us | SPSC job/completion + staging 读 + table 写 |
 | `vsim` | 无直接等价 | 取决于候选数/compute | 取决于 compute | SuperNode compute 成本主导 |
 
@@ -1030,8 +1023,7 @@ client 写 staging region
 
 ```text
 ping:             >= 1.8M QPS
-vemb-handle:      >= 800k QPS
-vemb-read-vector: >= 600k QPS
+vemb-handle:      >= 600k QPS
 vadd-stage:       >= 800k QPS
 ```
 
@@ -1069,7 +1061,7 @@ ping ring round-trip 达到 TLC V16 同量级
 - 将 `vemb_v16_job_t` / `vemb_v16_completion_t` 移到 data-plane 头文件。
 - 将 SuperNode worker loop 从 `vemb_v16_proxy.c` 拆到独立模块。
 - 将 vector table/backend 从 `vemb_v16_proxy.c` 拆到独立模块。
-- 保持 `VEMB_HANDLE`、`vemb-read-vector`、`vadd-inline` 功能不回退。
+- 保持 `VEMB_HANDLE`、`VEMB_INLINE`、`vadd` 功能不回退。
 
 验收目标：
 
@@ -1096,11 +1088,11 @@ completion 通过 Aeron completion ring 回 proxy
 handle-only VEMB 达到 800k+ QPS，并量化 SPSC job ring 和 completion ring 开销
 ```
 
-### 阶段 4：客户端 read-vector
+### 阶段 4：客户端 handle read
 
 - 客户端按 handle 读取 vector region。
-- benchmark 增加 `vemb-read-vector`。
-- 对比 handle-only 与 read-vector 差距。
+- benchmark 的 `vemb-handle` 覆盖 handle 返回和本地 region 读取。
+- TCP 跨主机场景使用 `vemb-inline` 返回完整 vector payload。
 
 ### 阶段 5：VADD_STAGE
 
