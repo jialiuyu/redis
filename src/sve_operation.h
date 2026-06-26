@@ -66,6 +66,8 @@ int  bitmap_init(state_bitmap_t *bmp, size_t num_bits);
 void bitmap_destroy(state_bitmap_t *bmp);
 int  bitmap_try_acquire(state_bitmap_t *bmp, uint64_t bit_index);
 void bitmap_release(state_bitmap_t *bmp, uint64_t bit_index);
+void bitmap_lock_blocking(state_bitmap_t *bmp, uint64_t bit_index);
+void bitmap_unlock(state_bitmap_t *bmp, uint64_t bit_index);
 
 void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
                          ub_address_space_t *ubas,

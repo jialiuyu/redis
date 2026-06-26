@@ -247,11 +247,10 @@ static void tlc_core_log_put_failure(
         const tlc_core_key_meta_entry_t *meta) {
     if (!tlc_core_should_log_put_diag()) return;
 
-    uint64_t source_fence_count =
-        atomic_load_explicit(&core->source_fence_active_count,
-                             memory_order_acquire);
-    uint32_t key_meta_count =
-        atomic_load_explicit(&core->key_meta_count, memory_order_relaxed);
+    uint64_t source_fence_count = atomic_load_explicit(
+        &core->source_fence_active_count, memory_order_acquire);
+    uint32_t key_meta_count = atomic_load_explicit(
+        &core->key_meta_count, memory_order_relaxed);
     uint32_t meta_present = 0;
     uint32_t meta_state = 0;
     uint64_t meta_epoch = 0;
@@ -373,8 +372,6 @@ static vemb_v16_warm_slot_meta_t *fallback_slot_meta_acquire(
 
 static void fallback_slot_meta_release(vemb_v16_shared_region_allocator_t *allocator,
                                        vemb_v16_warm_slot_meta_t *slot_meta) {
-    if (!allocator || !slot_meta)
-        return;
     pthread_mutex_lock(&slot_meta_registry_lock);
     for (uint32_t i = 0; i < TLC_CORE_SLOT_META_REGISTRY_MAX; i++) {
         tlc_core_slot_meta_registry_entry_t *entry =
@@ -424,19 +421,8 @@ static uint32_t vnode_lower_bound(const tlc_core_warm_layer_t *warm,
     return lo == warm->vnode_count ? 0 : lo;
 }
 
-#if TLC_CORE_ENABLE_COLD_LAYER
-static void bitmap_lock_blocking(state_bitmap_t *locks, uint32_t lock_id) {
-    while (bitmap_try_acquire(locks, lock_id) != 0)
-        cpu_relax();
-}
-
-static void bitmap_unlock(state_bitmap_t *locks, uint32_t lock_id) {
-    bitmap_release(locks, lock_id);
-}
-#endif
-
-static int key_valid(const char *key, uint32_t key_len) {
-    return key && key_len > 0 && key_len <= VEMB_V16_MAX_KEY_LEN;
+static int key_valid(const char * _, uint32_t key_len) {
+    return likely(key_len > 0 && key_len <= VEMB_V16_MAX_KEY_LEN);
 }
 
 static int key_matches(uint64_t key_hash,
@@ -453,14 +439,12 @@ static int key_matches(uint64_t key_hash,
 static int key_meta_init(tlc_core_t *core) {
     uint32_t shard_count = TLC_CORE_KEY_META_SHARDS;
     uint64_t target_capacity = (uint64_t)core->warm_capacity * 2u;
-    uint64_t per_shard_target =
-        (target_capacity + shard_count - 1u) / shard_count;
+    uint64_t per_shard_target = (target_capacity + shard_count - 1u) / shard_count;
     uint32_t shard_capacity = vemb_v16_pow2_ceil_u32(per_shard_target);
     if (shard_capacity < TLC_CORE_KEY_META_MIN_SHARD_CAPACITY)
         shard_capacity = TLC_CORE_KEY_META_MIN_SHARD_CAPACITY;
 
-    core->key_meta_shards =
-        zcalloc(sizeof(*core->key_meta_shards) * shard_count);
+    core->key_meta_shards = zcalloc(sizeof(tlc_core_key_meta_shard_t) * shard_count);
     RETURN_IF(!core->key_meta_shards, -1);
     RETURN_IF(bitmap_init(&core->key_meta_locks, shard_count) != 0, -1);
     core->key_meta_capacity = shard_capacity * shard_count;
@@ -468,115 +452,75 @@ static int key_meta_init(tlc_core_t *core) {
 
     for (uint32_t i = 0; i < shard_count; i++) {
         tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[i];
-        shard->lock_id = i;
-        core->key_meta_shard_count++;
-    }
-    for (uint32_t i = 0; i < shard_count; i++) {
-        tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[i];
         shard->entries = zcalloc(sizeof(*shard->entries) * shard_capacity);
-        if (!shard->entries)
+        if (!shard->entries) {
+            core->key_meta_shard_count = i;
             return -1;
+        }
+        shard->lock_id = i;
         shard->capacity = shard_capacity;
         shard->mask = shard_capacity - 1u;
         shard->count = 0;
     }
+    core->key_meta_shard_count = shard_count;
     return 0;
 }
 
-static void key_meta_shard_lock(tlc_core_t *core,
-                                tlc_core_key_meta_shard_t *shard) {
-    while (bitmap_try_acquire(&core->key_meta_locks, shard->lock_id) != 0)
-        cpu_relax();
+static tlc_core_key_meta_shard_t *key_meta_shard_for_hash(tlc_core_t *core,
+                                                          uint64_t key_hash) {
+    uint32_t shard_index =
+        vemb_v16_mix32_u64(key_hash) & (core->key_meta_shard_count - 1u);
+    return &core->key_meta_shards[shard_index];
 }
 
-static void key_meta_shard_unlock(tlc_core_t *core,
-                                  tlc_core_key_meta_shard_t *shard) {
-    bitmap_release(&core->key_meta_locks, shard->lock_id);
-}
-
-static uint32_t key_meta_shard_index(const tlc_core_t *core,
-                                     uint64_t key_hash) {
-    return vemb_v16_mix32_u64(key_hash) & (core->key_meta_shard_count - 1u);
-}
-
-static tlc_core_key_meta_shard_t *key_meta_shard_for_hash(
-        tlc_core_t *core,
-        uint64_t key_hash) {
-    return &core->key_meta_shards[key_meta_shard_index(core, key_hash)];
-}
-
-static tlc_core_key_meta_entry_t *key_meta_find_in_shard_locked(
-        tlc_core_key_meta_shard_t *shard,
-        const char *key,
-        uint32_t key_len,
-        uint64_t key_hash) {
-    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
-    for (uint32_t i = 0; i < shard->capacity; i++) {
-        tlc_core_key_meta_entry_t *entry =
-            &shard->entries[(slot + i) & shard->mask];
-        if (!entry->occupied)
-            return NULL;
-        if (key_matches(key_hash, key, key_len,
-                        entry->key_hash, entry->key, entry->key_len)) {
-            return entry;
-        }
-    }
-    return NULL;
+static void key_meta_init_entry_locked(tlc_core_key_meta_entry_t *entry,
+                                       const char *key,
+                                       uint32_t key_len,
+                                       uint64_t key_hash) {
+    entry->occupied = 1;
+    entry->key_hash = key_hash;
+    entry->key_len = key_len;
+    memcpy(entry->key, key, key_len);
+    entry->key_version = 0;
+    entry->topology_epoch = 0;
+    entry->owner_epoch = 0;
+    entry->migration_state = TLC_CORE_KEY_SOURCE_ACTIVE;
+    entry->source_owner = UINT32_MAX;
+    entry->target_owner = UINT32_MAX;
+    entry->tombstone = 0;
+    entry->shard_id = 0;
+    entry->location = tlc_invalid_location;
 }
 
 static tlc_core_key_meta_entry_t *key_meta_find_locked(
         tlc_core_t *core,
         const char *key,
         uint32_t key_len,
-        uint64_t key_hash) {
-    return key_meta_find_in_shard_locked(key_meta_shard_for_hash(core, key_hash),
-                                         key,
-                                         key_len,
-                                         key_hash);
-}
-
-static tlc_core_key_meta_entry_t *key_meta_find_or_create_locked(
-        tlc_core_t *core,
-        const char *key,
-        uint32_t key_len,
-        uint64_t key_hash) {
+        uint64_t key_hash,
+        int create) {
     tlc_core_key_meta_shard_t *shard = key_meta_shard_for_hash(core, key_hash);
     uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
     for (uint32_t i = 0; i < shard->capacity; i++) {
         tlc_core_key_meta_entry_t *entry = &shard->entries[(slot + i) & shard->mask];
-        if (entry->occupied) {
-            if (key_matches(key_hash, key, key_len,
-                            entry->key_hash,
-                            entry->key,
-                            entry->key_len)) {
-                return entry;
-            }
-            continue;
+        if (!entry->occupied) {
+            if (!create) return NULL;
+            key_meta_init_entry_locked(entry, key, key_len, key_hash);
+            shard->count++;
+            atomic_fetch_add_explicit(&core->key_meta_count, 1, memory_order_relaxed);
+            return entry;
         }
-        entry->occupied = 1;
-        entry->key_hash = key_hash;
-        entry->key_len = key_len;
-        memcpy(entry->key, key, key_len);
-        entry->key_version = 0;
-        entry->topology_epoch = 0;
-        entry->owner_epoch = 0;
-        entry->migration_state = TLC_CORE_KEY_SOURCE_ACTIVE;
-        entry->source_owner = UINT32_MAX;
-        entry->target_owner = UINT32_MAX;
-        entry->tombstone = 0;
-        entry->shard_id = 0;
-        entry->location = tlc_invalid_location;
-        shard->count++;
-        atomic_fetch_add_explicit(&core->key_meta_count, 1, memory_order_relaxed);
-        return entry;
+        if (key_matches(key_hash, key, key_len,
+                        entry->key_hash,
+                        entry->key,
+                        entry->key_len)) {
+            return entry;
+        }
     }
     return NULL;
 }
 
 static void key_meta_fill_info(const tlc_core_key_meta_entry_t *entry,
                                tlc_core_key_migration_info_t *info) {
-    if (!info)
-        return;
     *info = (tlc_core_key_migration_info_t){
         .key_hash = entry->key_hash,
         .key_version = entry->key_version,
@@ -618,6 +562,9 @@ static int key_meta_state_blocks_source_access(uint32_t migration_state) {
            migration_state == TLC_CORE_KEY_SOURCE_GC;
 }
 
+/* TODO: maintain this as an active source-fence refcount and decrement it
+ * when cutover/source-gc entries are released, instead of leaving it as a
+ * conservative once-set fast-path gate. */
 int tlc_core_source_fence_active(const tlc_core_t *core) {
     return atomic_load_explicit(&core->source_fence_active_count,
                                 memory_order_acquire) != 0;
@@ -669,14 +616,14 @@ static int key_meta_blocks_source_access(tlc_core_t *core,
     int blocked = 0;
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     blocked = meta &&
         (meta->tombstone ||
          (source_fence_active &&
           key_meta_state_blocks_source_access(meta->migration_state)));
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return blocked;
 }
 
@@ -711,7 +658,8 @@ static int32_t hot_get(tlc_core_t *core, uint64_t key_hash) {
         if (i + 1 < TLC_CORE_HOT_PROBES) {
             __builtin_prefetch(&hold->table[(slot + i + 1) & hold->mask], 0, 3);
         }
-        int32_t warm_idx = atomic_load_explicit(&hold->table[pos].warm_idx, memory_order_acquire);
+        int32_t warm_idx =
+            atomic_load_explicit(&hold->table[pos].warm_idx, memory_order_acquire);
         if (warm_idx < 0) break;
         uint64_t entry_hash =
             atomic_load_explicit(&hold->table[pos].key_hash, memory_order_relaxed);
@@ -825,39 +773,20 @@ static void location_cache_store_entry(tlc_core_location_cache_entry_t *entry,
     if (location_cache_try_begin_write(entry, &seq) != 0)
         return;
 
-    uint32_t words =
-        (key_len + (uint32_t)sizeof(uint64_t) - 1u) /
-        (uint32_t)sizeof(uint64_t);
+    uint32_t words = (key_len + (uint32_t)sizeof(uint64_t) - 1u) / (uint32_t)sizeof(uint64_t);
     for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_KEY_WORDS; i++) {
-        uint64_t word = i < words ?
-            location_cache_key_word(key, key_len, i) : 0;
-        atomic_store_explicit(&entry->key_words[i],
-                              word,
-                              memory_order_relaxed);
+        uint64_t word = i < words ?  location_cache_key_word(key, key_len, i) : 0;
+        atomic_store_explicit(&entry->key_words[i], word, memory_order_relaxed);
     }
-    atomic_store_explicit(&entry->region_id,
-                          location->region_id,
-                          memory_order_relaxed);
-    atomic_store_explicit(&entry->region_index,
-                          location->region_index,
-                          memory_order_relaxed);
-    atomic_store_explicit(&entry->local_slot,
-                          location->local_slot,
-                          memory_order_relaxed);
-    atomic_store_explicit(&entry->bytes,
-                          location->bytes,
-                          memory_order_relaxed);
-    atomic_store_explicit(&entry->offset,
-                          location->offset,
-                          memory_order_relaxed);
-    atomic_store_explicit(&entry->owner_generation,
-                          location->owner_generation,
-                          memory_order_relaxed);
+    atomic_store_explicit(&entry->region_id, location->region_id, memory_order_relaxed);
+    atomic_store_explicit(&entry->region_index, location->region_index, memory_order_relaxed);
+    atomic_store_explicit(&entry->local_slot, location->local_slot, memory_order_relaxed);
+    atomic_store_explicit(&entry->bytes, location->bytes, memory_order_relaxed);
+    atomic_store_explicit(&entry->offset, location->offset, memory_order_relaxed);
+    atomic_store_explicit(&entry->owner_generation, location->owner_generation, memory_order_relaxed);
     atomic_store_explicit(&entry->key_hash, key_hash, memory_order_relaxed);
     atomic_store_explicit(&entry->key_len, key_len, memory_order_relaxed);
-    atomic_store_explicit(&entry->seq,
-                          seq + SEQLOCK_VERSION_STEP,
-                          memory_order_release);
+    atomic_store_explicit(&entry->seq, seq + SEQLOCK_VERSION_STEP, memory_order_release);
 }
 
 static void location_cache_put(tlc_core_t *core,
@@ -1124,11 +1053,8 @@ static void slot_write_payload(tlc_core_warm_region_runtime_t *region,
 
 static void slot_publish_ready(vemb_v16_warm_slot_meta_t *meta,
                                uint64_t old_seq) {
-    atomic_store_explicit(&meta->write_seq,
-                          old_seq + SEQLOCK_VERSION_STEP,
-                          memory_order_release);
-    atomic_store_explicit(&meta->state, VEMB_V16_WARM_SLOT_READY,
-                          memory_order_release);
+    atomic_store_explicit(&meta->write_seq, old_seq + SEQLOCK_VERSION_STEP, memory_order_release);
+    atomic_store_explicit(&meta->state, VEMB_V16_WARM_SLOT_READY, memory_order_release);
 }
 
 static void fill_location_from_slot(const tlc_core_warm_region_runtime_t *region,
@@ -1142,19 +1068,15 @@ static void fill_location_from_slot(const tlc_core_warm_region_runtime_t *region
         .local_slot = local_slot,
         .bytes = meta->bytes,
         .offset = (uint64_t)local_slot * region->value_size,
-        .owner_generation =
-            atomic_load_explicit(&meta->owner_generation,
-                                 memory_order_acquire),
-        };
+        .owner_generation = atomic_load_explicit(&meta->owner_generation, memory_order_acquire),
+    };
 }
 
 static void warm_slot_note_read_access(vemb_v16_warm_slot_meta_t *meta) {
-    uint32_t clock_bit =
-        atomic_load_explicit(&meta->clock_bit, memory_order_relaxed);
+    uint32_t clock_bit = atomic_load_explicit(&meta->clock_bit, memory_order_relaxed);
     if (clock_bit != 0)
         return;
-    atomic_store_explicit(&meta->last_access_ns, vemb_v16_monotonic_ns(),
-                          memory_order_relaxed);
+    atomic_store_explicit(&meta->last_access_ns, vemb_v16_monotonic_ns(), memory_order_relaxed);
     atomic_store_explicit(&meta->clock_bit, 1, memory_order_relaxed);
 }
 
@@ -1170,23 +1092,19 @@ static tlc_core_warm_verify_rc_t warm_slot_verify_ready_result(
     if (local_slot >= region->capacity_slots)
         return TLC_CORE_WARM_VERIFY_MISS;
     vemb_v16_warm_slot_meta_t *meta = &region->slot_meta[local_slot];
-    uint32_t state = atomic_load_explicit(&meta->state,
-                                          memory_order_acquire);
+    uint32_t state = atomic_load_explicit(&meta->state, memory_order_acquire);
     if (state != VEMB_V16_WARM_SLOT_READY)
         return TLC_CORE_WARM_VERIFY_MISS;
-    uint64_t seq1 = atomic_load_explicit(&meta->write_seq,
-                                         memory_order_acquire);
+    uint64_t seq1 = atomic_load_explicit(&meta->write_seq, memory_order_acquire);
     if (seqlock_seq_is_writing(seq1))
         return TLC_CORE_WARM_VERIFY_BUSY;
     uint64_t owner_generation =
-        atomic_load_explicit(&meta->owner_generation,
-                             memory_order_acquire);
+        atomic_load_explicit(&meta->owner_generation, memory_order_acquire);
     uint32_t bytes = meta->bytes;
     uint64_t slot_key_hash = meta->key_hash;
     uint64_t slot_fp = meta->key_fingerprint;
     atomic_thread_fence(memory_order_acquire);
-    uint64_t seq2 = atomic_load_explicit(&meta->write_seq,
-                                         memory_order_acquire);
+    uint64_t seq2 = atomic_load_explicit(&meta->write_seq, memory_order_acquire);
     if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
         return TLC_CORE_WARM_VERIFY_BUSY;
     if (slot_key_hash != key_hash || (fp != 0 && slot_fp != fp) ||
@@ -1298,44 +1216,27 @@ static int location_cache_get(tlc_core_t *core,
                               uint32_t key_len,
                               uint64_t key_hash,
                               tlc_warm_location_t *location) {
-    tlc_core_location_cache_t *cache = &core->location_cache;
-    if (!key_valid(key, key_len) || !location)
-        return -1;
+    RETURN_IF(!key_valid(key, key_len) || !location, -1);
 
+    tlc_core_location_cache_t *cache = &core->location_cache;
     uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cache->mask);
     for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_PROBES; i++) {
-        tlc_core_location_cache_entry_t *entry =
-            &cache->entries[(slot + i) & cache->mask];
-        uint64_t seq1 = atomic_load_explicit(&entry->seq,
-                                             memory_order_acquire);
-        if (seq1 == SEQLOCK_EMPTY ||
-            seqlock_seq_is_writing(seq1))
+        tlc_core_location_cache_entry_t *entry = &cache->entries[(slot + i) & cache->mask];
+        uint64_t seq1 = atomic_load_explicit(&entry->seq, memory_order_acquire);
+        if (seq1 == SEQLOCK_EMPTY || seqlock_seq_is_writing(seq1))
             continue;
         if (!location_cache_entry_key_matches(entry, key, key_len, key_hash))
             continue;
 
         tlc_warm_location_t cached = {
-            .region_id =
-                atomic_load_explicit(&entry->region_id,
-                                     memory_order_relaxed),
-            .region_index =
-                atomic_load_explicit(&entry->region_index,
-                                     memory_order_relaxed),
-            .local_slot =
-                atomic_load_explicit(&entry->local_slot,
-                                     memory_order_relaxed),
-            .bytes =
-                atomic_load_explicit(&entry->bytes,
-                                     memory_order_relaxed),
-            .offset =
-                atomic_load_explicit(&entry->offset,
-                                     memory_order_relaxed),
-            .owner_generation =
-                atomic_load_explicit(&entry->owner_generation,
-                                     memory_order_relaxed),
+            .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
+            .region_index = atomic_load_explicit(&entry->region_index, memory_order_relaxed),
+            .local_slot = atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
+            .bytes = atomic_load_explicit(&entry->bytes, memory_order_relaxed),
+            .offset = atomic_load_explicit(&entry->offset, memory_order_relaxed),
+            .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
         };
-        uint64_t seq2 = atomic_load_explicit(&entry->seq,
-                                             memory_order_acquire);
+        uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
         if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
             continue;
         if (location_cache_validate_location(core,
@@ -1354,21 +1255,14 @@ static int location_cache_peek(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                tlc_warm_location_t *location) {
+    RETURN_IF(!key_valid(key, key_len) || !location, -1);
     tlc_core_location_cache_t *cache = &core->location_cache;
-    if (!key_valid(key, key_len) || !location)
-        return -1;
-
     uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cache->mask);
     for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_PROBES; i++) {
-        tlc_core_location_cache_entry_t *entry =
-            &cache->entries[(slot + i) & cache->mask];
-        uint64_t seq1 = atomic_load_explicit(&entry->seq,
-                                             memory_order_acquire);
-        if (seq1 == SEQLOCK_EMPTY ||
-            seqlock_seq_is_writing(seq1))
-            continue;
-        if (!location_cache_entry_key_matches(entry, key, key_len, key_hash))
-            continue;
+        tlc_core_location_cache_entry_t *entry = &cache->entries[(slot + i) & cache->mask];
+        uint64_t seq1 = atomic_load_explicit(&entry->seq, memory_order_acquire);
+        if (seq1 == SEQLOCK_EMPTY || seqlock_seq_is_writing(seq1)) continue;
+        if (!location_cache_entry_key_matches(entry, key, key_len, key_hash)) continue;
 
         tlc_warm_location_t cached = {
             .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
@@ -1379,8 +1273,7 @@ static int location_cache_peek(tlc_core_t *core,
             .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
         };
         uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
-        if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
-            continue;
+        if (seq1 != seq2 || seqlock_seq_is_writing(seq2)) continue;
         *location = cached;
         return 0;
     }
@@ -2279,12 +2172,10 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
     }
     int32_t hot_idx = hot_get(core, key_hash);
     if (warm_validate_idx(core, hot_idx, key, key_len, key_hash, location) == 0) {
-        location_cache_put(core, key, key_len, key_hash, location);
-        return 0;
+        goto found;
     }
     if (warm_lookup(core, key, key_len, key_hash, location) == 0) {
-        location_cache_put(core, key, key_len, key_hash, location);
-        return 0;
+        goto found;
     }
 
     const uint8_t *cold_value = NULL;
@@ -2296,6 +2187,8 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
     int warm_rc = warm_put(core, key, key_len, key_hash,
                            cold_value, cold_value_size, location);
     RETURN_IF(warm_rc != 0, -1);
+
+found:
     location_cache_put(core, key, key_len, key_hash, location);
     return 0;
 }
@@ -2370,9 +2263,9 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (tlc_core_source_fence_active(core) &&
         meta &&
         key_meta_state_blocks_source_access(meta->migration_state)) {
@@ -2384,7 +2277,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                  topology_epoch,
                                  enforce_epoch,
                                  meta);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (enforce_epoch && meta && topology_epoch < meta->topology_epoch) {
@@ -2396,7 +2289,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                  topology_epoch,
                                  enforce_epoch,
                                  meta);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (!meta && shard->count >= shard->capacity) {
@@ -2408,7 +2301,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                  topology_epoch,
                                  enforce_epoch,
                                  meta);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     int cold_rc = cold_append(core, key, key_len, key_hash, value, value_size);
@@ -2421,7 +2314,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                  topology_epoch,
                                  enforce_epoch,
                                  meta);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (meta &&
@@ -2442,13 +2335,13 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
         key_meta_set_tombstone_locked(core, meta, 0);
         meta->location = *location;
         location_cache_put(core, key, key_len, key_hash, location);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return 0;
     }
 
     if (warm_put(core, key, key_len, key_hash,
                  value, value_size, location) == 0) {
-        meta = key_meta_find_or_create_locked(core, key, key_len, key_hash);
+        meta = key_meta_find_locked(core, key, key_len, key_hash, 1);
         if (!meta) {
             tlc_core_log_put_failure("key_meta_create_after_warm_failed",
                                      core,
@@ -2458,7 +2351,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                      topology_epoch,
                                      enforce_epoch,
                                      NULL);
-            key_meta_shard_unlock(core, shard);
+            bitmap_unlock(&core->key_meta_locks, shard->lock_id);
             return -1;
         }
         meta->key_version++;
@@ -2467,7 +2360,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
         key_meta_set_tombstone_locked(core, meta, 0);
         meta->location = *location;
         location_cache_put(core, key, key_len, key_hash, location);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return 0;
     }
 
@@ -2480,13 +2373,13 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                              topology_epoch,
                              enforce_epoch,
                              meta);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return -1;
 #else
     atomic_fetch_add_explicit(&core->warm_alloc_cold_spill, 1,
                               memory_order_relaxed);
     *location = tlc_invalid_location;
-    meta = key_meta_find_or_create_locked(core, key, key_len, key_hash);
+    meta = key_meta_find_locked(core, key, key_len, key_hash, 1);
     if (!meta) {
         tlc_core_log_put_failure("key_meta_create_after_spill_failed",
                                  core,
@@ -2496,7 +2389,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
                                  topology_epoch,
                                  enforce_epoch,
                                  NULL);
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     meta->key_version++;
@@ -2504,7 +2397,7 @@ static int tlc_core_put_location_epoch(tlc_core_t *core,
         meta->topology_epoch = topology_epoch;
     key_meta_set_tombstone_locked(core, meta, 0);
     meta->location = *location;
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 #endif
 }
@@ -2559,15 +2452,15 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta ||
         meta->tombstone ||
         (tlc_core_source_fence_active(core) &&
          key_meta_state_blocks_source_access(meta->migration_state)) ||
         topology_epoch < meta->topology_epoch) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
 
@@ -2577,7 +2470,7 @@ int tlc_core_delete_with_epoch(tlc_core_t *core,
     key_meta_set_tombstone_locked(core, meta, 1);
     meta->location = tlc_invalid_location;
     key_meta_fill_info(meta, info);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -2602,15 +2495,15 @@ int tlc_core_get_migration_info(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     key_meta_fill_info(meta, info);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -2644,26 +2537,26 @@ int tlc_core_mark_migrating_in_shard(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta || meta->tombstone) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (meta->migration_state != TLC_CORE_KEY_SOURCE_ACTIVE &&
         meta->migration_state != TLC_CORE_KEY_MIGRATING) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (meta->migration_state == TLC_CORE_KEY_MIGRATING &&
         (meta->target_owner != target_owner ||
          meta->shard_id != shard_id)) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (topology_epoch < meta->topology_epoch) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     meta->migration_state = TLC_CORE_KEY_MIGRATING;
@@ -2672,7 +2565,7 @@ int tlc_core_mark_migrating_in_shard(tlc_core_t *core,
     if (topology_epoch > meta->topology_epoch)
         meta->topology_epoch = topology_epoch;
     key_meta_fill_info(meta, info);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -2688,15 +2581,15 @@ int tlc_core_mark_cutover(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta ||
         (meta->migration_state != TLC_CORE_KEY_MIGRATING &&
          meta->migration_state != TLC_CORE_KEY_CUTOVER) ||
         meta->target_owner != target_owner ||
         topology_epoch < meta->topology_epoch) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     key_meta_note_source_fence_transition(core,
@@ -2708,7 +2601,7 @@ int tlc_core_mark_cutover(tlc_core_t *core,
     if (topology_epoch > meta->owner_epoch)
         meta->owner_epoch = topology_epoch;
     key_meta_fill_info(meta, info);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -2724,15 +2617,15 @@ int tlc_core_mark_source_gc(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta ||
         (meta->migration_state != TLC_CORE_KEY_CUTOVER &&
          meta->migration_state != TLC_CORE_KEY_SOURCE_GC) ||
         meta->target_owner != target_owner ||
         topology_epoch < meta->topology_epoch) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     key_meta_note_source_fence_transition(core,
@@ -2744,7 +2637,7 @@ int tlc_core_mark_source_gc(tlc_core_t *core,
     if (topology_epoch > meta->owner_epoch)
         meta->owner_epoch = topology_epoch;
     key_meta_fill_info(meta, info);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -2761,15 +2654,15 @@ int tlc_core_accept_owner_lease(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta ||
         meta->migration_state != TLC_CORE_KEY_DEST_COMMITTED ||
         meta->target_owner != target_owner ||
         topology_epoch < meta->topology_epoch ||
         owner_epoch < meta->owner_epoch) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (topology_epoch > meta->topology_epoch)
@@ -2777,7 +2670,7 @@ int tlc_core_accept_owner_lease(tlc_core_t *core,
     if (owner_epoch > meta->owner_epoch)
         meta->owner_epoch = owner_epoch;
     key_meta_fill_info(meta, info);
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -2794,15 +2687,15 @@ int tlc_core_key_is_source_cutover(tlc_core_t *core,
     int cutover = 0;
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (meta) {
         cutover = key_meta_state_blocks_source_access(meta->migration_state);
         if (cutover)
             key_meta_fill_info(meta, info);
     }
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return cutover;
 }
 
@@ -2811,7 +2704,7 @@ int tlc_core_has_uncommitted_source_migrations(tlc_core_t *core) {
     int has_uncommitted = 0;
     for (uint32_t s = 0; s < core->key_meta_shard_count; s++) {
         tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[s];
-        key_meta_shard_lock(core, shard);
+        bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
         for (uint32_t i = 0; i < shard->capacity; i++) {
             const tlc_core_key_meta_entry_t *meta = &shard->entries[i];
             if (meta->occupied &&
@@ -2821,7 +2714,7 @@ int tlc_core_has_uncommitted_source_migrations(tlc_core_t *core) {
                 break;
             }
         }
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         if (has_uncommitted)
             break;
     }
@@ -2842,7 +2735,7 @@ int tlc_core_collect_migration_keys(tlc_core_t *core,
     *key_count = 0;
     for (uint32_t s = 0; s < core->key_meta_shard_count; s++) {
         tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[s];
-        key_meta_shard_lock(core, shard);
+        bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
         for (uint32_t i = 0; i < shard->capacity; i++) {
             const tlc_core_key_meta_entry_t *meta = &shard->entries[i];
             if (!meta->occupied ||
@@ -2854,7 +2747,7 @@ int tlc_core_collect_migration_keys(tlc_core_t *core,
                 continue;
             }
             if (*key_count >= max_keys) {
-                key_meta_shard_unlock(core, shard);
+                bitmap_unlock(&core->key_meta_locks, shard->lock_id);
                 return -1;
             }
             tlc_core_migration_key_ref_t *entry = &keys[*key_count];
@@ -2865,7 +2758,7 @@ int tlc_core_collect_migration_keys(tlc_core_t *core,
             key_meta_fill_info(meta, &entry->info);
             (*key_count)++;
         }
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     }
     return 0;
 }
@@ -2887,7 +2780,7 @@ int tlc_core_collect_migration_keys_page(tlc_core_t *core,
 
     for (uint32_t s = 0; s < core->key_meta_shard_count; s++) {
         tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[s];
-        key_meta_shard_lock(core, shard);
+        bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
         for (uint32_t i = 0; i < shard->capacity; i++) {
             const tlc_core_key_meta_entry_t *meta = &shard->entries[i];
             if (!meta->occupied ||
@@ -2910,7 +2803,7 @@ int tlc_core_collect_migration_keys_page(tlc_core_t *core,
             key_meta_fill_info(meta, &entry->info);
             (*key_count)++;
         }
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     }
     return 0;
 }
@@ -2926,7 +2819,7 @@ int tlc_core_count_migration_keys(tlc_core_t *core,
 
     for (uint32_t s = 0; s < core->key_meta_shard_count; s++) {
         tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[s];
-        key_meta_shard_lock(core, shard);
+        bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
         for (uint32_t i = 0; i < shard->capacity; i++) {
             const tlc_core_key_meta_entry_t *meta = &shard->entries[i];
             if (!meta->occupied ||
@@ -2939,7 +2832,7 @@ int tlc_core_count_migration_keys(tlc_core_t *core,
             }
             (*key_count)++;
         }
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     }
     return 0;
 }
@@ -2954,7 +2847,7 @@ int tlc_core_collect_migration_ranges(tlc_core_t *core,
     *range_count = 0;
     for (uint32_t s = 0; s < core->key_meta_shard_count; s++) {
         tlc_core_key_meta_shard_t *shard = &core->key_meta_shards[s];
-        key_meta_shard_lock(core, shard);
+        bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
         for (uint32_t i = 0; i < shard->capacity; i++) {
             const tlc_core_key_meta_entry_t *meta = &shard->entries[i];
             if (!meta->occupied ||
@@ -2976,7 +2869,7 @@ int tlc_core_collect_migration_ranges(tlc_core_t *core,
             }
             if (!range) {
                 if (*range_count >= max_ranges) {
-                    key_meta_shard_unlock(core, shard);
+                    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
                     return -1;
                 }
                 range = &ranges[*range_count];
@@ -2988,7 +2881,7 @@ int tlc_core_collect_migration_ranges(tlc_core_t *core,
             }
             range->key_count++;
         }
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     }
     return 0;
 }
@@ -3013,7 +2906,7 @@ int tlc_core_collect_source_active_keys(tlc_core_t *core,
         if (flat >= shard_base + shard->capacity)
             continue;
         uint32_t i = flat > shard_base ? flat - shard_base : 0;
-        key_meta_shard_lock(core, shard);
+        bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
         for (; i < shard->capacity; i++) {
             next = shard_base + i;
             const tlc_core_key_meta_entry_t *meta = &shard->entries[i];
@@ -3023,7 +2916,7 @@ int tlc_core_collect_source_active_keys(tlc_core_t *core,
                 continue;
             }
             if (*key_count >= max_keys) {
-                key_meta_shard_unlock(core, shard);
+                bitmap_unlock(&core->key_meta_locks, shard->lock_id);
                 *cursor = next;
                 return 0;
             }
@@ -3035,7 +2928,7 @@ int tlc_core_collect_source_active_keys(tlc_core_t *core,
             key_meta_fill_info(meta, &entry->info);
             (*key_count)++;
         }
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         flat = shard_base + shard->capacity;
         next = flat;
     }
@@ -3059,15 +2952,15 @@ int tlc_core_snapshot(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_locked(core, key, key_len, key_hash);
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
     if (!meta) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (key_meta_state_blocks_source_access(meta->migration_state)) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
 
@@ -3087,14 +2980,14 @@ int tlc_core_snapshot(tlc_core_t *core,
     memcpy(snapshot->key, key, key_len);
 
     if (snapshot->tombstone) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return 0;
     }
 
     tlc_warm_location_t location = tlc_invalid_location;
     if (tlc_core_get_warm_location_raw(core, key, key_len,
                                        key_hash, &location) != 0) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     if (tlc_core_copy_warm_location_value(core,
@@ -3103,12 +2996,12 @@ int tlc_core_snapshot(tlc_core_t *core,
                                           value_out,
                                           value_out_size,
                                           TLC_CORE_WARM_BUSY_RETRIES) != 0) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         return -1;
     }
     snapshot->location = location;
     meta->location = location;
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     return 0;
 }
 
@@ -3131,26 +3024,27 @@ int tlc_core_apply_migration(tlc_core_t *core,
 
     tlc_core_key_meta_shard_t *shard =
         key_meta_shard_for_hash(core, snapshot->key_hash);
-    key_meta_shard_lock(core, shard);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
     tlc_core_key_meta_entry_t *meta =
-        key_meta_find_or_create_locked(core,
-                                       snapshot->key,
-                                       snapshot->key_len,
-                                       snapshot->key_hash);
+        key_meta_find_locked(core,
+                             snapshot->key,
+                             snapshot->key_len,
+                             snapshot->key_hash,
+                             1);
     if (!meta) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         *status = TLC_CORE_MIGRATION_ERROR;
         return -1;
     }
     if (incoming_snapshot_is_stale(meta, snapshot)) {
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         *status = TLC_CORE_MIGRATION_STALE_REJECTED;
         return 0;
     }
     if (incoming_snapshot_is_duplicate(meta, snapshot)) {
         if (location)
             *location = meta->location;
-        key_meta_shard_unlock(core, shard);
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
         *status = TLC_CORE_MIGRATION_DUPLICATE;
         return 0;
     }
@@ -3170,7 +3064,7 @@ int tlc_core_apply_migration(tlc_core_t *core,
                      value,
                      value_size,
                      &new_location) != 0) {
-            key_meta_shard_unlock(core, shard);
+            bitmap_unlock(&core->key_meta_locks, shard->lock_id);
             *status = TLC_CORE_MIGRATION_RETRY;
             return 0;
         }
@@ -3193,7 +3087,7 @@ int tlc_core_apply_migration(tlc_core_t *core,
                            &meta->location);
     if (location)
         *location = meta->location;
-    key_meta_shard_unlock(core, shard);
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
     *status = TLC_CORE_MIGRATION_APPLIED;
     return 0;
 }
