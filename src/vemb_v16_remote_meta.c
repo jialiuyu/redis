@@ -3,6 +3,7 @@
 #include "cpu_relax.h"
 #include "macro.h"
 #include "vemb_v16_hash.h"
+#include "vemb_v16_util.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -14,19 +15,8 @@ typedef char vemb_v16_remote_meta_bucket_size_must_be_64[
 typedef char vemb_v16_remote_meta_entry_size_must_be_64[
     sizeof(vemb_v16_remote_meta_entry_t) == 64 ? 1 : -1];
 
-static size_t align64(size_t value) {
-    return (value + 63u) & ~(size_t)63u;
-}
-
 static int is_power_of_two(uint32_t value) {
     return value && ((value & (value - 1u)) == 0);
-}
-
-static uint32_t pow2_ceil_u32(uint32_t value) {
-    uint32_t p = 1;
-    while (p < value && p < (1u << 30))
-        p <<= 1;
-    return p;
 }
 
 static uint64_t mix_hash64(uint64_t x) {
@@ -68,8 +58,8 @@ static int derive_legacy_shape(uint32_t requested_entry_count,
     if (derived_ways == 0)
         derived_ways = 1;
     uint32_t sets =
-        pow2_ceil_u32((requested_entry_count + derived_ways - 1u) /
-                      derived_ways);
+        vemb_v16_pow2_ceil_u32(
+            (requested_entry_count + derived_ways - 1u) / derived_ways);
     RETURN_IF(sets == 0, VEMB_V16_REMOTE_META_INVALID);
     *set_count = sets;
     *ways = derived_ways;
@@ -84,7 +74,8 @@ static int layout_sets(vemb_v16_remote_meta_view_t *view,
     RETURN_IF(!view || !base || !is_power_of_two(set_count) ||
               ways == 0 || ways > VEMB_V16_REMOTE_META_MAX_WAYS,
               VEMB_V16_REMOTE_META_INVALID);
-    size_t entries_off = align64(sizeof(vemb_v16_remote_meta_header_t));
+    size_t entries_off =
+        vemb_v16_align64_size(sizeof(vemb_v16_remote_meta_header_t));
     size_t entry_count = (size_t)set_count * ways;
     size_t need =
         entries_off + entry_count * sizeof(vemb_v16_remote_meta_entry_t);
@@ -105,7 +96,8 @@ size_t vemb_v16_remote_meta_layout_bytes_for_sets(uint32_t set_count,
         ways > VEMB_V16_REMOTE_META_MAX_WAYS) {
         return 0;
     }
-    size_t entries_off = align64(sizeof(vemb_v16_remote_meta_header_t));
+    size_t entries_off =
+        vemb_v16_align64_size(sizeof(vemb_v16_remote_meta_header_t));
     return entries_off +
            (size_t)set_count * ways * sizeof(vemb_v16_remote_meta_entry_t);
 }

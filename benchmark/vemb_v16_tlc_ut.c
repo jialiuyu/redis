@@ -161,7 +161,7 @@ static void test_overwrite_and_capacity(void) {
     assert(vemb_v16_tlc_get_handle(tlc, evicting, (uint32_t)strlen(evicting),
                                    evicting_hash, &handle, &warm_slot) == 0);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_same_key_overwrite >= 1);
     assert(stats.warm_eviction_success >= 1);
     vemb_v16_tlc_destroy(tlc);
@@ -211,7 +211,7 @@ static void test_eviction_rejects_stale_handle(void) {
     assert(len == sizeof(second));
     assert(memcmp(bytes, second, sizeof(second)) == 0);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_stale_handle_reject >= 1);
     vemb_v16_tlc_destroy(tlc);
 }
@@ -240,7 +240,7 @@ static void test_cold_read_through_promotes_warm_handle(void) {
     init_test_allocator(&allocator, 42, max_vectors);
     assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
     fill_vector(vector, dim, 200);
-    assert(vemb_v16_tlc_cold_append(tlc, key, (uint32_t)strlen(key), key_hash,
+    assert(tlc_core_cold_append(tlc->core, key, (uint32_t)strlen(key), key_hash,
                                     vector, sizeof(vector)) == 0);
     assert(vemb_v16_tlc_get_handle(tlc, key, (uint32_t)strlen(key), key_hash,
                                    &handle, &warm_slot) == 0);
@@ -651,7 +651,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     assert(h3.offset == h1.offset);
     assert(memcmp(local_region, overwrite, sizeof(overwrite)) == 0);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_region_count == 2);
     assert(stats.warm_alloc_local >= 1);
     assert(stats.warm_region_full_count >= 1);
@@ -715,7 +715,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     assert(handle.bytes == sizeof(vector));
     assert(handle.owner_generation >= 2);
     tlc_core_stats_t stats;
-    vemb_v16_tlc_get_core_stats(tlc, &stats);
+    tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_region_count == 2);
     assert(stats.warm_region_full_count >= 1);
     assert(stats.warm_alloc_cold_spill == 0);
@@ -920,11 +920,13 @@ static void test_vsim_key2_lookup_remote_source(void) {
     fill_vector(vector, dim, 300);
     assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
                             vector, sizeof(vector), &handle, &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            key2,
-                                            (uint32_t)strlen(key2),
-                                            key2_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       key2_hash,
+                                       &handle,
+                                       0) == 0);
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          key2,
@@ -1001,11 +1003,13 @@ static void test_remote_meta_async_publish_flush(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta_async(tlc,
-                                                  key,
-                                                  (uint32_t)strlen(key),
-                                                  key_hash,
-                                                  &handle) == 0);
+    assert(enqueue_remote_meta_publish(tlc,
+                                       tlc->remote_meta_view,
+                                       key,
+                                       (uint32_t)strlen(key),
+                                       key_hash,
+                                       &handle,
+                                       0) == 0);
     (void)vemb_v16_tlc_flush_remote_meta_publishes(tlc, 0);
     assert(vemb_v16_remote_meta_lookup(&meta,
                                        key,
@@ -1618,11 +1622,13 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                             &warm_slot) == 0);
     stale_old = stale_new;
     stale_old.owner_generation++;
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            stale_key,
-                                            (uint32_t)strlen(stale_key),
-                                            stale_hash,
-                                            &stale_old) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       stale_key,
+                                       (uint32_t)strlen(stale_key),
+                                       stale_hash,
+                                       &stale_old,
+                                       0) == 0);
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          stale_key,
@@ -1646,11 +1652,13 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                             sizeof(first),
                             &evict_a_handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            evict_a,
-                                            (uint32_t)strlen(evict_a),
-                                            evict_a_hash,
-                                            &evict_a_handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       evict_a,
+                                       (uint32_t)strlen(evict_a),
+                                       evict_a_hash,
+                                       &evict_a_handle,
+                                       0) == 0);
     assert(vemb_v16_tlc_put(owner,
                             evict_b,
                             (uint32_t)strlen(evict_b),
@@ -1659,11 +1667,13 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                             sizeof(other),
                             &evict_b_handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            evict_b,
-                                            (uint32_t)strlen(evict_b),
-                                            evict_b_hash,
-                                            &evict_b_handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       evict_b,
+                                       (uint32_t)strlen(evict_b),
+                                       evict_b_hash,
+                                       &evict_b_handle,
+                                       0) == 0);
 
     memset(&remote_handle, 0, sizeof(remote_handle));
     source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
@@ -1766,11 +1776,13 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
     fill_vector(second, dim, 600);
     assert(vemb_v16_tlc_put(owner, key1, (uint32_t)strlen(key1), key1_hash,
                             first, sizeof(first), &handle, &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner,
-                                            key1,
-                                            (uint32_t)strlen(key1),
-                                            key1_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       key1,
+                                       (uint32_t)strlen(key1),
+                                       key1_hash,
+                                       &handle,
+                                       0) == 0);
     assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
                             second, sizeof(second), &handle, &warm_slot) == 0);
 
@@ -1783,7 +1795,7 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
                                          &timing) != 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_NONE);
     assert(timing.remote_meta_lookup_count == 1);
-    vemb_v16_tlc_get_core_stats(reader, &stats);
+    tlc_core_get_stats(reader->core, &stats);
     assert(stats.remote_meta_stale >= 1);
     assert(stats.warm_stale_handle_reject >= 1);
 
@@ -1902,11 +1914,13 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_publish_remote_meta(owner2,
-                                            key2,
-                                            (uint32_t)strlen(key2),
-                                            key2_hash,
-                                            &handle) == 0);
+    assert(publish_remote_meta_to_view(owner2,
+                                       owner2->remote_meta_view,
+                                       key2,
+                                       (uint32_t)strlen(key2),
+                                       key2_hash,
+                                       &handle,
+                                       0) == 0);
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          key2,
@@ -2075,7 +2089,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
                             sizeof(v1),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2083,7 +2097,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     assert(info.key_version == 1);
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_ACTIVE);
 
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -2095,7 +2109,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     assert(info.migration_state == TLC_CORE_KEY_MIGRATING);
     assert(info.target_owner == 3);
 
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  key,
                                  key_len,
                                  key_hash,
@@ -2134,7 +2148,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
                             sizeof(v2),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  key,
                                  key_len,
                                  key_hash,
@@ -2229,7 +2243,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
                                        7,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2247,7 +2261,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
                                        6,
                                        &handle,
                                        &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2277,7 +2291,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
                                        8,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2330,7 +2344,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v1),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -2349,14 +2363,14 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v2),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_cutover(source,
+    assert(tlc_core_mark_cutover(source->core,
                                      key,
                                      key_len,
                                      key_hash,
                                      19,
                                      3,
                                      &info) != 0);
-    assert(vemb_v16_tlc_mark_cutover(source,
+    assert(tlc_core_mark_cutover(source->core,
                                      key,
                                      key_len,
                                      key_hash,
@@ -2367,7 +2381,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
     assert(info.topology_epoch == 21);
     assert(info.owner_epoch == 21);
     assert(info.target_owner == 3);
-    assert(vemb_v16_tlc_key_is_source_cutover(source,
+    assert(tlc_core_key_is_source_cutover(source->core,
                                               key,
                                               key_len,
                                               key_hash,
@@ -2388,7 +2402,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v3),
                             &handle,
                             &warm_slot) != 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  key,
                                  key_len,
                                  key_hash,
@@ -2397,7 +2411,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                                  &snapshot,
                                  snapshot_value,
                                  sizeof(snapshot_value)) != 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -2613,7 +2627,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
                                    key_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2746,7 +2760,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
     assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_OK);
     assert(resp.lease.owner_epoch == 45);
     assert(resp.lease.target_owner == 3);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -2761,7 +2775,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
                                                     &lease_req,
                                                     &resp) == 0);
     assert(resp.status == VEMB_V16_UB_MIGRATION_RPC_RETRY);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -3087,7 +3101,7 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        key,
                                        key_len,
                                        key_hash,

@@ -3,6 +3,7 @@
 #include "macro.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
+#include "vemb_v16_util.h"
 #include "zmalloc.h"
 
 #include <assert.h>
@@ -54,13 +55,6 @@ static int parse_u64_value(const char *s, uint64_t *out) {
 #define VEMB_V16_STORAGE_SCALEOUT_AUTO_MAX_SHARDS 16u
 #define VEMB_V16_STORAGE_MIGRATION_RETRY_INTERVAL_US 10000u
 #define VEMB_V16_STORAGE_MIGRATION_RETRY_BATCH_SIZE 32u
-
-static uint32_t pow2_ceil_u32(uint64_t value) {
-    uint32_t p = 1;
-    while ((uint64_t)p < value && p < (1u << 30))
-        p <<= 1;
-    return p;
-}
 
 static int cmp_u32(const void *a, const void *b) {
     uint32_t va = *(const uint32_t *)a;
@@ -237,7 +231,7 @@ static int storage_remote_meta_open_view(vemb_v16_storage_ctx_t *storage,
             requested_entry_count : storage->max_vectors;
         *bucket_count = requested_bucket_count ?
             requested_bucket_count :
-            pow2_ceil_u32((uint64_t)(*entry_count) * 2u);
+            vemb_v16_pow2_ceil_u32((uint64_t)(*entry_count) * 2u);
         *bytes = vemb_v16_remote_meta_layout_bytes(*entry_count,
                                                    *bucket_count);
     }
@@ -926,7 +920,8 @@ static int reset_remote_meta_backing(uint32_t owner_id,
             return 0;
         }
         uint32_t effective_bucket_count = bucket_count ?
-            bucket_count : pow2_ceil_u32((uint64_t)entry_count * 2u);
+            bucket_count :
+            vemb_v16_pow2_ceil_u32((uint64_t)entry_count * 2u);
         size_t bytes = (set_count && ways) ?
             vemb_v16_remote_meta_layout_bytes_for_sets(set_count, ways) :
             vemb_v16_remote_meta_layout_bytes(entry_count,
@@ -1578,7 +1573,7 @@ int vemb_v16_storage_ask_redirect_write_ready(
         .source_owner = UINT32_MAX,
         .target_owner = UINT32_MAX,
     };
-    if (vemb_v16_tlc_get_migration_info(storage->tlc,
+    if (tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
                                         key_hash,
@@ -1787,7 +1782,7 @@ static int topology_publish_requires_lease_guard(
 
 static int topology_publish_lease_guard_passed(
         vemb_v16_storage_ctx_t *storage) {
-    return !vemb_v16_tlc_has_uncommitted_source_migrations(storage->tlc) &&
+    return !tlc_core_has_uncommitted_source_migrations(storage->tlc->core) &&
            migration_outboxes_all_cutover_ready(storage);
 }
 
@@ -2029,7 +2024,7 @@ static int storage_push_baseline_snapshot(
 
     uint8_t snapshot_value[VEMB_V16_MAX_DIM * sizeof(float)];
     tlc_core_migration_snapshot_t snapshot = {0};
-    if (vemb_v16_tlc_snapshot(storage->tlc,
+    if (tlc_core_snapshot(storage->tlc->core,
                               key,
                               key_len,
                               key_hash,
@@ -2176,7 +2171,7 @@ static int baseline_retry_is_still_needed(
         vemb_v16_storage_ctx_t *storage,
         const vemb_v16_storage_migration_baseline_retry_t *entry) {
     tlc_core_key_migration_info_t info = {0};
-    return vemb_v16_tlc_get_migration_info(storage->tlc,
+    return tlc_core_get_migration_info(storage->tlc->core,
                                            entry->key,
                                            entry->key_len,
                                            entry->key_hash,
@@ -2215,8 +2210,7 @@ static int storage_auto_mark_migrating_for_topology(
     while (!done) {
         tlc_core_migration_key_ref_t keys[VEMB_V16_MIGRATION_CONTROL_MAX_RANGE_KEYS];
         uint32_t key_count = 0;
-        if (vemb_v16_tlc_collect_source_active_keys(
-                storage->tlc,
+        if (tlc_core_collect_source_active_keys(storage->tlc->core,
                 &cursor,
                 keys,
                 VEMB_V16_MIGRATION_CONTROL_MAX_RANGE_KEYS,
@@ -2713,7 +2707,7 @@ int vemb_v16_storage_migration_delta_put_after_local_write(
         return 0;
 
     tlc_core_key_migration_info_t info = {0};
-    if (vemb_v16_tlc_get_migration_info(storage->tlc,
+    if (tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
                                         key_hash,
@@ -2864,7 +2858,7 @@ int vemb_v16_storage_delete_with_epoch(
     }
 
     tlc_core_key_migration_info_t deleted = {0};
-    if (vemb_v16_tlc_delete_with_epoch(storage->tlc,
+    if (tlc_core_delete_with_epoch(storage->tlc->core,
                                        key,
                                        key_len,
                                        key_hash,
@@ -3172,8 +3166,7 @@ int vemb_v16_storage_scaleout_auto_step(
                                                    &sent_count,
                                                    &acked_count);
 
-    if (vemb_v16_tlc_collect_migration_ranges(
-            storage->tlc,
+    if (tlc_core_collect_migration_ranges(storage->tlc->core,
             migration_epoch,
             TLC_CORE_KEY_MIGRATING,
             ranges,
@@ -3243,8 +3236,7 @@ int vemb_v16_storage_scaleout_auto_step(
 
 source_gc:
     range_count = 0;
-    if (vemb_v16_tlc_collect_migration_ranges(
-            storage->tlc,
+    if (tlc_core_collect_migration_ranges(storage->tlc->core,
             cutover_epoch,
             TLC_CORE_KEY_CUTOVER,
             ranges,
@@ -3275,8 +3267,7 @@ source_gc:
     }
 
     range_count = 0;
-    if (vemb_v16_tlc_collect_migration_ranges(
-            storage->tlc,
+    if (tlc_core_collect_migration_ranges(storage->tlc->core,
             cutover_epoch,
             TLC_CORE_KEY_CUTOVER,
             ranges,
@@ -3338,8 +3329,7 @@ int vemb_v16_storage_scaleout_auto_get_status(
         tlc_core_migration_range_ref_t ranges[
             VEMB_V16_STORAGE_MAX_SCALEOUT_RANGES];
         uint32_t range_count = 0;
-        if (vemb_v16_tlc_collect_migration_ranges(
-                storage->tlc,
+        if (tlc_core_collect_migration_ranges(storage->tlc->core,
                 status->migration_epoch,
                 TLC_CORE_KEY_MIGRATING,
                 ranges,
@@ -3509,7 +3499,7 @@ int vemb_v16_storage_migration_write_blocked_info(
     if (!vemb_v16_storage_migration_active(storage))
         return 0;
     tlc_core_key_migration_info_t current = {0};
-    if (vemb_v16_tlc_get_migration_info(storage->tlc,
+    if (tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
                                         key_hash,
@@ -3563,7 +3553,7 @@ int vemb_v16_storage_migration_barrier_in_shard(
         memset(outbox_stats, 0, sizeof(*outbox_stats));
 
     tlc_core_key_migration_info_t current = {0};
-    if (vemb_v16_tlc_get_migration_info(storage->tlc,
+    if (tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
                                         key_hash,
@@ -3619,7 +3609,7 @@ int vemb_v16_storage_migration_mark_cutover_in_shard(
     tlc_core_key_migration_info_t *info) {
     RETURN_IF(!storage || !key, -1);
     tlc_core_key_migration_info_t current = {0};
-    if (vemb_v16_tlc_get_migration_info(storage->tlc,
+    if (tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
         key_hash,
@@ -3675,7 +3665,7 @@ int vemb_v16_storage_migration_mark_cutover_in_shard(
         return -1;
     }
 
-    return vemb_v16_tlc_mark_cutover(storage->tlc,
+    return tlc_core_mark_cutover(storage->tlc->core,
                                      key,
                                      key_len,
                                      key_hash,
@@ -3720,7 +3710,7 @@ int vemb_v16_storage_migration_mark_source_gc_in_shard(
         memset(info, 0, sizeof(*info));
 
     tlc_core_key_migration_info_t current = {0};
-    if (vemb_v16_tlc_get_migration_info(storage->tlc,
+    if (tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
                                         key_hash,
@@ -3738,7 +3728,7 @@ int vemb_v16_storage_migration_mark_source_gc_in_shard(
     }
 
     tlc_core_key_migration_info_t updated = {0};
-    int rc = vemb_v16_tlc_mark_source_gc(storage->tlc,
+    int rc = tlc_core_mark_source_gc(storage->tlc->core,
                                          key,
                                          key_len,
                                          key_hash,
@@ -3838,8 +3828,7 @@ int vemb_v16_storage_migration_range_barrier(
     RETURN_IF(!storage || target_owner == UINT32_MAX, -1);
     uint32_t limit = migration_range_page_limit(page_limit);
     uint32_t key_count = 0;
-    if (vemb_v16_tlc_count_migration_keys(
-            storage->tlc,
+    if (tlc_core_count_migration_keys(storage->tlc->core,
             migration_topology_epoch,
             target_owner,
             shard_id,
@@ -3917,8 +3906,7 @@ int vemb_v16_storage_migration_range_mark_cutover(
     uint32_t limit = migration_range_page_limit(page_limit);
     uint32_t key_count = 0;
     uint32_t remaining_before = 0;
-    if (vemb_v16_tlc_collect_migration_keys_page(
-            storage->tlc,
+    if (tlc_core_collect_migration_keys_page(storage->tlc->core,
             migration_topology_epoch,
             target_owner,
             shard_id,
@@ -3999,7 +3987,7 @@ int vemb_v16_storage_migration_range_mark_cutover(
     uint32_t error_count = 0;
     for (uint32_t i = 0; i < key_count; i++) {
         tlc_core_key_migration_info_t current = {0};
-        if (vemb_v16_tlc_get_migration_info(storage->tlc,
+        if (tlc_core_get_migration_info(storage->tlc->core,
                                             keys[i].key,
                                             keys[i].key_len,
                                             keys[i].key_hash,
@@ -4053,7 +4041,7 @@ int vemb_v16_storage_migration_range_mark_cutover(
                                            cutover_topology_epoch,
                                            target_owner,
                                            shard_id) ||
-            vemb_v16_tlc_mark_cutover(storage->tlc,
+            tlc_core_mark_cutover(storage->tlc->core,
                                       keys[i].key,
                                       keys[i].key_len,
                                       keys[i].key_hash,
@@ -4067,8 +4055,7 @@ int vemb_v16_storage_migration_range_mark_cutover(
     }
 
     uint32_t remaining_after = 0;
-    if (vemb_v16_tlc_count_migration_keys(
-            storage->tlc,
+    if (tlc_core_count_migration_keys(storage->tlc->core,
             migration_topology_epoch,
             target_owner,
             shard_id,
@@ -4120,8 +4107,7 @@ int vemb_v16_storage_migration_range_mark_source_gc(
     uint32_t limit = migration_range_page_limit(page_limit);
     uint32_t key_count = 0;
     uint32_t remaining_before = 0;
-    if (vemb_v16_tlc_collect_migration_keys_page(
-            storage->tlc,
+    if (tlc_core_collect_migration_keys_page(storage->tlc->core,
             cutover_topology_epoch,
             target_owner,
             shard_id,
@@ -4195,8 +4181,7 @@ int vemb_v16_storage_migration_range_mark_source_gc(
     }
 
     uint32_t remaining_after = 0;
-    if (vemb_v16_tlc_count_migration_keys(
-            storage->tlc,
+    if (tlc_core_count_migration_keys(storage->tlc->core,
             cutover_topology_epoch,
             target_owner,
             shard_id,
@@ -4256,7 +4241,7 @@ int vemb_v16_storage_migration_mark_migrating_in_shard(
               -1);
     tlc_core_key_migration_info_t current = {0};
     int already_active =
-        vemb_v16_tlc_get_migration_info(storage->tlc,
+        tlc_core_get_migration_info(storage->tlc->core,
                                         key,
                                         key_len,
                                         key_hash,
@@ -4265,7 +4250,7 @@ int vemb_v16_storage_migration_mark_migrating_in_shard(
     if (!already_active)
         storage_migration_active_inc(storage);
 
-    int rc = vemb_v16_tlc_mark_migrating_in_shard(storage->tlc,
+    int rc = tlc_core_mark_migrating_in_shard(storage->tlc->core,
                                                   key,
                                                   key_len,
                                                   key_hash,

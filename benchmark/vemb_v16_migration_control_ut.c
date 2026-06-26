@@ -1084,7 +1084,7 @@ static void test_proxy_migration_control_primitives(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(storage->tlc,
+    assert(tlc_core_get_migration_info(storage->tlc->core,
                                            epoch_key,
                                            epoch_key_len,
                                            epoch_key_hash,
@@ -1102,7 +1102,7 @@ static void test_proxy_migration_control_primitives(void) {
                  dim,
                  &completion);
     assert(completion.status == VEMB_V16_STATUS_OK);
-    assert(vemb_v16_tlc_get_migration_info(storage->tlc,
+    assert(tlc_core_get_migration_info(storage->tlc->core,
                                            epoch_key,
                                            epoch_key_len,
                                            epoch_key_hash,
@@ -1119,7 +1119,7 @@ static void test_proxy_migration_control_primitives(void) {
                  dim,
                  &completion);
     assert(completion.status == VEMB_V16_STATUS_OK);
-    assert(vemb_v16_tlc_get_migration_info(storage->tlc,
+    assert(tlc_core_get_migration_info(storage->tlc->core,
                                            epoch_key,
                                            epoch_key_len,
                                            epoch_key_hash,
@@ -1158,7 +1158,7 @@ static void test_proxy_migration_control_primitives(void) {
                  dim,
                  &completion);
     assert(completion.status == VEMB_V16_STATUS_STALE_TOPOLOGY);
-    assert(vemb_v16_tlc_get_migration_info(storage->tlc,
+    assert(tlc_core_get_migration_info(storage->tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -1197,7 +1197,7 @@ static void test_proxy_migration_control_primitives(void) {
                  dim,
                  &completion);
     assert(completion.status == VEMB_V16_STATUS_OK);
-    assert(vemb_v16_tlc_get_migration_info(storage->tlc,
+    assert(tlc_core_get_migration_info(storage->tlc->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -1518,7 +1518,7 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
     assert(vemb_v16_storage_topology_set(&storage, &topology_req) == 0);
     assert(vemb_v16_storage_migration_active(&storage));
 
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            migrate_key,
                                            (uint32_t)strlen(migrate_key),
                                            migrate_key_hash,
@@ -1529,7 +1529,7 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
     assert(info.shard_id == 0);
 
     memset(&info, 0, sizeof(info));
-    assert(vemb_v16_tlc_get_migration_info(tlc,
+    assert(tlc_core_get_migration_info(tlc->core,
                                            stay_key,
                                            (uint32_t)strlen(stay_key),
                                            stay_key_hash,
@@ -1702,7 +1702,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
     assert(vemb_v16_storage_topology_set(&source_storage,
                                          &topology_req) == 0);
 
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -1712,7 +1712,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
     assert(info.topology_epoch == 9);
 
     memset(&info, 0, sizeof(info));
-    assert(vemb_v16_tlc_get_migration_info(target,
+    assert(tlc_core_get_migration_info(target->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -1905,7 +1905,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
     assert(vemb_v16_storage_topology_set(&source_storage,
                                          &topology_req) == 0);
 
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -1951,7 +1951,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
                memory_order_relaxed) == 1);
 
     memset(&info, 0, sizeof(info));
-    assert(vemb_v16_tlc_get_migration_info(target,
+    assert(tlc_core_get_migration_info(target->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -2184,7 +2184,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
     assert((topology_resp.flags &
             VEMB_V16_TOPOLOGY_CONTROL_F_AUTO_SCALEOUT) == 0);
 
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -2194,7 +2194,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
     assert(info.topology_epoch == 14);
 
     memset(&info, 0, sizeof(info));
-    assert(vemb_v16_tlc_get_migration_info(target,
+    assert(tlc_core_get_migration_info(target->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -2451,7 +2451,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
             VEMB_V16_TOPOLOGY_CONTROL_F_COORDINATED_SCALEOUT) != 0);
     assert(topology_resp.coordinator_endpoint_valid == 1);
 
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -2504,7 +2504,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
     assert(topology_resp.coordinator_endpoint_valid == 0);
 
     memset(&info, 0, sizeof(info));
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            (uint32_t)strlen(key),
                                            key_hash,
@@ -2805,7 +2805,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                        50,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        baseline_key,
                                        baseline_key_len,
                                        baseline_key_hash,
@@ -2822,7 +2822,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                       2);
     assert(vemb_v16_storage_topology_set(&source_storage,
                                          &topology_req) != 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  baseline_key,
                                  baseline_key_len,
                                  baseline_key_hash,
@@ -2864,7 +2864,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.owner_epoch == 51);
     memset(&info, 0, sizeof(info));
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            baseline_key,
                                            baseline_key_len,
                                            baseline_key_hash,
@@ -2910,14 +2910,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                        55,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_mark_migrating(source,
+    assert(tlc_core_mark_migrating(source->core,
                                        lease_fail_key,
                                        lease_fail_key_len,
                                        lease_fail_key_hash,
                                        55,
                                        3,
                                        &info) == 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  lease_fail_key,
                                  lease_fail_key_len,
                                  lease_fail_key_hash,
@@ -2933,7 +2933,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                         &apply_status,
                                         &handle) == 0);
     assert(apply_status == TLC_CORE_MIGRATION_APPLIED);
-    assert(vemb_v16_tlc_accept_owner_lease(dest,
+    assert(tlc_core_accept_owner_lease(dest->core,
                                            lease_fail_key,
                                            lease_fail_key_len,
                                            lease_fail_key_hash,
@@ -2960,7 +2960,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                                    56,
                                                    3,
                                                    &info) != 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            lease_fail_key,
                                            lease_fail_key_len,
                                            lease_fail_key_hash,
@@ -3099,7 +3099,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                range_shard_id,
                &info) == 0);
     assert(info.shard_id == range_shard_id);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  range_key1,
                                  range_key1_len,
                                  range_key1_hash,
@@ -3109,7 +3109,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                  range_snapshot_value1,
                                  sizeof(range_snapshot_value1)) == 0);
     assert(range_snapshot1.shard_id == range_shard_id);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  range_key2,
                                  range_key2_len,
                                  range_key2_hash,
@@ -3240,7 +3240,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                    range_key2_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            range_key1,
                                            range_key1_len,
                                            range_key1_hash,
@@ -3248,7 +3248,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.owner_epoch == 81);
     assert(info.shard_id == range_shard_id);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            range_key1,
                                            range_key1_len,
                                            range_key1_hash,
@@ -3256,7 +3256,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_DEST_COMMITTED);
     assert(info.owner_epoch == 81);
     assert(info.shard_id == range_shard_id);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            range_key2,
                                            range_key2_len,
                                            range_key2_hash,
@@ -3289,7 +3289,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(memcmp(stored,
                   range_ask_update,
                   sizeof(range_ask_update)) == 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            range_key1,
                                            range_key1_len,
                                            range_key1_hash,
@@ -3312,7 +3312,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                    range_key2_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            range_key2,
                                            range_key2_len,
                                            range_key2_hash,
@@ -3334,14 +3334,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(range_resp.success_count == 2);
     assert(range_resp.source_seq == 3);
     assert(range_resp.retry_delta == 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            range_key1,
                                            range_key1_len,
                                            range_key1_hash,
                                            &info) == 0);
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_GC);
     assert(info.owner_epoch == 81);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            range_key2,
                                            range_key2_len,
                                            range_key2_hash,
@@ -3409,7 +3409,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                range_tcp_shard_id,
                &info) == 0);
     assert(info.shard_id == range_tcp_shard_id);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  range_tcp_key1,
                                  range_tcp_key1_len,
                                  range_tcp_key1_hash,
@@ -3419,7 +3419,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                  range_tcp_snapshot_value1,
                                  sizeof(range_tcp_snapshot_value1)) == 0);
     assert(range_tcp_snapshot1.shard_id == range_tcp_shard_id);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  range_tcp_key2,
                                  range_tcp_key2_len,
                                  range_tcp_key2_hash,
@@ -3528,7 +3528,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                    range_tcp_key2_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            range_tcp_key1,
                                            range_tcp_key1_len,
                                            range_tcp_key1_hash,
@@ -3536,7 +3536,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.owner_epoch == 83);
     assert(info.shard_id == range_tcp_shard_id);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            range_tcp_key1,
                                            range_tcp_key1_len,
                                            range_tcp_key1_hash,
@@ -3544,7 +3544,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_DEST_COMMITTED);
     assert(info.owner_epoch == 83);
     assert(info.shard_id == range_tcp_shard_id);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            range_tcp_key2,
                                            range_tcp_key2_len,
                                            range_tcp_key2_hash,
@@ -3564,14 +3564,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(range_resp.success_count == 2);
     assert(range_resp.source_seq == 3);
     assert(range_resp.retry_delta == 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            range_tcp_key1,
                                            range_tcp_key1_len,
                                            range_tcp_key1_hash,
                                            &info) == 0);
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_GC);
     assert(info.owner_epoch == 83);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            range_tcp_key2,
                                            range_tcp_key2_len,
                                            range_tcp_key2_hash,
@@ -3639,7 +3639,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                live_range_shard_id,
                &info) == 0);
     assert(info.shard_id == live_range_shard_id);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  live_range_key1,
                                  live_range_key1_len,
                                  live_range_key1_hash,
@@ -3649,7 +3649,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                  live_range_snapshot_value1,
                                  sizeof(live_range_snapshot_value1)) == 0);
     assert(live_range_snapshot1.shard_id == live_range_shard_id);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  live_range_key2,
                                  live_range_key2_len,
                                  live_range_key2_hash,
@@ -3735,7 +3735,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                    live_range_key2_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            live_range_key2,
                                            live_range_key2_len,
                                            live_range_key2_hash,
@@ -3758,14 +3758,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(range_resp.source_seq == 2);
     assert(range_resp.barrier_seq == 2);
     assert(range_resp.owner_epoch == 87);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            live_range_key1,
                                            live_range_key1_len,
                                            live_range_key1_hash,
                                            &info) == 0);
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.owner_epoch == 87);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            live_range_key2,
                                            live_range_key2_len,
                                            live_range_key2_hash,
@@ -3773,14 +3773,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(info.migration_state == TLC_CORE_KEY_CUTOVER);
     assert(info.tombstone == 1);
     assert(info.owner_epoch == 87);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            live_range_key1,
                                            live_range_key1_len,
                                            live_range_key1_hash,
                                            &info) == 0);
     assert(info.migration_state == TLC_CORE_KEY_DEST_COMMITTED);
     assert(info.owner_epoch == 87);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            live_range_key2,
                                            live_range_key2_len,
                                            live_range_key2_hash,
@@ -3867,7 +3867,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
         assert(info.shard_id == large_range_shard_id);
 
         tlc_core_migration_snapshot_t large_range_snapshot = {0};
-        assert(vemb_v16_tlc_snapshot(source,
+        assert(tlc_core_snapshot(source->core,
                                      large_range_keys[i],
                                      large_range_key_lens[i],
                                      large_range_key_hashes[i],
@@ -3970,7 +3970,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(range_resp.range_done == 1);
 
     for (uint32_t i = 0; i < large_range_key_count; i++) {
-        assert(vemb_v16_tlc_get_migration_info(source,
+        assert(tlc_core_get_migration_info(source->core,
                                                large_range_keys[i],
                                                large_range_key_lens[i],
                                                large_range_key_hashes[i],
@@ -4041,7 +4041,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                      &stored_len) == 0);
     assert(stored_len == sizeof(updated));
     assert(memcmp(stored, updated, sizeof(updated)) == 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -4060,7 +4060,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                        60,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -4124,7 +4124,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                        60,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            key,
                                            key_len,
                                            key_hash,
@@ -4208,7 +4208,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                                      70,
                                                      3,
                                                      &info) == 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  deleted_key,
                                  deleted_key_len,
                                  deleted_key_hash,
@@ -4256,7 +4256,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                    deleted_key_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            deleted_key,
                                            deleted_key_len,
                                            deleted_key_hash,
@@ -4309,7 +4309,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                                      72,
                                                      3,
                                                      &info) == 0);
-    assert(vemb_v16_tlc_snapshot(source,
+    assert(tlc_core_snapshot(source->core,
                                  vrem_key,
                                  vrem_key_len,
                                  vrem_key_hash,
@@ -4353,7 +4353,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                    vrem_key_hash,
                                    &handle,
                                    &warm_slot) != 0);
-    assert(vemb_v16_tlc_get_migration_info(dest,
+    assert(tlc_core_get_migration_info(dest->core,
                                            vrem_key,
                                            vrem_key_len,
                                            vrem_key_hash,
@@ -4409,7 +4409,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     assert(control_resp.migration_state == TLC_CORE_KEY_SOURCE_GC);
     assert(control_resp.tombstone == 1);
     assert(control_resp.target_owner == 3);
-    assert(vemb_v16_tlc_get_migration_info(source,
+    assert(tlc_core_get_migration_info(source->core,
                                            vrem_key,
                                            vrem_key_len,
                                            vrem_key_hash,

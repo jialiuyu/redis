@@ -3,6 +3,7 @@
 #include "vemb_v16_remote_meta.h"
 #include "cpu_relax.h"
 #include "vemb_v16_log.h"
+#include "vemb_v16_util.h"
 #include "zmalloc.h"
 #include "macro.h"
 
@@ -11,7 +12,6 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #define VEMB_V16_REMOTE_META_PUBLISH_QUEUE_CAP 1024u
 #define VEMB_V16_TLC_LOG_LIMIT 32u
@@ -54,12 +54,6 @@ static int tlc_log_should(atomic_uint_fast32_t *counter) {
     uint32_t n = atomic_fetch_add_explicit(counter, 1,
                                           memory_order_relaxed);
     return n < VEMB_V16_TLC_LOG_LIMIT;
-}
-
-static uint64_t monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 static void tlc_queue_pause(void) {
@@ -131,14 +125,13 @@ static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
     atomic_init(&tlc->remote_meta_repair_drop, 0);
 }
 
-static int publish_remote_meta_to_view(
-    vemb_v16_tlc_t *tlc,
-    vemb_v16_remote_meta_view_t *view,
-    const char *key,
-    uint32_t key_len,
-    uint64_t key_hash,
-    const vemb_v16_vector_handle_t *handle,
-    int is_repair) {
+int publish_remote_meta_to_view(vemb_v16_tlc_t *tlc,
+                                vemb_v16_remote_meta_view_t *view,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const vemb_v16_vector_handle_t *handle,
+                                int is_repair) {
     RETURN_IF(!tlc || !view || !key || !handle || key_len == 0 ||
               handle->bytes == 0,
               -1);
@@ -151,14 +144,15 @@ static int publish_remote_meta_to_view(
         .owner_generation = handle->owner_generation,
     };
     vemb_v16_remote_meta_publish_result_t result = {0};
-    uint64_t start = monotonic_ns();
+    uint64_t start = vemb_v16_monotonic_ns();
     int rc = vemb_v16_remote_meta_publish_with_result(view,
                                                       key,
                                                       key_len,
                                                       key_hash,
                                                       &remote_handle,
                                                       &result);
-    tlc_counter_add(&tlc->remote_meta_publish_ns, monotonic_ns() - start);
+    tlc_counter_add(&tlc->remote_meta_publish_ns,
+                    vemb_v16_monotonic_ns() - start);
     if (rc == VEMB_V16_REMOTE_META_OK) {
         tlc_counter_add(&tlc->remote_meta_publish_ok, 1);
         if (is_repair)
@@ -411,14 +405,13 @@ static uint32_t region_index_id_mapping(const vemb_v16_tlc_t *tlc,
     return UINT32_MAX;
 }
 
-static int enqueue_remote_meta_publish(
-    vemb_v16_tlc_t *tlc,
-    vemb_v16_remote_meta_view_t *target_view,
-    const char *key,
-    uint32_t key_len,
-    uint64_t key_hash,
-    const vemb_v16_vector_handle_t *handle,
-    int is_repair) {
+int enqueue_remote_meta_publish(vemb_v16_tlc_t *tlc,
+                                vemb_v16_remote_meta_view_t *target_view,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const vemb_v16_vector_handle_t *handle,
+                                int is_repair) {
     if (!tlc || !target_view || !key || !handle ||
         key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
         handle->bytes == 0 ||
@@ -671,35 +664,6 @@ static vemb_v16_remote_meta_view_t *remote_meta_view_for_owner(vemb_v16_tlc_t *t
             return tlc->remote_meta_views[i].view;
     }
     return NULL;
-}
-
-int vemb_v16_tlc_publish_remote_meta(vemb_v16_tlc_t *tlc,
-                                     const char *key,
-                                     uint32_t key_len,
-                                     uint64_t key_hash,
-                                     const vemb_v16_vector_handle_t *handle) {
-    return publish_remote_meta_to_view(tlc,
-                                       tlc->remote_meta_view,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       handle,
-                                       0);
-}
-
-int vemb_v16_tlc_publish_remote_meta_async(
-    vemb_v16_tlc_t *tlc,
-    const char *key,
-    uint32_t key_len,
-    uint64_t key_hash,
-    const vemb_v16_vector_handle_t *handle) {
-    return enqueue_remote_meta_publish(tlc,
-                                       tlc ? tlc->remote_meta_view : NULL,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       handle,
-                                       0);
 }
 
 uint32_t vemb_v16_tlc_flush_remote_meta_publishes(vemb_v16_tlc_t *tlc,
@@ -1195,7 +1159,7 @@ static int migration_handle_barrier(
 
     if (status == VEMB_V16_UB_MIGRATION_RPC_OK && req->key_len > 0) {
         tlc_core_key_migration_info_t info = {0};
-        if (vemb_v16_tlc_get_migration_info(owner,
+        if (tlc_core_get_migration_info(owner->core,
                                             req->key,
                                             req->key_len,
                                             req->key_hash,
@@ -1243,7 +1207,7 @@ static int migration_handle_lease_commit(
     }
 
     tlc_core_key_migration_info_t info = {0};
-    if (vemb_v16_tlc_accept_owner_lease(owner,
+    if (tlc_core_accept_owner_lease(owner->core,
                                         req->key,
                                         req->key_len,
                                         req->key_hash,
@@ -1325,7 +1289,7 @@ int vemb_v16_tlc_migration_rpc_local_handler(
     uint32_t target_owner = req->target_owner_id;
     if (target_owner == UINT32_MAX)
         target_owner = req->src_owner_id;
-    int rc = vemb_v16_tlc_snapshot(owner,
+    int rc = tlc_core_snapshot(owner->core,
                                    req->key,
                                    req->key_len,
                                    req->key_hash,
@@ -1367,10 +1331,8 @@ static int repair_remote_meta_async(vemb_v16_tlc_t *tlc,
                                     uint32_t key_len,
                                     uint64_t key_hash,
                                     const vemb_v16_vector_handle_t *handle) {
-    vemb_v16_remote_meta_view_t *view =
-        remote_meta_view_for_owner(tlc, owner_id);
     return enqueue_remote_meta_publish(tlc,
-                                       view,
+                                       remote_meta_view_for_owner(tlc, owner_id),
                                        key,
                                        key_len,
                                        key_hash,
@@ -1404,10 +1366,11 @@ static int lookup_vsim_key2_via_rpc(vemb_v16_tlc_t *tlc,
     };
     memcpy(req.key, key2, key2_len);
     vemb_v16_ub_lookup_rpc_resp_t resp = {0};
-    uint64_t rpc_start = monotonic_ns();
+    uint64_t rpc_start = vemb_v16_monotonic_ns();
     tlc_counter_add(&tlc->ub_lookup_rpc_count, 1);
     int rc = tlc->lookup_rpc(tlc->lookup_rpc_arg, &req, &resp);
-    tlc_counter_add(&tlc->ub_lookup_rpc_ns, monotonic_ns() - rpc_start);
+    tlc_counter_add(&tlc->ub_lookup_rpc_ns,
+                    vemb_v16_monotonic_ns() - rpc_start);
     if (rc != 0) {
         tlc_counter_add(&tlc->ub_lookup_rpc_error, 1);
         return -1;
@@ -1496,7 +1459,7 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
         try_local = owner_id == local_owner_id;
     }
 
-    uint64_t stage_start = monotonic_ns();
+    uint64_t stage_start = vemb_v16_monotonic_ns();
     if (try_local &&
         vemb_v16_tlc_get_handle(tlc,
                                 key2,
@@ -1505,19 +1468,19 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                 handle,
                                 NULL) == 0) {
         timing->local_lookup_count = 1;
-        timing->local_lookup_ns = monotonic_ns() - stage_start;
+        timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
         *source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
         return 0;
     }
     timing->local_lookup_count = 1;
-    timing->local_lookup_ns = monotonic_ns() - stage_start;
+    timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
 
     if (!remote_meta)
         remote_meta = remote_meta_view_for_key(tlc, key2, key2_len, key2_hash);
     if (remote_meta) {
         vemb_v16_remote_meta_handle_t remote_handle = {0};
         vemb_v16_remote_meta_lookup_result_t lookup_result = {0};
-        stage_start = monotonic_ns();
+        stage_start = vemb_v16_monotonic_ns();
         int remote_rc = vemb_v16_remote_meta_lookup_with_result(
             remote_meta,
             key2,
@@ -1527,9 +1490,8 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
             &remote_handle,
             &lookup_result);
         timing->remote_meta_lookup_count = 1;
-        timing->remote_meta_lookup_ns = monotonic_ns() - stage_start;
-        tlc_counter_add(&tlc->remote_meta_lookup_way_probe,
-                        lookup_result.probes);
+        timing->remote_meta_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
+        tlc_counter_add(&tlc->remote_meta_lookup_way_probe, lookup_result.probes);
         if (remote_rc == VEMB_V16_REMOTE_META_OK) {
             tlc_counter_add(&tlc->remote_meta_lookup_hit, 1);
             vemb_v16_vector_handle_t candidate = {
@@ -1652,134 +1614,6 @@ int vemb_v16_tlc_put_with_epoch(vemb_v16_tlc_t *tlc,
     return 0;
 }
 
-int vemb_v16_tlc_delete_with_epoch(vemb_v16_tlc_t *tlc,
-                                   const char *key,
-                                   uint32_t key_len,
-                                   uint64_t key_hash,
-                                   uint64_t topology_epoch,
-                                   tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_delete_with_epoch(tlc->core,
-                                      key,
-                                      key_len,
-                                      key_hash,
-                                      topology_epoch,
-                                      info);
-}
-
-int vemb_v16_tlc_cold_append(vemb_v16_tlc_t *tlc,
-                             const char *key,
-                             uint32_t key_len,
-                             uint64_t key_hash,
-                             const float *vector,
-                             uint32_t vector_bytes) {
-    return tlc_core_cold_append(tlc->core, key, key_len, key_hash,
-                                vector, vector_bytes);
-}
-
-int vemb_v16_tlc_get_migration_info(vemb_v16_tlc_t *tlc,
-                                    const char *key,
-                                    uint32_t key_len,
-                                    uint64_t key_hash,
-                                    tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_get_migration_info(tlc->core,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       info);
-}
-
-int vemb_v16_tlc_mark_migrating(vemb_v16_tlc_t *tlc,
-                                const char *key,
-                                uint32_t key_len,
-                                uint64_t key_hash,
-                                uint64_t topology_epoch,
-                                uint32_t target_owner,
-                                tlc_core_key_migration_info_t *info) {
-    return vemb_v16_tlc_mark_migrating_in_shard(tlc,
-                                                key,
-                                                key_len,
-                                                key_hash,
-                                                topology_epoch,
-                                                target_owner,
-                                                0,
-                                                info);
-}
-
-int vemb_v16_tlc_mark_migrating_in_shard(
-                                vemb_v16_tlc_t *tlc,
-                                const char *key,
-                                uint32_t key_len,
-                                uint64_t key_hash,
-                                uint64_t topology_epoch,
-                                uint32_t target_owner,
-                                uint32_t shard_id,
-                                tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_mark_migrating_in_shard(tlc->core,
-                                            key,
-                                            key_len,
-                                            key_hash,
-                                            topology_epoch,
-                                            target_owner,
-                                            shard_id,
-                                            info);
-}
-
-int vemb_v16_tlc_mark_cutover(vemb_v16_tlc_t *tlc,
-                              const char *key,
-                              uint32_t key_len,
-                              uint64_t key_hash,
-                              uint64_t topology_epoch,
-                              uint32_t target_owner,
-                              tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_mark_cutover(tlc->core,
-                                 key,
-                                 key_len,
-                                 key_hash,
-                                 topology_epoch,
-                                 target_owner,
-                                 info);
-}
-
-int vemb_v16_tlc_mark_source_gc(vemb_v16_tlc_t *tlc,
-                                const char *key,
-                                uint32_t key_len,
-                                uint64_t key_hash,
-                                uint64_t topology_epoch,
-                                uint32_t target_owner,
-                                tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_mark_source_gc(tlc->core,
-                                   key,
-                                   key_len,
-                                   key_hash,
-                                   topology_epoch,
-                                   target_owner,
-                                   info);
-}
-
-int vemb_v16_tlc_accept_owner_lease(vemb_v16_tlc_t *tlc,
-                                    const char *key,
-                                    uint32_t key_len,
-                                    uint64_t key_hash,
-                                    uint64_t topology_epoch,
-                                    uint64_t owner_epoch,
-                                    uint32_t target_owner,
-                                    tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_accept_owner_lease(tlc->core,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       topology_epoch,
-                                       owner_epoch,
-                                       target_owner,
-                                       info);
-}
-
 int vemb_v16_tlc_migration_progress_ready(vemb_v16_tlc_t *tlc,
                                           uint32_t source_owner,
                                           uint32_t target_owner,
@@ -1828,135 +1662,6 @@ int vemb_v16_tlc_migration_progress_ready(vemb_v16_tlc_t *tlc,
     if (barrier_seq)
         *barrier_seq = best.barrier_seq;
     return best.applied_seq >= best.barrier_seq;
-}
-
-int vemb_v16_tlc_key_is_source_cutover(vemb_v16_tlc_t *tlc,
-                                       const char *key,
-                                       uint32_t key_len,
-                                       uint64_t key_hash,
-                                       tlc_core_key_migration_info_t *info) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_key_is_source_cutover(tlc->core,
-                                          key,
-                                          key_len,
-                                          key_hash,
-                                          info);
-}
-
-int vemb_v16_tlc_has_uncommitted_source_migrations(vemb_v16_tlc_t *tlc) {
-    RETURN_IF(!tlc, 1);
-    return tlc_core_has_uncommitted_source_migrations(tlc->core);
-}
-
-int vemb_v16_tlc_collect_migration_keys(
-                                vemb_v16_tlc_t *tlc,
-                                uint64_t topology_epoch,
-                                uint32_t target_owner,
-                                uint32_t shard_id,
-                                uint32_t migration_state,
-                                tlc_core_migration_key_ref_t *keys,
-                                uint32_t max_keys,
-                                uint32_t *key_count) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_collect_migration_keys(tlc->core,
-                                           topology_epoch,
-                                           target_owner,
-                                           shard_id,
-                                           migration_state,
-                                           keys,
-                                           max_keys,
-                                           key_count);
-}
-
-int vemb_v16_tlc_collect_migration_keys_page(
-                                vemb_v16_tlc_t *tlc,
-                                uint64_t topology_epoch,
-                                uint32_t target_owner,
-                                uint32_t shard_id,
-                                uint32_t migration_state,
-                                tlc_core_migration_key_ref_t *keys,
-                                uint32_t max_keys,
-                                uint32_t *key_count,
-                                uint32_t *remaining_count) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_collect_migration_keys_page(tlc->core,
-                                                topology_epoch,
-                                                target_owner,
-                                                shard_id,
-                                                migration_state,
-                                                keys,
-                                                max_keys,
-                                                key_count,
-                                                remaining_count);
-}
-
-int vemb_v16_tlc_count_migration_keys(
-                                vemb_v16_tlc_t *tlc,
-                                uint64_t topology_epoch,
-                                uint32_t target_owner,
-                                uint32_t shard_id,
-                                uint32_t migration_state,
-                                uint32_t *key_count) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_count_migration_keys(tlc->core,
-                                         topology_epoch,
-                                         target_owner,
-                                         shard_id,
-                                         migration_state,
-                                         key_count);
-}
-
-int vemb_v16_tlc_collect_migration_ranges(
-                                vemb_v16_tlc_t *tlc,
-                                uint64_t topology_epoch,
-                                uint32_t migration_state,
-                                tlc_core_migration_range_ref_t *ranges,
-                                uint32_t max_ranges,
-                                uint32_t *range_count) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_collect_migration_ranges(tlc->core,
-                                             topology_epoch,
-                                             migration_state,
-                                             ranges,
-                                             max_ranges,
-                                             range_count);
-}
-
-int vemb_v16_tlc_collect_source_active_keys(
-                                vemb_v16_tlc_t *tlc,
-                                uint32_t *cursor,
-                                tlc_core_migration_key_ref_t *keys,
-                                uint32_t max_keys,
-                                uint32_t *key_count,
-                                int *done) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_collect_source_active_keys(tlc->core,
-                                               cursor,
-                                               keys,
-                                               max_keys,
-                                               key_count,
-                                               done);
-}
-
-int vemb_v16_tlc_snapshot(vemb_v16_tlc_t *tlc,
-                          const char *key,
-                          uint32_t key_len,
-                          uint64_t key_hash,
-                          uint32_t source_owner,
-                          uint32_t target_owner,
-                          tlc_core_migration_snapshot_t *snapshot,
-                          void *value_out,
-                          uint32_t value_out_size) {
-    RETURN_IF(!tlc, -1);
-    return tlc_core_snapshot(tlc->core,
-                             key,
-                             key_len,
-                             key_hash,
-                             source_owner,
-                             target_owner,
-                             snapshot,
-                             value_out,
-                             value_out_size);
 }
 
 int vemb_v16_tlc_apply_migration(vemb_v16_tlc_t *tlc,
@@ -2055,69 +1760,32 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
     return 0;
 }
 
-void vemb_v16_tlc_get_core_stats(vemb_v16_tlc_t *tlc,
-                                 tlc_core_stats_t *stats) {
-    tlc_core_get_stats(tlc->core, stats);
-}
-
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats) {
-    stats->remote_meta_lookup_hit =
-        tlc_counter_load(&tlc->remote_meta_lookup_hit);
-    stats->remote_meta_lookup_miss =
-        tlc_counter_load(&tlc->remote_meta_lookup_miss);
-    stats->remote_meta_lookup_busy =
-        tlc_counter_load(&tlc->remote_meta_lookup_busy);
-    stats->remote_meta_lookup_way_probe =
-        tlc_counter_load(&tlc->remote_meta_lookup_way_probe);
-    stats->remote_meta_lookup_set_conflict =
-        tlc_counter_load(&tlc->remote_meta_lookup_set_conflict);
-    stats->remote_meta_publish_async_enqueue =
-        tlc_counter_load(&tlc->remote_meta_publish_async_enqueue);
-    stats->remote_meta_publish_async_drop =
-        tlc_counter_load(&tlc->remote_meta_publish_async_drop);
-    stats->remote_meta_publish_async_coalesce =
-        tlc_counter_load(&tlc->remote_meta_publish_async_coalesce);
-    stats->remote_meta_publish_ok =
-        tlc_counter_load(&tlc->remote_meta_publish_ok);
-    stats->remote_meta_publish_busy =
-        tlc_counter_load(&tlc->remote_meta_publish_busy);
-    stats->remote_meta_publish_insert =
-        tlc_counter_load(&tlc->remote_meta_publish_insert);
-    stats->remote_meta_publish_update =
-        tlc_counter_load(&tlc->remote_meta_publish_update);
-    stats->remote_meta_publish_evict =
-        tlc_counter_load(&tlc->remote_meta_publish_evict);
-    stats->remote_meta_publish_ns =
-        tlc_counter_load(&tlc->remote_meta_publish_ns);
-    stats->ub_lookup_rpc_count =
-        tlc_counter_load(&tlc->ub_lookup_rpc_count);
-    stats->ub_lookup_rpc_ok =
-        tlc_counter_load(&tlc->ub_lookup_rpc_ok);
-    stats->ub_lookup_rpc_not_found =
-        tlc_counter_load(&tlc->ub_lookup_rpc_not_found);
-    stats->ub_lookup_rpc_busy =
-        tlc_counter_load(&tlc->ub_lookup_rpc_busy);
-    stats->ub_lookup_rpc_timeout =
-        tlc_counter_load(&tlc->ub_lookup_rpc_timeout);
-    stats->ub_lookup_rpc_error =
-        tlc_counter_load(&tlc->ub_lookup_rpc_error);
-    stats->ub_lookup_rpc_handle =
-        tlc_counter_load(&tlc->ub_lookup_rpc_handle);
-    stats->ub_lookup_rpc_snapshot =
-        tlc_counter_load(&tlc->ub_lookup_rpc_snapshot);
-    stats->ub_lookup_rpc_ns =
-        tlc_counter_load(&tlc->ub_lookup_rpc_ns);
-    stats->remote_meta_repair_enqueue =
-        tlc_counter_load(&tlc->remote_meta_repair_enqueue);
-    stats->remote_meta_repair_ok =
-        tlc_counter_load(&tlc->remote_meta_repair_ok);
-    stats->remote_meta_repair_drop =
-        tlc_counter_load(&tlc->remote_meta_repair_drop);
-}
-
-uint32_t vemb_v16_tlc_get_region_stats(vemb_v16_tlc_t *tlc,
-                                       tlc_core_region_stats_t *regions,
-                                       uint32_t max_regions) {
-    return tlc_core_get_region_stats(tlc->core, regions, max_regions);
+    stats->remote_meta_lookup_hit = tlc_counter_load(&tlc->remote_meta_lookup_hit);
+    stats->remote_meta_lookup_miss = tlc_counter_load(&tlc->remote_meta_lookup_miss);
+    stats->remote_meta_lookup_busy = tlc_counter_load(&tlc->remote_meta_lookup_busy);
+    stats->remote_meta_lookup_way_probe = tlc_counter_load(&tlc->remote_meta_lookup_way_probe);
+    stats->remote_meta_lookup_set_conflict = tlc_counter_load(&tlc->remote_meta_lookup_set_conflict);
+    stats->remote_meta_publish_async_enqueue = tlc_counter_load(&tlc->remote_meta_publish_async_enqueue);
+    stats->remote_meta_publish_async_drop = tlc_counter_load(&tlc->remote_meta_publish_async_drop);
+    stats->remote_meta_publish_async_coalesce = tlc_counter_load(&tlc->remote_meta_publish_async_coalesce);
+    stats->remote_meta_publish_ok = tlc_counter_load(&tlc->remote_meta_publish_ok);
+    stats->remote_meta_publish_busy = tlc_counter_load(&tlc->remote_meta_publish_busy);
+    stats->remote_meta_publish_insert = tlc_counter_load(&tlc->remote_meta_publish_insert);
+    stats->remote_meta_publish_update = tlc_counter_load(&tlc->remote_meta_publish_update);
+    stats->remote_meta_publish_evict = tlc_counter_load(&tlc->remote_meta_publish_evict);
+    stats->remote_meta_publish_ns = tlc_counter_load(&tlc->remote_meta_publish_ns);
+    stats->ub_lookup_rpc_count = tlc_counter_load(&tlc->ub_lookup_rpc_count);
+    stats->ub_lookup_rpc_ok = tlc_counter_load(&tlc->ub_lookup_rpc_ok);
+    stats->ub_lookup_rpc_not_found = tlc_counter_load(&tlc->ub_lookup_rpc_not_found);
+    stats->ub_lookup_rpc_busy = tlc_counter_load(&tlc->ub_lookup_rpc_busy);
+    stats->ub_lookup_rpc_timeout = tlc_counter_load(&tlc->ub_lookup_rpc_timeout);
+    stats->ub_lookup_rpc_error = tlc_counter_load(&tlc->ub_lookup_rpc_error);
+    stats->ub_lookup_rpc_handle = tlc_counter_load(&tlc->ub_lookup_rpc_handle);
+    stats->ub_lookup_rpc_snapshot = tlc_counter_load(&tlc->ub_lookup_rpc_snapshot);
+    stats->ub_lookup_rpc_ns = tlc_counter_load(&tlc->ub_lookup_rpc_ns);
+    stats->remote_meta_repair_enqueue = tlc_counter_load(&tlc->remote_meta_repair_enqueue);
+    stats->remote_meta_repair_ok = tlc_counter_load(&tlc->remote_meta_repair_ok);
+    stats->remote_meta_repair_drop = tlc_counter_load(&tlc->remote_meta_repair_drop);
 }

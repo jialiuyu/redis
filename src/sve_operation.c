@@ -1,4 +1,5 @@
 #include "sve_operation.h"
+#include "cpu_relax.h"
 #include "macro.h"
 #include "monotonic.h"
 #include <stdlib.h>
@@ -57,6 +58,15 @@ void bitmap_release(state_bitmap_t *bmp, uint64_t bit_index) {
     RETURN_IF(wi >= bmp->num_words);
     atomic_fetch_and_explicit(&bmp->bits[wi].word,
                               ~(1ULL << bo), memory_order_release);
+}
+
+void bitmap_lock_blocking(state_bitmap_t *bmp, uint64_t bit_index) {
+    while (bitmap_try_acquire(bmp, bit_index) != 0)
+        cpu_relax();
+}
+
+void bitmap_unlock(state_bitmap_t *bmp, uint64_t bit_index) {
+    bitmap_release(bmp, bit_index);
 }
 
 void sve_gather_ctx_init(sve_gather_ctx_t *ctx,
