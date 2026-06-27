@@ -6,7 +6,7 @@ DIM=${VEMB_DIM:-300}
 HOST=${VEMB_HOST:-127.0.0.1}
 PORT=${VEMB_PORT:-$SNIFF_PORT}
 MEMTIER_DIR=/root/gqs/codespace/UnifiedBus/memtier_benchmark
-CODE_DIR=/root/gqs/codespace/UnifiedBus/hpc-redis
+CODE_DIR=/root/gqs/codespace/UnifiedBus/test_hpc
 NUM_KEYS=10000
 KEY_PREFIX="item:"
 MANIFEST="$CODE_DIR/examples/vemb_v16_warm_regions_111.yaml"
@@ -34,6 +34,13 @@ fi
 
 # 清空旧数据，保证每次测试基线一致
 "$CODE_DIR/src/redis-cli" -p "$SNIFF_PORT" FLUSHDB
+
+# 确保 vector-engine=vemb-v16 (VEMB V16 二进制协议 sniff 需要)
+VE=$("$CODE_DIR/src/redis-cli" -p "$SNIFF_PORT" CONFIG GET vector-engine 2>/dev/null | tail -1)
+if [ "$VE" != "vemb-v16" ]; then
+    echo "Setting vector-engine to vemb-v16 (was: ${VE:-empty})"
+    "$CODE_DIR/src/redis-cli" -p "$SNIFF_PORT" CONFIG SET vector-engine vemb-v16 >/dev/null 2>&1
+fi
 
 cd "$MEMTIER_DIR"
 
