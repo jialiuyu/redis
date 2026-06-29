@@ -1555,10 +1555,9 @@ static void apply_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                            void *job,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
-    atomic_fetch_add_explicit(&ch->stats.supernode_vemb_poll, 1,
-                              memory_order_relaxed);
     (void)scratch;
     vemb_v16_supernode_handle_vemb_job(ctx, job);
+    atomic_fetch_add_explicit(&ch->stats.supernode_vemb_poll, 1, memory_order_relaxed);
 }
 
 /// Execution: run one VADD job on the SuperNode storage/backend path.
@@ -1567,9 +1566,8 @@ static void apply_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
     (void)scratch;
-    atomic_fetch_add_explicit(&ch->stats.supernode_vadd_poll, 1,
-                              memory_order_relaxed);
     vemb_v16_supernode_handle_vadd_job(ctx, job);
+    atomic_fetch_add_explicit(&ch->stats.supernode_vadd_poll, 1, memory_order_relaxed);
 }
 
 static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx) {

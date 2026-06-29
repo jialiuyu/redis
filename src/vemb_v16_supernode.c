@@ -41,18 +41,16 @@ static monotime timing_start_if_sampled(int sample) {
 static void timing_acc_add_ns_if_sampled(vemb_v16_timing_acc_t *acc,
                                          int sample,
                                          uint64_t ns) {
-    if (sample)
-        vemb_v16_timing_acc_add(acc, ns);
+    if (sample) vemb_v16_timing_acc_add(acc, ns);
 }
 
 static uint64_t timing_acc_add_if_sampled(vemb_v16_timing_acc_t *acc,
                                           int sample,
                                           monotime start) {
+    if (!sample) return 0;
     uint64_t ns = 0;
-    if (sample) {
-        ns = elapsedNs(start);
-        vemb_v16_timing_acc_add(acc, ns);
-    }
+    ns = elapsedNs(start);
+    vemb_v16_timing_acc_add(acc, ns);
     return ns;
 }
 
@@ -62,12 +60,14 @@ static const char *op_name(uint8_t op) {
         return "vadd";
     case VEMB_V16_OP_VREM:
         return "vrem";
+    case VEMB_V16_OP_VEMB_HANDLE:
+        return "vemb-handle";
     case VEMB_V16_OP_VEMB_INLINE:
         return "vemb-inline";
     case VEMB_V16_OP_VSIM_INLINE:
         return "vsim-inline";
     case VEMB_V16_OP_VSIM_KEY_KEY:
-        return "vsim-key-key";
+        return "vsim-key1-key2";
     default:
         return "unknown";
     }

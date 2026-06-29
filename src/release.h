@@ -1,5 +1,0 @@
-#define REDIS_GIT_SHA1 "f4f4e4f3"
-#define REDIS_GIT_DIRTY "      78"
-#define REDIS_BUILD_ID "fibonaccii.local-1782197945"
-#include "version.h"
-#define REDIS_BUILD_ID_RAW REDIS_VERSION REDIS_BUILD_ID REDIS_GIT_DIRTY REDIS_GIT_SHA1
