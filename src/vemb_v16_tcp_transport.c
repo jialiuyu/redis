@@ -25,6 +25,10 @@ static int diag_should_log_req(uint32_t req_id) {
     return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
 }
 
+static int tcp_payloads_encoded(uint32_t net_flags) {
+    return (net_flags & VEMB_V16_NET_F_ENCODED_PAYLOAD) != 0;
+}
+
 static int tcp_response_needs_inline_snapshot(const vemb_v16_resp_t *resp) {
     return resp->status == VEMB_V16_STATUS_OK &&
         resp->op == VEMB_V16_OP_VEMB_INLINE &&
@@ -165,15 +169,19 @@ int vemb_v16_tcp_flush_response_backlog(vemb_v16_channel_t *ch) {
 
 /// TCP transport: compute one response frame size.
 static size_t tcp_response_wire_size(vemb_v16_resp_t *resp,
+                                     uint32_t net_flags,
                                      uint32_t vector_bytes) {
+    size_t resp_bytes = tcp_payloads_encoded(net_flags) ?
+        vemb_v16_resp_encoded_len() : sizeof(vemb_v16_resp_t);
     (void)resp;
-    return sizeof(vemb_v16_net_hdr_t) + sizeof(vemb_v16_resp_t) + vector_bytes;
+    return sizeof(vemb_v16_net_hdr_t) + resp_bytes + vector_bytes;
 }
 
 /// TCP transport: encode one response frame, optionally including inline vector bytes.
 static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
                                           vemb_v16_resp_t *resp,
                                           size_t *out_len) {
+    uint32_t net_flags = vemb_v16_channel_tcp_net_flags(ch);
     const uint8_t *vector = NULL;
     uint32_t vector_bytes = 0;
     if (tcp_response_needs_inline_snapshot(resp)) {
@@ -201,7 +209,9 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
                   (unsigned long long)resp->owner_generation);
     }
 
-    size_t bytes = tcp_response_wire_size(resp, vector_bytes);
+    size_t resp_bytes = tcp_payloads_encoded(net_flags) ?
+        vemb_v16_resp_encoded_len() : sizeof(*resp);
+    size_t bytes = tcp_response_wire_size(resp, net_flags, vector_bytes);
     uint8_t *buf = zmalloc(bytes);
     if (!buf)
         return NULL;
@@ -210,16 +220,28 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
         .magic = VEMB_V16_MAGIC,
         .version = VEMB_V16_VERSION,
         .type = VEMB_V16_NET_RESPONSE,
-        .flags = 0,
-        .payload_len = (uint32_t)sizeof(*resp) + vector_bytes,
+        .flags = net_flags,
+        .payload_len = (uint32_t)resp_bytes + vector_bytes,
         .channel_id = vemb_v16_channel_id(ch),
         .req_id = resp->req_id,
     };
     size_t off = 0;
     memcpy(buf + off, &hdr, sizeof(hdr));
     off += sizeof(hdr);
-    memcpy(buf + off, resp, sizeof(*resp));
-    off += sizeof(*resp);
+    if (tcp_payloads_encoded(net_flags)) {
+        size_t encoded_len = 0;
+        if (vemb_v16_resp_encode(buf + off,
+                                 bytes - off,
+                                 resp,
+                                 &encoded_len) != 0) {
+            zfree(buf);
+            return NULL;
+        }
+        off += encoded_len;
+    } else {
+        memcpy(buf + off, resp, sizeof(*resp));
+        off += sizeof(*resp);
+    }
     if (vector_bytes) {
         memcpy(buf + off, vector, vector_bytes);
         off += vector_bytes;
@@ -234,6 +256,7 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
                                           uint32_t n,
                                           uint32_t *published,
                                           size_t *out_len) {
+    uint32_t net_flags = vemb_v16_channel_tcp_net_flags(ch);
     vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
     const uint8_t *vectors[VEMB_V16_PROXY_BATCH];
     uint32_t vector_bytes[VEMB_V16_PROXY_BATCH];
@@ -258,8 +281,10 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
             .magic = VEMB_V16_MAGIC,
             .version = VEMB_V16_VERSION,
             .type = VEMB_V16_NET_RESPONSE,
-            .flags = 0,
-            .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes[out],
+            .flags = net_flags,
+            .payload_len = (uint32_t)(tcp_payloads_encoded(net_flags) ?
+                                      vemb_v16_resp_encoded_len() :
+                                      sizeof(responses[out])) + vector_bytes[out],
             .channel_id = vemb_v16_channel_id(ch),
             .req_id = responses[out].req_id,
         };
@@ -281,7 +306,7 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
                       responses[out].local_slot,
                       (unsigned long long)responses[out].owner_generation);
         }
-        total_bytes += sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes[out];
+        total_bytes += sizeof(headers[out]) + headers[out].payload_len;
         out++;
     }
 
@@ -297,8 +322,20 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
     for (uint32_t i = 0; i < out; i++) {
         memcpy(buf + off, &headers[i], sizeof(headers[i]));
         off += sizeof(headers[i]);
-        memcpy(buf + off, &responses[i], sizeof(responses[i]));
-        off += sizeof(responses[i]);
+        if (tcp_payloads_encoded(net_flags)) {
+            size_t encoded_len = 0;
+            if (vemb_v16_resp_encode(buf + off,
+                                     total_bytes - off,
+                                     &responses[i],
+                                     &encoded_len) != 0) {
+                zfree(buf);
+                return NULL;
+            }
+            off += encoded_len;
+        } else {
+            memcpy(buf + off, &responses[i], sizeof(responses[i]));
+            off += sizeof(responses[i]);
+        }
         if (vector_bytes[i]) {
             memcpy(buf + off, vectors[i], vector_bytes[i]);
             off += vector_bytes[i];
@@ -311,8 +348,12 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
 /// TCP transport: write one completion response to the socket.
 int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
+        uint32_t net_flags = vemb_v16_channel_tcp_net_flags(ch);
         const uint8_t *vector = NULL;
         uint32_t vector_bytes = 0;
+        uint8_t encoded_resp[64];
+        const void *resp_payload = resp;
+        uint32_t resp_payload_len = (uint32_t)sizeof(*resp);
         if (tcp_response_needs_inline_snapshot(resp)) {
             serverLog(LL_WARNING,
                       "vemb_v16 tcp direct inline response has no completion snapshot: channel_id=%llu req_id=%u op=%u flags=%u vector_bytes=%u",
@@ -323,13 +364,24 @@ int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp)
                       resp->vector_bytes);
             tcp_mark_inline_snapshot_error(resp);
         }
+        if (tcp_payloads_encoded(net_flags)) {
+            size_t encoded_len = 0;
+            if (vemb_v16_resp_encode(encoded_resp,
+                                     sizeof(encoded_resp),
+                                     resp,
+                                     &encoded_len) != 0) {
+                return -1;
+            }
+            resp_payload = encoded_resp;
+            resp_payload_len = (uint32_t)encoded_len;
+        }
         return vemb_v16_net_write_frame2(vemb_v16_channel_net_fd(ch),
                                          VEMB_V16_NET_RESPONSE,
-                                         0,
+                                         net_flags,
                                          vemb_v16_channel_id(ch),
                                          resp->req_id,
-                                         resp,
-                                         (uint32_t)sizeof(*resp),
+                                         resp_payload,
+                                         resp_payload_len,
                                          vector,
                                          vector_bytes);
     }
@@ -363,7 +415,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                uint32_t n,
                                uint32_t *published) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
+        uint32_t net_flags = vemb_v16_channel_tcp_net_flags(ch);
         vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
+        uint8_t encoded_resps[VEMB_V16_PROXY_BATCH][64];
         vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
         struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
         int iovcnt = 0;
@@ -388,8 +442,10 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 .magic = VEMB_V16_MAGIC,
                 .version = VEMB_V16_VERSION,
                 .type = VEMB_V16_NET_RESPONSE,
-                .flags = 0,
-                .payload_len = (uint32_t)sizeof(responses[out]) + vector_bytes,
+                .flags = net_flags,
+                .payload_len = (uint32_t)(tcp_payloads_encoded(net_flags) ?
+                                          vemb_v16_resp_encoded_len() :
+                                          sizeof(responses[out])) + vector_bytes,
                 .channel_id = vemb_v16_channel_id(ch),
                 .req_id = responses[out].req_id,
             };
@@ -412,7 +468,24 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                           (unsigned long long)responses[out].owner_generation);
             }
             iov[iovcnt++] = (struct iovec){ .iov_base = &headers[out], .iov_len = sizeof(headers[out]) };
-            iov[iovcnt++] = (struct iovec){ .iov_base = &responses[out], .iov_len = sizeof(responses[out]) };
+            if (tcp_payloads_encoded(net_flags)) {
+                size_t encoded_len = 0;
+                if (vemb_v16_resp_encode(encoded_resps[out],
+                                         sizeof(encoded_resps[out]),
+                                         &responses[out],
+                                         &encoded_len) != 0) {
+                    return -1;
+                }
+                iov[iovcnt++] = (struct iovec){
+                    .iov_base = encoded_resps[out],
+                    .iov_len = encoded_len,
+                };
+            } else {
+                iov[iovcnt++] = (struct iovec){
+                    .iov_base = &responses[out],
+                    .iov_len = sizeof(responses[out]),
+                };
+            }
             if (vector_bytes) {
                 iov[iovcnt++] = (struct iovec){ .iov_base = (void *)vector, .iov_len = vector_bytes };
             }
@@ -477,6 +550,7 @@ static int tcp_poll_input(int fd) {
 static int channel_read_tcp_request(vemb_v16_channel_t *ch,
                                     uint32_t proxy_io_worker_id) {
     vemb_v16_net_hdr_t hdr;
+    int req_len = 0;
     if (vemb_v16_net_read_header(vemb_v16_channel_net_fd(ch), &hdr) != 0)
         return -1;
     if (hdr.type == VEMB_V16_NET_CLOSE)
@@ -489,13 +563,40 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
     }
 
     vemb_v16_req_t *req = zmalloc(sizeof(*req));
+    uint8_t *payload = NULL;
     if (!req)
         return -1;
     memset(req, 0, sizeof(*req));
-    if (vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch), req, hdr.payload_len) != 0) {
+    if (!tcp_payloads_encoded(hdr.flags)) {
+        if (vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch),
+                                   req,
+                                   hdr.payload_len) != 0) {
+            zfree(req);
+            return -1;
+        }
+    } else {
+        payload = zmalloc(hdr.payload_len);
+        if (!payload ||
+            vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch),
+                                   payload,
+                                   hdr.payload_len) != 0 ||
+            vemb_v16_req_decode(req, payload, hdr.payload_len) != 0) {
+            zfree(payload);
+            zfree(req);
+            return -1;
+        }
+        zfree(payload);
+    }
+    if (req->channel_id == 0)
+        req->channel_id = vemb_v16_channel_id(ch);
+    if (vemb_v16_channel_tcp_net_flags(ch) != hdr.flags) {
         zfree(req);
         return -1;
     }
+    req_len = (int)((req->op == VEMB_V16_OP_VADD ||
+                     req->op == VEMB_V16_OP_VSIM_INLINE) ?
+        vemb_v16_req_inline_len(req->vector_bytes) :
+        vemb_v16_req_handle_len());
     if (diag_should_log_req(req->req_id)) {
         serverLog(LL_DEBUG,
                   "vemb_v16 diag tcp request recv: proxy_worker=%u channel_id=%llu hdr_req_id=%u req_id=%u op=%u flags=%u payload_len=%u key_hash=%llu vector_bytes=%u",
@@ -509,7 +610,7 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
                   (unsigned long long)req->key_hash,
                   req->vector_bytes);
     }
-    vemb_v16_proxy_handle_request(ch, req, (int)hdr.payload_len, proxy_io_worker_id);
+    vemb_v16_proxy_handle_request(ch, req, req_len, proxy_io_worker_id);
     zfree(req);
     if (vemb_v16_channel_net_fd(ch) < 0)
         return -1;
@@ -799,24 +900,60 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
 
     vemb_v16_alloc_req_t req;
     if (hdr.type != VEMB_V16_NET_HELLO ||
-        hdr.payload_len != sizeof(req) ||
-        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        ((tcp_payloads_encoded(hdr.flags) &&
+          hdr.payload_len != vemb_v16_alloc_req_encoded_len()) ||
+         (!tcp_payloads_encoded(hdr.flags) && hdr.payload_len != sizeof(req)))) {
         close(fd);
         return;
     }
-    (void)req;
+    memset(&req, 0, sizeof(req));
+    if (!tcp_payloads_encoded(hdr.flags)) {
+        if (vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+            close(fd);
+            return;
+        }
+    } else {
+        uint8_t payload[8];
+        if (vemb_v16_net_read_full(fd, payload, sizeof(payload)) != 0 ||
+            vemb_v16_alloc_req_decode(&req, payload, sizeof(payload)) != 0) {
+            close(fd);
+            return;
+        }
+    }
 
     vemb_v16_channel_desc_t desc;
-    if (vemb_v16_proxy_alloc_tcp_channel(proxy, fd, &desc) != 0) {
+    if (vemb_v16_proxy_alloc_tcp_channel(proxy, fd, hdr.flags, &desc) != 0) {
         return;
     }
-    if (vemb_v16_net_write_frame(fd,
-                                 VEMB_V16_NET_WELCOME,
-                                 0,
-                                 desc.channel_id,
-                                 0,
-                                 &desc,
-                                 sizeof(desc)) != 0) {
-        vemb_v16_proxy_close_channel_by_id(proxy, desc.channel_id);
+    if (!tcp_payloads_encoded(hdr.flags)) {
+        if (vemb_v16_net_write_frame(fd,
+                                     VEMB_V16_NET_WELCOME,
+                                     0,
+                                     desc.channel_id,
+                                     0,
+                                     &desc,
+                                     sizeof(desc)) != 0) {
+            vemb_v16_proxy_close_channel_by_id(proxy, desc.channel_id);
+        }
+    } else {
+        size_t payload_len = vemb_v16_channel_desc_encoded_len(&desc);
+        uint8_t *payload = zmalloc(payload_len);
+        int write_rc = -1;
+        if (payload &&
+            vemb_v16_channel_desc_encode(payload,
+                                         payload_len,
+                                         &desc,
+                                         &payload_len) == 0) {
+            write_rc = vemb_v16_net_write_frame(fd,
+                                                VEMB_V16_NET_WELCOME,
+                                                hdr.flags,
+                                                desc.channel_id,
+                                                0,
+                                                payload,
+                                                (uint32_t)payload_len);
+        }
+        zfree(payload);
+        if (write_rc != 0)
+            vemb_v16_proxy_close_channel_by_id(proxy, desc.channel_id);
     }
 }

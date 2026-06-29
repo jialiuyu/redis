@@ -339,13 +339,15 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
     assert(tlc_core_create(&core, &config) == 0);
     for (uint32_t i = 0; i < 16; i++) {
         fill_vector(vector, dim, 1000 + i);
-        assert(tlc_core_put_location(core,
-                                     key,
-                                     (uint32_t)strlen(key),
-                                     key_hash,
-                                     vector,
-                                     sizeof(vector),
-                                     &location) == 0);
+        assert(tlc_core_put_location_epoch(core,
+                                           key,
+                                           (uint32_t)strlen(key),
+                                           key_hash,
+                                           vector,
+                                           sizeof(vector),
+                                           0,
+                                           0,
+                                           &location) == 0);
     }
     fill_vector(expected, dim, 1015);
     assert(tlc_core_get_warm_location(core,
@@ -2097,13 +2099,14 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     assert(info.key_version == 1);
     assert(info.migration_state == TLC_CORE_KEY_SOURCE_ACTIVE);
 
-    assert(tlc_core_mark_migrating(source->core,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       2,
-                                       3,
-                                       &info) == 0);
+    assert(tlc_core_mark_migrating_in_shard(source->core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            2,
+                                            3,
+                                            0,
+                                            &info) == 0);
     assert(info.key_version == 1);
     assert(info.topology_epoch == 2);
     assert(info.migration_state == TLC_CORE_KEY_MIGRATING);
@@ -2344,13 +2347,14 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                             sizeof(v1),
                             &handle,
                             &warm_slot) == 0);
-    assert(tlc_core_mark_migrating(source->core,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       20,
-                                       3,
-                                       &info) == 0);
+    assert(tlc_core_mark_migrating_in_shard(source->core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            20,
+                                            3,
+                                            0,
+                                            &info) == 0);
     assert(info.migration_state == TLC_CORE_KEY_MIGRATING);
     assert(info.owner_epoch == 0);
 
@@ -2411,13 +2415,14 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
                                  &snapshot,
                                  snapshot_value,
                                  sizeof(snapshot_value)) != 0);
-    assert(tlc_core_mark_migrating(source->core,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       22,
-                                       3,
-                                       &info) != 0);
+    assert(tlc_core_mark_migrating_in_shard(source->core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            22,
+                                            3,
+                                            0,
+                                            &info) != 0);
 
     vemb_v16_tlc_destroy(source);
 }
@@ -3101,13 +3106,14 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(tlc_core_mark_migrating(source->core,
-                                       key,
-                                       key_len,
-                                       key_hash,
-                                       33,
-                                       3,
-                                       &info) == 0);
+    assert(tlc_core_mark_migrating_in_shard(source->core,
+                                            key,
+                                            key_len,
+                                            key_hash,
+                                            33,
+                                            3,
+                                            0,
+                                            &info) == 0);
 
     req.request_id = 9001;
     req.src_owner_id = 3;

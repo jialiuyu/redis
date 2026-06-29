@@ -562,8 +562,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
         int put_rc = -1;
         int stale_topology = 0;
         uint64_t write_topology_epoch = job->topology_epoch;
-        int ask_redirect =
-            (job->flags & VEMB_V16_REQ_F_ASK_REDIRECT) != 0;
+        int ask_redirect = (job->flags & VEMB_V16_REQ_F_ASK_REDIRECT) != 0;
         int migration_active = vemb_v16_storage_migration_active(storage);
         tlc_core_key_migration_info_t redirect_info = {0};
         if (ask_redirect) {
@@ -578,20 +577,17 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                 write_topology_epoch = redirect_info.owner_epoch ?
                     redirect_info.owner_epoch : redirect_info.topology_epoch;
             }
-        } else if (migration_active &&
-            vemb_v16_storage_write_epoch_is_stale(storage,
-                                                  job->topology_epoch)) {
-            stale_topology = 1;
-        } else {
-            if (migration_active &&
-                job_key_is_source_cutover(tlc,
-                                          job->key,
-                                          job->key_len,
-                                          job->key_hash,
-                                          &redirect_info)) {
+        } else if (migration_active) {
+            if (vemb_v16_storage_write_epoch_is_stale(storage,
+                                                      job->topology_epoch)) {
+                stale_topology = 1;
+            } else if (job_key_is_source_cutover(tlc,
+                                                 job->key,
+                                                 job->key_len,
+                                                 job->key_hash,
+                                                 &redirect_info)) {
                 completion_set_moved(&completion, &redirect_info);
-            } else if (migration_active &&
-                       vemb_v16_storage_migration_write_blocked_info(
+            } else if (vemb_v16_storage_migration_write_blocked_info(
                            storage,
                            job->key,
                            job->key_len,
@@ -601,8 +597,10 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                 completion_set_ask(&completion, &redirect_info);
             }
         }
-        if (completion.status == VEMB_V16_STATUS_OK &&
-            !stale_topology) {
+
+        // ASK is resolved before this point; entering here means local put can proceed.
+        // normal vadd put if not redirected or moved, and topology is not stale
+        if (completion.status == VEMB_V16_STATUS_OK && !stale_topology) {
             monotime put_start = timing_start_if_sampled(sample);
             put_rc = vemb_v16_tlc_put_with_epoch(tlc,
                                                  job->key,
@@ -613,7 +611,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                                  write_topology_epoch,
                                                  &handle,
                                                  &warm_slot);
-            if (put_rc == 0 && handle.bytes > 0)
+            if (put_rc == 0 && handle.bytes > 0) {
                 timing_acc_add_vector_locality_if_sampled(
                     tlc,
                     &handle,
@@ -621,83 +619,97 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                     &payload_remote_slice,
                     sample,
                     put_start);
-        }
-        if (completion.status == VEMB_V16_STATUS_OK &&
-            !stale_topology &&
-            !ask_redirect &&
-            put_rc != 0) {
-            tlc_core_key_migration_info_t redirect_info = {0};
-            if (migration_active &&
-                job_key_is_source_cutover(tlc,
-                                          job->key,
-                                          job->key_len,
-                                          job->key_hash,
-                                          &redirect_info)) {
-                completion_set_moved(&completion, &redirect_info);
-            }
-        }
-        if (completion.status != VEMB_V16_STATUS_MOVED &&
-            completion.status != VEMB_V16_STATUS_ASK) {
-            if (stale_topology) {
-                completion.status = VEMB_V16_STATUS_STALE_TOPOLOGY;
-            } else if (put_rc != 0) {
-                if (diag_should_log_req(job->req_id)) {
-                    uint64_t current_epoch = 0;
-                    uint64_t min_write_epoch = 0;
-                    tlc_core_key_migration_info_t info = {
-                        .source_owner = UINT32_MAX,
-                        .target_owner = UINT32_MAX,
-                    };
-                    int info_rc = tlc_core_get_migration_info(tlc->core,
-                        job->key,
-                        job->key_len,
-                        job->key_hash,
-                        &info);
-                    vemb_v16_storage_epoch_get(storage,
-                                               &current_epoch,
-                                               &min_write_epoch);
-                    serverLog(LL_WARNING,
-                              "vemb_v16 vadd put failed: req_id=%u key_hash=%llu key_len=%u status_reason=%s put_rc=%d dim=%u/%u vector_bytes=%u/%u request_epoch=%llu write_epoch=%llu current_epoch=%llu min_write_epoch=%llu migration_active=%d ask_redirect=%d stale_topology=%d info_rc=%d state=%u info_epoch=%llu owner_epoch=%llu source=%u target=%u shard=%u",
-                              job->req_id,
-                              (unsigned long long)job->key_hash,
-                              job->key_len,
-                              "tlc_put",
-                              put_rc,
-                              job->dim,
-                              tlc->vector_dim,
-                              job->vector_bytes,
-                              tlc->value_size,
-                              (unsigned long long)job->topology_epoch,
-                              (unsigned long long)write_topology_epoch,
-                              (unsigned long long)current_epoch,
-                              (unsigned long long)min_write_epoch,
-                              migration_active,
-                              ask_redirect,
-                              stale_topology,
-                              info_rc,
-                              info.migration_state,
-                              (unsigned long long)info.topology_epoch,
-                              (unsigned long long)info.owner_epoch,
-                              info.source_owner,
-                              info.target_owner,
-                              info.shard_id);
+            } else if (put_rc != 0 && !ask_redirect) {
+                tlc_core_key_migration_info_t redirect_info = {0};
+                if (migration_active &&
+                    job_key_is_source_cutover(tlc,
+                                              job->key,
+                                              job->key_len,
+                                              job->key_hash,
+                                              &redirect_info)) {
+                    completion_set_moved(&completion, &redirect_info);
                 }
-                completion.status = VEMB_V16_STATUS_ERR;
-            } else {
-                completion_set_vector_handle(&completion, &handle);
-                if (!ask_redirect &&
-                    migration_active &&
-                    vemb_v16_storage_migration_delta_put_after_local_write(
-                        storage,
-                        job->key,
-                        job->key_len,
-                        job->key_hash,
-                        &handle,
-                        NULL) != 0) {
-                    completion.status = VEMB_V16_STATUS_ERR;
+            }
+            // MOVED after the local put attempt must not continue local success completion.
+            if (completion.status != VEMB_V16_STATUS_MOVED) {
+                if (put_rc != 0) {
                     if (diag_should_log_req(job->req_id)) {
+                        uint64_t current_epoch = 0;
+                        uint64_t min_write_epoch = 0;
+                        tlc_core_key_migration_info_t info = {
+                            .source_owner = UINT32_MAX,
+                            .target_owner = UINT32_MAX,
+                        };
+                        int info_rc = tlc_core_get_migration_info(tlc->core,
+                            job->key,
+                            job->key_len,
+                            job->key_hash,
+                            &info);
+                        vemb_v16_storage_epoch_get(storage,
+                                                   &current_epoch,
+                                                   &min_write_epoch);
                         serverLog(LL_WARNING,
-                                  "vemb_v16 vadd migration delta publish failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
+                                  "vemb_v16 vadd put failed: req_id=%u key_hash=%llu key_len=%u status_reason=%s put_rc=%d dim=%u/%u vector_bytes=%u/%u request_epoch=%llu write_epoch=%llu current_epoch=%llu min_write_epoch=%llu migration_active=%d ask_redirect=%d stale_topology=%d info_rc=%d state=%u info_epoch=%llu owner_epoch=%llu source=%u target=%u shard=%u",
+                                  job->req_id,
+                                  (unsigned long long)job->key_hash,
+                                  job->key_len,
+                                  "tlc_put",
+                                  put_rc,
+                                  job->dim,
+                                  tlc->vector_dim,
+                                  job->vector_bytes,
+                                  tlc->value_size,
+                                  (unsigned long long)job->topology_epoch,
+                                  (unsigned long long)write_topology_epoch,
+                                  (unsigned long long)current_epoch,
+                                  (unsigned long long)min_write_epoch,
+                                  migration_active,
+                                  ask_redirect,
+                                  stale_topology,
+                                  info_rc,
+                                  info.migration_state,
+                                  (unsigned long long)info.topology_epoch,
+                                  (unsigned long long)info.owner_epoch,
+                                  info.source_owner,
+                                  info.target_owner,
+                                  info.shard_id);
+                    }
+                    completion.status = VEMB_V16_STATUS_ERR;
+                } else {
+                    completion_set_vector_handle(&completion, &handle);
+                    if (!ask_redirect &&
+                        migration_active &&
+                        vemb_v16_storage_migration_delta_put_after_local_write(
+                            storage,
+                            job->key,
+                            job->key_len,
+                            job->key_hash,
+                            &handle,
+                            NULL) != 0) {
+                        completion.status = VEMB_V16_STATUS_ERR;
+                        if (diag_should_log_req(job->req_id)) {
+                            serverLog(LL_WARNING,
+                                      "vemb_v16 vadd migration delta publish failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
+                                      job->req_id,
+                                      (unsigned long long)job->key_hash,
+                                      handle.region_id,
+                                      (unsigned long long)handle.offset,
+                                      handle.bytes);
+                        }
+                    }
+                    if (handle.bytes > 0 &&
+                        completion.status == VEMB_V16_STATUS_OK &&
+                        tlc->remote_meta_view_count > 1 &&
+                        enqueue_remote_meta_publish(tlc,
+                                                    tlc->remote_meta_view,
+                                                    job->key,
+                                                    job->key_len,
+                                                    job->key_hash,
+                                                    &handle,
+                                                    0) != 0 &&
+                        diag_should_log_req(job->req_id)) {
+                        serverLog(LL_WARNING,
+                                  "vemb_v16 vadd remote meta publish enqueue failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
                                   job->req_id,
                                   (unsigned long long)job->key_hash,
                                   handle.region_id,
@@ -705,27 +717,10 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                   handle.bytes);
                     }
                 }
-                if (handle.bytes > 0 &&
-                    completion.status == VEMB_V16_STATUS_OK &&
-                    tlc->remote_meta_view_count > 1 &&
-                    enqueue_remote_meta_publish(tlc,
-                                                tlc->remote_meta_view,
-                                                job->key,
-                                                job->key_len,
-                                                job->key_hash,
-                                                &handle,
-                                                0) != 0 &&
-                    diag_should_log_req(job->req_id)) {
-                    serverLog(LL_WARNING,
-                              "vemb_v16 vadd remote meta publish enqueue failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
-                              job->req_id,
-                              (unsigned long long)job->key_hash,
-                              handle.region_id,
-                              (unsigned long long)handle.offset,
-                              handle.bytes);
-                }
             }
         }
+        if (stale_topology)
+            completion.status = VEMB_V16_STATUS_STALE_TOPOLOGY;
     } else if (job->op == VEMB_V16_OP_VREM) {
         int stale_topology = 0;
         tlc_core_key_migration_info_t redirect_info = {0};
@@ -746,64 +741,34 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                 write_topology_epoch = redirect_info.owner_epoch ?
                     redirect_info.owner_epoch : redirect_info.topology_epoch;
             }
-        } else if (migration_active &&
-            vemb_v16_storage_write_epoch_is_stale(storage,
-                                                  job->topology_epoch)) {
-            stale_topology = 1;
-        } else if (migration_active &&
-                   job_key_is_source_cutover(tlc,
-                                             job->key,
-                                             job->key_len,
-                                             job->key_hash,
-                                             &redirect_info)) {
-            completion_set_moved(&completion, &redirect_info);
-        } else if (migration_active &&
-                   vemb_v16_storage_migration_write_blocked_info(
-                       storage,
-                       job->key,
-                       job->key_len,
-                       job->key_hash,
-                       &redirect_info,
-                       NULL)) {
-            completion_set_ask(&completion, &redirect_info);
-        }
-        if (completion.status == VEMB_V16_STATUS_OK &&
-            !stale_topology &&
-            vemb_v16_tlc_get_handle(tlc,
-                                    job->key,
-                                    job->key_len,
-                                    job->key_hash,
-                                    &existing,
-                                    &warm_slot) != 0) {
-            memset(&redirect_info, 0, sizeof(redirect_info));
-            if (!ask_redirect &&
-                migration_active &&
-                job_key_is_source_cutover(tlc,
-                                          job->key,
-                                          job->key_len,
-                                          job->key_hash,
-                                          &redirect_info)) {
+        } else if (migration_active) {
+            if (vemb_v16_storage_write_epoch_is_stale(storage,
+                                                      job->topology_epoch)) {
+                stale_topology = 1;
+            } else if (job_key_is_source_cutover(tlc,
+                                                 job->key,
+                                                 job->key_len,
+                                                 job->key_hash,
+                                                 &redirect_info)) {
                 completion_set_moved(&completion, &redirect_info);
-            } else {
-                completion.status = VEMB_V16_STATUS_NOT_FOUND;
-                completion.vector_bytes = 0;
-                atomic_fetch_add_explicit(&ctx->stats->not_found, 1, memory_order_relaxed);
+            } else if (vemb_v16_storage_migration_write_blocked_info(
+                           storage,
+                           job->key,
+                           job->key_len,
+                           job->key_hash,
+                           &redirect_info,
+                           NULL)) {
+                completion_set_ask(&completion, &redirect_info);
             }
-        } else if (completion.status == VEMB_V16_STATUS_OK &&
-                   !stale_topology) {
-            tlc_core_key_migration_info_t delete_info = {0};
-            if (vemb_v16_storage_delete_with_epoch(storage,
-                                                   job->key,
-                                                   job->key_len,
-                                                   job->key_hash,
-                                                   write_topology_epoch,
-                                                   &delete_info,
-                                                   NULL) == 0) {
-                completion.vector_bytes = 0;
-                completion.dim = 0;
-                completion.region_id = UINT32_MAX;
-                completion.local_slot = UINT32_MAX;
-            } else {
+        }
+
+        if (completion.status == VEMB_V16_STATUS_OK && !stale_topology) {
+            if (vemb_v16_tlc_get_handle(tlc,
+                                        job->key,
+                                        job->key_len,
+                                        job->key_hash,
+                                        &existing,
+                                        &warm_slot) != 0) {
                 memset(&redirect_info, 0, sizeof(redirect_info));
                 if (!ask_redirect &&
                     migration_active &&
@@ -814,7 +779,36 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                               &redirect_info)) {
                     completion_set_moved(&completion, &redirect_info);
                 } else {
-                    completion.status = VEMB_V16_STATUS_ERR;
+                    completion.status = VEMB_V16_STATUS_NOT_FOUND;
+                    completion.vector_bytes = 0;
+                    atomic_fetch_add_explicit(&ctx->stats->not_found, 1, memory_order_relaxed);
+                }
+            } else {
+                tlc_core_key_migration_info_t delete_info = {0};
+                if (vemb_v16_storage_delete_with_epoch(storage,
+                                                       job->key,
+                                                       job->key_len,
+                                                       job->key_hash,
+                                                       write_topology_epoch,
+                                                       &delete_info,
+                                                       NULL) == 0) {
+                    completion.vector_bytes = 0;
+                    completion.dim = 0;
+                    completion.region_id = UINT32_MAX;
+                    completion.local_slot = UINT32_MAX;
+                } else {
+                    memset(&redirect_info, 0, sizeof(redirect_info));
+                    if (!ask_redirect &&
+                        migration_active &&
+                        job_key_is_source_cutover(tlc,
+                                                  job->key,
+                                                  job->key_len,
+                                                  job->key_hash,
+                                                  &redirect_info)) {
+                        completion_set_moved(&completion, &redirect_info);
+                    } else {
+                        completion.status = VEMB_V16_STATUS_ERR;
+                    }
                 }
             }
         }

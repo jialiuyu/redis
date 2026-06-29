@@ -59,6 +59,10 @@ int vemb_v16_channel_net_fd(vemb_v16_channel_t *ch) {
     return ch->net_fd;
 }
 
+uint32_t vemb_v16_channel_tcp_net_flags(vemb_v16_channel_t *ch) {
+    return ch->tcp_net_flags;
+}
+
 int vemb_v16_channel_tcp_backpressure_enabled(vemb_v16_channel_t *ch) {
     return ch->tcp_backpressure_enabled;
 }
@@ -914,6 +918,7 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
 static int alloc_channel_common(vemb_v16_proxy_t *proxy,
                                 uint32_t transport_type,
                                 int net_fd,
+                                uint32_t tcp_net_flags,
                                 vemb_v16_channel_desc_t *desc) {
     uint32_t idx = VEMB_V16_MAX_CHANNELS;
     uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
@@ -940,6 +945,7 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
     ch->proxy = proxy;
     ch->transport_type = transport_type;
     ch->net_fd = net_fd;
+    ch->tcp_net_flags = tcp_net_flags;
     atomic_store_explicit(&ch->active, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_state, 0, memory_order_release);
@@ -1026,14 +1032,19 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
 
 /// UB/SHM control plane: allocate a shared-memory client channel.
 int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, desc);
+    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, 0, desc);
 }
 
 /// TCP control plane: attach an accepted socket to a channel.
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                       int net_fd,
+                      uint32_t tcp_net_flags,
                       vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_TCP, net_fd, desc);
+    return alloc_channel_common(proxy,
+                                VEMB_V16_TRANSPORT_TCP,
+                                net_fd,
+                                tcp_net_flags,
+                                desc);
 }
 
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.

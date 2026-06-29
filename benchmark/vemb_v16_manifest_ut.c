@@ -585,13 +585,14 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
                             sizeof(vector),
                             &handle,
                             &warm_slot) == 0);
-    assert(tlc_core_mark_migrating(storage->tlc->core,
-                                       cutover_key,
-                                       cutover_key_len,
-                                       cutover_key_hash,
-                                       40,
-                                       1,
-                                       &info) == 0);
+    assert(tlc_core_mark_migrating_in_shard(storage->tlc->core,
+                                            cutover_key,
+                                            cutover_key_len,
+                                            cutover_key_hash,
+                                            40,
+                                            1,
+                                            0,
+                                            &info) == 0);
     assert(vemb_v16_storage_migration_mark_cutover(storage,
                                                   cutover_key,
                                                   cutover_key_len,
