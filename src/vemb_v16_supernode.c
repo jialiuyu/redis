@@ -38,22 +38,20 @@ static monotime timing_start_if_sampled(int sample) {
     return start;
 }
 
-static uint64_t timing_elapsed_if_sampled(int sample, monotime start) {
-    return sample ? elapsedNs(start) : 0;
+static void timing_acc_add_ns_if_sampled(vemb_v16_timing_acc_t *acc,
+                                         int sample,
+                                         uint64_t ns) {
+    if (sample) vemb_v16_timing_acc_add(acc, ns);
 }
 
-static void timing_acc_add_if_sampled(vemb_v16_timing_acc_t *acc,
-                                      int sample,
-                                      uint64_t ns) {
-    if (sample)
-        vemb_v16_timing_acc_add(acc, ns);
-}
-
-static void timing_acc_add_elapsed_if_sampled(vemb_v16_timing_acc_t *acc,
-                                              int sample,
-                                              monotime start) {
-    if (sample)
-        vemb_v16_timing_acc_add(acc, elapsedNs(start));
+static uint64_t timing_acc_add_if_sampled(vemb_v16_timing_acc_t *acc,
+                                          int sample,
+                                          monotime start) {
+    if (!sample) return 0;
+    uint64_t ns = 0;
+    ns = elapsedNs(start);
+    vemb_v16_timing_acc_add(acc, ns);
+    return ns;
 }
 
 static const char *op_name(uint8_t op) {
@@ -62,12 +60,14 @@ static const char *op_name(uint8_t op) {
         return "vadd";
     case VEMB_V16_OP_VREM:
         return "vrem";
+    case VEMB_V16_OP_VEMB_HANDLE:
+        return "vemb-handle";
     case VEMB_V16_OP_VEMB_INLINE:
         return "vemb-inline";
     case VEMB_V16_OP_VSIM_INLINE:
         return "vsim-inline";
     case VEMB_V16_OP_VSIM_KEY_KEY:
-        return "vsim-key-key";
+        return "vsim-key1-key2";
     default:
         return "unknown";
     }
@@ -78,6 +78,20 @@ static int vector_handle_is_local(vemb_v16_tlc_t *tlc,
     const vemb_v16_tlc_warm_region_t *region =
         vemb_v16_tlc_find_region(tlc, handle->region_id);
     return region && region->is_local;
+}
+
+static void timing_acc_add_vector_locality_if_sampled(
+    vemb_v16_tlc_t *tlc,
+    const vemb_v16_vector_handle_t *handle,
+    vemb_v16_timing_acc_t *payload_local_slice,
+    vemb_v16_timing_acc_t *payload_remote_slice,
+    int sample,
+    monotime start) {
+    if (!sample) return;
+    vemb_v16_timing_acc_t *acc = payload_remote_slice;
+    if (vector_handle_is_local(tlc, handle))
+        acc = payload_local_slice;
+    vemb_v16_timing_acc_add(acc, elapsedNs(start));
 }
 
 static int job_shape_matches_tlc(const vemb_v16_job_base_t *job,
@@ -121,16 +135,15 @@ static void completion_set_vector_handle(
     completion->owner_generation = handle->owner_generation;
 }
 
-static int snapshot_vemb_payload(vemb_v16_tlc_t *tlc,
+static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
+                                 vemb_v16_tlc_t *tlc,
                                  const vemb_v16_job_base_t *job,
                                  const vemb_v16_vector_handle_t *handle,
                                  vemb_v16_completion_t *completion,
                                  vemb_v16_timing_acc_t *payload_local_slice,
                                  vemb_v16_timing_acc_t *payload_remote_slice,
                                  int sample) {
-    if (job->op != VEMB_V16_OP_VEMB_INLINE)
-        return -1;
-
+    RETURN_IF (job->op != VEMB_V16_OP_VEMB_INLINE, -1);
     completion->inline_vector = zmalloc(job->vector_bytes);
     RETURN_IF(!completion->inline_vector, -1);
 
@@ -141,14 +154,12 @@ static int snapshot_vemb_payload(vemb_v16_tlc_t *tlc,
                                            completion->inline_vector,
                                            job->vector_bytes,
                                            &vector_len);
-    uint64_t vector_load_ns =
-        timing_elapsed_if_sampled(sample, vector_load_start);
-    if (sample) {
-        if (vector_handle_is_local(tlc, handle))
-            vemb_v16_timing_acc_add(payload_local_slice, vector_load_ns);
-        else
-            vemb_v16_timing_acc_add(payload_remote_slice, vector_load_ns);
-    }
+    timing_acc_add_vector_locality_if_sampled(tlc,
+                                              handle,
+                                              payload_local_slice,
+                                              payload_remote_slice,
+                                              sample,
+                                              vector_load_start);
     if (copy_rc != 0 || vector_len != job->vector_bytes) {
         zfree(completion->inline_vector);
         completion->inline_vector = NULL;
@@ -157,6 +168,12 @@ static int snapshot_vemb_payload(vemb_v16_tlc_t *tlc,
     }
 
     completion->inline_vector_bytes = vector_len;
+    if (sample) {
+        atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
+                                  payload_local_slice->ns +
+                                  payload_remote_slice->ns,
+                                  memory_order_relaxed);
+    }
     return 0;
 }
 
@@ -309,22 +326,18 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                        job->key_hash,
                                        &handle,
                                        &warm_slot) == 0) {
-        lookup_ns = timing_elapsed_if_sampled(sample, lookup_start);
-        timing_acc_add_if_sampled(&primary_lookup, sample, lookup_ns);
+        lookup_ns = timing_acc_add_if_sampled(&primary_lookup,
+                                              sample,
+                                              lookup_start);
         completion_set_vector_handle(&completion, &handle);
-        if (snapshot_vemb_payload(tlc,
+        if (snapshot_vemb_payload(ctx,
+                                  tlc,
                                   job,
                                   &handle,
                                   &completion,
                                   &payload_local_slice,
                                   &payload_remote_slice,
                                   sample) == 0) {
-            if (sample) {
-                atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
-                                          payload_local_slice.ns +
-                                          payload_remote_slice.ns,
-                                          memory_order_relaxed);
-            }
             goto finish_vemb_job;
         }
         completion.status = VEMB_V16_STATUS_OK;
@@ -334,8 +347,9 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
 
     if (vemb_v16_tlc_get_handle(tlc, job->key, job->key_len,
                                 job->key_hash, &handle, &warm_slot) != 0) {
-        lookup_ns = timing_elapsed_if_sampled(sample, lookup_start);
-        timing_acc_add_if_sampled(&primary_lookup, sample, lookup_ns);
+        lookup_ns = timing_acc_add_if_sampled(&primary_lookup,
+                                              sample,
+                                              lookup_start);
         tlc_core_key_migration_info_t redirect_info = {0};
         if (migration_active &&
             job_key_is_source_cutover(tlc,
@@ -349,8 +363,9 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
             atomic_fetch_add_explicit(&ctx->stats->not_found, 1, memory_order_relaxed);
         }
     } else {
-        lookup_ns = timing_elapsed_if_sampled(sample, lookup_start);
-        timing_acc_add_if_sampled(&primary_lookup, sample, lookup_ns);
+        lookup_ns = timing_acc_add_if_sampled(&primary_lookup,
+                                              sample,
+                                              lookup_start);
         completion_set_vector_handle(&completion, &handle);
         if (job->op == VEMB_V16_OP_VSIM_KEY_KEY) {
             vemb_v16_vector_handle_t handle2 = {0};
@@ -363,9 +378,14 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                               &handle2,
                                               &key2_source,
                                               &key2_timing) != 0) {
-                timing_acc_add_if_sampled(&secondary_lookup, sample, key2_timing.local_lookup_ns);
+                timing_acc_add_ns_if_sampled(&secondary_lookup,
+                                             sample,
+                                             key2_timing.local_lookup_ns);
                 if (key2_timing.remote_meta_lookup_count)
-                    timing_acc_add_if_sampled(&remote_meta_lookup, sample, key2_timing.remote_meta_lookup_ns);
+                    timing_acc_add_ns_if_sampled(
+                        &remote_meta_lookup,
+                        sample,
+                        key2_timing.remote_meta_lookup_ns);
                 tlc_core_key_migration_info_t redirect_info = {0};
                 if (migration_active &&
                     job_key_is_source_cutover(tlc,
@@ -389,35 +409,38 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                 const uint8_t *v2_bytes = NULL;
                 uint32_t v1_len = 0;
                 uint32_t v2_len = 0;
-                timing_acc_add_if_sampled(&secondary_lookup, sample, key2_timing.local_lookup_ns);
+                timing_acc_add_ns_if_sampled(&secondary_lookup,
+                                             sample,
+                                             key2_timing.local_lookup_ns);
                 if (key2_timing.remote_meta_lookup_count)
-                    timing_acc_add_if_sampled(&remote_meta_lookup, sample, key2_timing.remote_meta_lookup_ns);
+                    timing_acc_add_ns_if_sampled(
+                        &remote_meta_lookup,
+                        sample,
+                        key2_timing.remote_meta_lookup_ns);
                 monotime slice_start = timing_start_if_sampled(sample);
                 int v1_rc = vemb_v16_tlc_vector_slice(tlc,
                                                       &handle,
                                                       &v1_bytes,
                                                       &v1_len);
-                uint64_t slice_ns = timing_elapsed_if_sampled(sample, slice_start);
-                if (sample) {
-                    if (vector_handle_is_local(tlc, &handle)) {
-                        vemb_v16_timing_acc_add(&payload_local_slice, slice_ns);
-                    } else {
-                        vemb_v16_timing_acc_add(&payload_remote_slice, slice_ns);
-                    }
-                }
+                timing_acc_add_vector_locality_if_sampled(
+                    tlc,
+                    &handle,
+                    &payload_local_slice,
+                    &payload_remote_slice,
+                    sample,
+                    slice_start);
                 slice_start = timing_start_if_sampled(sample);
                 int v2_rc = vemb_v16_tlc_vector_slice(tlc,
                                                       &handle2,
                                                       &v2_bytes,
                                                       &v2_len);
-                slice_ns = timing_elapsed_if_sampled(sample, slice_start);
-                if (sample) {
-                    if (vector_handle_is_local(tlc, &handle2)) {
-                        vemb_v16_timing_acc_add(&payload_local_slice, slice_ns);
-                    } else {
-                        vemb_v16_timing_acc_add(&payload_remote_slice, slice_ns);
-                    }
-                }
+                timing_acc_add_vector_locality_if_sampled(
+                    tlc,
+                    &handle2,
+                    &payload_local_slice,
+                    &payload_remote_slice,
+                    sample,
+                    slice_start);
                 if (v1_rc != 0 || v2_rc != 0 ||
                     v1_len != job->vector_bytes ||
                     v2_len != job->vector_bytes) {
@@ -439,7 +462,7 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                     const float *v2 = (const float *)(const void *)v2_bytes;
                     monotime compute_start = timing_start_if_sampled(sample);
                     completion.score = sve_cosine_similarity_f32(v1, v2, job->dim);
-                    timing_acc_add_elapsed_if_sampled(&compute, sample, compute_start);
+                    timing_acc_add_if_sampled(&compute, sample, compute_start);
                     serverLog(LL_DEBUG,
                               "vemb_v16 vsim key-key ok: req_id=%u key_hash=%llu key2_hash=%llu key2_source=%u region1=%u offset1=%llu region2=%u offset2=%llu score=%f",
                               job->req_id,
@@ -454,7 +477,8 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                 }
             }
         } else if (needs_payload_snapshot) {
-            if (snapshot_vemb_payload(tlc,
+            if (snapshot_vemb_payload(ctx,
+                                      tlc,
                                       job,
                                       &handle,
                                       &completion,
@@ -463,12 +487,6 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                       sample) != 0) {
                 completion.status = VEMB_V16_STATUS_ERR;
                 completion.vector_bytes = 0;
-            }
-            if (sample) {
-                atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
-                                          payload_local_slice.ns +
-                                          payload_remote_slice.ns,
-                                          memory_order_relaxed);
             }
         }
     }
@@ -543,7 +561,6 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
         vemb_v16_vector_handle_t handle = {0};
         int put_rc = -1;
         int stale_topology = 0;
-        uint64_t put_ns = 0;
         uint64_t write_topology_epoch = job->topology_epoch;
         int ask_redirect =
             (job->flags & VEMB_V16_REQ_F_ASK_REDIRECT) != 0;
@@ -596,14 +613,14 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                                  write_topology_epoch,
                                                  &handle,
                                                  &warm_slot);
-            put_ns = timing_elapsed_if_sampled(sample, put_start);
-            if (sample && put_rc == 0 && handle.bytes > 0) {
-                if (vector_handle_is_local(tlc, &handle)) {
-                    vemb_v16_timing_acc_add(&payload_local_slice, put_ns);
-                } else {
-                    vemb_v16_timing_acc_add(&payload_remote_slice, put_ns);
-                }
-            }
+            if (put_rc == 0 && handle.bytes > 0)
+                timing_acc_add_vector_locality_if_sampled(
+                    tlc,
+                    &handle,
+                    &payload_local_slice,
+                    &payload_remote_slice,
+                    sample,
+                    put_start);
         }
         if (completion.status == VEMB_V16_STATUS_OK &&
             !stale_topology &&
@@ -810,7 +827,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
         int migration_active = vemb_v16_storage_migration_active(storage);
         if (vemb_v16_tlc_get_handle(tlc, job->key, job->key_len,
                                     job->key_hash, &handle, &warm_slot) != 0) {
-            timing_acc_add_elapsed_if_sampled(&primary_lookup, sample, lookup_start);
+            timing_acc_add_if_sampled(&primary_lookup, sample, lookup_start);
             tlc_core_key_migration_info_t redirect_info = {0};
             if (migration_active &&
                 job_key_is_source_cutover(tlc,
@@ -824,7 +841,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                 atomic_fetch_add_explicit(&ctx->stats->not_found, 1, memory_order_relaxed);
             }
         } else {
-            timing_acc_add_elapsed_if_sampled(&primary_lookup, sample, lookup_start);
+            timing_acc_add_if_sampled(&primary_lookup, sample, lookup_start);
             const uint8_t *stored_bytes = NULL;
             uint32_t stored_len = 0;
             monotime slice_start = timing_start_if_sampled(sample);
@@ -832,29 +849,27 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                           &stored_bytes,
                                           &stored_len) != 0 ||
                 stored_len != job->vector_bytes) {
-                uint64_t slice_ns =
-                    timing_elapsed_if_sampled(sample, slice_start);
-                if (sample) {
-                    if (vector_handle_is_local(tlc, &handle))
-                        vemb_v16_timing_acc_add(&payload_local_slice, slice_ns);
-                    else
-                        vemb_v16_timing_acc_add(&payload_remote_slice, slice_ns);
-                }
+                timing_acc_add_vector_locality_if_sampled(
+                    tlc,
+                    &handle,
+                    &payload_local_slice,
+                    &payload_remote_slice,
+                    sample,
+                    slice_start);
                 completion.status = VEMB_V16_STATUS_ERR;
             } else {
-                uint64_t slice_ns =
-                    timing_elapsed_if_sampled(sample, slice_start);
-                if (sample) {
-                    if (vector_handle_is_local(tlc, &handle))
-                        vemb_v16_timing_acc_add(&payload_local_slice, slice_ns);
-                    else
-                        vemb_v16_timing_acc_add(&payload_remote_slice, slice_ns);
-                }
+                timing_acc_add_vector_locality_if_sampled(
+                    tlc,
+                    &handle,
+                    &payload_local_slice,
+                    &payload_remote_slice,
+                    sample,
+                    slice_start);
                 const float *stored = (const float *)(const void *)stored_bytes;
                 completion_set_vector_handle(&completion, &handle);
                 monotime compute_start = timing_start_if_sampled(sample);
                 completion.score = sve_cosine_similarity_f32(stored, vadd_job->vector, job->dim);
-                timing_acc_add_elapsed_if_sampled(&compute, sample, compute_start);
+                timing_acc_add_if_sampled(&compute, sample, compute_start);
             }
         }
     } else {
