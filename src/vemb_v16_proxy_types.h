@@ -48,6 +48,7 @@ struct vemb_v16_channel {
     size_t response_ring_bytes;
     uint32_t transport_type;
     int net_fd;
+    uint32_t tcp_net_flags;
     atomic_int proxy_io_registered;
     atomic_uint_fast32_t proxy_io_state;
     atomic_uint_fast32_t supernode_state;

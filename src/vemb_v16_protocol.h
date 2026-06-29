@@ -45,6 +45,8 @@
 #define VEMB_V16_TRANSPORT_AERON 1u
 #define VEMB_V16_TRANSPORT_TCP 2u
 
+#define VEMB_V16_NET_F_ENCODED_PAYLOAD 0x01u
+
 #define VEMB_V16_REQ_F_ASK_REDIRECT 0x02u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_PUBLISHED 0x01u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED 0x02u
@@ -653,6 +655,347 @@ static inline size_t vemb_v16_req_handle_len(void) {
 
 static inline size_t vemb_v16_req_inline_len(uint32_t vector_bytes) {
     return offsetof(vemb_v16_req_t, vector) + (size_t)vector_bytes;
+}
+
+static inline void vemb_v16_proto_put_u16(uint8_t **p, uint16_t v) {
+    uint8_t *dst = *p;
+    dst[0] = (uint8_t)(v >> 8);
+    dst[1] = (uint8_t)v;
+    *p = dst + 2;
+}
+
+static inline void vemb_v16_proto_put_u32(uint8_t **p, uint32_t v) {
+    uint8_t *dst = *p;
+    dst[0] = (uint8_t)(v >> 24);
+    dst[1] = (uint8_t)(v >> 16);
+    dst[2] = (uint8_t)(v >> 8);
+    dst[3] = (uint8_t)v;
+    *p = dst + 4;
+}
+
+static inline void vemb_v16_proto_put_u64(uint8_t **p, uint64_t v) {
+    uint8_t *dst = *p;
+    dst[0] = (uint8_t)(v >> 56);
+    dst[1] = (uint8_t)(v >> 48);
+    dst[2] = (uint8_t)(v >> 40);
+    dst[3] = (uint8_t)(v >> 32);
+    dst[4] = (uint8_t)(v >> 24);
+    dst[5] = (uint8_t)(v >> 16);
+    dst[6] = (uint8_t)(v >> 8);
+    dst[7] = (uint8_t)v;
+    *p = dst + 8;
+}
+
+static inline uint16_t vemb_v16_proto_get_u16(const uint8_t **p) {
+    const uint8_t *src = *p;
+    uint16_t v = (uint16_t)(((uint16_t)src[0] << 8) | (uint16_t)src[1]);
+    *p = src + 2;
+    return v;
+}
+
+static inline uint32_t vemb_v16_proto_get_u32(const uint8_t **p) {
+    const uint8_t *src = *p;
+    uint32_t v = ((uint32_t)src[0] << 24) |
+                 ((uint32_t)src[1] << 16) |
+                 ((uint32_t)src[2] << 8) |
+                 (uint32_t)src[3];
+    *p = src + 4;
+    return v;
+}
+
+static inline uint64_t vemb_v16_proto_get_u64(const uint8_t **p) {
+    const uint8_t *src = *p;
+    uint64_t v = ((uint64_t)src[0] << 56) |
+                 ((uint64_t)src[1] << 48) |
+                 ((uint64_t)src[2] << 40) |
+                 ((uint64_t)src[3] << 32) |
+                 ((uint64_t)src[4] << 24) |
+                 ((uint64_t)src[5] << 16) |
+                 ((uint64_t)src[6] << 8) |
+                 (uint64_t)src[7];
+    *p = src + 8;
+    return v;
+}
+
+static inline void vemb_v16_proto_put_bytes(uint8_t **p,
+                                            const void *src,
+                                            size_t len) {
+    if (len != 0)
+        memcpy(*p, src, len);
+    *p += len;
+}
+
+static inline void vemb_v16_proto_get_bytes(const uint8_t **p,
+                                            void *dst,
+                                            size_t len) {
+    if (len != 0)
+        memcpy(dst, *p, len);
+    *p += len;
+}
+
+static inline void vemb_v16_proto_put_f32(uint8_t **p, float v) {
+    uint32_t bits = 0;
+    memcpy(&bits, &v, sizeof(bits));
+    vemb_v16_proto_put_u32(p, bits);
+}
+
+static inline float vemb_v16_proto_get_f32(const uint8_t **p) {
+    uint32_t bits = vemb_v16_proto_get_u32(p);
+    float v = 0;
+    memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+static inline size_t vemb_v16_alloc_req_encoded_len(void) {
+    return 8u;
+}
+
+static inline int vemb_v16_alloc_req_encode(uint8_t *dst,
+                                            size_t cap,
+                                            const vemb_v16_alloc_req_t *req,
+                                            size_t *out_len) {
+    if (!dst || !req || cap < vemb_v16_alloc_req_encoded_len())
+        return -1;
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u32(&p, req->vector_dim);
+    vemb_v16_proto_put_u32(&p, req->flags);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_alloc_req_decode(vemb_v16_alloc_req_t *req,
+                                            const uint8_t *src,
+                                            size_t len) {
+    if (!req || !src || len != vemb_v16_alloc_req_encoded_len())
+        return -1;
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->vector_dim = vemb_v16_proto_get_u32(&p);
+    req->flags = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
+static inline size_t vemb_v16_channel_desc_encoded_len(
+    const vemb_v16_channel_desc_t *desc) {
+    uint32_t warm_region_count = desc ? desc->warm_region_count : 0;
+    if (warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
+        warm_region_count = VEMB_V16_MAX_DESC_WARM_REGIONS;
+    return 452u + (size_t)warm_region_count * 280u;
+}
+
+static inline int vemb_v16_channel_desc_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_channel_desc_t *desc,
+    size_t *out_len) {
+    if (!dst || !desc)
+        return -1;
+    size_t need = vemb_v16_channel_desc_encoded_len(desc);
+    if (cap < need)
+        return -1;
+    uint8_t *p = dst;
+    uint32_t warm_region_count = desc->warm_region_count;
+    if (warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
+        warm_region_count = VEMB_V16_MAX_DESC_WARM_REGIONS;
+    vemb_v16_proto_put_u32(&p, desc->magic);
+    vemb_v16_proto_put_u32(&p, desc->version);
+    vemb_v16_proto_put_u64(&p, desc->channel_id);
+    vemb_v16_proto_put_u32(&p, desc->channel_index);
+    vemb_v16_proto_put_u32(&p, desc->vector_dim);
+    vemb_v16_proto_put_u32(&p, desc->vector_stride);
+    vemb_v16_proto_put_u32(&p, desc->max_vectors);
+    vemb_v16_proto_put_u32(&p, desc->request_ring_slot_size);
+    vemb_v16_proto_put_u32(&p, desc->response_ring_slot_size);
+    vemb_v16_proto_put_u32(&p, desc->warm_region_id);
+    vemb_v16_proto_put_u32(&p, desc->warm_backend_type);
+    vemb_v16_proto_put_u64(&p, desc->warm_region_bytes);
+    vemb_v16_proto_put_u64(&p, desc->warm_mmap_offset);
+    vemb_v16_proto_put_bytes(&p,
+                             desc->request_ring_name,
+                             sizeof(desc->request_ring_name));
+    vemb_v16_proto_put_bytes(&p,
+                             desc->response_ring_name,
+                             sizeof(desc->response_ring_name));
+    vemb_v16_proto_put_bytes(&p,
+                             desc->vector_region_name,
+                             sizeof(desc->vector_region_name));
+    vemb_v16_proto_put_u32(&p, warm_region_count);
+    for (uint32_t i = 0; i < warm_region_count; i++) {
+        vemb_v16_proto_put_u32(&p, desc->warm_regions[i].region_id);
+        vemb_v16_proto_put_u32(&p, desc->warm_regions[i].backend_type);
+        vemb_v16_proto_put_u64(&p, desc->warm_regions[i].region_bytes);
+        vemb_v16_proto_put_u64(&p, desc->warm_regions[i].mmap_offset);
+        vemb_v16_proto_put_bytes(&p,
+                                 desc->warm_regions[i].path,
+                                 sizeof(desc->warm_regions[i].path));
+    }
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
+                                               const uint8_t *src,
+                                               size_t len) {
+    if (!desc || !src || len < 452u)
+        return -1;
+    const uint8_t *p = src;
+    memset(desc, 0, sizeof(*desc));
+    desc->magic = vemb_v16_proto_get_u32(&p);
+    desc->version = vemb_v16_proto_get_u32(&p);
+    desc->channel_id = vemb_v16_proto_get_u64(&p);
+    desc->channel_index = vemb_v16_proto_get_u32(&p);
+    desc->vector_dim = vemb_v16_proto_get_u32(&p);
+    desc->vector_stride = vemb_v16_proto_get_u32(&p);
+    desc->max_vectors = vemb_v16_proto_get_u32(&p);
+    desc->request_ring_slot_size = vemb_v16_proto_get_u32(&p);
+    desc->response_ring_slot_size = vemb_v16_proto_get_u32(&p);
+    desc->warm_region_id = vemb_v16_proto_get_u32(&p);
+    desc->warm_backend_type = vemb_v16_proto_get_u32(&p);
+    desc->warm_region_bytes = vemb_v16_proto_get_u64(&p);
+    desc->warm_mmap_offset = vemb_v16_proto_get_u64(&p);
+    vemb_v16_proto_get_bytes(&p,
+                             desc->request_ring_name,
+                             sizeof(desc->request_ring_name));
+    vemb_v16_proto_get_bytes(&p,
+                             desc->response_ring_name,
+                             sizeof(desc->response_ring_name));
+    vemb_v16_proto_get_bytes(&p,
+                             desc->vector_region_name,
+                             sizeof(desc->vector_region_name));
+    desc->warm_region_count = vemb_v16_proto_get_u32(&p);
+    if (desc->warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
+        return -1;
+    if (len != vemb_v16_channel_desc_encoded_len(desc))
+        return -1;
+    for (uint32_t i = 0; i < desc->warm_region_count; i++) {
+        desc->warm_regions[i].region_id = vemb_v16_proto_get_u32(&p);
+        desc->warm_regions[i].backend_type = vemb_v16_proto_get_u32(&p);
+        desc->warm_regions[i].region_bytes = vemb_v16_proto_get_u64(&p);
+        desc->warm_regions[i].mmap_offset = vemb_v16_proto_get_u64(&p);
+        vemb_v16_proto_get_bytes(&p,
+                                 desc->warm_regions[i].path,
+                                 sizeof(desc->warm_regions[i].path));
+    }
+    return 0;
+}
+
+static inline size_t vemb_v16_req_encoded_len(const vemb_v16_req_t *req) {
+    return 54u + (size_t)req->key_len + (size_t)req->key2_len +
+           (size_t)req->vector_bytes;
+}
+
+static inline int vemb_v16_req_encode(uint8_t *dst,
+                                      size_t cap,
+                                      const vemb_v16_req_t *req,
+                                      size_t *out_len) {
+    if (!dst || !req)
+        return -1;
+    if (req->key_len > VEMB_V16_MAX_KEY_LEN ||
+        req->key2_len > VEMB_V16_MAX_KEY_LEN ||
+        req->vector_bytes > sizeof(req->vector)) {
+        return -1;
+    }
+    size_t need = vemb_v16_req_encoded_len(req);
+    if (cap < need)
+        return -1;
+    uint8_t *p = dst;
+    *p++ = req->op;
+    *p++ = req->flags;
+    vemb_v16_proto_put_u32(&p, req->req_id);
+    vemb_v16_proto_put_u64(&p, req->channel_id);
+    vemb_v16_proto_put_u64(&p, req->key_hash);
+    vemb_v16_proto_put_u32(&p, req->key_len);
+    vemb_v16_proto_put_u32(&p, req->key2_len);
+    vemb_v16_proto_put_u64(&p, req->key2_hash);
+    vemb_v16_proto_put_u64(&p, req->topology_epoch);
+    vemb_v16_proto_put_u32(&p, req->dim);
+    vemb_v16_proto_put_u32(&p, req->vector_bytes);
+    vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
+    vemb_v16_proto_put_bytes(&p, req->key2, req->key2_len);
+    vemb_v16_proto_put_bytes(&p, req->vector, req->vector_bytes);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_req_decode(vemb_v16_req_t *req,
+                                      const uint8_t *src,
+                                      size_t len) {
+    if (!req || !src || len < 54u)
+        return -1;
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->op = *p++;
+    req->flags = *p++;
+    req->req_id = vemb_v16_proto_get_u32(&p);
+    req->channel_id = vemb_v16_proto_get_u64(&p);
+    req->key_hash = vemb_v16_proto_get_u64(&p);
+    req->key_len = vemb_v16_proto_get_u32(&p);
+    req->key2_len = vemb_v16_proto_get_u32(&p);
+    req->key2_hash = vemb_v16_proto_get_u64(&p);
+    req->topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->dim = vemb_v16_proto_get_u32(&p);
+    req->vector_bytes = vemb_v16_proto_get_u32(&p);
+    if (req->key_len > VEMB_V16_MAX_KEY_LEN ||
+        req->key2_len > VEMB_V16_MAX_KEY_LEN ||
+        req->vector_bytes > sizeof(req->vector))
+        return -1;
+    if (len != vemb_v16_req_encoded_len(req))
+        return -1;
+    vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
+    vemb_v16_proto_get_bytes(&p, req->key2, req->key2_len);
+    vemb_v16_proto_get_bytes(&p, req->vector, req->vector_bytes);
+    return 0;
+}
+
+static inline size_t vemb_v16_resp_encoded_len(void) {
+    return 56u;
+}
+
+static inline int vemb_v16_resp_encode(uint8_t *dst,
+                                       size_t cap,
+                                       const vemb_v16_resp_t *resp,
+                                       size_t *out_len) {
+    if (!dst || !resp || cap < vemb_v16_resp_encoded_len())
+        return -1;
+    uint8_t *p = dst;
+    *p++ = resp->status;
+    *p++ = resp->op;
+    vemb_v16_proto_put_u16(&p, resp->flags);
+    vemb_v16_proto_put_u32(&p, resp->req_id);
+    vemb_v16_proto_put_u64(&p, resp->key_hash);
+    vemb_v16_proto_put_u64(&p, resp->vector_offset);
+    vemb_v16_proto_put_u32(&p, resp->vector_bytes);
+    vemb_v16_proto_put_u32(&p, resp->dim);
+    vemb_v16_proto_put_u32(&p, resp->region_id);
+    vemb_v16_proto_put_u32(&p, resp->local_slot);
+    vemb_v16_proto_put_u64(&p, resp->owner_generation);
+    vemb_v16_proto_put_u32(&p, resp->redirect_owner);
+    vemb_v16_proto_put_f32(&p, resp->score);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_resp_decode(vemb_v16_resp_t *resp,
+                                       const uint8_t *src,
+                                       size_t len) {
+    if (!resp || !src || len != vemb_v16_resp_encoded_len())
+        return -1;
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = *p++;
+    resp->op = *p++;
+    resp->flags = vemb_v16_proto_get_u16(&p);
+    resp->req_id = vemb_v16_proto_get_u32(&p);
+    resp->key_hash = vemb_v16_proto_get_u64(&p);
+    resp->vector_offset = vemb_v16_proto_get_u64(&p);
+    resp->vector_bytes = vemb_v16_proto_get_u32(&p);
+    resp->dim = vemb_v16_proto_get_u32(&p);
+    resp->region_id = vemb_v16_proto_get_u32(&p);
+    resp->local_slot = vemb_v16_proto_get_u32(&p);
+    resp->owner_generation = vemb_v16_proto_get_u64(&p);
+    resp->redirect_owner = vemb_v16_proto_get_u32(&p);
+    resp->score = vemb_v16_proto_get_f32(&p);
+    return 0;
 }
 
 #endif
