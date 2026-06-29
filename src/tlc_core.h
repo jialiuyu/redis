@@ -15,6 +15,10 @@
 #endif
 #define TLC_CORE_INVALID_SLOT UINT32_MAX
 #define TLC_CORE_INVALID_REGION_ID UINT32_MAX
+#define IS_VALID_LOCATION(loc) \
+    ((loc).region_id != TLC_CORE_INVALID_REGION_ID && \
+     (loc).local_slot != TLC_CORE_INVALID_SLOT)
+#define IS_INVALID_LOCATION(loc) (!IS_VALID_LOCATION(loc))
 #define TLC_CORE_MAX_WARM_REGIONS 128u
 
 typedef struct tlc_warm_location {
@@ -161,21 +165,15 @@ int tlc_core_put(tlc_core_t *core,
                  const void *value,
                  uint32_t value_size,
                  uint32_t *warm_slot);
-int tlc_core_put_location(tlc_core_t *core,
-                          const char *key,
-                          uint32_t key_len,
-                          uint64_t key_hash,
-                          const void *value,
-                          uint32_t value_size,
-                          tlc_warm_location_t *location);
-int tlc_core_put_location_with_epoch(tlc_core_t *core,
-                                     const char *key,
-                                     uint32_t key_len,
-                                     uint64_t key_hash,
-                                     const void *value,
-                                     uint32_t value_size,
-                                     uint64_t topology_epoch,
-                                     tlc_warm_location_t *location);
+int tlc_core_put_location_epoch(tlc_core_t *core,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                const void *value,
+                                uint32_t value_size,
+                                uint64_t topology_epoch,
+                                int enforce_epoch,
+                                tlc_warm_location_t *location);
 int tlc_core_delete_with_epoch(tlc_core_t *core,
                                const char *key,
                                uint32_t key_len,
@@ -193,13 +191,6 @@ int tlc_core_get_migration_info(tlc_core_t *core,
                                 uint32_t key_len,
                                 uint64_t key_hash,
                                 tlc_core_key_migration_info_t *info);
-int tlc_core_mark_migrating(tlc_core_t *core,
-                            const char *key,
-                            uint32_t key_len,
-                            uint64_t key_hash,
-                            uint64_t topology_epoch,
-                            uint32_t target_owner,
-                            tlc_core_key_migration_info_t *info);
 int tlc_core_mark_migrating_in_shard(tlc_core_t *core,
                                      const char *key,
                                      uint32_t key_len,

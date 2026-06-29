@@ -2805,13 +2805,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                        50,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(tlc_core_mark_migrating(source->core,
-                                       baseline_key,
-                                       baseline_key_len,
-                                       baseline_key_hash,
-                                       50,
-                                       3,
-                                       &info) == 0);
+    assert(tlc_core_mark_migrating_in_shard(source->core,
+                                            baseline_key,
+                                            baseline_key_len,
+                                            baseline_key_hash,
+                                            50,
+                                            3,
+                                            0,
+                                            &info) == 0);
     fill_topology_req(&topology_req,
                       60,
                       50,
@@ -2910,13 +2911,14 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                        55,
                                        &handle,
                                        &warm_slot) == 0);
-    assert(tlc_core_mark_migrating(source->core,
-                                       lease_fail_key,
-                                       lease_fail_key_len,
-                                       lease_fail_key_hash,
-                                       55,
-                                       3,
-                                       &info) == 0);
+    assert(tlc_core_mark_migrating_in_shard(source->core,
+                                            lease_fail_key,
+                                            lease_fail_key_len,
+                                            lease_fail_key_hash,
+                                            55,
+                                            3,
+                                            0,
+                                            &info) == 0);
     assert(tlc_core_snapshot(source->core,
                                  lease_fail_key,
                                  lease_fail_key_len,

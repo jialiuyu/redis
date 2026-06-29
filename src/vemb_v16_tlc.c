@@ -1570,8 +1570,15 @@ int vemb_v16_tlc_put(vemb_v16_tlc_t *tlc,
                      vemb_v16_vector_handle_t *handle,
                      uint32_t *warm_slot) {
     tlc_warm_location_t location = {0};
-    if (tlc_core_put_location(tlc->core, key, key_len, key_hash,
-                              vector, vector_bytes, &location) != 0) {
+    if (tlc_core_put_location_epoch(tlc->core,
+                                    key,
+                                    key_len,
+                                    key_hash,
+                                    vector,
+                                    vector_bytes,
+                                    0,
+                                    0,
+                                    &location) != 0) {
         return -1;
     }
     *warm_slot = location.local_slot;
@@ -1594,19 +1601,19 @@ int vemb_v16_tlc_put_with_epoch(vemb_v16_tlc_t *tlc,
                                 vemb_v16_vector_handle_t *handle,
                                 uint32_t *warm_slot) {
     tlc_warm_location_t location = {0};
-    if (tlc_core_put_location_with_epoch(tlc->core,
-                                         key,
-                                         key_len,
-                                         key_hash,
-                                         vector,
-                                         vector_bytes,
-                                         topology_epoch,
-                                         &location) != 0) {
+    if (tlc_core_put_location_epoch(tlc->core,
+                                    key,
+                                    key_len,
+                                    key_hash,
+                                    vector,
+                                    vector_bytes,
+                                    topology_epoch,
+                                    1,
+                                    &location) != 0) {
         return -1;
     }
     *warm_slot = location.local_slot;
-    if (location.local_slot == TLC_CORE_INVALID_SLOT ||
-        location.region_id == TLC_CORE_INVALID_REGION_ID) {
+    if (IS_INVALID_LOCATION(location)) {
         memset(handle, 0, sizeof(*handle));
         return 0;
     }
