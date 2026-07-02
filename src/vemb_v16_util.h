@@ -1,22 +1,29 @@
 #ifndef __VEMB_V16_UTIL_H
 #define __VEMB_V16_UTIL_H
 
+#include "monotonic.h"
+
 #include <stddef.h>
 #include <stdint.h>
-#include <time.h>
 
 static inline uint64_t vemb_v16_monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) +
-        (uint64_t)ts.tv_nsec;
+    return getMonotonicNs();
 }
 
+const uint32_t max_power = UINT32_C(1) << 30;
 static inline uint32_t vemb_v16_pow2_ceil_u32(uint64_t value) {
-    uint32_t p = 1;
-    while ((uint64_t)p < value && p < (UINT32_C(1) << 30))
-        p <<= 1;
-    return p;
+    if (value <= 1)
+        return 1;
+    if (value >= max_power)
+        return max_power;
+
+    uint32_t v = (uint32_t)(value - 1);
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
 }
 
 static inline size_t vemb_v16_align64_size(size_t value) {

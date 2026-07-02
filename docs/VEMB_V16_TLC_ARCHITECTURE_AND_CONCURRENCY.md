@@ -417,3 +417,4 @@ payload 写入按 slot CAS/seqlock 发布；
 - `hold/hot` 和 `warm.entries/hash_table` 结构仍存在，但当前代码中未看到 warm put 维护这些结构，性能分析应优先看 `location_cache` 和 slot meta。
 - remote meta handle 命中不是最终可信结果，必须通过 `tlc_core_validate_warm_location()`。
 - `owner_generation` 是 handle 正确性的关键字段，slot overwrite/evict 后可识别旧 handle。
+

@@ -178,6 +178,22 @@ vemb_v16_tlc_ut: vemb_v16_tlc_ut.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h .
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/sve_operation.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c ../src/vemb_v16_log.c ../src/localtime.c -pthread -lm
 	@echo "✅ Built: $@"
 
+UB_BATCH_LOAD_CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=gnu11 \
+	-I../src -DSVE_OP_STANDALONE
+ifeq ($(USE_SVE),yes)
+    UB_BATCH_LOAD_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+ifeq ($(PREFETCH),pld)
+    UB_BATCH_LOAD_CFLAGS += -DUB_BATCH_PREFETCH_PLDL1KEEP
+endif
+ifneq ($(CACHELINE),)
+    UB_BATCH_LOAD_CFLAGS += -DUB_BATCH_CACHELINE=$(CACHELINE)
+endif
+
+vemb_v16_ub_batch_load_perf_ut: vemb_v16_ub_batch_load_perf_ut.c ../src/sve_operation.c ../src/sve_operation.h ../src/sve_config.h ../src/monotonic.c ../src/monotonic.h ../src/redisassert.c
+	$(CC) $(UB_BATCH_LOAD_CFLAGS) -o $@ vemb_v16_ub_batch_load_perf_ut.c ../src/sve_operation.c ../src/monotonic.c ../src/redisassert.c -pthread -lm
+	@echo "✅ Built: $@"
+
 vemb_v16_manifest_ut: vemb_v16_manifest_ut.c ../src/vemb_v16_storage.c ../src/vemb_v16_storage.h ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/vemb_v16_tlc.h ../src/tlc_core.c ../src/tlc_core.h ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_shared_allocator.h ../src/vemb_v16_mapped_region.c ../src/vemb_v16_mapped_region.h ../src/vemb_v16_remote_meta.c ../src/vemb_v16_remote_meta.h ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_ub_rpc.h ../src/vemb_v16_topology.c ../src/vemb_v16_topology.h ../src/vemb_v16_migration_outbox.c ../src/vemb_v16_migration_outbox.h ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c
 	$(CC) -O3 -Wall -Wextra -march=native -pthread -std=gnu11 -I../src -o $@ $< ../src/vemb_v16_storage.c ../src/vemb_v16_warm_provider.c ../src/vemb_v16_tlc.c ../src/tlc_core.c ../src/vemb_v16_shared_allocator.c ../src/vemb_v16_mapped_region.c ../src/vemb_v16_remote_meta.c ../src/vemb_v16_ub_rpc.c ../src/vemb_v16_topology.c ../src/vemb_v16_migration_outbox.c ../src/sve_operation.c ../src/vemb_v16_log.c ../src/localtime.c ../src/monotonic.c ../src/zmalloc.c ../src/redisassert.c -pthread -lm
 	@echo "✅ Built: $@"

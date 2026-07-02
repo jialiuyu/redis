@@ -1,5 +1,6 @@
 #include "../src/vemb_v16_tlc.h"
 #include "../src/tlc_core.h"
+#include "../src/monotonic.h"
 #include "../src/vemb_v16_remote_meta.h"
 #include "../src/vemb_v16_ub_rpc.h"
 
@@ -3169,6 +3170,8 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
 }
 
 int main(void) {
+    monotonicInit();
+
     test_put_get_handle();
     test_overwrite_and_capacity();
     test_eviction_rejects_stale_handle();

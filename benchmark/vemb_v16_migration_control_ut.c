@@ -1,3 +1,4 @@
+#include "../src/monotonic.h"
 #include "../src/vemb_v16_proxy.h"
 #include "../src/vemb_v16_aeron_transport.h"
 #include "../src/vemb_v16_net.h"
@@ -4655,6 +4656,8 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
 }
 
 int main(void) {
+    monotonicInit();
+
     test_proxy_migration_control_primitives();
     test_storage_topology_auto_marks_migrating_keys();
     test_storage_topology_auto_pushes_baseline_snapshot();
