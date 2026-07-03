@@ -60,7 +60,6 @@ typedef struct bench_cfg {
     int vsim_key2_owner;
     int client_topology_enabled;
     int client_topology_valid;
-    int tcp_encoded_payloads;
     vemb_v16_client_topology_t client_topology;
 } bench_cfg_t;
 
@@ -85,7 +84,6 @@ typedef struct bench_node_channel {
     const char *tcp_host;
     uint16_t tcp_port;
     uint32_t timeout_ms;
-    int tcp_encoded_payloads;
     bench_region_map_t warm_region;
     uint32_t warm_region_count;
     bench_region_map_t warm_regions[VEMB_V16_MAX_DESC_WARM_REGIONS];
@@ -257,20 +255,17 @@ static int alloc_tcp_channel(const bench_cfg_t *cfg,
     uint8_t req_buf[8];
     const void *payload = &req;
     uint32_t payload_len = (uint32_t)sizeof(req);
-    uint32_t net_flags = cfg->tcp_encoded_payloads ?
-        VEMB_V16_NET_F_ENCODED_PAYLOAD : 0;
-    if (cfg->tcp_encoded_payloads) {
-        size_t encoded_len = 0;
-        if (vemb_v16_alloc_req_encode(req_buf,
-                                      sizeof(req_buf),
-                                      &req,
-                                      &encoded_len) != 0) {
-            close(fd);
-            return -1;
-        }
-        payload = req_buf;
-        payload_len = (uint32_t)encoded_len;
+    uint32_t net_flags = 0;
+    size_t encoded_len = 0;
+    if (vemb_v16_alloc_req_encode(req_buf,
+                                  sizeof(req_buf),
+                                  &req,
+                                  &encoded_len) != 0) {
+        close(fd);
+        return -1;
     }
+    payload = req_buf;
+    payload_len = (uint32_t)encoded_len;
     if (vemb_v16_net_write_frame(fd,
                                  VEMB_V16_NET_HELLO,
                                  net_flags,
@@ -288,24 +283,16 @@ static int alloc_tcp_channel(const bench_cfg_t *cfg,
         close(fd);
         return -1;
     }
-    if (!cfg->tcp_encoded_payloads) {
-        if (hdr.payload_len != sizeof(*desc) ||
-            vemb_v16_net_read_full(fd, desc, sizeof(*desc)) != 0) {
-            close(fd);
-            return -1;
-        }
-    } else {
-        uint8_t *desc_buf = zmalloc(hdr.payload_len);
-        if (!desc_buf ||
-            (hdr.flags & VEMB_V16_NET_F_ENCODED_PAYLOAD) == 0 ||
-            vemb_v16_net_read_full(fd, desc_buf, hdr.payload_len) != 0 ||
-            vemb_v16_channel_desc_decode(desc, desc_buf, hdr.payload_len) != 0) {
-            zfree(desc_buf);
-            close(fd);
-            return -1;
-        }
+    uint8_t *desc_buf = zmalloc(hdr.payload_len);
+    if (!desc_buf ||
+        hdr.flags != 0 ||
+        vemb_v16_net_read_full(fd, desc_buf, hdr.payload_len) != 0 ||
+        vemb_v16_channel_desc_decode(desc, desc_buf, hdr.payload_len) != 0) {
         zfree(desc_buf);
+        close(fd);
+        return -1;
     }
+        zfree(desc_buf);
     if (desc->magic != VEMB_V16_MAGIC || desc->version != VEMB_V16_VERSION) {
         close(fd);
         return -1;
@@ -827,32 +814,26 @@ static int send_channel_req(bench_node_channel_t *node,
                             uint64_t *publish_spins,
                             uint32_t timeout_ms) {
     if (node->transport_type == VEMB_V16_TRANSPORT_TCP) {
+        size_t encoded_len = vemb_v16_req_encoded_len(req);
         uint8_t *req_buf = NULL;
-        const void *payload = req;
-        uint32_t payload_len = (uint32_t)len;
-        uint32_t net_flags = node->tcp_encoded_payloads ?
-            VEMB_V16_NET_F_ENCODED_PAYLOAD : 0;
+        uint32_t net_flags = 0;
         (void)publish_spins;
         (void)timeout_ms;
+        (void)len;
         if (node->net_fd < 0) return -1;
-        if (node->tcp_encoded_payloads) {
-            size_t encoded_len = vemb_v16_req_encoded_len(req);
-            req_buf = zmalloc(encoded_len);
-            if (!req_buf ||
-                vemb_v16_req_encode(req_buf, encoded_len, req, &encoded_len) != 0) {
-                zfree(req_buf);
-                return -1;
-            }
-            payload = req_buf;
-            payload_len = (uint32_t)encoded_len;
+        req_buf = zmalloc(encoded_len);
+        if (!req_buf ||
+            vemb_v16_req_encode(req_buf, encoded_len, req, &encoded_len) != 0) {
+            zfree(req_buf);
+            return -1;
         }
         int rc = vemb_v16_net_write_frame(node->net_fd,
                                           VEMB_V16_NET_REQUEST,
                                           net_flags,
                                           node->desc.channel_id,
                                           req->req_id,
-                                          payload,
-                                          payload_len);
+                                          req_buf,
+                                          (uint32_t)encoded_len);
         zfree(req_buf);
         return rc;
     }
@@ -877,39 +858,31 @@ static int recv_channel_resp(bench_node_channel_t *node,
             hdr.channel_id != node->desc.channel_id) {
             return -1;
         }
-        if ((hdr.flags & VEMB_V16_NET_F_ENCODED_PAYLOAD) == 0) {
-            if (hdr.payload_len < sizeof(*resp))
-                return -1;
-            uint32_t extra = hdr.payload_len - (uint32_t)sizeof(*resp);
-            if (extra) {
-                if (!inline_vector || extra > inline_vector_cap)
-                    return -1;
-                struct iovec iov[2] = {
-                    {.iov_base = resp, .iov_len = sizeof(*resp)},
-                    {.iov_base = inline_vector, .iov_len = extra},
-                };
-                if (vemb_v16_net_readv_full(node->net_fd, iov, 2) != 0)
-                    return -1;
-                if (inline_vector_bytes) *inline_vector_bytes = extra;
-            } else if (vemb_v16_net_read_full(node->net_fd, resp, sizeof(*resp)) != 0) {
+        uint8_t resp_buf[64];
+        uint32_t base_bytes = (uint32_t)vemb_v16_resp_encoded_base_len();
+        if (hdr.flags != 0 ||
+            hdr.payload_len < base_bytes ||
+            vemb_v16_net_read_full(node->net_fd, resp_buf, base_bytes) != 0) {
+            return -1;
+        }
+        size_t resp_bytes = vemb_v16_resp_encoded_len_for_fields(
+            resp_buf[0],
+            (uint8_t)(resp_buf[1] & VEMB_V16_TCP_RESP_OP_MASK));
+        if (resp_bytes > sizeof(resp_buf) ||
+            hdr.payload_len < resp_bytes ||
+            vemb_v16_net_read_full(node->net_fd,
+                                   resp_buf + base_bytes,
+                                   resp_bytes - base_bytes) != 0 ||
+            vemb_v16_resp_decode(resp, resp_buf, resp_bytes) != 0) {
+            return -1;
+        }
+        uint32_t extra = hdr.payload_len - (uint32_t)resp_bytes;
+        if (extra) {
+            if (!inline_vector || extra > inline_vector_cap ||
+                vemb_v16_net_read_full(node->net_fd, inline_vector, extra) != 0) {
                 return -1;
             }
-        } else {
-            uint8_t resp_buf[64];
-            uint32_t resp_bytes = (uint32_t)vemb_v16_resp_encoded_len();
-            if (hdr.payload_len < resp_bytes ||
-                vemb_v16_net_read_full(node->net_fd, resp_buf, resp_bytes) != 0 ||
-                vemb_v16_resp_decode(resp, resp_buf, resp_bytes) != 0) {
-                return -1;
-            }
-            uint32_t extra = hdr.payload_len - resp_bytes;
-            if (extra) {
-                if (!inline_vector || extra > inline_vector_cap ||
-                    vemb_v16_net_read_full(node->net_fd, inline_vector, extra) != 0) {
-                    return -1;
-                }
-                if (inline_vector_bytes) *inline_vector_bytes = extra;
-            }
+            if (inline_vector_bytes) *inline_vector_bytes = extra;
         }
         return 0;
     }
@@ -1850,7 +1823,6 @@ static int setup_node_channel(const bench_cfg_t *cfg,
     node->tcp_host = tcp_host_for_node(cfg, node_index);
     node->tcp_port = tcp_port_for_node(cfg, node_index);
     node->timeout_ms = cfg->timeout_ms;
-    node->tcp_encoded_payloads = cfg->tcp_encoded_payloads;
     if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP) {
         if (alloc_tcp_channel(cfg, node_index, &node->desc, &node->net_fd) != 0) {
             close_node_channel(cfg->socket_paths[node_index], node);
@@ -1907,12 +1879,11 @@ static int run_once(bench_cfg_t cfg) {
                cfg.client_topology.standby_ring.owner_count,
                cfg.client_topology.flags);
     }
-    printf("[setup] transport=%s mode=%s dim=%u prefill=%u keyspace=%u ops/thread=%u threads=%d pipeline=%u pin=%s tcp_encoded=%s\n",
+    printf("[setup] transport=%s mode=%s dim=%u prefill=%u keyspace=%u ops/thread=%u threads=%d pipeline=%u pin=%s\n",
            vemb_v16_transport_name(cfg.transport_type),
            mode_name(cfg.mode), cfg.dim, cfg.prefill,
            workload_keyspace(&cfg), cfg.ops, cfg.threads, cfg.pipeline,
-           cfg.pin_threads ? "yes" : "no",
-           cfg.tcp_encoded_payloads ? "yes" : "no");
+           cfg.pin_threads ? "yes" : "no");
     if (cfg.prefill && cfg.mode != MODE_PING) {
         for (uint32_t n = 0; n < cfg.node_count; n++) {
             if (setup_node_channel(&cfg, n, 0, &pre_nodes[n]) != 0) {
@@ -2075,7 +2046,6 @@ int main(int argc, char **argv) {
         .pipeline = 1,
         .transport_type = VEMB_V16_TRANSPORT_AERON,
         .tcp_port = VEMB_V16_TCP_PORT,
-        .tcp_encoded_payloads = 0,
         .vsim_key2_owner = VSIM_KEY2_OWNER_SAME,
     };
     cfg.node_count = 1;
@@ -2133,8 +2103,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--keyspace") && i + 1 < argc) cfg.keyspace = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ops") && i + 1 < argc) cfg.ops = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) cfg.timeout_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--tcp-encoded-payloads")) cfg.tcp_encoded_payloads = 1;
-        else if (!strcmp(argv[i], "--no-tcp-encoded-payloads")) cfg.tcp_encoded_payloads = 0;
         else if (!strcmp(argv[i], "--pipeline") && i + 1 < argc) cfg.pipeline = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *arg = argv[++i];
@@ -2175,7 +2143,7 @@ int main(int argc, char **argv) {
             }
         }
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--tcp-encoded-payloads] [--hot-key-id N] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
+            printf("usage: %s [--transport tcp|aeron] [--socket PATH | --sockets PATH[,PATH...] | --endpoints HOST:PORT[,HOST:PORT...]] [--host HOST] [--port PORT] [--dim N] [--prefill N] [--keyspace N] [--ops N] [--timeout-ms N] [--pipeline N] [--threads N[,N...]] [--pin [yes|no]] [--no-pin] [--client-topology] [--no-client-topology] [--hot-key-id N] [--mode ping|vemb-handle|vemb-inline|vadd|vrem|mixed-80r20w|vsim-inline|vsim-key-key] [--vsim-key2-owner same|remote]\n", argv[0]);
             return 0;
         }
         else {

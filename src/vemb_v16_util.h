@@ -10,12 +10,12 @@ static inline uint64_t vemb_v16_monotonic_ns(void) {
     return getMonotonicNs();
 }
 
-const uint32_t max_power = UINT32_C(1) << 30;
+static const uint32_t VEMB_V16_MAX_POWER_U32 = UINT32_C(1) << 30;
 static inline uint32_t vemb_v16_pow2_ceil_u32(uint64_t value) {
     if (value <= 1)
         return 1;
-    if (value >= max_power)
-        return max_power;
+    if (value >= VEMB_V16_MAX_POWER_U32)
+        return VEMB_V16_MAX_POWER_U32;
 
     uint32_t v = (uint32_t)(value - 1);
     v |= v >> 1;

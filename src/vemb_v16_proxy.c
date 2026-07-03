@@ -59,10 +59,6 @@ int vemb_v16_channel_net_fd(vemb_v16_channel_t *ch) {
     return ch->net_fd;
 }
 
-uint32_t vemb_v16_channel_tcp_net_flags(vemb_v16_channel_t *ch) {
-    return ch->tcp_net_flags;
-}
-
 int vemb_v16_channel_tcp_backpressure_enabled(vemb_v16_channel_t *ch) {
     return ch->tcp_backpressure_enabled;
 }
@@ -918,7 +914,6 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
 static int alloc_channel_common(vemb_v16_proxy_t *proxy,
                                 uint32_t transport_type,
                                 int net_fd,
-                                uint32_t tcp_net_flags,
                                 vemb_v16_channel_desc_t *desc) {
     uint32_t idx = VEMB_V16_MAX_CHANNELS;
     uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
@@ -945,7 +940,6 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
     ch->proxy = proxy;
     ch->transport_type = transport_type;
     ch->net_fd = net_fd;
-    ch->tcp_net_flags = tcp_net_flags;
     atomic_store_explicit(&ch->active, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_state, 0, memory_order_release);
@@ -1032,18 +1026,16 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
 
 /// UB/SHM control plane: allocate a shared-memory client channel.
 int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, 0, desc);
+    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, desc);
 }
 
 /// TCP control plane: attach an accepted socket to a channel.
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                       int net_fd,
-                      uint32_t tcp_net_flags,
                       vemb_v16_channel_desc_t *desc) {
     return alloc_channel_common(proxy,
                                 VEMB_V16_TRANSPORT_TCP,
                                 net_fd,
-                                tcp_net_flags,
                                 desc);
 }
 
@@ -1901,21 +1893,32 @@ static int scaleout_notify_send_tcp(
                                   VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS);
     if (fd < 0)
         return -1;
-    if (vemb_v16_net_write_frame(fd,
+    uint8_t req_buf[64];
+    size_t req_len = 0;
+    if (vemb_v16_scaleout_local_done_req_encode(req_buf,
+                                                sizeof(req_buf),
+                                                req,
+                                                &req_len) != 0 ||
+        vemb_v16_net_write_frame(fd,
                                  VEMB_V16_NET_SCALEOUT_LOCAL_DONE,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 (uint32_t)sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(fd);
         return -1;
     }
     vemb_v16_net_hdr_t hdr;
+    uint8_t resp_buf[64];
     if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
         hdr.type != VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE ||
-        hdr.payload_len != sizeof(*resp) ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        hdr.flags != 0 ||
+        hdr.payload_len != vemb_v16_scaleout_local_done_resp_encoded_len() ||
+        vemb_v16_net_read_full(fd, resp_buf, hdr.payload_len) != 0 ||
+        vemb_v16_scaleout_local_done_resp_decode(resp,
+                                                 resp_buf,
+                                                 hdr.payload_len) != 0) {
         close(fd);
         return -1;
     }

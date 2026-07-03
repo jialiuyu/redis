@@ -197,9 +197,9 @@ Redis 主线程串行执行的好处是简单：很多对象生命周期、dict 
 | --- | --- | ---: | --- |
 | Aeron/SHM pooled | `mixed-80r20w` | **7,096,721.24 QPS** | 读侧可走 handle/mmap，不要求 TCP 回 1200B payload |
 | TCP pooled 历史读口径 | `vemb-supernode-read` | **3,386,415.44 QPS** | 历史 mode，不返回 vector-inline payload |
-| TCP pooled 当前 vector-inline | `mixed-80r20w` | **3,011,502.12 QPS** | TCP 读侧返回 1200B vector-inline payload |
+| TCP pooled 当前 vector-inline | `mixed-80r20w` | **2,843,824.98 QPS** | 2026-07-03 最新 5 轮复测均值；TCP 读侧返回 1200B vector-inline payload |
 
-这里最关键的是最后一行：当前 TCP mixed 已经不是 handle-only 历史口径，而是 vector-inline 口径，仍能稳定达到约 `3.01M QPS`，并且 clean run 指标为：
+这里最关键的是最后一行：当前 TCP mixed 已经不是 handle-only 历史口径，而是 vector-inline 口径。按 2026-07-03 最新 5 轮复测，仍能稳定达到约 `2.84M QPS`，并且 `fail=0`。单轮结果区间为 `2.83M - 2.85M QPS`，说明当前代码下这个口径是稳定的，而不是偶发高点。
 
 ```text
 fail=0
@@ -209,7 +209,7 @@ stale_handle=0
 remote_meta_stale=0
 ```
 
-这说明 hpc-redis 的优势已经不只是“共享内存模式快”，而是即使走 TCP、即使读侧真的回 vector-inline payload，也仍然能维持数百万级吞吐。
+这说明 hpc-redis 的优势已经不只是“共享内存模式快”，而是即使走 TCP、即使读侧真的回 vector-inline payload，也仍然能维持接近 `2.85M QPS` 的数百万级吞吐。
 
 ### 2.6 迭代主线总结
 
@@ -218,7 +218,7 @@ remote_meta_stale=0
 1. **先优化存储层**：TLC/UB/SVE 让 Redis 形态下拿到 `1.1x - 1.7x` 的真实收益。
 2. **再重做协议和执行面**：VEMB V16 去掉 Redis 通用命令路径后，吞吐上限跨进 `1M - 3M+` 的 TCP 区间。
 3. **再收敛线程模型**：pooled-only 把高并发下的线程膨胀、慢客户端拖累和 cache footprint 问题压住。
-4. **最后补齐 vector-inline TCP 语义**：即使读侧返回 vector-inline payload，TCP mixed 仍能稳定在 `3.01M QPS` 左右。
+4. **最后补齐 vector-inline TCP 语义**：即使读侧返回 vector-inline payload，TCP mixed 在最新代码下仍能稳定在 `2.84M QPS` 左右。
 
 ### 2.7 UB 相关开发演进
 
@@ -265,7 +265,22 @@ RESP parse
   -> generic reply builder
 ```
 
-固定协议和固定向量 shape 让 server 可以在早期就知道请求属于 `VADD/VREM/VEMB/VSIM` 哪条路径，后续结构体字段和 payload 长度也都是直接可用的，不需要每次重新解释命令参数。
+固定协议和固定向量 shape 让 server 可以在早期就知道请求属于 `VADD/VREM/VEMB/VSIM` 哪条路径，后续字段和 payload 长度也都是直接可用的，不需要每次重新解释命令参数。
+
+当前 TCP 已经完全收敛到 encode/decode only 的 compact protocol，不再保留旧的 `struct + memcpy` payload 模式，也不再需要 `--tcp-encoded-payloads` 之类的兼容开关。对于 `dim=300`、`key_len=10` 的当前主测口径：
+
+1. `VEMB_INLINE` request 从旧 fixed request frame 的 `16736B` 降到 `66B`。
+2. `VADD` request 从旧 fixed request frame 的 `16736B` 降到 `1270B`。
+3. `VADD` response 从 `96B` 降到 `38B`。
+4. `VEMB_INLINE` response 因为仍要返回 `1200B` vector payload，所以从 `1296B` 降到 `1266B`，节省主要集中在 metadata。
+
+按 `mixed-80r20w` 的 `80% VEMB_INLINE + 20% VADD` 加权：
+
+1. 平均 request frame 从 `16736B` 降到 `306.8B`，节省 `98.17%`。
+2. 平均 response frame 从 `1056.0B` 降到 `1020.4B`，节省 `3.37%`。
+3. 平均 round-trip bytes/op 从 `17792.0B` 降到 `1327.2B`，节省 `92.54%`。
+
+也就是说，在 `25,600,000` 次请求的这组 benchmark 里，估算总线流量大约从 `455.48 GB` 降到 `33.98 GB`。这解释了为什么新协议的主要收益首先体现在 TCP request write path，而不是 vector-inline response path。
 
 ### 3.2 Proxy 只做连接、搬运和背压隔离
 
@@ -293,9 +308,16 @@ Redis 的通用 server 则需要把 socket 输入解析为通用命令，再进�
 
 这也是 SHM/Aeron `mixed-80r20w` 能在 pooled 模型下跑到约 `7.10M QPS` 的关键原因之一。它证明高并发下主路径不应该让 channel 数量决定线程数量。
 
-### 3.4 TCP response 用 op 语义和 writev 直接编码
+### 3.4 TCP encode/decode 协议和 response writev 直接编码
 
 TCP vector-inline read 由 `VEMB_V16_OP_VEMB_INLINE` 本身表示 response 后面追加 vector-inline payload。
+
+请求和响应都只保留一种 TCP wire format：
+
+1. request 按 op 精确编码，再 decode 回内部 `vemb_v16_req_t`
+2. response 按 status/op 精确编码，`VEMB_INLINE` success 才追加 vector payload
+3. `hdr.flags` 不再承载“选择哪一种 TCP payload 布局”的语义
+4. 旧的 fixed request struct 直传、fixed response metadata 直传、`tcp_payloads_encoded` 分支都已经删除
 
 这使 TCP response 编码更简单：
 
@@ -335,6 +357,7 @@ while (curcnt > 0) {
 2. **响应构造固定**：response header 和 payload 都是固定结构，TCP transport 可以用 `writev` 批量写 frame 和 inline payload。
 3. **慢客户端隔离**：socket 写不动时进入 per-channel backlog，再通过 `EPOLLOUT` flush，不让慢连接长期占住 worker。
 4. **handle-only 路径更轻**：Aeron/SHM `vemb-handle` 只返回 handle，client mmap payload，避免每次复制/返回 1200B vector。
+5. **带宽收益集中在 request 侧**：`mixed-80r20w` 下平均 request frame 节省 `98.17%`，整体 round-trip bytes/op 节省 `92.54%`。
 
 Redis 通用 reply builder 要处理多种 RESP 类型、bulk string 长度、client output buffer 策略和命令返回形态。VEMB 的 response 形态窄很多，因此可以做得更直。
 
@@ -551,11 +574,11 @@ bitmap acquire 已从 CAS 路线收敛到当前 `fetch_or`，后续收益应来�
 
 | 层面 | 当前实现 | 相对原生 Redis 的收益 |
 | --- | --- | --- |
-| 协议 | VEMB V16 固定 binary frame，请求直接携带 `op / key_hash / key / dim / vector`，响应直接携带 `handle / score / vector_bytes`。 | 避免 RESP 解析、命令查表、参数对象化和通用 reply 编码。 |
+| 协议 | VEMB V16 TCP 已收敛到 compact encode/decode-only binary frame：request 按 op 精确编码，response 按 status/op 精确编码。 | 避免 RESP 解析、命令查表、参数对象化和通用 reply 编码，同时去掉旧 `struct + memcpy` TCP wire 冗余。 |
 | inline 语义 | `VEMB_INLINE` op 直接表示 TCP vector-inline response。 | 语义集中在 op/status/payload length 上，减少 client/server 口径不一致风险。 |
 | 数据模型 | 固定 FP32 vector，payload 大小稳定，metadata 与 payload 分离。 | 避免 Redis object/SDS/listpack/HNSW 节点等通用结构成本。 |
 | handle/mmap | Aeron/SHM `vemb-handle` 返回 `{region_id, offset, bytes}`，client mmap warm region 后本地读 payload。 | 非 TCP vector-inline 场景避免每次返回 1200B payload，网络和复制压力更小。 |
-| TCP vector-inline | `vemb-inline` 返回 vector-inline payload，但仍使用专用 frame、SuperNode snapshot 和 TCP `writev` 编码。 | payload 仍要传输，收益小于 handle-only；优势主要来自少对象层、少 reply 构造和调度稳定性。 |
+| TCP vector-inline | `vemb-inline` 返回 vector-inline payload，但仍使用专用 frame、SuperNode snapshot 和 TCP `writev` 编码。`mixed-80r20w` 最新 5 轮均值约 `2.84M QPS`。 | payload 仍要传输，收益小于 handle-only；优势主要来自少对象层、少 reply 构造和调度稳定性。 |
 | 线程模型 | `proxy I/O worker pool + SuperNode worker pool`，accept/control 只处理连接生命周期。 | 避免 per-channel thread 膨胀，降低高并发调度和 cache footprint。 |
 | 慢客户端隔离 | TCP 写不动时进入 per-channel backlog，通过 `EPOLLOUT` flush。 | 慢连接不长期占住 worker，降低尾延迟扩散。 |
 | 队列 | proxy 到 SuperNode 使用 shard queue，completion 仍按 channel 边界保存。SPSC ring 采用 64B head/tail、batch poll、acquire/release memory order。 | 比通用锁队列更轻，跨线程转发成本可控。 |
