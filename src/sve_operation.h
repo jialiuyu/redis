@@ -111,5 +111,15 @@ int sve_cross_emb_gather_read(sve_gather_ctx_t *ctx,
 void sve_streaming_load(const void *src, void *dst, size_t size);
 void sve_streaming_store(const void *src, void *dst, size_t size);
 void sve_streaming_load_f32(const void *src, void *dst, size_t size);
+void sve_gather_scatter_load_f32(const void *src, void *dst, size_t size);
+void sve_gatther_load_f32(const void *src, void *dst, size_t size);
+void sve_column_gather_load_f32(const float *const *src_rows,
+                                float *const *dst_rows,
+                                size_t num_rows,
+                                size_t floats_per_row);
+void sve_column_gather_load_f32_v2_base(const float *const *src_rows,
+                                        float *const *dst_rows,
+                                        size_t num_rows,
+                                        size_t floats_per_row);
 
 #endif /* __SVE_OPERATION_H */

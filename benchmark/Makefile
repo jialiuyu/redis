@@ -316,6 +316,26 @@ endif
 
 .PHONY: sve_row_copy_compare
 
+# Direct f32 load/scatter comparison, no UB client and no bitmap
+# 编译: make sve_f32_load_ut USE_SVE=yes
+SVE_F32_LOAD_UT_CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=gnu11 \
+    -I../src -DSVE_OP_STANDALONE
+
+ifeq ($(USE_SVE),yes)
+    SVE_F32_LOAD_UT_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+sve_f32_load_ut: sve_f32_load_ut.c ../src/sve_operation.c ../src/sve_operation.h ../src/sve_config.h ../src/monotonic.c ../src/redisassert.c
+ifeq ($(USE_SVE),yes)
+	$(CC) $(SVE_F32_LOAD_UT_CFLAGS) -o $@ sve_f32_load_ut.c ../src/sve_operation.c ../src/monotonic.c ../src/redisassert.c -lm -lpthread
+	@echo "✅ Built: $@"
+else
+	@echo "❌ sve_f32_load_ut requires USE_SVE=yes"
+	@exit 1
+endif
+
+.PHONY: sve_f32_load_ut
+
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes
@@ -366,7 +386,7 @@ sve_gather_ub_bench: test_runtime_shim.c $(SVE_GATHER_SRCS)
 
 # 清理
 clean:
-	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_gather_ub_bench vemb_v16_migration_outbox_ut
+	rm -f $(TARGETS) gemm_compare ub_client_ut scatter_gather_bench sve_row_copy_compare sve_f32_load_ut sve_gather_ub_bench vemb_v16_migration_outbox_ut
 	rm -f *.o
 	rm -f results/*.txt
 	@echo "Cleaned build artifacts"
