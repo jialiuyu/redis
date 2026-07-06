@@ -20,14 +20,14 @@ $ note
   Do not pass `--tcp-encoded-payloads`; the old struct + memcpy TCP payload mode has been removed.
 
 $ benchmarking
-  Run the benchmark at least 3 to 5 times and compare the average QPS instead of
+  Run the benchmark 3 times and compare the average QPS instead of
   judging by a single run. The first run after a server restart may be slightly
   lower because of warmup effects such as CPU scheduling, page faults, and cache
   population.
 
 $ latest result
   Latest `mixed-80r20w` TCP rerun on `2026-07-03`:
-    - runs: `5`
+    - runs: `3`
     - qps avg: `2843824.98`
     - qps min: `2831729.75`
     - qps max: `2853016.37`

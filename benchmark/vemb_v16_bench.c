@@ -1633,6 +1633,11 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(proxy_request_poll), D(proxy_completion_poll),
            D(proxy_vemb_publish), D(proxy_vadd_publish),
            D(proxy_response_publish));
+    printf("[stats] read_pool alloc_ok=%llu alloc_fail=%llu inuse_peak=%llu free_min=%llu\n",
+           D(read_pool_alloc_ok),
+           D(read_pool_alloc_fail),
+           (unsigned long long)after->read_pool_inuse_peak,
+           (unsigned long long)after->read_pool_free_min);
     printf("[stats] full job_ring_vemb=%llu job_ring_vadd=%llu response_ring=%llu completion_ring=%llu\n",
            D(proxy_vemb_ring_full), D(proxy_vadd_ring_full),
            D(proxy_response_ring_full), D(supernode_completion_ring_full));

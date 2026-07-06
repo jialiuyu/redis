@@ -589,6 +589,10 @@ typedef struct vemb_v16_stats {
     uint64_t proxy_vemb_ring_full;
     uint64_t proxy_vadd_ring_full;
     uint64_t proxy_response_publish;
+    uint64_t read_pool_alloc_ok;
+    uint64_t read_pool_alloc_fail;
+    uint64_t read_pool_inuse_peak;
+    uint64_t read_pool_free_min;
     uint64_t proxy_response_ring_full;
     uint64_t supernode_vemb_poll;
     uint64_t supernode_vadd_poll;

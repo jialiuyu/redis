@@ -15,6 +15,7 @@ typedef struct vemb_v16_proxy_io_worker {
     uint32_t worker_id;
     struct vemb_v16_proxy *proxy;
     pthread_t thread;
+    vemb_v16_job_pool_t job_pools[VEMB_V16_JOB_POOL_COUNT];
 #ifdef __linux__
     int notify_fd;
 #endif
@@ -94,6 +95,12 @@ struct vemb_v16_proxy {
     uint32_t job_shard_proxy_count;
     uint32_t job_shard_supernode_count;
     vemb_v16_shard_queue_t *job_shard_queues;
+    vemb_v16_shard_queue_t *job_return_queues;
+    atomic_uint_fast64_t read_pool_alloc_ok;
+    atomic_uint_fast64_t read_pool_alloc_fail;
+    atomic_uint_fast64_t read_pool_inuse;
+    atomic_uint_fast64_t read_pool_inuse_peak;
+    uint64_t read_pool_slot_total;
     pthread_mutex_t stats_lock;
     vemb_v16_stats_t closed_stats;
 };

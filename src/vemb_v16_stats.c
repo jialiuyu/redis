@@ -155,6 +155,14 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->proxy_vemb_ring_full += src->proxy_vemb_ring_full;
     dst->proxy_vadd_ring_full += src->proxy_vadd_ring_full;
     dst->proxy_response_publish += src->proxy_response_publish;
+    dst->read_pool_alloc_ok += src->read_pool_alloc_ok;
+    dst->read_pool_alloc_fail += src->read_pool_alloc_fail;
+    stats_set_max(&dst->read_pool_inuse_peak, src->read_pool_inuse_peak);
+    if (src->read_pool_free_min != 0 &&
+        (dst->read_pool_free_min == 0 ||
+         dst->read_pool_free_min > src->read_pool_free_min)) {
+        dst->read_pool_free_min = src->read_pool_free_min;
+    }
     dst->proxy_response_ring_full += src->proxy_response_ring_full;
     dst->supernode_vemb_poll += src->supernode_vemb_poll;
     dst->supernode_vadd_poll += src->supernode_vadd_poll;

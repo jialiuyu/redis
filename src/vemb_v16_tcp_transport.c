@@ -667,8 +667,7 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
 
     vemb_v16_req_t *req = zmalloc(sizeof(*req));
     uint8_t *payload = NULL;
-    if (!req)
-        return -1;
+    RETURN_IF(!req, -1);
     memset(req, 0, sizeof(*req));
     payload = zmalloc(hdr.payload_len);
     if (!payload ||
