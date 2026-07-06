@@ -407,6 +407,40 @@ SuperNode
 
 Redis 的 GET/模块读路径通常围绕通用 dict、robj、SDS/module value 展开。VEMB read 面向固定 vector handle，把 lookup 和 payload 读取拆开，**热读成本更接近一次稳定 location 解析**。
 
+#### 测试数据
+这条读路径的另一个关键点，是把 key meta 控制面锁从“全局共享锁”缩成“按 hash 分片的 shard lock”。即使 cache miss 或 stale handle 需要退回 full lookup，竞争也只会集中在对应 shard，而不是把所有 key 的 metadata 读写都串到同一把锁上。
+
+`2026-07-05` 按 [benchmark/test_host.md](/Users/szza/codespace/work/hpc-redis/benchmark/test_host.md) 的 `mixed-80r20w` TCP 基准，在 `192.168.90.111` 上对比了默认 `256` 分片和“退化成单锁”的 `1` 分片配置：
+
+| `TLC_CORE_KEY_META_SHARDS` | 有效样本 | 平均 QPS | 结果 |
+| --- | ---: | ---: | --- |
+| `256` | `5` | `2,851,977.02` | 默认配置 |
+| `1` | `5` | `866,119.37` | 退化为单个 key meta 锁 |
+
+同一套 server/client 参数下，`256` 分片相对 `1` 分片的吞吐提升约 `3.29x`，QPS 降幅约 `69.63%`。这说明 VEMB 读路径里的“cache hit 尽量不拿锁”很重要，而即便进入 metadata 路径，**控制面锁的分片粒度本身也是决定 mixed 负载吞吐的核心因素**。
+
+另外，`2026-07-05` 在同一台 `192.168.90.111` 上，针对 `TCP + vemb-inline + hot-key-id=1` 口径，额外测了 `location_cache` 对 **SuperNode 内部 primary lookup** 的收益。用 `TLC_CORE_DISABLE_LOCATION_CACHE=1` 关闭 cache 后，对比 `primary_lookup_avg_ns` 的 3 轮均值：
+
+| 模式 | `primary_lookup_avg_ns` 均值 | 说明 |
+| --- | ---: | --- |
+| 默认 `location_cache` 开启 | `99.1ns` | `vemb_v16_tlc_get_cached_handle()` 可优先走 cached handle |
+| `TLC_CORE_DISABLE_LOCATION_CACHE=1` | `105.3ns` | 回退到非 cache 口径 |
+
+也就是说，在 `TCP` 模式下如果只看 `SuperNode` 内部 lookup 阶段，`location_cache` 带来的收益大约是 `6.2ns/op`，相对提升约 `6.26%`。这个数字明显小于端到端 QPS 提升，原因是 `TCP vector-inline` 路径里还包含 payload snapshot、response encode/write 等额外固定成本；但它仍然说明 **cached handle 先命中，再做稳定校验** 的设计，在热点读场景下可以稳定压低 metadata lookup 开销。
+
+#### 3.6.1 proxy/supernode 消息瘦身：先缩 job/completion，再考虑 `slot-id`
+
+这一节的详细设计已拆到独立文档：[docs/VEMB_PROXY_SUPERNODE_MESSAGE_SLIMMING.md](./VEMB_PROXY_SUPERNODE_MESSAGE_SLIMMING.md)。
+
+这里保留结论版：
+
+1. 当前 `proxy -> SuperNode -> proxy` 热路径的主要额外成本，来自 `job_shard_queue` 和 `completion_ring` 上“大而全结构体”的整 slot `memcpy`。
+2. 优先级应该是**先把 read job 和 completion 按语义裁小**，减少 copy 体积和 cache footprint，而不是一开始就把 queue 改成 `slot-id` / pool 生命周期管理。
+3. `job` 侧重点是把 `vemb-handle` / `vemb-inline` 从通用 `job_base` 中拆出来，去掉 `key2`、`topology_epoch`、`dim`、`vector_bytes` 等热读不需要的字段。
+4. `completion` 侧重点是把 handle、inline payload、VSIM score 分开承载，避免所有 completion slot 都为少数语义背固定布局成本。
+
+也就是说，更稳的演进顺序是：**先瘦消息，再评估 `slot-id`**。
+
 ### 3.7 VADD 写路径：inline 写入、分片串行、same-key overwrite
 
 VADD request 本身携带 inline vector payload，SuperNode 直接把 payload 写入 TLC warm slot：
@@ -587,7 +621,7 @@ bitmap acquire 已从 CAS 路线收敛到当前 `fetch_or`，后续收益应来�
 | region 放置 | warm region hash ring 支持 local weight、local/remote alloc、fallback 和 full 统计。 | 本地 UB region 优先，容量不足时可走下一个 region，便于无 eviction 容量配置。 |
 | location cache | VEMB read 先走 cached handle，命中后仍通过 slot meta 校验。 | 热读不必总是进入 key meta shard lock，同时保留 stale handle 防护。 |
 | slot seqlock | `state + write_seq + owner_generation` 校验 payload 版本，copy 前后双读 `write_seq`。 | 支持无锁读稳定 snapshot，避免半写 payload 和旧 handle 被误读。 |
-| key meta shard | 256 个 key meta shard，写路径按 hash 分片串行化，维护 migration state、epoch、tombstone 和 location。 | 控制面锁粒度小，普通读写路径不需要全局 Redis dict/object 锁。 |
+| key meta shard | 256 个 key meta shard，写路径按 hash 分片串行化，维护 migration state、epoch、tombstone 和 location。`2026-07-05` 的 `mixed-80r20w` TCP 实测中，`256` 分片均值 `2.85M QPS`，退化到 `1` 分片只剩 `0.87M QPS`。 | 控制面锁粒度小，普通读写路径不需要全局 Redis dict/object 锁；相对单锁配置，当前分片设计带来约 `3.29x` 吞吐提升。 |
 | VADD overwrite | existing key 尽量写回原 `{region_id, local_slot, offset}`。 | 减少重新分配、bucket scan 和 handle 抖动，mixed 写入路径更稳定。 |
 | VREM | delete 走 key meta / tombstone / migration 语义，不再伪装成 vector-carrying op。 | 避免无意义的 shape 检查和错误 payload 假设。 |
 | remote meta | remote meta view 支持异步 publish、repair 和 stale 校验；单 owner 时跳过 publish。 | 跨 owner VSIM 可查 remote handle，单机/单 owner fast path 不承担无用 publish 成本。 |
@@ -603,6 +637,7 @@ bitmap acquire 已从 CAS 路线收敛到当前 `fetch_or`，后续收益应来�
 | --- | --- | --- | --- |
 | P0 | TCP inline per-request allocation | 当前仍为 per-request `zmalloc + copy`；简单全局池已回退。 | 做 per-worker/per-channel cache 或生命周期内复用，降低 vector-inline CPU 成本和尾延迟。 |
 | P0 | batch 指标补齐 | 已有 sampled timing，但 batch rounds、avg batch、HOT hit/miss、WARM probe、bitmap word conflict 仍不完整。 | 先量化瓶颈，避免盲调。 |
+| P1 | proxy/supernode ring 消息瘦身 | 当前 `job_shard_queue` 和 `completion_ring` 仍按整 slot `memcpy` 传递 `vemb_v16_vemb_job_t` / `vemb_v16_completion_t`。 | 先裁小热路径消息，再评估改成 `slot-id` / 小 descriptor 传递，减少 queue copy、cache footprint 和线程间搬运成本。 |
 | P1 | SuperNode batch execute | 当前主要是 batch poll，执行仍偏逐条。 | 按 op 分组后批量 lookup、批量 slot validate、批量 payload slice。 |
 | P1 | bitmap word 分组 | acquire/release helper 已统一，竞争规避尚未做。 | 减少同一 atomic word 的反复争用。 |
 | P1 | batch 内重复 key/slot 去重 | 尚未落地。 | 热点 key 场景减少重复 lookup、validate 和 copy。 |
