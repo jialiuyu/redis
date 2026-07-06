@@ -450,6 +450,16 @@ Redis 的 GET/模块读路径通常围绕通用 dict、robj、SDS/module value �
 
 也就是说，更稳的演进顺序是：**先瘦消息，再评估 `slot-id`**。
 
+`2026-07-06` 还做了一次同口径的小步验证：在已经使用 `job pool + slot_id` 的 TCP `mixed-80r20w` 路径上，把 `channel_read_tcp_request()` 里的临时 `req` 和 `payload` 从“每请求 `zmalloc/zfree`”改成栈上对象后，按 [benchmark/test_host.md](/Users/szza/codespace/work/hpc-redis/benchmark/test_host.md) 在 `192.168.90.111` 上补跑 3 轮：
+
+| Run | QPS | Fail |
+| --- | ---: | ---: |
+| 1 | `3,579,030.17` | `0` |
+| 2 | `3,543,132.82` | `0` |
+| 3 | `3,601,439.96` | `0` |
+
+三轮均值为 `3,574,534.32 QPS`，相对同文档里此前的 `job pool + slot_id` 六轮均值 `3,491,019.48 QPS` 再提升 `83,514.84 QPS`，约 **2.39%**。这说明在 queue payload 已经瘦身、真实 job 生命周期也已经从 heap 挪到 pool 之后，**TCP ingress 上最后一小段短生命周期分配**仍然是能测出来的固定成本。
+
 #### 3.6.2 `job pool + slot_id`：保留小 queue payload，同时去掉每请求 `zmalloc/zfree`
 
 `proxy -> SuperNode` 的消息瘦身第一阶段已经把大 job slot 改成了小 `job_desc { job_ptr }`，证明：

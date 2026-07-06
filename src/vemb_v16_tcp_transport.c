@@ -653,6 +653,8 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
                                     uint32_t proxy_io_worker_id) {
     vemb_v16_net_hdr_t hdr;
     int req_len = 0;
+    vemb_v16_req_t req;
+    uint8_t payload[sizeof(vemb_v16_req_t)];
     if (vemb_v16_net_read_header(vemb_v16_channel_net_fd(ch), &hdr) != 0)
         return -1;
     if (hdr.type == VEMB_V16_NET_CLOSE)
@@ -665,42 +667,33 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
         return -1;
     }
 
-    vemb_v16_req_t *req = zmalloc(sizeof(*req));
-    uint8_t *payload = NULL;
-    RETURN_IF(!req, -1);
-    memset(req, 0, sizeof(*req));
-    payload = zmalloc(hdr.payload_len);
-    if (!payload ||
-        vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch),
+    memset(&req, 0, sizeof(req));
+    if (vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch),
                                payload,
                                hdr.payload_len) != 0 ||
-        vemb_v16_req_decode(req, payload, hdr.payload_len) != 0) {
-        zfree(payload);
-        zfree(req);
+        vemb_v16_req_decode(&req, payload, hdr.payload_len) != 0) {
         return -1;
     }
-    zfree(payload);
-    if (req->channel_id == 0)
-        req->channel_id = vemb_v16_channel_id(ch);
-    req_len = (int)((req->op == VEMB_V16_OP_VADD ||
-                     req->op == VEMB_V16_OP_VSIM_INLINE) ?
-        vemb_v16_req_inline_len(req->vector_bytes) :
+    if (req.channel_id == 0)
+        req.channel_id = vemb_v16_channel_id(ch);
+    req_len = (int)((req.op == VEMB_V16_OP_VADD ||
+                     req.op == VEMB_V16_OP_VSIM_INLINE) ?
+        vemb_v16_req_inline_len(req.vector_bytes) :
         vemb_v16_req_handle_len());
-    if (diag_should_log_req(req->req_id)) {
+    if (diag_should_log_req(req.req_id)) {
         serverLog(LL_DEBUG,
                   "vemb_v16 diag tcp request recv: proxy_worker=%u channel_id=%llu hdr_req_id=%u req_id=%u op=%u flags=%u payload_len=%u key_hash=%llu vector_bytes=%u",
                   proxy_io_worker_id,
                   (unsigned long long)vemb_v16_channel_id(ch),
                   hdr.req_id,
-                  req->req_id,
-                  req->op,
-                  req->flags,
+                  req.req_id,
+                  req.op,
+                  req.flags,
                   hdr.payload_len,
-                  (unsigned long long)req->key_hash,
-                  req->vector_bytes);
+                  (unsigned long long)req.key_hash,
+                  req.vector_bytes);
     }
-    vemb_v16_proxy_handle_request(ch, req, req_len, proxy_io_worker_id);
-    zfree(req);
+    vemb_v16_proxy_handle_request(ch, &req, req_len, proxy_io_worker_id);
     if (vemb_v16_channel_net_fd(ch) < 0)
         return -1;
     return 1;
