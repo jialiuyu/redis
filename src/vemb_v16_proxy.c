@@ -259,12 +259,12 @@ static int shard_queue_topology_ready(vemb_v16_proxy_t *proxy) {
 
 static uint32_t shard_queue_index(vemb_v16_proxy_t *proxy,
                                   uint32_t proxy_worker_id,
-                                  uint32_t supernode_worker_id) {
+                                  uint32_t sn_work_id) {
     assert(proxy != NULL);
     assert(shard_queue_topology_ready(proxy));
     assert(proxy_worker_id < proxy->job_shard_proxy_count);
-    assert(supernode_worker_id < proxy->job_shard_supernode_count);
-    return proxy_worker_id * proxy->job_shard_supernode_count + supernode_worker_id;
+    assert(sn_work_id < proxy->job_shard_supernode_count);
+    return proxy_worker_id * proxy->job_shard_supernode_count + sn_work_id;
 }
 
 static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
@@ -1617,17 +1617,6 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
                                     vemb_v16_channel_t *ch) {
     vemb_v16_job_base_t *base = job;
     switch (base->op) {
-    case VEMB_V16_OP_PING: {
-        vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_OK,
-            .op = base->op,
-            .req_id = base->req_id,
-            .channel_index = base->channel_index,
-            .channel_id = base->channel_id,
-        };
-        publish_synthetic_completion(ctx, &completion);
-        break;
-    }
     case VEMB_V16_OP_VADD:
     case VEMB_V16_OP_VREM:
     case VEMB_V16_OP_VSIM_INLINE:
@@ -1640,11 +1629,13 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
         break;
     default: {
         vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_ERR,
             .op = base->op,
             .req_id = base->req_id,
-            .channel_index = base->channel_index,
             .channel_id = base->channel_id,
+            .channel_index = base->channel_index,
+            .status = base->op == VEMB_V16_OP_PING ?
+                VEMB_V16_STATUS_OK :
+                VEMB_V16_STATUS_ERR,
         };
         publish_synthetic_completion(ctx, &completion);
         break;
@@ -1654,7 +1645,7 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
 
 /// Execution scheduling: drain shard queues assigned to one SuperNode worker.
 static int drain_shard_queues(vemb_v16_proxy_t *proxy,
-                              uint32_t supernode_worker_id,
+                              uint32_t sn_work_id,
                               vemb_v16_supernode_scratch_t *scratch,
                               vemb_v16_shard_queue_t *queues,
                               void *job_buf) {
@@ -1662,24 +1653,17 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
     assert(scratch != NULL);
     assert(queues != NULL);
     assert(job_buf != NULL);
-    if (!shard_queue_topology_ready(proxy) ||
-        supernode_worker_id >= proxy->job_shard_supernode_count) {
-        return 0;
-    }
+    RETURN_IF(!shard_queue_topology_ready(proxy) ||
+              sn_work_id >= proxy->job_shard_supernode_count, 0);
 
     int did_work = 0;
-    for (uint32_t proxy_id = 0;
-         proxy_id < proxy->job_shard_proxy_count;
-         proxy_id++) {
-        uint32_t queue_index =
-            shard_queue_index(proxy, proxy_id, supernode_worker_id);
+    for (uint32_t work_id = 0; work_id < proxy->job_shard_proxy_count; work_id++) {
+        uint32_t queue_index = shard_queue_index(proxy, work_id, sn_work_id);
         vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
-        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_buf,
-                                               VEMB_V16_PROXY_BATCH);
-        if (!n)
-            continue;
-        did_work += (int)n;
+        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_buf, VEMB_V16_PROXY_BATCH);
+        if (!n) continue;
 
+        did_work += (int)n;
         for (uint32_t i = 0; i < n; i++) {
             uint8_t *slot = (uint8_t *)job_buf + (size_t)i * ring->slot_size;
             vemb_v16_job_base_t *job_base = (vemb_v16_job_base_t *)slot;
@@ -1688,16 +1672,15 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
             vemb_v16_channel_t *ch = &proxy->channels[job_base->channel_index];
             if (!supernode_channel_acquire(ch))
                 continue;
-            if (atomic_load_explicit(&ch->slot_channel_id,
-                                     memory_order_acquire) ==
-                    job_base->channel_id &&
+            if (atomic_load_explicit(
+                &ch->slot_channel_id, memory_order_acquire) == job_base->channel_id &&
                 atomic_load_explicit(&ch->active, memory_order_acquire)) {
                 if (diag_should_log_req(job_base->req_id)) {
                     serverLog(LL_DEBUG,
                               "vemb_v16 diag supernode dequeue: worker_id=%u queue=%s proxy_worker=%u queue_index=%u batch_index=%u batch_count=%u channel_index=%u channel_id=%llu req_id=%u op=%u flags=%u key_hash=%llu vector_bytes=%u",
-                              supernode_worker_id,
+                              sn_work_id,
                               "job",
-                              proxy_id,
+                              work_id,
                               queue_index,
                               i,
                               n,
@@ -1710,7 +1693,7 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
                               job_base->vector_bytes);
                 }
                 vemb_v16_supernode_ctx_t ctx = ch->supernode_ctx;
-                ctx.worker_id = supernode_worker_id;
+                ctx.worker_id = sn_work_id;
                 apply_unified_shard_job(&ctx, slot, scratch, ch);
             }
             supernode_channel_release(ch);
@@ -1721,12 +1704,12 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
 
 /// Execution scheduling: drain FIFO job queues for one SuperNode worker.
 static int drain_job_shard_queues(vemb_v16_proxy_t *proxy,
-                                  uint32_t supernode_worker_id,
+                                  uint32_t sn_work_id,
                                   vemb_v16_supernode_scratch_t *scratch) {
     assert(proxy != NULL);
     assert(scratch != NULL);
     return drain_shard_queues(proxy,
-                              supernode_worker_id,
+                              sn_work_id,
                               scratch,
                               proxy->job_shard_queues,
                               scratch->vadd_jobs);
@@ -1736,9 +1719,8 @@ static int drain_job_shard_queues(vemb_v16_proxy_t *proxy,
 /// Execution scheduling: check whether a SuperNode worker can sleep.
 static int supernode_worker_has_pending(vemb_v16_proxy_t *proxy,
                                         uint32_t worker_id) {
-    if (!shard_queue_topology_ready(proxy) ||
-        worker_id >= proxy->job_shard_supernode_count)
-        return 0;
+    RETURN_IF(!shard_queue_topology_ready(proxy) ||
+        worker_id >= proxy->job_shard_supernode_count, 0);
 
     for (uint32_t proxy_id = 0;
          proxy_id < proxy->job_shard_proxy_count;
