@@ -87,6 +87,10 @@ typedef struct vemb_v16_warm_regions_manifest {
     uint32_t remote_meta_ways;
     uint64_t remote_meta_mmap_offset;
     char remote_meta_path[256];
+    uint32_t job_plane_backend_type;
+    uint32_t has_job_plane_backend_type;
+    uint64_t job_plane_mmap_offset;
+    char job_plane_path[256];
     uint32_t remote_meta_view_count;
     vemb_v16_manifest_remote_meta_view_t
         remote_meta_views[VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS];

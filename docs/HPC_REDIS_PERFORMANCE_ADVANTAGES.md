@@ -438,6 +438,15 @@ Redis 的 GET/模块读路径通常围绕通用 dict、robj、SDS/module value �
 2. 优先级应该是**先把 read job 和 completion 按语义裁小**，减少 copy 体积和 cache footprint，而不是一开始就把 queue 改成 `slot-id` / pool 生命周期管理。
 3. `job` 侧重点是把 `vemb-handle` / `vemb-inline` 从通用 `job_base` 中拆出来，去掉 `key2`、`topology_epoch`、`dim`、`vector_bytes` 等热读不需要的字段。
 4. `completion` 侧重点是把 handle、inline payload、VSIM score 分开承载，避免所有 completion slot 都为少数语义背固定布局成本。
+5. `2026-07-06` 新增的 UB backing 只落在 `job_pool->slots` 上；`job_shard_queue`、`job_return_queue`、`completion_ring` 和 `free_stack` 仍保留本地 heap/ring 语义，因此这轮 UB 改动的目的不是把整个 proxy/supernode 消息面共享化，而是验证“真实 job payload 存储移到 UB”本身的成本。
+
+这轮实现边界可以概括为：
+
+1. queue 上继续只搬小 `job_ref`
+2. 真实 job payload 可选 heap-backed 或 UB-backed
+3. slot 分配/释放所有权仍在 owner proxy worker
+
+同一台 `192.168.90.111`、同一组 TCP `mixed-80r20w` 参数下，`shared-plane` 方案约为 `307w QPS`，而“本地 ring/free-stack + 仅 slot payload 可选 UB backing”的实现，在移除 read-pool 热路径诊断原子更新后已经回到 `346w ~ 349w QPS`。这说明当前阶段的主要收益仍然来自**消息瘦身和本地调度面保持轻量**，而不是“只要上 UB 就会更快”。
 
 也就是说，更稳的演进顺序是：**先瘦消息，再评估 `slot-id`**。
 
