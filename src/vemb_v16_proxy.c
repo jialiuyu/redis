@@ -85,20 +85,9 @@ uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch) {
     return ch->request_ring->slot_size;
 }
 
-void vemb_v16_channel_add_proxy_request_poll(vemb_v16_channel_t *ch,
-                                             uint64_t n) {
-    atomic_fetch_add_explicit(&ch->stats.proxy_request_poll, n,
-                              memory_order_relaxed);
-}
-
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n) {
     atomic_fetch_add_explicit(&ch->stats.proxy_response_ring_full, n,
-                              memory_order_relaxed);
-}
-
-void vemb_v16_channel_add_channel_ops(vemb_v16_channel_t *ch, uint64_t n) {
-    atomic_fetch_add_explicit(&ch->stats.channel_ops, n,
                               memory_order_relaxed);
 }
 
@@ -771,8 +760,6 @@ static void publish_response(vemb_v16_channel_t *ch,
         if (vemb_v16_aeron_publish_response(ch, &resp) != 0)
             return;
     }
-    atomic_fetch_add_explicit(&ch->stats.proxy_response_publish, 1,
-                              memory_order_relaxed);
     channel_note_response_status(ch, completion->status);
 }
 
@@ -814,9 +801,6 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
             }
             return -1;
         }
-        atomic_fetch_add_explicit(&ch->stats.proxy_response_publish,
-                                  published,
-                                  memory_order_relaxed);
         for (uint32_t i = 0; i < n; i++) {
             if (completions[i].channel_id == ch->channel_id &&
                 atomic_load_explicit(&ch->active, memory_order_acquire)) {
@@ -1059,9 +1043,6 @@ static int publish_request_job(vemb_v16_channel_t *ch,
     vemb_v16_shard_queue_t *queues = ch->proxy->job_shard_queues;
     atomic_uint_fast64_t *ring_full_counter = has_inline_vector ?
         &ch->stats.proxy_vadd_ring_full : &ch->stats.proxy_vemb_ring_full;
-    atomic_uint_fast64_t *publish_counter = has_inline_vector ?
-        &ch->stats.proxy_vadd_publish : &ch->stats.proxy_vemb_publish;
-
     if (diag_should_log_req(req->req_id)) {
         uint32_t supernode_id = ch->index % ch->proxy->job_shard_supernode_count;
         uint32_t queue_index = shard_queue_index(ch->proxy,
@@ -1088,7 +1069,6 @@ static int publish_request_job(vemb_v16_channel_t *ch,
                            queues,
                            ring_full_counter);
     if (likely(rc == 0)) {
-        atomic_fetch_add_explicit(publish_counter, 1, memory_order_relaxed);
         return 0;
     }
 release_slot:
@@ -1156,8 +1136,6 @@ static int drain_completions(vemb_v16_channel_t *ch) {
                                           completions,
                                           VEMB_V16_PROXY_BATCH)) != 0) {
         total += n;
-        atomic_fetch_add_explicit(&ch->stats.proxy_completion_poll, n,
-                                  memory_order_relaxed);
         uint32_t ready_count = 0;
         for (uint32_t i = 0; i < n; i++) {
             if (diag_should_log_req(completions[i].req_id)) {
@@ -1880,8 +1858,8 @@ static void apply_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
     (void)scratch;
+    (void)ch;
     vemb_v16_supernode_handle_vemb_job(ctx, job);
-    atomic_fetch_add_explicit(&ch->stats.supernode_vemb_poll, 1, memory_order_relaxed);
 }
 
 static void apply_vsim_key_key_job(vemb_v16_supernode_ctx_t *ctx,
@@ -1889,8 +1867,8 @@ static void apply_vsim_key_key_job(vemb_v16_supernode_ctx_t *ctx,
                                    vemb_v16_supernode_scratch_t *scratch,
                                    vemb_v16_channel_t *ch) {
     (void)scratch;
+    (void)ch;
     vemb_v16_supernode_handle_vsim_key_key_job(ctx, job);
-    atomic_fetch_add_explicit(&ch->stats.supernode_vemb_poll, 1, memory_order_relaxed);
 }
 
 static void apply_vrem_job(vemb_v16_supernode_ctx_t *ctx,
@@ -1898,8 +1876,8 @@ static void apply_vrem_job(vemb_v16_supernode_ctx_t *ctx,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
     (void)scratch;
+    (void)ch;
     vemb_v16_supernode_handle_vrem_job(ctx, job);
-    atomic_fetch_add_explicit(&ch->stats.supernode_vadd_poll, 1, memory_order_relaxed);
 }
 
 /// Execution: run one VADD job on the SuperNode storage/backend path.
@@ -1908,8 +1886,8 @@ static void apply_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
     (void)scratch;
+    (void)ch;
     vemb_v16_supernode_handle_vadd_job(ctx, job);
-    atomic_fetch_add_explicit(&ch->stats.supernode_vadd_poll, 1, memory_order_relaxed);
 }
 
 static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx) {

@@ -520,27 +520,30 @@ owner proxy worker
 | --- | --- | ---: | ---: | --- |
 | 原始 pooled 基线 | `2026-07-03` | `5` | `2,843,824.98` | 旧实现仍按较大 job slot 过 ring，是本轮优化前的主基线 |
 | `job_ptr descriptor` | `2026-07-06` 之前 | `3` | `2,944,068.16` | ring 里传小 descriptor，但真实 job 仍是每请求 `zmalloc/zfree` |
-| `job pool + slot_id` | `2026-07-06` | `3` | `3,472,419.33` | ring 里传 `job_ref`，真实 job 落到 per-proxy-worker pool |
+| `job pool + slot_id` | `2026-07-06` | `6` | `3,491,019.48` | ring 里传 `job_ref`，真实 job 落到 per-proxy-worker pool；同机型补跑 6 轮复测 |
 
-`job pool + slot_id` 版三轮原始结果：
+`job pool + slot_id` 版六轮原始结果：
 
 | Run | QPS | Fail |
 | --- | ---: | ---: |
 | 1 | `3,514,139.84` | `0` |
 | 2 | `3,459,060.78` | `0` |
 | 3 | `3,444,057.37` | `0` |
+| 4 | `3,498,825.91` | `0` |
+| 5 | `3,501,914.53` | `0` |
+| 6 | `3,482,587.95` | `0` |
 
 相对 `job_ptr descriptor` 版：
 
-1. 平均提升 `528,351.17 QPS`
-2. 相对提升约 **17.95%**
-3. 三轮 `fail=0`
+1. 平均提升 `546,951.32 QPS`
+2. 相对提升约 **18.58%**
+3. 六轮 `fail=0`
 4. `job_ring_vemb=0`、`job_ring_vadd=0`、`completion_ring=0`
 
 相对更早的原始 `2.84M` pooled 基线：
 
-1. 平均提升 `628,594.35 QPS`
-2. 相对提升约 **22.10%**
+1. 平均提升 `647,194.50 QPS`
+2. 相对提升约 **22.76%**
 
 也就是说，这次收益不是因为 queue 堵住后偶然解开，而是沿着同一条热路径连续吃掉了两块固定成本：
 
@@ -555,16 +558,16 @@ owner proxy worker
 
 1. 原始 pooled 基线 `2.84M QPS`
 2. `job_ptr descriptor` 升到 `2.94M QPS`
-3. `job pool + slot_id` 再升到 `3.47M QPS`
+3. `job pool + slot_id` 再升到 `3.49M QPS`
 
 按均值拆开看：
 
 1. **原始 pooled -> `job_ptr descriptor`**
    提升 `100,243.18 QPS`，约 **3.52%**
 2. **`job_ptr descriptor` -> `job pool + slot_id`**
-   提升 `528,351.17 QPS`，约 **17.95%**
+   提升 `546,951.32 QPS`，约 **18.58%**
 3. **原始 pooled -> `job pool + slot_id`**
-   总提升 `628,594.35 QPS`，约 **22.10%**
+   总提升 `647,194.50 QPS`，约 **22.76%**
 
 这说明两件事：
 

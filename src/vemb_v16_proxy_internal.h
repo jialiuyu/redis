@@ -29,11 +29,8 @@ int vemb_v16_channel_proxy_running(vemb_v16_channel_t *ch);
 vemb_v16_client_ring_t *vemb_v16_channel_request_ring(vemb_v16_channel_t *ch);
 vemb_v16_client_ring_t *vemb_v16_channel_response_ring(vemb_v16_channel_t *ch);
 uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch);
-void vemb_v16_channel_add_proxy_request_poll(vemb_v16_channel_t *ch,
-                                             uint64_t n);
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n);
-void vemb_v16_channel_add_channel_ops(vemb_v16_channel_t *ch, uint64_t n);
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy);

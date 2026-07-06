@@ -582,20 +582,13 @@ typedef struct vemb_v16_stats {
     uint64_t published_jobs;
     uint64_t completed_jobs;
     uint64_t active_channels;
-    uint64_t proxy_request_poll;
-    uint64_t proxy_completion_poll;
-    uint64_t proxy_vemb_publish;
-    uint64_t proxy_vadd_publish;
     uint64_t proxy_vemb_ring_full;
     uint64_t proxy_vadd_ring_full;
-    uint64_t proxy_response_publish;
     uint64_t read_pool_alloc_ok;
     uint64_t read_pool_alloc_fail;
     uint64_t read_pool_inuse_peak;
     uint64_t read_pool_free_min;
     uint64_t proxy_response_ring_full;
-    uint64_t supernode_vemb_poll;
-    uint64_t supernode_vadd_poll;
     uint64_t supernode_completion_publish;
     uint64_t supernode_completion_ring_full;
     uint64_t sample_count;
@@ -611,7 +604,6 @@ typedef struct vemb_v16_stats {
     uint64_t job_shard_queue_depth;
     uint64_t reserved_shard_queue_depth;
     uint64_t completion_ring_depth;
-    uint64_t channel_ops;
     uint64_t warm_region_count;
     uint64_t warm_region_full_count;
     uint64_t warm_alloc_local;

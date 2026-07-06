@@ -26,11 +26,11 @@ $ benchmarking
   population.
 
 $ latest result
-  Latest `mixed-80r20w` TCP rerun on `2026-07-03`:
-    - runs: `3`
-    - qps avg: `2843824.98`
-    - qps min: `2831729.75`
-    - qps max: `2853016.37`
+  Latest `mixed-80r20w` TCP rerun on `2026-07-06`:
+    - runs: `6`
+    - qps avg: `3491019.48`
+    - qps min: `3465210.65`
+    - qps max: `3504216.37`
     - fail: `0`
 
 $ bandwidth conclusion

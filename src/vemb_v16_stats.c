@@ -93,16 +93,9 @@ void vemb_v16_stats_add_channel_counters(vemb_v16_stats_t *dst,
     dst->not_found += counter_load(&src->not_found);
     dst->published_jobs += counter_load(&src->published_jobs);
     dst->completed_jobs += counter_load(&src->completed_jobs);
-    dst->proxy_request_poll += counter_load(&src->proxy_request_poll);
-    dst->proxy_completion_poll += counter_load(&src->proxy_completion_poll);
-    dst->proxy_vemb_publish += counter_load(&src->proxy_vemb_publish);
-    dst->proxy_vadd_publish += counter_load(&src->proxy_vadd_publish);
     dst->proxy_vemb_ring_full += counter_load(&src->proxy_vemb_ring_full);
     dst->proxy_vadd_ring_full += counter_load(&src->proxy_vadd_ring_full);
-    dst->proxy_response_publish += counter_load(&src->proxy_response_publish);
     dst->proxy_response_ring_full += counter_load(&src->proxy_response_ring_full);
-    dst->supernode_vemb_poll += counter_load(&src->supernode_vemb_poll);
-    dst->supernode_vadd_poll += counter_load(&src->supernode_vadd_poll);
     dst->supernode_completion_publish += counter_load(&src->supernode_completion_publish);
     dst->supernode_completion_ring_full += counter_load(&src->supernode_completion_ring_full);
     dst->sample_count += counter_load(&src->sample_count);
@@ -111,7 +104,6 @@ void vemb_v16_stats_add_channel_counters(vemb_v16_stats_t *dst,
     dst->sample_bitmap_unlock_ns += counter_load(&src->sample_bitmap_unlock_ns);
     dst->sample_vector_load_ns += counter_load(&src->sample_vector_load_ns);
     dst->sample_completion_publish_ns += counter_load(&src->sample_completion_publish_ns);
-    dst->channel_ops += counter_load(&src->channel_ops);
     dst->moved_count += counter_load(&src->moved_count);
     dst->stale_count += counter_load(&src->stale_count);
     dst->ask_count += counter_load(&src->ask_count);
@@ -148,13 +140,8 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->not_found += src->not_found;
     dst->published_jobs += src->published_jobs;
     dst->completed_jobs += src->completed_jobs;
-    dst->proxy_request_poll += src->proxy_request_poll;
-    dst->proxy_completion_poll += src->proxy_completion_poll;
-    dst->proxy_vemb_publish += src->proxy_vemb_publish;
-    dst->proxy_vadd_publish += src->proxy_vadd_publish;
     dst->proxy_vemb_ring_full += src->proxy_vemb_ring_full;
     dst->proxy_vadd_ring_full += src->proxy_vadd_ring_full;
-    dst->proxy_response_publish += src->proxy_response_publish;
     dst->read_pool_alloc_ok += src->read_pool_alloc_ok;
     dst->read_pool_alloc_fail += src->read_pool_alloc_fail;
     stats_set_max(&dst->read_pool_inuse_peak, src->read_pool_inuse_peak);
@@ -164,8 +151,6 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
         dst->read_pool_free_min = src->read_pool_free_min;
     }
     dst->proxy_response_ring_full += src->proxy_response_ring_full;
-    dst->supernode_vemb_poll += src->supernode_vemb_poll;
-    dst->supernode_vadd_poll += src->supernode_vadd_poll;
     dst->supernode_completion_publish += src->supernode_completion_publish;
     dst->supernode_completion_ring_full += src->supernode_completion_ring_full;
     dst->sample_count += src->sample_count;
@@ -174,7 +159,6 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->sample_bitmap_unlock_ns += src->sample_bitmap_unlock_ns;
     dst->sample_vector_load_ns += src->sample_vector_load_ns;
     dst->sample_completion_publish_ns += src->sample_completion_publish_ns;
-    dst->channel_ops += src->channel_ops;
     dst->moved_count += src->moved_count;
     dst->stale_count += src->stale_count;
     dst->ask_count += src->ask_count;

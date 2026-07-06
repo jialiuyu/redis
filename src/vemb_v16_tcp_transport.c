@@ -724,8 +724,6 @@ int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
             break;
     }
 
-    vemb_v16_channel_add_proxy_request_poll(ch, count);
-    vemb_v16_channel_add_channel_ops(ch, count);
     return (int)count;
 }
 

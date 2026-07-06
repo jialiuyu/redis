@@ -1629,10 +1629,6 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(vsim_requests),
            D(not_found), D(published_jobs), D(completed_jobs),
            (unsigned long long)after->active_channels);
-    printf("[stats] proxy request_poll=%llu completion_poll=%llu job_publish_vemb=%llu job_publish_vadd=%llu response_publish=%llu\n",
-           D(proxy_request_poll), D(proxy_completion_poll),
-           D(proxy_vemb_publish), D(proxy_vadd_publish),
-           D(proxy_response_publish));
     printf("[stats] read_pool alloc_ok=%llu alloc_fail=%llu inuse_peak=%llu free_min=%llu\n",
            D(read_pool_alloc_ok),
            D(read_pool_alloc_fail),
@@ -1641,8 +1637,7 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
     printf("[stats] full job_ring_vemb=%llu job_ring_vadd=%llu response_ring=%llu completion_ring=%llu\n",
            D(proxy_vemb_ring_full), D(proxy_vadd_ring_full),
            D(proxy_response_ring_full), D(supernode_completion_ring_full));
-    printf("[stats] supernode vemb_poll=%llu vadd_poll=%llu completion_publish=%llu\n",
-           D(supernode_vemb_poll), D(supernode_vadd_poll),
+    printf("[stats] supernode completion_publish=%llu\n",
            D(supernode_completion_publish));
     printf("[stats] migration moved=%llu stale=%llu ask=%llu forward=%llu duplicate=%llu source_gc=%llu gc_safe_watermark=%llu baseline_sent=%llu baseline_skipped=%llu baseline_error=%llu baseline_retry_queued=%llu baseline_retry_sent=%llu baseline_retry_pending=%llu\n",
            D(moved_count),
@@ -1674,12 +1669,11 @@ static void print_stats_delta(const vemb_v16_stats_t *before,
            D(warm_stale_handle_reject),
            D(remote_meta_stale),
            (unsigned long long)after->warm_region_hash_local_pct);
-    printf("[stats] depth request=%llu response=%llu job_shard=%llu completion=%llu channel_ops=%llu\n",
+    printf("[stats] depth request=%llu response=%llu job_shard=%llu completion=%llu\n",
            (unsigned long long)after->request_ring_depth,
            (unsigned long long)after->response_ring_depth,
            (unsigned long long)after->job_shard_queue_depth,
-           (unsigned long long)after->completion_ring_depth,
-           D(channel_ops));
+           (unsigned long long)after->completion_ring_depth);
     printf("[stats] remote_meta hit=%llu miss=%llu busy=%llu probes=%llu async_enqueue=%llu async_drop=%llu publish_ok=%llu insert=%llu update=%llu evict=%llu repair_enqueue=%llu repair_ok=%llu rpc_count=%llu rpc_ok=%llu rpc_not_found=%llu rpc_busy=%llu rpc_timeout=%llu rpc_error=%llu rpc_handle=%llu rpc_snapshot=%llu\n",
            D(remote_meta_lookup_hit),
            D(remote_meta_lookup_miss),
