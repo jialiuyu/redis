@@ -284,26 +284,53 @@ static int topology_control_tcp(const topology_ctl_cfg_t *cfg,
         return -1;
     uint16_t type = req ? VEMB_V16_NET_TOPOLOGY_SET :
                           VEMB_V16_NET_TOPOLOGY_GET;
-    uint32_t payload_len = req ? (uint32_t)sizeof(*req) : 0;
+    size_t payload_len = 0;
+    uint8_t *payload = NULL;
+    if (req) {
+        payload_len = vemb_v16_topology_control_req_encoded_len(req);
+        payload = malloc(payload_len);
+        if (!payload ||
+            vemb_v16_topology_control_req_encode(payload,
+                                                 payload_len,
+                                                 req,
+                                                 &payload_len) != 0) {
+            free(payload);
+            close(fd);
+            return -1;
+        }
+    }
     if (vemb_v16_net_write_frame(fd,
                                  type,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 payload_len) != 0) {
+                                 payload,
+                                 (uint32_t)payload_len) != 0) {
+        free(payload);
         close(fd);
         return -1;
     }
+    free(payload);
 
     vemb_v16_net_hdr_t hdr;
+    uint8_t *resp_buf = NULL;
     if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
         hdr.type != VEMB_V16_NET_TOPOLOGY_RESPONSE ||
-        hdr.payload_len != sizeof(*resp) ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        hdr.flags != 0) {
         close(fd);
         return -1;
     }
+    resp_buf = malloc(hdr.payload_len);
+    if (!resp_buf ||
+        vemb_v16_net_read_full(fd, resp_buf, hdr.payload_len) != 0 ||
+        vemb_v16_topology_control_resp_decode(resp,
+                                              resp_buf,
+                                              hdr.payload_len) != 0) {
+        free(resp_buf);
+        close(fd);
+        return -1;
+    }
+    free(resp_buf);
     close(fd);
     return 0;
 }
@@ -370,21 +397,35 @@ static int migration_range_control_tcp(
     int fd = vemb_v16_net_connect(cfg->host, cfg->port, cfg->timeout_ms);
     if (fd < 0)
         return -1;
+    uint8_t req_buf[32];
+    size_t req_len = 0;
+    if (vemb_v16_migration_range_control_req_encode(req_buf,
+                                                    sizeof(req_buf),
+                                                    req,
+                                                    &req_len) != 0) {
+        close(fd);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(fd,
                                  type,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 (uint32_t)sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(fd);
         return -1;
     }
     vemb_v16_net_hdr_t hdr;
+    uint8_t resp_buf[128];
     if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
         hdr.type != VEMB_V16_NET_MIGRATION_RANGE_CONTROL_RESPONSE ||
-        hdr.payload_len != sizeof(*resp) ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        hdr.flags != 0 ||
+        hdr.payload_len != vemb_v16_migration_range_control_resp_encoded_len() ||
+        vemb_v16_net_read_full(fd, resp_buf, hdr.payload_len) != 0 ||
+        vemb_v16_migration_range_control_resp_decode(resp,
+                                                     resp_buf,
+                                                     hdr.payload_len) != 0) {
         close(fd);
         return -1;
     }

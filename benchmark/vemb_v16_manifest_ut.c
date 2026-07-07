@@ -1,3 +1,4 @@
+#include "../src/monotonic.h"
 #include "../src/vemb_v16_storage.h"
 
 #include <assert.h>
@@ -731,6 +732,8 @@ static void test_storage_reset_clears_payload_and_allocator(void) {
 }
 
 int main(void) {
+    monotonicInit();
+
     test_shm_provider_attaches_existing_payload();
     test_manifest_shm_mock_ub_create_and_put();
     test_manifest_remote_meta_shm_attach_existing();

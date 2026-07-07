@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+#include "vemb_v16_hash.h"
+
 #include "cpu_relax.h"
 #include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_proxy_types.h"
@@ -30,10 +32,14 @@
 #include <unistd.h>
 
 #define VEMB_V16_JOB_SHARD_RING_SIZE 256u
+#define VEMB_V16_JOB_RETURN_RING_SIZE 256u
 #define VEMB_V16_COMPLETION_RING_SIZE VEMB_V16_AERON_RING_SIZE
 #define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
 #define VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US 100000u
 #define VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS 1000u
+#define VEMB_V16_READ_JOB_POOL_SLOTS 1024u
+#define VEMB_V16_VSIM_JOB_POOL_SLOTS 256u
+#define VEMB_V16_INLINE_JOB_POOL_SLOTS 512u
 
 static int diag_should_log_req(uint32_t req_id) {
     return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
@@ -59,10 +65,6 @@ int vemb_v16_channel_net_fd(vemb_v16_channel_t *ch) {
     return ch->net_fd;
 }
 
-uint32_t vemb_v16_channel_tcp_net_flags(vemb_v16_channel_t *ch) {
-    return ch->tcp_net_flags;
-}
-
 int vemb_v16_channel_tcp_backpressure_enabled(vemb_v16_channel_t *ch) {
     return ch->tcp_backpressure_enabled;
 }
@@ -83,20 +85,9 @@ uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch) {
     return ch->request_ring->slot_size;
 }
 
-void vemb_v16_channel_add_proxy_request_poll(vemb_v16_channel_t *ch,
-                                             uint64_t n) {
-    atomic_fetch_add_explicit(&ch->stats.proxy_request_poll, n,
-                              memory_order_relaxed);
-}
-
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n) {
     atomic_fetch_add_explicit(&ch->stats.proxy_response_ring_full, n,
-                              memory_order_relaxed);
-}
-
-void vemb_v16_channel_add_channel_ops(vemb_v16_channel_t *ch, uint64_t n) {
-    atomic_fetch_add_explicit(&ch->stats.channel_ops, n,
                               memory_order_relaxed);
 }
 
@@ -194,6 +185,10 @@ static void vemb_v16_channel_free_slots(vemb_v16_channel_t *ch) {
     ch->tcp_response_backlog_sent = 0;
 }
 
+static size_t align64_size(size_t value) {
+    return (value + 63u) & ~(size_t)63u;
+}
+
 static void free_shard_queue_array(vemb_v16_shard_queue_t *queues,
                                    uint32_t count) {
     if (!queues)
@@ -240,6 +235,208 @@ static void free_job_shard_queues(vemb_v16_proxy_t *proxy) {
     proxy->job_shard_supernode_count = 0;
 }
 
+static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy);
+static int drain_job_return_queues(vemb_v16_proxy_t *proxy,
+                                   uint32_t proxy_worker_id);
+static int tcp_vemb_read_requires_inline_op(vemb_v16_channel_t *ch,
+                                            const vemb_v16_req_t *req);
+
+static void free_job_return_queues(vemb_v16_proxy_t *proxy) {
+    assert(proxy != NULL);
+    uint32_t count = proxy->job_shard_proxy_count *
+        proxy->job_shard_supernode_count;
+    free_shard_queue_array(proxy->job_return_queues, count);
+    proxy->job_return_queues = NULL;
+}
+
+static int init_job_return_queues(vemb_v16_proxy_t *proxy) {
+    if (validate_pooled_worker_config(proxy) != 0)
+        return -1;
+    if (proxy->job_return_queues)
+        return 0;
+
+    uint32_t count = proxy->proxy_io_worker_count *
+        proxy->supernode_worker_count;
+    if (init_shard_queue_array(&proxy->job_return_queues,
+                               count,
+                               sizeof(vemb_v16_job_return_t),
+                               VEMB_V16_JOB_RETURN_RING_SIZE) != 0) {
+        free_job_return_queues(proxy);
+        return -1;
+    }
+    return 0;
+}
+
+static uint32_t job_pool_slot_count(const vemb_v16_proxy_t *proxy,
+                                    uint16_t pool_type) {
+    assert(proxy != NULL);
+    switch (pool_type) {
+    case VEMB_V16_JOB_POOL_READ:
+        return VEMB_V16_READ_JOB_POOL_SLOTS;
+    case VEMB_V16_JOB_POOL_VSIM_KEY_KEY:
+        return VEMB_V16_VSIM_JOB_POOL_SLOTS;
+    case VEMB_V16_JOB_POOL_INLINE_VECTOR:
+        return VEMB_V16_INLINE_JOB_POOL_SLOTS;
+    default:
+        return 0;
+    }
+}
+
+static size_t job_pool_slot_stride(uint16_t pool_type) {
+    switch (pool_type) {
+    case VEMB_V16_JOB_POOL_READ:
+        return offsetof(vemb_v16_job_slot_t, u) + sizeof(vemb_v16_vemb_job_t);
+    case VEMB_V16_JOB_POOL_VSIM_KEY_KEY:
+        return offsetof(vemb_v16_job_slot_t, u) + sizeof(vemb_v16_vsim_key_key_job_t);
+    case VEMB_V16_JOB_POOL_INLINE_VECTOR:
+        return offsetof(vemb_v16_job_slot_t, u) + sizeof(vemb_v16_vadd_job_t);
+    default:
+        return 0;
+    }
+}
+
+static vemb_v16_job_slot_t *job_pool_slot(vemb_v16_job_pool_t *pool,
+                                          uint32_t slot_id) {
+    assert(pool != NULL);
+    assert(slot_id < pool->slot_count);
+    return (vemb_v16_job_slot_t *)(
+        (uint8_t *)pool->slots + (size_t)slot_id * pool->slot_stride);
+}
+
+static void job_pool_slot_reset(vemb_v16_job_pool_t *pool, uint32_t slot_id) {
+    vemb_v16_job_slot_t *slot = job_pool_slot(pool, slot_id);
+    memset(&slot->u, 0, pool->slot_stride - offsetof(vemb_v16_job_slot_t, u));
+    slot->hdr.op = 0;
+}
+
+static size_t job_pool_slots_region_bytes(const vemb_v16_proxy_t *proxy,
+                                          uint16_t pool_type) {
+    return align64_size((size_t)job_pool_slot_count(proxy, pool_type) *
+                        job_pool_slot_stride(pool_type));
+}
+
+static uint64_t job_pool_slots_region_offset(const vemb_v16_proxy_t *proxy,
+                                             uint32_t worker_id,
+                                             uint16_t pool_type) {
+    uint64_t offset = proxy->job_pool_slots_mmap_offset;
+    for (uint32_t i = 0; i < worker_id; i++) {
+        for (uint16_t t = 0; t < VEMB_V16_JOB_POOL_COUNT; t++)
+            offset += job_pool_slots_region_bytes(proxy, t);
+    }
+    for (uint16_t t = 0; t < pool_type; t++)
+        offset += job_pool_slots_region_bytes(proxy, t);
+    return offset;
+}
+
+static int init_worker_job_pool(vemb_v16_job_pool_t *pool,
+                                vemb_v16_proxy_t *proxy,
+                                uint32_t worker_id,
+                                uint16_t pool_type) {
+    memset(pool, 0, sizeof(*pool));
+    pool->pool_type = pool_type;
+    pool->slot_count = job_pool_slot_count(proxy, pool_type);
+    pool->slot_stride = (uint32_t)job_pool_slot_stride(pool_type);
+    RETURN_IF(pool->slot_count == 0 || pool->slot_stride == 0, -1);
+    if (proxy->job_pool_slots_path[0] != '\0') {
+        vemb_v16_mapped_region_t *region =
+            &proxy->proxy_io_workers[worker_id].job_pool_slot_regions[pool_type];
+        if (vemb_v16_mapped_region_open(region,
+                                        proxy->job_pool_slots_backend_type,
+                                        proxy->job_pool_slots_path,
+                                        job_pool_slots_region_offset(proxy,
+                                                                     worker_id,
+                                                                     pool_type),
+                                        job_pool_slots_region_bytes(proxy,
+                                                                    pool_type)) != 0) {
+            return -1;
+        }
+        pool->slots = region->mapped_addr;
+    } else if (posix_memalign(&pool->slots,
+                              64,
+                              (size_t)pool->slot_count * pool->slot_stride) != 0) {
+        return -1;
+    }
+    pool->free_stack = zmalloc(sizeof(*pool->free_stack) * pool->slot_count);
+    if (pool->free_stack == NULL) {
+        if (proxy->job_pool_slots_path[0] != '\0') {
+            vemb_v16_mapped_region_close(
+                &proxy->proxy_io_workers[worker_id].job_pool_slot_regions[pool_type]);
+        } else {
+            zfree(pool->slots);
+        }
+        pool->slots = NULL;
+        return -1;
+    }
+    pool->free_count = pool->slot_count;
+    for (uint32_t i = 0; i < pool->slot_count; i++) {
+        vemb_v16_job_slot_t *slot = job_pool_slot(pool, i);
+        memset(slot, 0, pool->slot_stride);
+        atomic_init(&slot->hdr.state, VEMB_V16_JOB_SLOT_FREE);
+        slot->hdr.generation = 1;
+        pool->free_stack[i] = pool->slot_count - 1 - i;
+    }
+    return 0;
+}
+
+static void cleanup_worker_job_pool(vemb_v16_job_pool_t *pool) {
+    RETURN_IF(!pool);
+    zfree(pool->free_stack);
+    memset(pool, 0, sizeof(*pool));
+}
+
+static int init_proxy_io_job_pools(vemb_v16_proxy_t *proxy) {
+    assert(proxy != NULL);
+    for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++) {
+        for (uint16_t pool_type = 0; pool_type < VEMB_V16_JOB_POOL_COUNT; pool_type++) {
+            if (init_worker_job_pool(
+                    &proxy->proxy_io_workers[i].job_pools[pool_type],
+                    proxy,
+                    i,
+                    pool_type) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void cleanup_proxy_io_job_pools(vemb_v16_proxy_t *proxy) {
+    RETURN_IF(!proxy);
+    for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++) {
+        for (uint16_t pool_type = 0; pool_type < VEMB_V16_JOB_POOL_COUNT; pool_type++) {
+            vemb_v16_mapped_region_close(
+                &proxy->proxy_io_workers[i].job_pool_slot_regions[pool_type]);
+            if (proxy->job_pool_slots_path[0] == '\0') {
+                zfree(proxy->proxy_io_workers[i].job_pools[pool_type].slots);
+                proxy->proxy_io_workers[i].job_pools[pool_type].slots = NULL;
+            }
+            cleanup_worker_job_pool(&proxy->proxy_io_workers[i].job_pools[pool_type]);
+        }
+    }
+}
+
+/// Scheduling plane: allocate the proxy-IO -> SuperNode shard queues.
+static int init_job_shard_queues(vemb_v16_proxy_t *proxy) {
+    if (validate_pooled_worker_config(proxy) != 0)
+        return -1;
+    if (proxy->job_shard_queues)
+        return 0;
+
+    uint32_t proxy_count = proxy->proxy_io_worker_count;
+    uint32_t supernode_count = proxy->supernode_worker_count;
+    uint32_t count = proxy_count * supernode_count;
+    proxy->job_shard_proxy_count = proxy_count;
+    proxy->job_shard_supernode_count = supernode_count;
+    if (init_shard_queue_array(&proxy->job_shard_queues,
+                               count,
+                               sizeof(vemb_v16_job_ref_t),
+                               VEMB_V16_JOB_SHARD_RING_SIZE) != 0) {
+        free_job_shard_queues(proxy);
+        return -1;
+    }
+    return 0;
+}
+
 static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (proxy->proxy_io_worker_count == 0)
@@ -263,12 +460,12 @@ static int shard_queue_topology_ready(vemb_v16_proxy_t *proxy) {
 
 static uint32_t shard_queue_index(vemb_v16_proxy_t *proxy,
                                   uint32_t proxy_worker_id,
-                                  uint32_t supernode_worker_id) {
+                                  uint32_t sn_work_id) {
     assert(proxy != NULL);
     assert(shard_queue_topology_ready(proxy));
     assert(proxy_worker_id < proxy->job_shard_proxy_count);
-    assert(supernode_worker_id < proxy->job_shard_supernode_count);
-    return proxy_worker_id * proxy->job_shard_supernode_count + supernode_worker_id;
+    assert(sn_work_id < proxy->job_shard_supernode_count);
+    return proxy_worker_id * proxy->job_shard_supernode_count + sn_work_id;
 }
 
 static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
@@ -373,28 +570,6 @@ static void topology_resp_add_local_endpoint(
         return;
     }
     topology_resp_upsert_endpoint(resp, &endpoint);
-}
-
-/// Scheduling plane: allocate the proxy-IO -> SuperNode shard queues.
-static int init_job_shard_queues(vemb_v16_proxy_t *proxy) {
-    if (validate_pooled_worker_config(proxy) != 0)
-        return -1;
-    if (proxy->job_shard_queues)
-        return 0;
-
-    uint32_t proxy_count = proxy->proxy_io_worker_count;
-    uint32_t supernode_count = proxy->supernode_worker_count;
-    uint32_t count = proxy_count * supernode_count;
-    proxy->job_shard_proxy_count = proxy_count;
-    proxy->job_shard_supernode_count = supernode_count;
-    if (init_shard_queue_array(&proxy->job_shard_queues,
-                               count,
-                               sizeof(vemb_v16_vadd_job_t),
-                               VEMB_V16_JOB_SHARD_RING_SIZE) != 0) {
-        free_job_shard_queues(proxy);
-        return -1;
-    }
-    return 0;
 }
 
 /// Lifecycle synchronization: reset a channel after TCP or UB/SHM teardown.
@@ -585,8 +760,6 @@ static void publish_response(vemb_v16_channel_t *ch,
         if (vemb_v16_aeron_publish_response(ch, &resp) != 0)
             return;
     }
-    atomic_fetch_add_explicit(&ch->stats.proxy_response_publish, 1,
-                              memory_order_relaxed);
     channel_note_response_status(ch, completion->status);
 }
 
@@ -628,9 +801,6 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
             }
             return -1;
         }
-        atomic_fetch_add_explicit(&ch->stats.proxy_response_publish,
-                                  published,
-                                  memory_order_relaxed);
         for (uint32_t i = 0; i < n; i++) {
             if (completions[i].channel_id == ch->channel_id &&
                 atomic_load_explicit(&ch->active, memory_order_acquire)) {
@@ -653,12 +823,12 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
 
 /// Job scheduling: route VADD/VEMB work from proxy IO to a SuperNode shard queue.
 static int publish_shard_job(vemb_v16_channel_t *ch,
-                             const void *job,
+                             const vemb_v16_job_ref_t *ref,
                              uint32_t proxy_io_worker_id,
                              vemb_v16_shard_queue_t *queues,
                              atomic_uint_fast64_t *ring_full_counter) {
     assert(ch != NULL);
-    assert(job != NULL);
+    assert(ref != NULL);
     vemb_v16_proxy_t *proxy = ch->proxy;
     assert(shard_queue_topology_ready(proxy));
     assert(queues != NULL);
@@ -670,11 +840,10 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
         shard_queue_index(proxy, proxy_io_worker_id, supernode_id);
     vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
 
-    while (vemb_v16_aeron_publish(ring, job) != 0 &&
+    while (vemb_v16_aeron_publish(ring, ref) != 0 &&
            atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
-        atomic_fetch_add_explicit(ring_full_counter, 1,
-                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(ring_full_counter, 1, memory_order_relaxed);
         cpu_relax();
     }
 #ifdef __linux__
@@ -695,26 +864,142 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
 }
 
 static void fill_job_base(vemb_v16_job_base_t *base,
+                          vemb_v16_job_kind_t kind,
                           vemb_v16_channel_t *ch,
-                          const vemb_v16_req_t *req,
-                          uint32_t key_len) {
+                          const vemb_v16_req_t *req) {
     *base = (vemb_v16_job_base_t){
+        .kind = (uint8_t)kind,
         .op = req->op,
         .flags = req->flags,
         .req_id = req->req_id,
         .channel_index = ch->index,
-        .key_len = key_len,
-        .key2_len = req->key2_len,
         .channel_id = ch->channel_id,
         .key_hash = req->key_hash,
-        .key2_hash = req->key2_hash,
         .topology_epoch = req->topology_epoch,
-        .dim = req->dim,
-        .vector_bytes = req->vector_bytes,
     };
-    memcpy(base->key, req->key, key_len);
-    if (req->key2_len)
-        memcpy(base->key2, req->key2, req->key2_len);
+}
+
+static uint16_t job_pool_type_for_op(uint8_t op) {
+    switch (op) {
+    case VEMB_V16_OP_PING:
+    case VEMB_V16_OP_VEMB_HANDLE:
+    case VEMB_V16_OP_VEMB_INLINE:
+    case VEMB_V16_OP_VREM:
+        return VEMB_V16_JOB_POOL_READ;
+    case VEMB_V16_OP_VSIM_KEY_KEY:
+        return VEMB_V16_JOB_POOL_VSIM_KEY_KEY;
+    case VEMB_V16_OP_VADD:
+    case VEMB_V16_OP_VSIM_INLINE:
+        return VEMB_V16_JOB_POOL_INLINE_VECTOR;
+    default:
+        return UINT16_MAX;
+    }
+}
+
+static int job_pool_alloc_slot(vemb_v16_job_pool_t *pool, uint32_t *slot_id) {
+    assert(pool != NULL);
+    assert(slot_id != NULL);
+    RETURN_IF(pool->free_count == 0, -1);
+    *slot_id = pool->free_stack[--pool->free_count];
+    vemb_v16_job_slot_t *slot = job_pool_slot(pool, *slot_id);
+    atomic_store_explicit(&slot->hdr.state,
+                          VEMB_V16_JOB_SLOT_RESERVED,
+                          memory_order_relaxed);
+    job_pool_slot_reset(pool, *slot_id);
+    return 0;
+}
+
+static void job_pool_release_slot(vemb_v16_job_pool_t *pool,
+                                  uint32_t slot_id,
+                                  int bump_generation) {
+    assert(pool != NULL);
+    assert(slot_id < pool->slot_count);
+    vemb_v16_job_slot_t *slot = job_pool_slot(pool, slot_id);
+    if (bump_generation)
+        slot->hdr.generation++;
+    slot->hdr.op = 0;
+    atomic_store_explicit(&slot->hdr.state,
+                          VEMB_V16_JOB_SLOT_FREE,
+                          memory_order_release);
+    assert(pool->free_count < pool->slot_count);
+    pool->free_stack[pool->free_count++] = slot_id;
+}
+
+static const vemb_v16_job_base_t *job_slot_payload_base(
+    const vemb_v16_job_pool_t *pool,
+    const vemb_v16_job_slot_t *slot) {
+    switch (pool->pool_type) {
+    case VEMB_V16_JOB_POOL_READ:
+        return &slot->u.read_job.base;
+    case VEMB_V16_JOB_POOL_VSIM_KEY_KEY:
+        return &slot->u.vsim_job.base;
+    case VEMB_V16_JOB_POOL_INLINE_VECTOR:
+        return &slot->u.inline_job.base;
+    default:
+        return &slot->u.base_job;
+    }
+}
+
+static int fill_job_slot(vemb_v16_job_pool_t *pool,
+                         uint32_t slot_id,
+                         vemb_v16_channel_t *ch,
+                         const vemb_v16_req_t *req,
+                         uint32_t key_len,
+                         int *has_inline_vector,
+                         int *is_vemb_like) {
+    vemb_v16_job_slot_t *slot = job_pool_slot(pool, slot_id);
+    assert(has_inline_vector != NULL);
+    assert(is_vemb_like != NULL);
+    *has_inline_vector = 0;
+    *is_vemb_like = 0;
+
+    switch (req->op) {
+    case VEMB_V16_OP_PING:
+        fill_job_base(&slot->u.base_job, VEMB_V16_JOB_KIND_BASE, ch, req);
+        break;
+    case VEMB_V16_OP_VEMB_HANDLE:
+    case VEMB_V16_OP_VEMB_INLINE:
+    case VEMB_V16_OP_VREM:
+        fill_job_base(&slot->u.read_job.base, VEMB_V16_JOB_KIND_READ, ch, req);
+        slot->u.read_job.key_len = key_len;
+        slot->u.read_job.dim = req->dim;
+        slot->u.read_job.vector_bytes = req->vector_bytes;
+        memcpy(slot->u.read_job.key, req->key, key_len);
+        *is_vemb_like = 1;
+        break;
+    case VEMB_V16_OP_VSIM_KEY_KEY:
+        fill_job_base(&slot->u.vsim_job.base,
+                      VEMB_V16_JOB_KIND_VSIM_KEY_KEY,
+                      ch,
+                      req);
+        slot->u.vsim_job.key_len = key_len;
+        slot->u.vsim_job.key2_len = req->key2_len;
+        slot->u.vsim_job.dim = req->dim;
+        slot->u.vsim_job.vector_bytes = req->vector_bytes;
+        slot->u.vsim_job.key2_hash = req->key2_hash;
+        memcpy(slot->u.vsim_job.key, req->key, key_len);
+        memcpy(slot->u.vsim_job.key2, req->key2, req->key2_len);
+        *is_vemb_like = 1;
+        break;
+    case VEMB_V16_OP_VADD:
+    case VEMB_V16_OP_VSIM_INLINE:
+        fill_job_base(&slot->u.inline_job.base,
+                      VEMB_V16_JOB_KIND_INLINE_VECTOR,
+                      ch,
+                      req);
+        slot->u.inline_job.key_len = key_len;
+        slot->u.inline_job.dim = req->dim;
+        slot->u.inline_job.vector_bytes = req->vector_bytes;
+        memcpy(slot->u.inline_job.key, req->key, key_len);
+        memcpy(slot->u.inline_job.vector, req->vector, req->vector_bytes);
+        *has_inline_vector = 1;
+        break;
+    default:
+        return -1;
+    }
+
+    slot->hdr.op = req->op;
+    return 0;
 }
 
 static int publish_request_job(vemb_v16_channel_t *ch,
@@ -722,42 +1007,53 @@ static int publish_request_job(vemb_v16_channel_t *ch,
                                uint32_t key_len,
                                uint32_t proxy_io_worker_id) {
     int is_ping = req->op == VEMB_V16_OP_PING;
-    int is_vadd = req->op == VEMB_V16_OP_VADD;
-    int is_vrem = req->op == VEMB_V16_OP_VREM;
-    int is_vsim = req->op == VEMB_V16_OP_VSIM_INLINE;
-    int has_inline_vector = is_vadd || is_vsim;
-    int is_vemb = req->op == VEMB_V16_OP_VEMB_HANDLE ||
-        req->op == VEMB_V16_OP_VEMB_INLINE ||
-        req->op == VEMB_V16_OP_VSIM_KEY_KEY;
-    RETURN_IF(!is_ping && !is_vrem && !has_inline_vector && !is_vemb, -1);
-
-    vemb_v16_vadd_job_t job = {0};
-
-    fill_job_base((vemb_v16_job_base_t *)&job, ch, req, key_len);
-    if (has_inline_vector) {
-        memcpy(job.vector,
-               req->vector,
-               req->vector_bytes);
+    int has_inline_vector = 0;
+    int is_vemb_like = 0;
+    uint16_t pool_type = job_pool_type_for_op(req->op);
+    RETURN_IF(pool_type == UINT16_MAX, -1);
+    if (pool_type == VEMB_V16_JOB_POOL_READ &&
+        !is_ping &&
+        tcp_vemb_read_requires_inline_op(ch, req) != 0) {
+        return -1;
     }
-
+    vemb_v16_job_pool_t *pool =
+        &ch->proxy->proxy_io_workers[proxy_io_worker_id].job_pools[pool_type];
+    uint32_t slot_id = 0;
+    if (job_pool_alloc_slot(pool, &slot_id) != 0) {
+        return -1;
+    }
+    GOTO_IF(fill_job_slot(pool,
+                          slot_id,
+                          ch,
+                          req,
+                          key_len,
+                          &has_inline_vector,
+                          &is_vemb_like) != 0, release_slot);
+    GOTO_IF(!is_ping && !has_inline_vector && !is_vemb_like, release_slot);
+    vemb_v16_job_slot_t *slot = job_pool_slot(pool, slot_id);
+    vemb_v16_job_ref_t ref = {
+        .proxy_worker_id = (uint16_t)proxy_io_worker_id,
+        .pool_type = pool_type,
+        .slot_id = slot_id,
+        .generation = slot->hdr.generation,
+        .req_id = req->req_id,
+        .op = req->op,
+    };
+    atomic_store_explicit(&slot->hdr.state, VEMB_V16_JOB_SLOT_PUBLISHED, memory_order_release);
     vemb_v16_shard_queue_t *queues = ch->proxy->job_shard_queues;
     atomic_uint_fast64_t *ring_full_counter = has_inline_vector ?
         &ch->stats.proxy_vadd_ring_full : &ch->stats.proxy_vemb_ring_full;
-    atomic_uint_fast64_t *publish_counter = has_inline_vector ?
-        &ch->stats.proxy_vadd_publish : &ch->stats.proxy_vemb_publish;
-
     if (diag_should_log_req(req->req_id)) {
-        uint32_t supernode_id =
-            ch->index % ch->proxy->job_shard_supernode_count;
-        uint32_t queue_index =
-            shard_queue_index(ch->proxy, proxy_io_worker_id, supernode_id);
+        uint32_t supernode_id = ch->index % ch->proxy->job_shard_supernode_count;
+        uint32_t queue_index = shard_queue_index(ch->proxy,
+            proxy_io_worker_id, supernode_id);
         serverLog(LL_DEBUG,
                   "vemb_v16 diag proxy enqueue: proxy_worker=%u channel_index=%u channel_id=%llu req_id=%u op=%u flags=%u key_hash=%llu key_len=%u queue=%s queue_index=%u supernode_worker=%u vector_bytes=%u",
                   proxy_io_worker_id,
                   ch->index,
                   (unsigned long long)ch->channel_id,
-                  req->req_id,
-                  req->op,
+                  ref.req_id,
+                  ref.op,
                   req->flags,
                   (unsigned long long)req->key_hash,
                   key_len,
@@ -768,13 +1064,16 @@ static int publish_request_job(vemb_v16_channel_t *ch,
     }
 
     int rc = publish_shard_job(ch,
-                               &job,
-                               proxy_io_worker_id,
-                               queues,
-                               ring_full_counter);
-    RETURN_IF(rc != 0, -1);
-    atomic_fetch_add_explicit(publish_counter, 1, memory_order_relaxed);
-    return 0;
+                           &ref,
+                           proxy_io_worker_id,
+                           queues,
+                           ring_full_counter);
+    if (likely(rc == 0)) {
+        return 0;
+    }
+release_slot:
+    job_pool_release_slot(pool, slot_id, 0);
+    return -1;
 }
 
 static int tcp_vemb_read_requires_inline_op(vemb_v16_channel_t *ch,
@@ -816,10 +1115,6 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         req->vector_bytes > sizeof(req->vector)) {
         goto error_response;
     }
-    if (tcp_vemb_read_requires_inline_op(ch, req) != 0) {
-        goto error_response;
-    }
-
     if (publish_request_job(ch, req, key_len, proxy_io_worker_id) != 0) {
         goto error_response;
     }
@@ -841,8 +1136,6 @@ static int drain_completions(vemb_v16_channel_t *ch) {
                                           completions,
                                           VEMB_V16_PROXY_BATCH)) != 0) {
         total += n;
-        atomic_fetch_add_explicit(&ch->stats.proxy_completion_poll, n,
-                                  memory_order_relaxed);
         uint32_t ready_count = 0;
         for (uint32_t i = 0; i < n; i++) {
             if (diag_should_log_req(completions[i].req_id)) {
@@ -918,7 +1211,6 @@ static void cleanup_unstarted_channel(vemb_v16_channel_t *ch) {
 static int alloc_channel_common(vemb_v16_proxy_t *proxy,
                                 uint32_t transport_type,
                                 int net_fd,
-                                uint32_t tcp_net_flags,
                                 vemb_v16_channel_desc_t *desc) {
     uint32_t idx = VEMB_V16_MAX_CHANNELS;
     uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
@@ -945,7 +1237,6 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
     ch->proxy = proxy;
     ch->transport_type = transport_type;
     ch->net_fd = net_fd;
-    ch->tcp_net_flags = tcp_net_flags;
     atomic_store_explicit(&ch->active, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
     atomic_store_explicit(&ch->proxy_io_state, 0, memory_order_release);
@@ -1032,18 +1323,16 @@ static int alloc_channel_common(vemb_v16_proxy_t *proxy,
 
 /// UB/SHM control plane: allocate a shared-memory client channel.
 int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy, vemb_v16_channel_desc_t *desc) {
-    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, 0, desc);
+    return alloc_channel_common(proxy, VEMB_V16_TRANSPORT_AERON, -1, desc);
 }
 
 /// TCP control plane: attach an accepted socket to a channel.
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                       int net_fd,
-                      uint32_t tcp_net_flags,
                       vemb_v16_channel_desc_t *desc) {
     return alloc_channel_common(proxy,
                                 VEMB_V16_TRANSPORT_TCP,
                                 net_fd,
-                                tcp_net_flags,
                                 desc);
 }
 
@@ -1162,9 +1451,10 @@ static void *proxy_io_poll_thread_main(void *arg) {
         if (worker_count == 0)
             break;
 
-        for (uint32_t i = worker->worker_id;
-             i < VEMB_V16_MAX_CHANNELS;
-             i += worker_count) {
+        if (drain_job_return_queues(proxy, worker->worker_id) > 0)
+            did_work = 1;
+
+        for (uint32_t i = worker->worker_id; i < VEMB_V16_MAX_CHANNELS; i += worker_count) {
             vemb_v16_channel_t *ch = &proxy->channels[i];
             if (!proxy_io_channel_acquire(ch))
                 continue;
@@ -1302,6 +1592,9 @@ static void *proxy_io_epoll_thread_main(void *arg) {
         uint32_t worker_count = proxy->proxy_io_worker_count;
         if (worker_count == 0)
             break;
+
+        if (drain_job_return_queues(proxy, worker->worker_id) > 0)
+            did_work = 1;
 
         for (uint32_t i = worker->worker_id;
              i < VEMB_V16_MAX_CHANNELS;
@@ -1530,13 +1823,11 @@ static int start_proxy_io_pool(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
     for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++) {
-        proxy->proxy_io_workers[i] = (vemb_v16_proxy_io_worker_t){
-            .worker_id = i,
-            .proxy = proxy,
+        proxy->proxy_io_workers[i].worker_id = i;
+        proxy->proxy_io_workers[i].proxy = proxy;
 #ifdef __linux__
-            .notify_fd = -1,
+        proxy->proxy_io_workers[i].notify_fd = -1;
 #endif
-        };
         if (pthread_create(&proxy->proxy_io_workers[i].thread,
                            NULL,
                            proxy_io_pool_thread_main,
@@ -1563,22 +1854,40 @@ static void stop_proxy_io_pool(vemb_v16_proxy_t *proxy) {
 
 /// Execution: run one VEMB job on the SuperNode storage/backend path.
 static void apply_vemb_job(vemb_v16_supernode_ctx_t *ctx,
-                           void *job,
+                           const vemb_v16_vemb_job_t *job,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
     (void)scratch;
+    (void)ch;
     vemb_v16_supernode_handle_vemb_job(ctx, job);
-    atomic_fetch_add_explicit(&ch->stats.supernode_vemb_poll, 1, memory_order_relaxed);
+}
+
+static void apply_vsim_key_key_job(vemb_v16_supernode_ctx_t *ctx,
+                                   const vemb_v16_vsim_key_key_job_t *job,
+                                   vemb_v16_supernode_scratch_t *scratch,
+                                   vemb_v16_channel_t *ch) {
+    (void)scratch;
+    (void)ch;
+    vemb_v16_supernode_handle_vsim_key_key_job(ctx, job);
+}
+
+static void apply_vrem_job(vemb_v16_supernode_ctx_t *ctx,
+                           const vemb_v16_vemb_job_t *job,
+                           vemb_v16_supernode_scratch_t *scratch,
+                           vemb_v16_channel_t *ch) {
+    (void)scratch;
+    (void)ch;
+    vemb_v16_supernode_handle_vrem_job(ctx, job);
 }
 
 /// Execution: run one VADD job on the SuperNode storage/backend path.
 static void apply_vadd_job(vemb_v16_supernode_ctx_t *ctx,
-                           void *job,
+                           const vemb_v16_vadd_job_t *job,
                            vemb_v16_supernode_scratch_t *scratch,
                            vemb_v16_channel_t *ch) {
     (void)scratch;
+    (void)ch;
     vemb_v16_supernode_handle_vadd_job(ctx, job);
-    atomic_fetch_add_explicit(&ch->stats.supernode_vadd_poll, 1, memory_order_relaxed);
 }
 
 static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx) {
@@ -1620,39 +1929,39 @@ static void publish_synthetic_completion(vemb_v16_supernode_ctx_t *ctx,
 }
 
 static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
-                                    void *job,
+                                    const vemb_v16_job_base_t *job,
                                     vemb_v16_supernode_scratch_t *scratch,
                                     vemb_v16_channel_t *ch) {
-    vemb_v16_job_base_t *base = job;
-    switch (base->op) {
-    case VEMB_V16_OP_PING: {
-        vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_OK,
-            .op = base->op,
-            .req_id = base->req_id,
-            .channel_index = base->channel_index,
-            .channel_id = base->channel_id,
-        };
-        publish_synthetic_completion(ctx, &completion);
+    (void)scratch;
+    switch (job->kind) {
+    case VEMB_V16_JOB_KIND_BASE:
+        vemb_v16_supernode_handle_base_job(ctx, job);
         break;
-    }
-    case VEMB_V16_OP_VADD:
-    case VEMB_V16_OP_VREM:
-    case VEMB_V16_OP_VSIM_INLINE:
-        apply_vadd_job(ctx, job, scratch, ch);
+    case VEMB_V16_JOB_KIND_READ:
+        if (job->op == VEMB_V16_OP_VREM) {
+            apply_vrem_job(ctx, (const vemb_v16_vemb_job_t *)job, scratch, ch);
+        } else {
+            apply_vemb_job(ctx, (const vemb_v16_vemb_job_t *)job, scratch, ch);
+        }
         break;
-    case VEMB_V16_OP_VEMB_HANDLE:
-    case VEMB_V16_OP_VEMB_INLINE:
-    case VEMB_V16_OP_VSIM_KEY_KEY:
-        apply_vemb_job(ctx, job, scratch, ch);
+    case VEMB_V16_JOB_KIND_VSIM_KEY_KEY:
+        apply_vsim_key_key_job(ctx,
+                               (const vemb_v16_vsim_key_key_job_t *)job,
+                               scratch,
+                               ch);
+        break;
+    case VEMB_V16_JOB_KIND_INLINE_VECTOR:
+        apply_vadd_job(ctx, (const vemb_v16_vadd_job_t *)job, scratch, ch);
         break;
     default: {
         vemb_v16_completion_t completion = {
-            .status = VEMB_V16_STATUS_ERR,
-            .op = base->op,
-            .req_id = base->req_id,
-            .channel_index = base->channel_index,
-            .channel_id = base->channel_id,
+            .op = job->op,
+            .req_id = job->req_id,
+            .channel_id = job->channel_id,
+            .channel_index = job->channel_index,
+            .status = job->op == VEMB_V16_OP_PING ?
+                VEMB_V16_STATUS_OK :
+                VEMB_V16_STATUS_ERR,
         };
         publish_synthetic_completion(ctx, &completion);
         break;
@@ -1660,52 +1969,84 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
     }
 }
 
+static void publish_job_return(vemb_v16_proxy_t *proxy,
+                               uint32_t proxy_worker_id,
+                               uint32_t sn_work_id,
+                               const vemb_v16_job_return_t *ret) {
+    assert(proxy != NULL);
+    assert(ret != NULL);
+    uint32_t queue_index = shard_queue_index(proxy, proxy_worker_id, sn_work_id);
+    vemb_v16_aeron_ring_t *ring = &proxy->job_return_queues[queue_index].ring;
+    while (vemb_v16_aeron_publish(ring, ret) != 0 &&
+           atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
+        cpu_relax();
+    }
+}
+
 /// Execution scheduling: drain shard queues assigned to one SuperNode worker.
 static int drain_shard_queues(vemb_v16_proxy_t *proxy,
-                              uint32_t supernode_worker_id,
+                              uint32_t sn_work_id,
                               vemb_v16_supernode_scratch_t *scratch,
                               vemb_v16_shard_queue_t *queues,
-                              void *job_buf) {
+                              vemb_v16_job_ref_t *job_refs) {
     assert(proxy != NULL);
     assert(scratch != NULL);
     assert(queues != NULL);
-    assert(job_buf != NULL);
-    if (!shard_queue_topology_ready(proxy) ||
-        supernode_worker_id >= proxy->job_shard_supernode_count) {
-        return 0;
-    }
+    assert(job_refs != NULL);
+    RETURN_IF(!shard_queue_topology_ready(proxy) ||
+              sn_work_id >= proxy->job_shard_supernode_count, 0);
 
     int did_work = 0;
-    for (uint32_t proxy_id = 0;
-         proxy_id < proxy->job_shard_proxy_count;
-         proxy_id++) {
-        uint32_t queue_index =
-            shard_queue_index(proxy, proxy_id, supernode_worker_id);
+    for (uint32_t work_id = 0; work_id < proxy->job_shard_proxy_count; work_id++) {
+        uint32_t queue_index = shard_queue_index(proxy, work_id, sn_work_id);
         vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
-        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_buf,
-                                               VEMB_V16_PROXY_BATCH);
-        if (!n)
-            continue;
-        did_work += (int)n;
+        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_refs, VEMB_V16_PROXY_BATCH);
+        if (!n) continue;
 
+        did_work += (int)n;
         for (uint32_t i = 0; i < n; i++) {
-            uint8_t *slot = (uint8_t *)job_buf + (size_t)i * ring->slot_size;
-            vemb_v16_job_base_t *job_base = (vemb_v16_job_base_t *)slot;
-            if (job_base->channel_index >= VEMB_V16_MAX_CHANNELS)
+            vemb_v16_job_ref_t *ref = &job_refs[i];
+            if (ref->proxy_worker_id >= proxy->proxy_io_worker_count ||
+                ref->pool_type >= VEMB_V16_JOB_POOL_COUNT)
                 continue;
+            vemb_v16_job_pool_t *pool =
+                &proxy->proxy_io_workers[ref->proxy_worker_id].job_pools[ref->pool_type];
+            if (ref->slot_id >= pool->slot_count)
+                continue;
+            vemb_v16_job_slot_t *slot = job_pool_slot(pool, ref->slot_id);
+            if (slot->hdr.generation != ref->generation ||
+                atomic_load_explicit(&slot->hdr.state, memory_order_acquire) !=
+                    VEMB_V16_JOB_SLOT_PUBLISHED)
+                continue;
+            const vemb_v16_job_base_t *job_base = job_slot_payload_base(pool, slot);
+            if (!job_base || job_base->op != ref->op)
+                continue;
+            atomic_store_explicit(&slot->hdr.state,
+                                  VEMB_V16_JOB_SLOT_RUNNING,
+                                  memory_order_release);
+            vemb_v16_job_return_t job_return = {
+                .pool_type = ref->pool_type,
+                .slot_id = ref->slot_id,
+                .generation = ref->generation,
+            };
+            if (job_base->channel_index >= VEMB_V16_MAX_CHANNELS) {
+                publish_job_return(proxy, ref->proxy_worker_id, sn_work_id, &job_return);
+                continue;
+            }
             vemb_v16_channel_t *ch = &proxy->channels[job_base->channel_index];
-            if (!supernode_channel_acquire(ch))
+            if (!supernode_channel_acquire(ch)) {
+                publish_job_return(proxy, ref->proxy_worker_id, sn_work_id, &job_return);
                 continue;
-            if (atomic_load_explicit(&ch->slot_channel_id,
-                                     memory_order_acquire) ==
-                    job_base->channel_id &&
+            }
+            if (atomic_load_explicit(
+                &ch->slot_channel_id, memory_order_acquire) == job_base->channel_id &&
                 atomic_load_explicit(&ch->active, memory_order_acquire)) {
                 if (diag_should_log_req(job_base->req_id)) {
                     serverLog(LL_DEBUG,
-                              "vemb_v16 diag supernode dequeue: worker_id=%u queue=%s proxy_worker=%u queue_index=%u batch_index=%u batch_count=%u channel_index=%u channel_id=%llu req_id=%u op=%u flags=%u key_hash=%llu vector_bytes=%u",
-                              supernode_worker_id,
+                              "vemb_v16 diag supernode dequeue: worker_id=%u queue=%s proxy_worker=%u queue_index=%u batch_index=%u batch_count=%u channel_index=%u channel_id=%llu req_id=%u op=%u flags=%u key_hash=%llu",
+                              sn_work_id,
                               "job",
-                              proxy_id,
+                              work_id,
                               queue_index,
                               i,
                               n,
@@ -1714,14 +2055,14 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
                               job_base->req_id,
                               job_base->op,
                               job_base->flags,
-                              (unsigned long long)job_base->key_hash,
-                              job_base->vector_bytes);
+                              (unsigned long long)job_base->key_hash);
                 }
                 vemb_v16_supernode_ctx_t ctx = ch->supernode_ctx;
-                ctx.worker_id = supernode_worker_id;
-                apply_unified_shard_job(&ctx, slot, scratch, ch);
+                ctx.worker_id = sn_work_id;
+                apply_unified_shard_job(&ctx, job_base, scratch, ch);
             }
             supernode_channel_release(ch);
+            publish_job_return(proxy, ref->proxy_worker_id, sn_work_id, &job_return);
         }
     }
     return did_work;
@@ -1729,24 +2070,63 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
 
 /// Execution scheduling: drain FIFO job queues for one SuperNode worker.
 static int drain_job_shard_queues(vemb_v16_proxy_t *proxy,
-                                  uint32_t supernode_worker_id,
+                                  uint32_t sn_work_id,
                                   vemb_v16_supernode_scratch_t *scratch) {
     assert(proxy != NULL);
     assert(scratch != NULL);
     return drain_shard_queues(proxy,
-                              supernode_worker_id,
+                              sn_work_id,
                               scratch,
                               proxy->job_shard_queues,
-                              scratch->vadd_jobs);
+                              scratch->job_refs);
+}
+
+static int drain_job_return_queues(vemb_v16_proxy_t *proxy,
+                                   uint32_t proxy_worker_id) {
+    assert(proxy != NULL);
+    RETURN_IF(!shard_queue_topology_ready(proxy) ||
+              !proxy->job_return_queues ||
+              proxy_worker_id >= proxy->job_shard_proxy_count,
+              0);
+
+    int reclaimed = 0;
+    vemb_v16_job_return_t returns[VEMB_V16_PROXY_BATCH];
+    for (uint32_t sn_id = 0; sn_id < proxy->job_shard_supernode_count; sn_id++) {
+        uint32_t queue_index = shard_queue_index(proxy, proxy_worker_id, sn_id);
+        vemb_v16_aeron_ring_t *ring = &proxy->job_return_queues[queue_index].ring;
+        uint32_t n;
+        while ((n = vemb_v16_aeron_poll_batch(ring,
+                                              returns,
+                                              VEMB_V16_PROXY_BATCH)) != 0) {
+            reclaimed += (int)n;
+            for (uint32_t i = 0; i < n; i++) {
+                vemb_v16_job_return_t *ret = &returns[i];
+                if (ret->pool_type >= VEMB_V16_JOB_POOL_COUNT)
+                    continue;
+                vemb_v16_job_pool_t *pool =
+                    &proxy->proxy_io_workers[proxy_worker_id].job_pools[ret->pool_type];
+                if (ret->slot_id >= pool->slot_count)
+                    continue;
+                vemb_v16_job_slot_t *slot = job_pool_slot(pool, ret->slot_id);
+                if (slot->hdr.generation != ret->generation)
+                    continue;
+                if (atomic_load_explicit(&slot->hdr.state, memory_order_acquire) !=
+                    VEMB_V16_JOB_SLOT_RUNNING) {
+                    continue;
+                }
+                job_pool_release_slot(pool, ret->slot_id, 1);
+            }
+        }
+    }
+    return reclaimed;
 }
 
 #ifdef __linux__
 /// Execution scheduling: check whether a SuperNode worker can sleep.
 static int supernode_worker_has_pending(vemb_v16_proxy_t *proxy,
                                         uint32_t worker_id) {
-    if (!shard_queue_topology_ready(proxy) ||
-        worker_id >= proxy->job_shard_supernode_count)
-        return 0;
+    RETURN_IF(!shard_queue_topology_ready(proxy) ||
+        worker_id >= proxy->job_shard_supernode_count, 0);
 
     for (uint32_t proxy_id = 0;
          proxy_id < proxy->job_shard_proxy_count;
@@ -1901,21 +2281,32 @@ static int scaleout_notify_send_tcp(
                                   VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS);
     if (fd < 0)
         return -1;
-    if (vemb_v16_net_write_frame(fd,
+    uint8_t req_buf[64];
+    size_t req_len = 0;
+    if (vemb_v16_scaleout_local_done_req_encode(req_buf,
+                                                sizeof(req_buf),
+                                                req,
+                                                &req_len) != 0 ||
+        vemb_v16_net_write_frame(fd,
                                  VEMB_V16_NET_SCALEOUT_LOCAL_DONE,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 (uint32_t)sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(fd);
         return -1;
     }
     vemb_v16_net_hdr_t hdr;
+    uint8_t resp_buf[64];
     if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
         hdr.type != VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE ||
-        hdr.payload_len != sizeof(*resp) ||
-        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        hdr.flags != 0 ||
+        hdr.payload_len != vemb_v16_scaleout_local_done_resp_encoded_len() ||
+        vemb_v16_net_read_full(fd, resp_buf, hdr.payload_len) != 0 ||
+        vemb_v16_scaleout_local_done_resp_decode(resp,
+                                                 resp_buf,
+                                                 hdr.payload_len) != 0) {
         close(fd);
         return -1;
     }
@@ -2049,7 +2440,8 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
-                          vemb_v16_storage_ctx_t *storage) {
+                          vemb_v16_storage_ctx_t *storage,
+                          const vemb_v16_warm_regions_manifest_t *manifest) {
     assert(out != NULL);
     assert(uds_path != NULL);
     assert(uds_path[0] != '\0');
@@ -2078,13 +2470,26 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
         VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US;
     pthread_mutex_init(&proxy->stats_lock, NULL);
     proxy->storage = storage;
+    if (manifest &&
+        manifest->has_job_plane_backend_type &&
+        manifest->job_plane_path[0] != '\0') {
+        proxy->job_pool_slots_backend_type = manifest->job_plane_backend_type;
+        proxy->job_pool_slots_mmap_offset = manifest->job_plane_mmap_offset;
+        strncpy(proxy->job_pool_slots_path,
+                manifest->job_plane_path,
+                sizeof(proxy->job_pool_slots_path) - 1);
+        proxy->job_pool_slots_path[sizeof(proxy->job_pool_slots_path) - 1] = '\0';
+    }
 
-    serverLog(LL_NOTICE, "vemb_v16 proxy created: uds=%s dim=%u max_vectors=%u vector_region=%s size=%zu",
+    serverLog(LL_NOTICE, "vemb_v16 proxy created: uds=%s dim=%u max_vectors=%u vector_region=%s size=%zu job_pool_slots=%s backend=%u offset=%llu",
               proxy->uds_path,
               proxy->vector_dim,
               proxy->max_vectors,
               vemb_v16_storage_vector_region_name(proxy_storage(proxy)),
-              vemb_v16_storage_vector_region_size(proxy_storage(proxy)));
+              vemb_v16_storage_vector_region_size(proxy_storage(proxy)),
+              proxy->job_pool_slots_path[0] ? proxy->job_pool_slots_path : "(heap)",
+              proxy->job_pool_slots_backend_type,
+              (unsigned long long)proxy->job_pool_slots_mmap_offset);
     *out = proxy;
     return 0;
 }
@@ -2147,6 +2552,8 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
     stop_proxy_io_pool(proxy);
     stop_supernode_pool(proxy);
     free_job_shard_queues(proxy);
+    free_job_return_queues(proxy);
+    cleanup_proxy_io_job_pools(proxy);
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++)
         close_channel(&proxy->channels[i]);
     if (proxy->listen_fd >= 0) close(proxy->listen_fd);
@@ -2178,6 +2585,17 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
         serverLog(LL_WARNING, "vemb_v16 job shard queue init failed: proxy_io_threads=%u supernode_workers=%u",
                   proxy->proxy_io_worker_count,
                   proxy->supernode_worker_count);
+        goto cleanup;
+    }
+    if (init_job_return_queues(proxy) != 0) {
+        serverLog(LL_WARNING, "vemb_v16 job return queue init failed: proxy_io_threads=%u supernode_workers=%u",
+                  proxy->proxy_io_worker_count,
+                  proxy->supernode_worker_count);
+        goto cleanup;
+    }
+    if (init_proxy_io_job_pools(proxy) != 0) {
+        serverLog(LL_WARNING, "vemb_v16 job pool init failed: proxy_io_threads=%u",
+                  proxy->proxy_io_worker_count);
         goto cleanup;
     }
     if (start_supernode_pool(proxy) != 0) {
@@ -2239,6 +2657,8 @@ cleanup:
     stop_proxy_io_pool(proxy);
     stop_supernode_pool(proxy);
     free_job_shard_queues(proxy);
+    free_job_return_queues(proxy);
+    cleanup_proxy_io_job_pools(proxy);
     if (proxy->listen_fd >= 0) {
         close(proxy->listen_fd);
         proxy->listen_fd = -1;
@@ -2579,7 +2999,8 @@ void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) 
         uint32_t count = proxy->job_shard_proxy_count *
             proxy->job_shard_supernode_count;
         for (uint32_t i = 0; i < count; i++) {
-            stats->job_shard_queue_depth += vemb_v16_aeron_available(&proxy->job_shard_queues[i].ring);
+            stats->job_shard_queue_depth +=
+                vemb_v16_aeron_available(&proxy->job_shard_queues[i].ring);
         }
     }
     for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {

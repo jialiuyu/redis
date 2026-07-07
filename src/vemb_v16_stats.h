@@ -30,16 +30,9 @@ typedef struct vemb_v16_channel_counters {
     atomic_uint_fast64_t not_found;
     atomic_uint_fast64_t published_jobs;
     atomic_uint_fast64_t completed_jobs;
-    atomic_uint_fast64_t proxy_request_poll;
-    atomic_uint_fast64_t proxy_completion_poll;
-    atomic_uint_fast64_t proxy_vemb_publish;
-    atomic_uint_fast64_t proxy_vadd_publish;
     atomic_uint_fast64_t proxy_vemb_ring_full;
     atomic_uint_fast64_t proxy_vadd_ring_full;
-    atomic_uint_fast64_t proxy_response_publish;
     atomic_uint_fast64_t proxy_response_ring_full;
-    atomic_uint_fast64_t supernode_vemb_poll;
-    atomic_uint_fast64_t supernode_vadd_poll;
     atomic_uint_fast64_t supernode_completion_publish;
     atomic_uint_fast64_t supernode_completion_ring_full;
     atomic_uint_fast64_t sample_count;
@@ -48,7 +41,6 @@ typedef struct vemb_v16_channel_counters {
     atomic_uint_fast64_t sample_bitmap_unlock_ns;
     atomic_uint_fast64_t sample_vector_load_ns;
     atomic_uint_fast64_t sample_completion_publish_ns;
-    atomic_uint_fast64_t channel_ops;
     atomic_uint_fast64_t moved_count;
     atomic_uint_fast64_t stale_count;
     atomic_uint_fast64_t ask_count;

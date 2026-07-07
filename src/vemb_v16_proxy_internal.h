@@ -24,17 +24,13 @@ typedef struct vemb_v16_transport_listener {
 uint64_t vemb_v16_channel_id(vemb_v16_channel_t *ch);
 int vemb_v16_channel_active(vemb_v16_channel_t *ch);
 int vemb_v16_channel_net_fd(vemb_v16_channel_t *ch);
-uint32_t vemb_v16_channel_tcp_net_flags(vemb_v16_channel_t *ch);
 int vemb_v16_channel_tcp_backpressure_enabled(vemb_v16_channel_t *ch);
 int vemb_v16_channel_proxy_running(vemb_v16_channel_t *ch);
 vemb_v16_client_ring_t *vemb_v16_channel_request_ring(vemb_v16_channel_t *ch);
 vemb_v16_client_ring_t *vemb_v16_channel_response_ring(vemb_v16_channel_t *ch);
 uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch);
-void vemb_v16_channel_add_proxy_request_poll(vemb_v16_channel_t *ch,
-                                             uint64_t n);
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n);
-void vemb_v16_channel_add_channel_ops(vemb_v16_channel_t *ch, uint64_t n);
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy);
@@ -68,7 +64,6 @@ int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy,
                                      vemb_v16_channel_desc_t *desc);
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                                      int net_fd,
-                                     uint32_t tcp_net_flags,
                                      vemb_v16_channel_desc_t *desc);
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy,
                                        uint64_t channel_id);

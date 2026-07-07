@@ -123,14 +123,12 @@ int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
         return 0;
     }
 
-    vemb_v16_channel_add_proxy_request_poll(ch, req_count);
     for (uint32_t i = 0; i < req_count; i++) {
         vemb_v16_proxy_handle_request(ch, &req_buf[i],
                        (int)vemb_v16_channel_request_slot_size(ch),
                        proxy_io_worker_id);
     }
     zfree(req_buf);
-    vemb_v16_channel_add_channel_ops(ch, req_count);
     return (int)req_count;
 }
 

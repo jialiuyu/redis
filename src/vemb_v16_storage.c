@@ -604,6 +604,20 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "remote_meta_mmap_offset"))
             return parse_u64_value(value, &manifest->remote_meta_mmap_offset);
+        if (!strcmp(key, "job_plane_provider") ||
+            !strcmp(key, "job_plane_backend")) {
+            if (parse_backend_value(value, &manifest->job_plane_backend_type) != 0)
+                return -1;
+            manifest->has_job_plane_backend_type = 1;
+            return 0;
+        }
+        if (!strcmp(key, "job_plane_path")) {
+            RETURN_IF(strlen(value) >= sizeof(manifest->job_plane_path), -1);
+            strcpy(manifest->job_plane_path, value);
+            return 0;
+        }
+        if (!strcmp(key, "job_plane_mmap_offset"))
+            return parse_u64_value(value, &manifest->job_plane_mmap_offset);
         if (!strcmp(key, "remote_meta_entries") ||
             !strcmp(key, "remote_meta_entry_count"))
             return parse_u32_value(value, &manifest->remote_meta_entry_count);

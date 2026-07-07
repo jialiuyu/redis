@@ -1,3 +1,4 @@
+#include "../src/monotonic.h"
 #include "../src/vemb_v16_proxy.h"
 #include "../src/vemb_v16_aeron_transport.h"
 #include "../src/vemb_v16_net.h"
@@ -920,7 +921,8 @@ static void test_proxy_migration_control_primitives(void) {
                                  uds_path,
                                  dim,
                                  max_vectors,
-                                 storage) == 0);
+                                 storage,
+                                 &manifest) == 0);
 
     assert(vemb_v16_proxy_epoch_get(proxy, &epoch_resp) == 0);
     assert(epoch_resp.status == VEMB_V16_STATUS_OK);
@@ -2782,7 +2784,8 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
                                  source_proxy_uds_path,
                                  dim,
                                  max_vectors,
-                                 &source_storage) == 0);
+                                 &source_storage,
+                                 NULL) == 0);
 
     fill_topology_req(&topology_req,
                       60,
@@ -4655,6 +4658,8 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
 }
 
 int main(void) {
+    monotonicInit();
+
     test_proxy_migration_control_primitives();
     test_storage_topology_auto_marks_migrating_keys();
     test_storage_topology_auto_pushes_baseline_snapshot();

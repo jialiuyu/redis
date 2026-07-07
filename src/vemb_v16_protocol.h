@@ -1,6 +1,7 @@
 #ifndef __VEMB_V16_PROTOCOL_H
 #define __VEMB_V16_PROTOCOL_H
 
+#include "macro.h"
 #include "vemb_v16_hash.h"
 
 #include <stddef.h>
@@ -24,6 +25,36 @@
 #define VEMB_V16_MAX_DIM 4096
 #define VEMB_V16_DEFAULT_DIM 300
 #define VEMB_V16_DEFAULT_MAX_VECTORS 131072
+#define VEMB_V16_ALLOC_REQ_ENCODED_LEN 8u
+#define VEMB_V16_NET_STATUS_ENCODED_LEN 9u
+#define VEMB_V16_EPOCH_CONTROL_REQ_ENCODED_LEN 20u
+#define VEMB_V16_EPOCH_CONTROL_RESP_ENCODED_LEN 17u
+#define VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN 180u
+#define VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN 56u
+#define VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN 33u
+#define VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN 73u
+#define VEMB_V16_MIGRATION_RANGE_CONTROL_REQ_ENCODED_LEN 32u
+#define VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN 105u
+#define VEMB_V16_RESP_ENCODED_BASE_LEN 6u
+#define vemb_v16_alloc_req_encoded_len() VEMB_V16_ALLOC_REQ_ENCODED_LEN
+#define vemb_v16_net_status_encoded_len() VEMB_V16_NET_STATUS_ENCODED_LEN
+#define vemb_v16_epoch_control_req_encoded_len() \
+    VEMB_V16_EPOCH_CONTROL_REQ_ENCODED_LEN
+#define vemb_v16_epoch_control_resp_encoded_len() \
+    VEMB_V16_EPOCH_CONTROL_RESP_ENCODED_LEN
+#define vemb_v16_topology_endpoint_encoded_len() \
+    VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN
+#define vemb_v16_scaleout_local_done_req_encoded_len() \
+    VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN
+#define vemb_v16_scaleout_local_done_resp_encoded_len() \
+    VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN
+#define vemb_v16_migration_control_resp_encoded_len() \
+    VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN
+#define vemb_v16_migration_range_control_req_encoded_len() \
+    VEMB_V16_MIGRATION_RANGE_CONTROL_REQ_ENCODED_LEN
+#define vemb_v16_migration_range_control_resp_encoded_len() \
+    VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN
+#define vemb_v16_resp_encoded_base_len() VEMB_V16_RESP_ENCODED_BASE_LEN
 #define VEMB_V16_MAX_DESC_WARM_REGIONS 16u
 #define VEMB_V16_MIGRATION_CONTROL_MAX_BATCH 16u
 #define VEMB_V16_MIGRATION_CONTROL_MAX_RANGE_KEYS 64u
@@ -45,9 +76,12 @@
 #define VEMB_V16_TRANSPORT_AERON 1u
 #define VEMB_V16_TRANSPORT_TCP 2u
 
-#define VEMB_V16_NET_F_ENCODED_PAYLOAD 0x01u
-
 #define VEMB_V16_REQ_F_ASK_REDIRECT 0x02u
+#define VEMB_V16_TCP_REQ_OP_MASK 0x3fu
+#define VEMB_V16_TCP_REQ_FLAG_MASK 0xc0u
+#define VEMB_V16_TCP_REQ_WIRE_F_ASK_REDIRECT 0x40u
+#define VEMB_V16_TCP_RESP_OP_MASK 0x3fu
+#define VEMB_V16_TCP_RESP_FLAG_MASK 0xc0u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_PUBLISHED 0x01u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_DUAL_WRITE_REQUIRED 0x02u
 #define VEMB_V16_TOPOLOGY_CONTROL_F_AUTO_SCALEOUT 0x04u
@@ -548,16 +582,13 @@ typedef struct vemb_v16_stats {
     uint64_t published_jobs;
     uint64_t completed_jobs;
     uint64_t active_channels;
-    uint64_t proxy_request_poll;
-    uint64_t proxy_completion_poll;
-    uint64_t proxy_vemb_publish;
-    uint64_t proxy_vadd_publish;
     uint64_t proxy_vemb_ring_full;
     uint64_t proxy_vadd_ring_full;
-    uint64_t proxy_response_publish;
+    uint64_t read_pool_alloc_ok;
+    uint64_t read_pool_alloc_fail;
+    uint64_t read_pool_inuse_peak;
+    uint64_t read_pool_free_min;
     uint64_t proxy_response_ring_full;
-    uint64_t supernode_vemb_poll;
-    uint64_t supernode_vadd_poll;
     uint64_t supernode_completion_publish;
     uint64_t supernode_completion_ring_full;
     uint64_t sample_count;
@@ -573,7 +604,6 @@ typedef struct vemb_v16_stats {
     uint64_t job_shard_queue_depth;
     uint64_t reserved_shard_queue_depth;
     uint64_t completion_ring_depth;
-    uint64_t channel_ops;
     uint64_t warm_region_count;
     uint64_t warm_region_full_count;
     uint64_t warm_alloc_local;
@@ -657,6 +687,10 @@ static inline size_t vemb_v16_req_inline_len(uint32_t vector_bytes) {
     return offsetof(vemb_v16_req_t, vector) + (size_t)vector_bytes;
 }
 
+static inline void vemb_v16_proto_put_u8(uint8_t **p, uint8_t v) {
+    *(*p)++ = v;
+}
+
 static inline void vemb_v16_proto_put_u16(uint8_t **p, uint16_t v) {
     uint8_t *dst = *p;
     dst[0] = (uint8_t)(v >> 8);
@@ -691,6 +725,10 @@ static inline uint16_t vemb_v16_proto_get_u16(const uint8_t **p) {
     uint16_t v = (uint16_t)(((uint16_t)src[0] << 8) | (uint16_t)src[1]);
     *p = src + 2;
     return v;
+}
+
+static inline uint8_t vemb_v16_proto_get_u8(const uint8_t **p) {
+    return *(*p)++;
 }
 
 static inline uint32_t vemb_v16_proto_get_u32(const uint8_t **p) {
@@ -746,16 +784,11 @@ static inline float vemb_v16_proto_get_f32(const uint8_t **p) {
     return v;
 }
 
-static inline size_t vemb_v16_alloc_req_encoded_len(void) {
-    return 8u;
-}
-
 static inline int vemb_v16_alloc_req_encode(uint8_t *dst,
                                             size_t cap,
                                             const vemb_v16_alloc_req_t *req,
                                             size_t *out_len) {
-    if (!dst || !req || cap < vemb_v16_alloc_req_encoded_len())
-        return -1;
+    RETURN_IF(cap < VEMB_V16_ALLOC_REQ_ENCODED_LEN, -1);
     uint8_t *p = dst;
     vemb_v16_proto_put_u32(&p, req->vector_dim);
     vemb_v16_proto_put_u32(&p, req->flags);
@@ -766,8 +799,7 @@ static inline int vemb_v16_alloc_req_encode(uint8_t *dst,
 static inline int vemb_v16_alloc_req_decode(vemb_v16_alloc_req_t *req,
                                             const uint8_t *src,
                                             size_t len) {
-    if (!req || !src || len != vemb_v16_alloc_req_encoded_len())
-        return -1;
+    RETURN_IF(len != VEMB_V16_ALLOC_REQ_ENCODED_LEN, -1);
     const uint8_t *p = src;
     memset(req, 0, sizeof(*req));
     req->vector_dim = vemb_v16_proto_get_u32(&p);
@@ -777,7 +809,7 @@ static inline int vemb_v16_alloc_req_decode(vemb_v16_alloc_req_t *req,
 
 static inline size_t vemb_v16_channel_desc_encoded_len(
     const vemb_v16_channel_desc_t *desc) {
-    uint32_t warm_region_count = desc ? desc->warm_region_count : 0;
+    uint32_t warm_region_count = desc->warm_region_count;
     if (warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
         warm_region_count = VEMB_V16_MAX_DESC_WARM_REGIONS;
     return 452u + (size_t)warm_region_count * 280u;
@@ -788,11 +820,8 @@ static inline int vemb_v16_channel_desc_encode(
     size_t cap,
     const vemb_v16_channel_desc_t *desc,
     size_t *out_len) {
-    if (!dst || !desc)
-        return -1;
     size_t need = vemb_v16_channel_desc_encoded_len(desc);
-    if (cap < need)
-        return -1;
+    RETURN_IF(cap < need, -1);
     uint8_t *p = dst;
     uint32_t warm_region_count = desc->warm_region_count;
     if (warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
@@ -836,7 +865,7 @@ static inline int vemb_v16_channel_desc_encode(
 static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
                                                const uint8_t *src,
                                                size_t len) {
-    if (!desc || !src || len < 452u)
+    if (len < 452u)
         return -1;
     const uint8_t *p = src;
     memset(desc, 0, sizeof(*desc));
@@ -879,40 +908,791 @@ static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
     return 0;
 }
 
+static inline int vemb_v16_net_status_encode(uint8_t *dst,
+                                             size_t cap,
+                                             const vemb_v16_net_status_t *st,
+                                             size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_NET_STATUS_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, st->status);
+    vemb_v16_proto_put_u64(&p, st->value);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_net_status_decode(vemb_v16_net_status_t *st,
+                                             const uint8_t *src,
+                                             size_t len) {
+    RETURN_IF(len != VEMB_V16_NET_STATUS_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(st, 0, sizeof(*st));
+    st->status = vemb_v16_proto_get_u8(&p);
+    st->value = vemb_v16_proto_get_u64(&p);
+    return 0;
+}
+
+static inline int vemb_v16_epoch_control_req_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_epoch_control_req_t *req,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_EPOCH_CONTROL_REQ_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u64(&p, req->current_topology_epoch);
+    vemb_v16_proto_put_u64(&p, req->min_write_epoch);
+    vemb_v16_proto_put_u32(&p, req->flags);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_epoch_control_req_decode(
+    vemb_v16_epoch_control_req_t *req,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_EPOCH_CONTROL_REQ_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->current_topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->min_write_epoch = vemb_v16_proto_get_u64(&p);
+    req->flags = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
+static inline int vemb_v16_epoch_control_resp_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_epoch_control_resp_t *resp,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_EPOCH_CONTROL_RESP_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, resp->status);
+    vemb_v16_proto_put_u64(&p, resp->current_topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->min_write_epoch);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_epoch_control_resp_decode(
+    vemb_v16_epoch_control_resp_t *resp,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_EPOCH_CONTROL_RESP_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = vemb_v16_proto_get_u8(&p);
+    resp->current_topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->min_write_epoch = vemb_v16_proto_get_u64(&p);
+    return 0;
+}
+
+static inline int vemb_v16_topology_endpoint_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_topology_endpoint_t *endpoint,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u32(&p, endpoint->owner_id);
+    vemb_v16_proto_put_u32(&p, endpoint->transport_type);
+    vemb_v16_proto_put_u16(&p, endpoint->tcp_port);
+    vemb_v16_proto_put_u16(&p, endpoint->reserved0);
+    vemb_v16_proto_put_bytes(&p, endpoint->host, sizeof(endpoint->host));
+    vemb_v16_proto_put_bytes(&p, endpoint->uds_path,
+                             sizeof(endpoint->uds_path));
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_topology_endpoint_decode(
+    vemb_v16_topology_endpoint_t *endpoint,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(endpoint, 0, sizeof(*endpoint));
+    endpoint->owner_id = vemb_v16_proto_get_u32(&p);
+    endpoint->transport_type = vemb_v16_proto_get_u32(&p);
+    endpoint->tcp_port = vemb_v16_proto_get_u16(&p);
+    endpoint->reserved0 = vemb_v16_proto_get_u16(&p);
+    vemb_v16_proto_get_bytes(&p, endpoint->host, sizeof(endpoint->host));
+    vemb_v16_proto_get_bytes(&p, endpoint->uds_path,
+                             sizeof(endpoint->uds_path));
+    return 0;
+}
+
+static inline size_t vemb_v16_topology_control_req_encoded_len(
+    const vemb_v16_topology_control_req_t *req) {
+    RETURN_IF(req->active_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+                  req->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+                  req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
+              0);
+    size_t len = 32u + (size_t)req->active_owner_count * 4u +
+                 (size_t)req->standby_owner_count * 4u;
+    if (req->coordinator_endpoint_valid)
+        len += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    len += (size_t)req->endpoint_count *
+           VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    return len;
+}
+
+static inline int vemb_v16_topology_control_req_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_topology_control_req_t *req,
+    size_t *out_len) {
+    size_t need = vemb_v16_topology_control_req_encoded_len(req);
+    RETURN_IF(need == 0 || cap < need, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u64(&p, req->current_topology_epoch);
+    vemb_v16_proto_put_u64(&p, req->min_write_epoch);
+    vemb_v16_proto_put_u32(&p, req->active_owner_count);
+    vemb_v16_proto_put_u32(&p, req->standby_owner_count);
+    vemb_v16_proto_put_u32(&p, req->vnode_count);
+    vemb_v16_proto_put_u32(&p, req->flags);
+    for (uint32_t i = 0; i < req->active_owner_count; i++)
+        vemb_v16_proto_put_u32(&p, req->active_owners[i]);
+    for (uint32_t i = 0; i < req->standby_owner_count; i++)
+        vemb_v16_proto_put_u32(&p, req->standby_owners[i]);
+    vemb_v16_proto_put_u32(&p, req->endpoint_count);
+    vemb_v16_proto_put_u32(&p, req->coordinator_endpoint_valid);
+    if (req->coordinator_endpoint_valid) {
+        size_t endpoint_len = 0;
+        RETURN_IF(vemb_v16_topology_endpoint_encode(
+                      p,
+                      cap - (size_t)(p - dst),
+                      &req->coordinator_endpoint,
+                      &endpoint_len) != 0,
+                  -1);
+        p += endpoint_len;
+    }
+    for (uint32_t i = 0; i < req->endpoint_count; i++) {
+        size_t endpoint_len = 0;
+        RETURN_IF(vemb_v16_topology_endpoint_encode(
+                      p,
+                      cap - (size_t)(p - dst),
+                      &req->endpoints[i],
+                      &endpoint_len) != 0,
+                  -1);
+        p += endpoint_len;
+    }
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_topology_control_req_decode(
+    vemb_v16_topology_control_req_t *req,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len < 32u, -1);
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->current_topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->min_write_epoch = vemb_v16_proto_get_u64(&p);
+    req->active_owner_count = vemb_v16_proto_get_u32(&p);
+    req->standby_owner_count = vemb_v16_proto_get_u32(&p);
+    req->vnode_count = vemb_v16_proto_get_u32(&p);
+    req->flags = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(req->active_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+                  req->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS,
+              -1);
+    for (uint32_t i = 0; i < req->active_owner_count; i++)
+        req->active_owners[i] = vemb_v16_proto_get_u32(&p);
+    for (uint32_t i = 0; i < req->standby_owner_count; i++)
+        req->standby_owners[i] = vemb_v16_proto_get_u32(&p);
+    req->endpoint_count = vemb_v16_proto_get_u32(&p);
+    req->coordinator_endpoint_valid = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
+              -1);
+    if (req->coordinator_endpoint_valid) {
+        RETURN_IF(vemb_v16_topology_endpoint_decode(
+                      &req->coordinator_endpoint,
+                      p,
+                      VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN) != 0,
+                  -1);
+        p += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    }
+    for (uint32_t i = 0; i < req->endpoint_count; i++) {
+        RETURN_IF(vemb_v16_topology_endpoint_decode(
+                      &req->endpoints[i],
+                      p,
+                      VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN) != 0,
+                  -1);
+        p += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    }
+    RETURN_IF((size_t)(p - src) != len, -1);
+    return 0;
+}
+
+static inline size_t vemb_v16_topology_control_resp_encoded_len(
+    const vemb_v16_topology_control_resp_t *resp) {
+    RETURN_IF(resp->active_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+                  resp->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+                  resp->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
+              0);
+    size_t len = 33u + (size_t)resp->active_owner_count * 4u +
+                 (size_t)resp->standby_owner_count * 4u;
+    if (resp->coordinator_endpoint_valid)
+        len += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    len += (size_t)resp->endpoint_count *
+           VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    return len;
+}
+
+static inline int vemb_v16_topology_control_resp_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_topology_control_resp_t *resp,
+    size_t *out_len) {
+    size_t need = vemb_v16_topology_control_resp_encoded_len(resp);
+    RETURN_IF(need == 0 || cap < need, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, resp->status);
+    vemb_v16_proto_put_u64(&p, resp->current_topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->min_write_epoch);
+    vemb_v16_proto_put_u32(&p, resp->active_owner_count);
+    vemb_v16_proto_put_u32(&p, resp->standby_owner_count);
+    vemb_v16_proto_put_u32(&p, resp->vnode_count);
+    vemb_v16_proto_put_u32(&p, resp->flags);
+    for (uint32_t i = 0; i < resp->active_owner_count; i++)
+        vemb_v16_proto_put_u32(&p, resp->active_owners[i]);
+    for (uint32_t i = 0; i < resp->standby_owner_count; i++)
+        vemb_v16_proto_put_u32(&p, resp->standby_owners[i]);
+    vemb_v16_proto_put_u32(&p, resp->endpoint_count);
+    vemb_v16_proto_put_u32(&p, resp->coordinator_endpoint_valid);
+    if (resp->coordinator_endpoint_valid) {
+        size_t endpoint_len = 0;
+        RETURN_IF(vemb_v16_topology_endpoint_encode(
+                      p,
+                      cap - (size_t)(p - dst),
+                      &resp->coordinator_endpoint,
+                      &endpoint_len) != 0,
+                  -1);
+        p += endpoint_len;
+    }
+    for (uint32_t i = 0; i < resp->endpoint_count; i++) {
+        size_t endpoint_len = 0;
+        RETURN_IF(vemb_v16_topology_endpoint_encode(
+                      p,
+                      cap - (size_t)(p - dst),
+                      &resp->endpoints[i],
+                      &endpoint_len) != 0,
+                  -1);
+        p += endpoint_len;
+    }
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_topology_control_resp_decode(
+    vemb_v16_topology_control_resp_t *resp,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len < 33u, -1);
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = vemb_v16_proto_get_u8(&p);
+    resp->current_topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->min_write_epoch = vemb_v16_proto_get_u64(&p);
+    resp->active_owner_count = vemb_v16_proto_get_u32(&p);
+    resp->standby_owner_count = vemb_v16_proto_get_u32(&p);
+    resp->vnode_count = vemb_v16_proto_get_u32(&p);
+    resp->flags = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(resp->active_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+                  resp->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS,
+              -1);
+    for (uint32_t i = 0; i < resp->active_owner_count; i++)
+        resp->active_owners[i] = vemb_v16_proto_get_u32(&p);
+    for (uint32_t i = 0; i < resp->standby_owner_count; i++)
+        resp->standby_owners[i] = vemb_v16_proto_get_u32(&p);
+    resp->endpoint_count = vemb_v16_proto_get_u32(&p);
+    resp->coordinator_endpoint_valid = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(resp->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
+              -1);
+    if (resp->coordinator_endpoint_valid) {
+        RETURN_IF(vemb_v16_topology_endpoint_decode(
+                      &resp->coordinator_endpoint,
+                      p,
+                      VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN) != 0,
+                  -1);
+        p += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    }
+    for (uint32_t i = 0; i < resp->endpoint_count; i++) {
+        RETURN_IF(vemb_v16_topology_endpoint_decode(
+                      &resp->endpoints[i],
+                      p,
+                      VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN) != 0,
+                  -1);
+        p += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
+    }
+    RETURN_IF((size_t)(p - src) != len, -1);
+    return 0;
+}
+
+static inline int vemb_v16_scaleout_local_done_req_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_scaleout_local_done_req_t *req,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u64(&p, req->migration_topology_epoch);
+    vemb_v16_proto_put_u64(&p, req->cutover_topology_epoch);
+    vemb_v16_proto_put_u64(&p, req->notify_seq);
+    vemb_v16_proto_put_u32(&p, req->source_owner);
+    vemb_v16_proto_put_u32(&p, req->phase);
+    vemb_v16_proto_put_u32(&p, req->error_code);
+    vemb_v16_proto_put_u32(&p, req->pending_delta);
+    vemb_v16_proto_put_u32(&p, req->baseline_retry_pending);
+    vemb_v16_proto_put_u32(&p, req->migrating_key_count);
+    vemb_v16_proto_put_u32(&p, req->range_count);
+    vemb_v16_proto_put_u32(&p, req->flags);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_scaleout_local_done_req_decode(
+    vemb_v16_scaleout_local_done_req_t *req,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->migration_topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->cutover_topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->notify_seq = vemb_v16_proto_get_u64(&p);
+    req->source_owner = vemb_v16_proto_get_u32(&p);
+    req->phase = vemb_v16_proto_get_u32(&p);
+    req->error_code = vemb_v16_proto_get_u32(&p);
+    req->pending_delta = vemb_v16_proto_get_u32(&p);
+    req->baseline_retry_pending = vemb_v16_proto_get_u32(&p);
+    req->migrating_key_count = vemb_v16_proto_get_u32(&p);
+    req->range_count = vemb_v16_proto_get_u32(&p);
+    req->flags = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
+static inline int vemb_v16_scaleout_local_done_resp_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_scaleout_local_done_resp_t *resp,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, resp->status);
+    vemb_v16_proto_put_u64(&p, resp->migration_topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->cutover_topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->notify_seq);
+    vemb_v16_proto_put_u32(&p, resp->source_owner);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_scaleout_local_done_resp_decode(
+    vemb_v16_scaleout_local_done_resp_t *resp,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = vemb_v16_proto_get_u8(&p);
+    resp->migration_topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->cutover_topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->notify_seq = vemb_v16_proto_get_u64(&p);
+    resp->source_owner = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
+static inline size_t vemb_v16_migration_control_req_encoded_len(
+    const vemb_v16_migration_control_req_t *req) {
+    RETURN_IF(req->key_len > VEMB_V16_MAX_KEY_LEN, 0);
+    return 28u + (size_t)req->key_len;
+}
+
+static inline int vemb_v16_migration_control_req_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_migration_control_req_t *req,
+    size_t *out_len) {
+    size_t need = vemb_v16_migration_control_req_encoded_len(req);
+    RETURN_IF(need == 0 || cap < need, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u64(&p, req->key_hash);
+    vemb_v16_proto_put_u64(&p, req->topology_epoch);
+    vemb_v16_proto_put_u32(&p, req->key_len);
+    vemb_v16_proto_put_u32(&p, req->target_owner);
+    vemb_v16_proto_put_u32(&p, req->shard_id);
+    vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_migration_control_req_decode(
+    vemb_v16_migration_control_req_t *req,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len < 28u, -1);
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->key_hash = vemb_v16_proto_get_u64(&p);
+    req->topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->key_len = vemb_v16_proto_get_u32(&p);
+    req->target_owner = vemb_v16_proto_get_u32(&p);
+    req->shard_id = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(req->key_len > VEMB_V16_MAX_KEY_LEN ||
+                  len != 28u + (size_t)req->key_len,
+              -1);
+    vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
+    return 0;
+}
+
+static inline int vemb_v16_migration_control_resp_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_migration_control_resp_t *resp,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, resp->status);
+    vemb_v16_proto_put_u64(&p, resp->key_hash);
+    vemb_v16_proto_put_u64(&p, resp->key_version);
+    vemb_v16_proto_put_u64(&p, resp->topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->owner_epoch);
+    vemb_v16_proto_put_u64(&p, resp->applied_seq);
+    vemb_v16_proto_put_u64(&p, resp->barrier_seq);
+    vemb_v16_proto_put_u32(&p, resp->migration_state);
+    vemb_v16_proto_put_u32(&p, resp->target_owner);
+    vemb_v16_proto_put_u32(&p, resp->tombstone);
+    vemb_v16_proto_put_u32(&p, resp->pending_delta);
+    vemb_v16_proto_put_u32(&p, resp->outbox_state);
+    vemb_v16_proto_put_u32(&p, resp->shard_id);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_migration_control_resp_decode(
+    vemb_v16_migration_control_resp_t *resp,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = vemb_v16_proto_get_u8(&p);
+    resp->key_hash = vemb_v16_proto_get_u64(&p);
+    resp->key_version = vemb_v16_proto_get_u64(&p);
+    resp->topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->owner_epoch = vemb_v16_proto_get_u64(&p);
+    resp->applied_seq = vemb_v16_proto_get_u64(&p);
+    resp->barrier_seq = vemb_v16_proto_get_u64(&p);
+    resp->migration_state = vemb_v16_proto_get_u32(&p);
+    resp->target_owner = vemb_v16_proto_get_u32(&p);
+    resp->tombstone = vemb_v16_proto_get_u32(&p);
+    resp->pending_delta = vemb_v16_proto_get_u32(&p);
+    resp->outbox_state = vemb_v16_proto_get_u32(&p);
+    resp->shard_id = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
+static inline size_t vemb_v16_migration_control_batch_req_encoded_len(
+    const vemb_v16_migration_control_batch_req_t *req) {
+    RETURN_IF(req->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH, 0);
+    size_t len = 4u;
+    for (uint32_t i = 0; i < req->entry_count; i++) {
+        size_t entry_len =
+            vemb_v16_migration_control_req_encoded_len(&req->entries[i]);
+        RETURN_IF(entry_len == 0, 0);
+        len += entry_len;
+    }
+    return len;
+}
+
+static inline int vemb_v16_migration_control_batch_req_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_migration_control_batch_req_t *req,
+    size_t *out_len) {
+    size_t need = vemb_v16_migration_control_batch_req_encoded_len(req);
+    RETURN_IF(need == 0 || cap < need, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u32(&p, req->entry_count);
+    for (uint32_t i = 0; i < req->entry_count; i++) {
+        size_t entry_len = 0;
+        RETURN_IF(vemb_v16_migration_control_req_encode(
+                      p,
+                      cap - (size_t)(p - dst),
+                      &req->entries[i],
+                      &entry_len) != 0,
+                  -1);
+        p += entry_len;
+    }
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_migration_control_batch_req_decode(
+    vemb_v16_migration_control_batch_req_t *req,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len < 4u, -1);
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->entry_count = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(req->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH, -1);
+    for (uint32_t i = 0; i < req->entry_count; i++) {
+        RETURN_IF((size_t)(p - src) >= len, -1);
+        size_t remaining = len - (size_t)(p - src);
+        RETURN_IF(vemb_v16_migration_control_req_decode(
+                      &req->entries[i],
+                      p,
+                      remaining) != 0,
+                  -1);
+        p += vemb_v16_migration_control_req_encoded_len(&req->entries[i]);
+    }
+    RETURN_IF((size_t)(p - src) != len, -1);
+    return 0;
+}
+
+static inline size_t vemb_v16_migration_control_batch_resp_encoded_len(
+    const vemb_v16_migration_control_batch_resp_t *resp) {
+    RETURN_IF(resp->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH, 0);
+    return 13u + (size_t)resp->entry_count *
+        VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN;
+}
+
+static inline int vemb_v16_migration_control_batch_resp_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_migration_control_batch_resp_t *resp,
+    size_t *out_len) {
+    size_t need = vemb_v16_migration_control_batch_resp_encoded_len(resp);
+    RETURN_IF(need == 0 || cap < need, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, resp->status);
+    vemb_v16_proto_put_u32(&p, resp->entry_count);
+    vemb_v16_proto_put_u32(&p, resp->success_count);
+    vemb_v16_proto_put_u32(&p, resp->error_count);
+    for (uint32_t i = 0; i < resp->entry_count; i++) {
+        size_t entry_len = 0;
+        RETURN_IF(vemb_v16_migration_control_resp_encode(
+                      p,
+                      cap - (size_t)(p - dst),
+                      &resp->entries[i],
+                      &entry_len) != 0,
+                  -1);
+        p += entry_len;
+    }
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_migration_control_batch_resp_decode(
+    vemb_v16_migration_control_batch_resp_t *resp,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len < 13u, -1);
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = vemb_v16_proto_get_u8(&p);
+    resp->entry_count = vemb_v16_proto_get_u32(&p);
+    resp->success_count = vemb_v16_proto_get_u32(&p);
+    resp->error_count = vemb_v16_proto_get_u32(&p);
+    RETURN_IF(resp->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH, -1);
+    for (uint32_t i = 0; i < resp->entry_count; i++) {
+        RETURN_IF(vemb_v16_migration_control_resp_decode(
+                      &resp->entries[i],
+                      p,
+                      VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN) != 0,
+                  -1);
+        p += VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN;
+    }
+    RETURN_IF((size_t)(p - src) != len, -1);
+    return 0;
+}
+
+static inline int vemb_v16_migration_range_control_req_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_migration_range_control_req_t *req,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_MIGRATION_RANGE_CONTROL_REQ_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u64(&p, req->migration_topology_epoch);
+    vemb_v16_proto_put_u64(&p, req->cutover_topology_epoch);
+    vemb_v16_proto_put_u32(&p, req->target_owner);
+    vemb_v16_proto_put_u32(&p, req->shard_id);
+    vemb_v16_proto_put_u32(&p, req->flags);
+    vemb_v16_proto_put_u32(&p, req->page_limit);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_migration_range_control_req_decode(
+    vemb_v16_migration_range_control_req_t *req,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_MIGRATION_RANGE_CONTROL_REQ_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(req, 0, sizeof(*req));
+    req->migration_topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->cutover_topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->target_owner = vemb_v16_proto_get_u32(&p);
+    req->shard_id = vemb_v16_proto_get_u32(&p);
+    req->flags = vemb_v16_proto_get_u32(&p);
+    req->page_limit = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
+static inline int vemb_v16_migration_range_control_resp_encode(
+    uint8_t *dst,
+    size_t cap,
+    const vemb_v16_migration_range_control_resp_t *resp,
+    size_t *out_len) {
+    RETURN_IF(cap < VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN, -1);
+    uint8_t *p = dst;
+    vemb_v16_proto_put_u8(&p, resp->status);
+    vemb_v16_proto_put_u64(&p, resp->migration_topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->cutover_topology_epoch);
+    vemb_v16_proto_put_u64(&p, resp->owner_epoch);
+    vemb_v16_proto_put_u64(&p, resp->applied_seq);
+    vemb_v16_proto_put_u64(&p, resp->barrier_seq);
+    vemb_v16_proto_put_u64(&p, resp->source_seq);
+    vemb_v16_proto_put_u64(&p, resp->retry_delta);
+    vemb_v16_proto_put_u32(&p, resp->target_owner);
+    vemb_v16_proto_put_u32(&p, resp->shard_id);
+    vemb_v16_proto_put_u32(&p, resp->key_count);
+    vemb_v16_proto_put_u32(&p, resp->success_count);
+    vemb_v16_proto_put_u32(&p, resp->error_count);
+    vemb_v16_proto_put_u32(&p, resp->pending_delta);
+    vemb_v16_proto_put_u32(&p, resp->outbox_state);
+    vemb_v16_proto_put_u32(&p, resp->remaining_keys);
+    vemb_v16_proto_put_u32(&p, resp->page_key_count);
+    vemb_v16_proto_put_u32(&p, resp->range_done);
+    vemb_v16_proto_put_u32(&p, resp->range_ready);
+    vemb_v16_proto_put_u32(&p, resp->page_limit);
+    if (out_len) *out_len = (size_t)(p - dst);
+    return 0;
+}
+
+static inline int vemb_v16_migration_range_control_resp_decode(
+    vemb_v16_migration_range_control_resp_t *resp,
+    const uint8_t *src,
+    size_t len) {
+    RETURN_IF(len != VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN, -1);
+    const uint8_t *p = src;
+    memset(resp, 0, sizeof(*resp));
+    resp->status = vemb_v16_proto_get_u8(&p);
+    resp->migration_topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->cutover_topology_epoch = vemb_v16_proto_get_u64(&p);
+    resp->owner_epoch = vemb_v16_proto_get_u64(&p);
+    resp->applied_seq = vemb_v16_proto_get_u64(&p);
+    resp->barrier_seq = vemb_v16_proto_get_u64(&p);
+    resp->source_seq = vemb_v16_proto_get_u64(&p);
+    resp->retry_delta = vemb_v16_proto_get_u64(&p);
+    resp->target_owner = vemb_v16_proto_get_u32(&p);
+    resp->shard_id = vemb_v16_proto_get_u32(&p);
+    resp->key_count = vemb_v16_proto_get_u32(&p);
+    resp->success_count = vemb_v16_proto_get_u32(&p);
+    resp->error_count = vemb_v16_proto_get_u32(&p);
+    resp->pending_delta = vemb_v16_proto_get_u32(&p);
+    resp->outbox_state = vemb_v16_proto_get_u32(&p);
+    resp->remaining_keys = vemb_v16_proto_get_u32(&p);
+    resp->page_key_count = vemb_v16_proto_get_u32(&p);
+    resp->range_done = vemb_v16_proto_get_u32(&p);
+    resp->range_ready = vemb_v16_proto_get_u32(&p);
+    resp->page_limit = vemb_v16_proto_get_u32(&p);
+    return 0;
+}
+
 static inline size_t vemb_v16_req_encoded_len(const vemb_v16_req_t *req) {
-    return 54u + (size_t)req->key_len + (size_t)req->key2_len +
-           (size_t)req->vector_bytes;
+    switch (req->op) {
+    case VEMB_V16_OP_VADD:
+    case VEMB_V16_OP_VSIM_INLINE:
+        return 24u + 4u + (size_t)req->key_len + (size_t)req->vector_bytes;
+    case VEMB_V16_OP_VSIM_KEY_KEY:
+        return 24u + 1u + (size_t)req->key_len + (size_t)req->key2_len;
+    case VEMB_V16_OP_VEMB_HANDLE:
+    case VEMB_V16_OP_VEMB_INLINE:
+    case VEMB_V16_OP_VREM:
+    case VEMB_V16_OP_PING:
+        return 24u + (size_t)req->key_len;
+    default:
+        return 0;
+    }
+}
+
+static inline int vemb_v16_req_wire_flags(uint8_t req_flags,
+                                          uint8_t *wire_flags_out) {
+    RETURN_IF((req_flags & (uint8_t)~VEMB_V16_REQ_F_ASK_REDIRECT) != 0, -1);
+    *wire_flags_out =
+        (req_flags & VEMB_V16_REQ_F_ASK_REDIRECT) ?
+        VEMB_V16_TCP_REQ_WIRE_F_ASK_REDIRECT : 0;
+    return 0;
+}
+
+static inline uint8_t vemb_v16_req_flags_from_wire(uint8_t wire_flags) {
+    uint8_t req_flags = 0;
+    if ((wire_flags & VEMB_V16_TCP_REQ_WIRE_F_ASK_REDIRECT) != 0)
+        req_flags |= VEMB_V16_REQ_F_ASK_REDIRECT;
+    return req_flags;
 }
 
 static inline int vemb_v16_req_encode(uint8_t *dst,
                                       size_t cap,
                                       const vemb_v16_req_t *req,
                                       size_t *out_len) {
-    if (!dst || !req)
-        return -1;
-    if (req->key_len > VEMB_V16_MAX_KEY_LEN ||
-        req->key2_len > VEMB_V16_MAX_KEY_LEN ||
-        req->vector_bytes > sizeof(req->vector)) {
-        return -1;
-    }
+    RETURN_IF(req->key_len > VEMB_V16_MAX_KEY_LEN ||
+                  req->key2_len > VEMB_V16_MAX_KEY_LEN ||
+                  req->vector_bytes > sizeof(req->vector) ||
+                  req->dim > VEMB_V16_MAX_DIM ||
+                  req->dim > UINT16_MAX ||
+                  req->op > VEMB_V16_TCP_REQ_OP_MASK,
+              -1);
     size_t need = vemb_v16_req_encoded_len(req);
-    if (cap < need)
-        return -1;
+    uint8_t wire_flags = 0;
+    RETURN_IF(need == 0 || cap < need ||
+              vemb_v16_req_wire_flags(req->flags, &wire_flags) != 0,
+              -1);
     uint8_t *p = dst;
-    *p++ = req->op;
-    *p++ = req->flags;
+    vemb_v16_proto_put_u8(&p, (uint8_t)(req->op | wire_flags));
+    vemb_v16_proto_put_u8(&p, (uint8_t)req->key_len);
+    vemb_v16_proto_put_u16(&p, (uint16_t)req->dim);
     vemb_v16_proto_put_u32(&p, req->req_id);
     vemb_v16_proto_put_u64(&p, req->channel_id);
-    vemb_v16_proto_put_u64(&p, req->key_hash);
-    vemb_v16_proto_put_u32(&p, req->key_len);
-    vemb_v16_proto_put_u32(&p, req->key2_len);
-    vemb_v16_proto_put_u64(&p, req->key2_hash);
     vemb_v16_proto_put_u64(&p, req->topology_epoch);
-    vemb_v16_proto_put_u32(&p, req->dim);
-    vemb_v16_proto_put_u32(&p, req->vector_bytes);
-    vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
-    vemb_v16_proto_put_bytes(&p, req->key2, req->key2_len);
-    vemb_v16_proto_put_bytes(&p, req->vector, req->vector_bytes);
+    switch (req->op) {
+    case VEMB_V16_OP_VADD:
+    case VEMB_V16_OP_VSIM_INLINE:
+        RETURN_IF(req->key_len == 0 || req->dim == 0 ||
+                      req->vector_bytes != req->dim * sizeof(float),
+                  -1);
+        vemb_v16_proto_put_u32(&p, req->vector_bytes);
+        vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
+        vemb_v16_proto_put_bytes(&p, req->vector, req->vector_bytes);
+        break;
+    case VEMB_V16_OP_VSIM_KEY_KEY:
+        RETURN_IF(req->key_len == 0 || req->key2_len == 0 || req->dim == 0 ||
+                      req->vector_bytes != req->dim * sizeof(float),
+                  -1);
+        vemb_v16_proto_put_u8(&p, (uint8_t)req->key2_len);
+        vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
+        vemb_v16_proto_put_bytes(&p, req->key2, req->key2_len);
+        break;
+    case VEMB_V16_OP_VEMB_HANDLE:
+    case VEMB_V16_OP_VEMB_INLINE:
+        RETURN_IF(req->key_len == 0 || req->dim == 0 ||
+                      req->vector_bytes != req->dim * sizeof(float),
+                  -1);
+        vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
+        break;
+    case VEMB_V16_OP_VREM:
+        RETURN_IF(req->key_len == 0 || req->dim != 0, -1);
+        vemb_v16_proto_put_bytes(&p, req->key, req->key_len);
+        break;
+    case VEMB_V16_OP_PING:
+        RETURN_IF(req->key_len != 0 || req->dim != 0, -1);
+        break;
+    default:
+        return -1;
+    }
     if (out_len) *out_len = (size_t)(p - dst);
     return 0;
 }
@@ -920,57 +1700,124 @@ static inline int vemb_v16_req_encode(uint8_t *dst,
 static inline int vemb_v16_req_decode(vemb_v16_req_t *req,
                                       const uint8_t *src,
                                       size_t len) {
-    if (!req || !src || len < 54u)
-        return -1;
+    RETURN_IF(len < 24u, -1);
     const uint8_t *p = src;
     memset(req, 0, sizeof(*req));
-    req->op = *p++;
-    req->flags = *p++;
+    uint8_t op_flags = vemb_v16_proto_get_u8(&p);
+    req->op = op_flags & VEMB_V16_TCP_REQ_OP_MASK;
+    req->flags = vemb_v16_req_flags_from_wire(op_flags & VEMB_V16_TCP_REQ_FLAG_MASK);
+    req->key_len = vemb_v16_proto_get_u8(&p);
+    req->dim = vemb_v16_proto_get_u16(&p);
     req->req_id = vemb_v16_proto_get_u32(&p);
     req->channel_id = vemb_v16_proto_get_u64(&p);
-    req->key_hash = vemb_v16_proto_get_u64(&p);
-    req->key_len = vemb_v16_proto_get_u32(&p);
-    req->key2_len = vemb_v16_proto_get_u32(&p);
-    req->key2_hash = vemb_v16_proto_get_u64(&p);
     req->topology_epoch = vemb_v16_proto_get_u64(&p);
-    req->dim = vemb_v16_proto_get_u32(&p);
-    req->vector_bytes = vemb_v16_proto_get_u32(&p);
-    if (req->key_len > VEMB_V16_MAX_KEY_LEN ||
-        req->key2_len > VEMB_V16_MAX_KEY_LEN ||
-        req->vector_bytes > sizeof(req->vector))
+    RETURN_IF(req->key_len > VEMB_V16_MAX_KEY_LEN || req->dim > VEMB_V16_MAX_DIM, -1);
+    switch (req->op) {
+    case VEMB_V16_OP_VADD:
+    case VEMB_V16_OP_VSIM_INLINE:
+        req->vector_bytes = vemb_v16_proto_get_u32(&p);
+        RETURN_IF(req->key_len == 0 || req->dim == 0 ||
+                      req->vector_bytes > sizeof(req->vector) ||
+                      req->vector_bytes != req->dim * sizeof(float),
+                  -1);
+        RETURN_IF(len != 24u + 4u + (size_t)req->key_len +
+                             (size_t)req->vector_bytes,
+                  -1);
+        vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
+        vemb_v16_proto_get_bytes(&p, req->vector, req->vector_bytes);
+        break;
+    case VEMB_V16_OP_VSIM_KEY_KEY:
+        req->key2_len = vemb_v16_proto_get_u8(&p);
+        RETURN_IF(req->key_len == 0 || req->key2_len == 0 ||
+                      req->key2_len > VEMB_V16_MAX_KEY_LEN || req->dim == 0,
+                  -1);
+        req->vector_bytes = req->dim * sizeof(float);
+        RETURN_IF(len != 24u + 1u + (size_t)req->key_len +
+                             (size_t)req->key2_len,
+                  -1);
+        vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
+        vemb_v16_proto_get_bytes(&p, req->key2, req->key2_len);
+        break;
+    case VEMB_V16_OP_VEMB_HANDLE:
+    case VEMB_V16_OP_VEMB_INLINE:
+        RETURN_IF(req->key_len == 0 || req->dim == 0, -1);
+        req->vector_bytes = req->dim * sizeof(float);
+        RETURN_IF(len != 24u + (size_t)req->key_len, -1);
+        vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
+        break;
+    case VEMB_V16_OP_VREM:
+        RETURN_IF(req->key_len == 0 || req->dim != 0, -1);
+        RETURN_IF(len != 24u + (size_t)req->key_len, -1);
+        vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
+        break;
+    case VEMB_V16_OP_PING:
+        RETURN_IF(req->key_len != 0 || req->dim != 0 || len != 24u, -1);
+        break;
+    default:
         return -1;
-    if (len != vemb_v16_req_encoded_len(req))
-        return -1;
-    vemb_v16_proto_get_bytes(&p, req->key, req->key_len);
-    vemb_v16_proto_get_bytes(&p, req->key2, req->key2_len);
-    vemb_v16_proto_get_bytes(&p, req->vector, req->vector_bytes);
+    }
+    req->key_hash = vemb_v16_murmur3(req->key, req->key_len);
+    if (req->key2_len != 0)
+        req->key2_hash = vemb_v16_murmur3(req->key2, req->key2_len);
     return 0;
 }
 
-static inline size_t vemb_v16_resp_encoded_len(void) {
-    return 56u;
+static inline size_t vemb_v16_resp_encoded_len_for_fields(uint8_t status,
+                                                          uint8_t op) {
+    size_t len = VEMB_V16_RESP_ENCODED_BASE_LEN;
+    if (status == VEMB_V16_STATUS_OK) {
+        switch (op) {
+        case VEMB_V16_OP_VEMB_HANDLE:
+        case VEMB_V16_OP_VEMB_INLINE:
+            return len + 28u;
+        case VEMB_V16_OP_VSIM_INLINE:
+        case VEMB_V16_OP_VSIM_KEY_KEY:
+            return len + 4u;
+        default:
+            return len;
+        }
+    }
+    if (status == VEMB_V16_STATUS_MOVED || status == VEMB_V16_STATUS_ASK)
+        return len + 4u;
+    return len;
+}
+
+static inline size_t vemb_v16_resp_encoded_len(const vemb_v16_resp_t *resp) {
+    return vemb_v16_resp_encoded_len_for_fields(resp->status, resp->op);
 }
 
 static inline int vemb_v16_resp_encode(uint8_t *dst,
                                        size_t cap,
                                        const vemb_v16_resp_t *resp,
                                        size_t *out_len) {
-    if (!dst || !resp || cap < vemb_v16_resp_encoded_len())
-        return -1;
+    size_t len = vemb_v16_resp_encoded_len(resp);
+    RETURN_IF(cap < len || (resp->flags & ~0x3u) != 0, -1);
     uint8_t *p = dst;
     *p++ = resp->status;
-    *p++ = resp->op;
-    vemb_v16_proto_put_u16(&p, resp->flags);
+    *p++ = (uint8_t)((resp->op & VEMB_V16_TCP_RESP_OP_MASK) |
+                     ((resp->flags & 0x3u) << 6));
     vemb_v16_proto_put_u32(&p, resp->req_id);
-    vemb_v16_proto_put_u64(&p, resp->key_hash);
-    vemb_v16_proto_put_u64(&p, resp->vector_offset);
-    vemb_v16_proto_put_u32(&p, resp->vector_bytes);
-    vemb_v16_proto_put_u32(&p, resp->dim);
-    vemb_v16_proto_put_u32(&p, resp->region_id);
-    vemb_v16_proto_put_u32(&p, resp->local_slot);
-    vemb_v16_proto_put_u64(&p, resp->owner_generation);
-    vemb_v16_proto_put_u32(&p, resp->redirect_owner);
-    vemb_v16_proto_put_f32(&p, resp->score);
+    if (resp->status == VEMB_V16_STATUS_OK) {
+        switch (resp->op) {
+        case VEMB_V16_OP_VEMB_HANDLE:
+        case VEMB_V16_OP_VEMB_INLINE:
+            vemb_v16_proto_put_u32(&p, resp->vector_bytes);
+            vemb_v16_proto_put_u64(&p, resp->vector_offset);
+            vemb_v16_proto_put_u32(&p, resp->region_id);
+            vemb_v16_proto_put_u32(&p, resp->local_slot);
+            vemb_v16_proto_put_u64(&p, resp->owner_generation);
+            break;
+        case VEMB_V16_OP_VSIM_INLINE:
+        case VEMB_V16_OP_VSIM_KEY_KEY:
+            vemb_v16_proto_put_f32(&p, resp->score);
+            break;
+        default:
+            break;
+        }
+    } else if (resp->status == VEMB_V16_STATUS_MOVED ||
+               resp->status == VEMB_V16_STATUS_ASK) {
+        vemb_v16_proto_put_u32(&p, resp->redirect_owner);
+    }
     if (out_len) *out_len = (size_t)(p - dst);
     return 0;
 }
@@ -978,23 +1825,42 @@ static inline int vemb_v16_resp_encode(uint8_t *dst,
 static inline int vemb_v16_resp_decode(vemb_v16_resp_t *resp,
                                        const uint8_t *src,
                                        size_t len) {
-    if (!resp || !src || len != vemb_v16_resp_encoded_len())
-        return -1;
+    RETURN_IF(len < vemb_v16_resp_encoded_base_len(), -1);
     const uint8_t *p = src;
+    uint8_t op_flags = 0;
     memset(resp, 0, sizeof(*resp));
     resp->status = *p++;
-    resp->op = *p++;
-    resp->flags = vemb_v16_proto_get_u16(&p);
+    op_flags = *p++;
+    resp->op = (uint8_t)(op_flags & VEMB_V16_TCP_RESP_OP_MASK);
+    resp->flags = (uint16_t)((op_flags & VEMB_V16_TCP_RESP_FLAG_MASK) >> 6);
     resp->req_id = vemb_v16_proto_get_u32(&p);
-    resp->key_hash = vemb_v16_proto_get_u64(&p);
-    resp->vector_offset = vemb_v16_proto_get_u64(&p);
-    resp->vector_bytes = vemb_v16_proto_get_u32(&p);
-    resp->dim = vemb_v16_proto_get_u32(&p);
-    resp->region_id = vemb_v16_proto_get_u32(&p);
-    resp->local_slot = vemb_v16_proto_get_u32(&p);
-    resp->owner_generation = vemb_v16_proto_get_u64(&p);
-    resp->redirect_owner = vemb_v16_proto_get_u32(&p);
-    resp->score = vemb_v16_proto_get_f32(&p);
+    RETURN_IF(len != vemb_v16_resp_encoded_len(resp), -1);
+    if (resp->status == VEMB_V16_STATUS_OK) {
+        switch (resp->op) {
+        case VEMB_V16_OP_VEMB_HANDLE:
+        case VEMB_V16_OP_VEMB_INLINE:
+            resp->vector_bytes = vemb_v16_proto_get_u32(&p);
+            resp->vector_offset = vemb_v16_proto_get_u64(&p);
+            resp->region_id = vemb_v16_proto_get_u32(&p);
+            resp->local_slot = vemb_v16_proto_get_u32(&p);
+            resp->owner_generation = vemb_v16_proto_get_u64(&p);
+            resp->dim = resp->vector_bytes / sizeof(float);
+            break;
+        case VEMB_V16_OP_VSIM_INLINE:
+        case VEMB_V16_OP_VSIM_KEY_KEY:
+            resp->score = vemb_v16_proto_get_f32(&p);
+            break;
+        case VEMB_V16_OP_PING:
+        case VEMB_V16_OP_VADD:
+        case VEMB_V16_OP_VREM:
+            break;
+        default:
+            return -1;
+        }
+    } else if (resp->status == VEMB_V16_STATUS_MOVED ||
+               resp->status == VEMB_V16_STATUS_ASK) {
+        resp->redirect_owner = vemb_v16_proto_get_u32(&p);
+    }
     return 0;
 }
 

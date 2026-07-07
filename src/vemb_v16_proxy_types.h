@@ -15,6 +15,8 @@ typedef struct vemb_v16_proxy_io_worker {
     uint32_t worker_id;
     struct vemb_v16_proxy *proxy;
     pthread_t thread;
+    vemb_v16_job_pool_t job_pools[VEMB_V16_JOB_POOL_COUNT];
+    vemb_v16_mapped_region_t job_pool_slot_regions[VEMB_V16_JOB_POOL_COUNT];
 #ifdef __linux__
     int notify_fd;
 #endif
@@ -48,7 +50,6 @@ struct vemb_v16_channel {
     size_t response_ring_bytes;
     uint32_t transport_type;
     int net_fd;
-    uint32_t tcp_net_flags;
     atomic_int proxy_io_registered;
     atomic_uint_fast32_t proxy_io_state;
     atomic_uint_fast32_t supernode_state;
@@ -94,7 +95,16 @@ struct vemb_v16_proxy {
     atomic_int scaleout_notify_stop;
     uint32_t job_shard_proxy_count;
     uint32_t job_shard_supernode_count;
+    uint32_t job_pool_slots_backend_type;
+    uint64_t job_pool_slots_mmap_offset;
+    char job_pool_slots_path[256];
     vemb_v16_shard_queue_t *job_shard_queues;
+    vemb_v16_shard_queue_t *job_return_queues;
+    atomic_uint_fast64_t read_pool_alloc_ok;
+    atomic_uint_fast64_t read_pool_alloc_fail;
+    atomic_uint_fast64_t read_pool_inuse;
+    atomic_uint_fast64_t read_pool_inuse_peak;
+    uint64_t read_pool_slot_total;
     pthread_mutex_t stats_lock;
     vemb_v16_stats_t closed_stats;
 };

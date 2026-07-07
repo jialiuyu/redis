@@ -206,7 +206,8 @@ int main(int argc, char **argv) {
                               uds_path,
                               dim,
                               max_vectors,
-                              storage) != 0) {
+                              storage,
+                              &manifest) != 0) {
         serverLog(LL_WARNING, "failed to create vemb_v16 proxy");
         goto cleanup;
     }
@@ -274,12 +275,11 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.warm_stale_handle_reject,
            (unsigned long long)stats.remote_meta_stale,
            (unsigned long long)stats.warm_region_hash_local_pct);
-    serverLog(LL_NOTICE, "vemb_v16 stats: depth request=%llu response=%llu job_shard=%llu completion=%llu channel_ops=%llu",
+    serverLog(LL_NOTICE, "vemb_v16 stats: depth request=%llu response=%llu job_shard=%llu completion=%llu",
            (unsigned long long)stats.request_ring_depth,
            (unsigned long long)stats.response_ring_depth,
            (unsigned long long)stats.job_shard_queue_depth,
-           (unsigned long long)stats.completion_ring_depth,
-           (unsigned long long)stats.channel_ops);
+           (unsigned long long)stats.completion_ring_depth);
     serverLog(LL_NOTICE,
               "vemb_v16 stats: remote_meta hit=%llu miss=%llu busy=%llu probes=%llu async_enqueue=%llu async_drop=%llu publish_ok=%llu insert=%llu update=%llu evict=%llu repair_enqueue=%llu repair_ok=%llu rpc_count=%llu rpc_ok=%llu rpc_not_found=%llu rpc_busy=%llu rpc_timeout=%llu rpc_error=%llu rpc_handle=%llu rpc_snapshot=%llu",
               (unsigned long long)stats.remote_meta_lookup_hit,

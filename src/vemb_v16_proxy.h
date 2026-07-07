@@ -10,7 +10,8 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
                           const char *uds_path,
                           uint32_t vector_dim,
                           uint32_t max_vectors,
-                          vemb_v16_storage_ctx_t *storage);
+                          vemb_v16_storage_ctx_t *storage,
+                          const vemb_v16_warm_regions_manifest_t *manifest);
 int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,

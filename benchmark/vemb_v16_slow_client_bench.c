@@ -23,7 +23,6 @@ typedef struct bench_cfg {
     uint32_t stall_ms;
     uint32_t timeout_ms;
     uint32_t assumed_proxy_io_threads;
-    int tcp_encoded_payloads;
 } bench_cfg_t;
 
 typedef struct tcp_channel {
@@ -128,20 +127,17 @@ static int alloc_tcp_channel(const bench_cfg_t *cfg, tcp_channel_t *channel) {
     uint8_t req_buf[8];
     const void *payload = &req;
     uint32_t payload_len = (uint32_t)sizeof(req);
-    uint32_t net_flags = cfg->tcp_encoded_payloads ?
-        VEMB_V16_NET_F_ENCODED_PAYLOAD : 0;
-    if (cfg->tcp_encoded_payloads) {
-        size_t encoded_len = 0;
-        if (vemb_v16_alloc_req_encode(req_buf,
-                                      sizeof(req_buf),
-                                      &req,
-                                      &encoded_len) != 0) {
-            close(fd);
-            return -1;
-        }
-        payload = req_buf;
-        payload_len = (uint32_t)encoded_len;
+    uint32_t net_flags = 0;
+    size_t encoded_len = 0;
+    if (vemb_v16_alloc_req_encode(req_buf,
+                                  sizeof(req_buf),
+                                  &req,
+                                  &encoded_len) != 0) {
+        close(fd);
+        return -1;
     }
+    payload = req_buf;
+    payload_len = (uint32_t)encoded_len;
     if (vemb_v16_net_write_frame(fd,
                                  VEMB_V16_NET_HELLO,
                                  net_flags,
@@ -158,26 +154,18 @@ static int alloc_tcp_channel(const bench_cfg_t *cfg, tcp_channel_t *channel) {
         close(fd);
         return -1;
     }
-    if (!cfg->tcp_encoded_payloads) {
-        if (hdr.payload_len != sizeof(channel->desc) ||
-            vemb_v16_net_read_full(fd, &channel->desc, sizeof(channel->desc)) != 0) {
-            close(fd);
-            return -1;
-        }
-    } else {
-        uint8_t *desc_buf = zmalloc(hdr.payload_len);
-        if (!desc_buf ||
-            (hdr.flags & VEMB_V16_NET_F_ENCODED_PAYLOAD) == 0 ||
-            vemb_v16_net_read_full(fd, desc_buf, hdr.payload_len) != 0 ||
-            vemb_v16_channel_desc_decode(&channel->desc,
-                                         desc_buf,
-                                         hdr.payload_len) != 0) {
-            zfree(desc_buf);
-            close(fd);
-            return -1;
-        }
+    uint8_t *desc_buf = zmalloc(hdr.payload_len);
+    if (!desc_buf ||
+        hdr.flags != 0 ||
+        vemb_v16_net_read_full(fd, desc_buf, hdr.payload_len) != 0 ||
+        vemb_v16_channel_desc_decode(&channel->desc,
+                                     desc_buf,
+                                     hdr.payload_len) != 0) {
         zfree(desc_buf);
+        close(fd);
+        return -1;
     }
+        zfree(desc_buf);
     if (channel->desc.magic != VEMB_V16_MAGIC ||
         channel->desc.version != VEMB_V16_VERSION) {
         close(fd);
@@ -224,32 +212,26 @@ static void prepare_req(vemb_v16_req_t *req,
 
 static int send_req_tcp(tcp_channel_t *channel,
                         const vemb_v16_req_t *req,
-                        size_t req_len,
-                        int encoded_payloads) {
+                        size_t req_len) {
     if (!channel || channel->fd < 0)
         return -1;
+    size_t encoded_len = vemb_v16_req_encoded_len(req);
     uint8_t *req_buf = NULL;
-    const void *payload = req;
-    uint32_t payload_len = (uint32_t)req_len;
-    uint32_t net_flags = encoded_payloads ? VEMB_V16_NET_F_ENCODED_PAYLOAD : 0;
-    if (encoded_payloads) {
-        size_t encoded_len = vemb_v16_req_encoded_len(req);
-        req_buf = zmalloc(encoded_len);
-        if (!req_buf ||
-            vemb_v16_req_encode(req_buf, encoded_len, req, &encoded_len) != 0) {
-            zfree(req_buf);
-            return -1;
-        }
-        payload = req_buf;
-        payload_len = (uint32_t)encoded_len;
+    uint32_t net_flags = 0;
+    (void)req_len;
+    req_buf = zmalloc(encoded_len);
+    if (!req_buf ||
+        vemb_v16_req_encode(req_buf, encoded_len, req, &encoded_len) != 0) {
+        zfree(req_buf);
+        return -1;
     }
     int rc = vemb_v16_net_write_frame(channel->fd,
                                       VEMB_V16_NET_REQUEST,
                                       net_flags,
                                       channel->desc.channel_id,
                                       req->req_id,
-                                      payload,
-                                      payload_len);
+                                      req_buf,
+                                      (uint32_t)encoded_len);
     zfree(req_buf);
     return rc;
 }
@@ -268,32 +250,25 @@ static int recv_resp_tcp(tcp_channel_t *channel,
         hdr.channel_id != channel->desc.channel_id) {
         return -1;
     }
-    if ((hdr.flags & VEMB_V16_NET_F_ENCODED_PAYLOAD) == 0) {
-        uint32_t extra = hdr.payload_len - (uint32_t)sizeof(*resp);
-        if (hdr.payload_len < sizeof(*resp))
-            return -1;
-        if (extra != 0) {
-            struct iovec iov[2] = {
-                {.iov_base = resp, .iov_len = sizeof(*resp)},
-                {.iov_base = inline_vector, .iov_len = extra},
-            };
-            if (!inline_vector || extra > inline_vector_cap ||
-                vemb_v16_net_readv_full(channel->fd, iov, 2) != 0) {
-                return -1;
-            }
-            if (inline_vector_bytes) *inline_vector_bytes = extra;
-            return 0;
-        }
-        return vemb_v16_net_read_full(channel->fd, resp, sizeof(*resp));
-    }
     uint8_t resp_buf[64];
-    uint32_t resp_bytes = (uint32_t)vemb_v16_resp_encoded_len();
-    if (hdr.payload_len < resp_bytes ||
-        vemb_v16_net_read_full(channel->fd, resp_buf, resp_bytes) != 0 ||
+    uint32_t base_bytes = (uint32_t)vemb_v16_resp_encoded_base_len();
+    if (hdr.flags != 0 ||
+        hdr.payload_len < base_bytes ||
+        vemb_v16_net_read_full(channel->fd, resp_buf, base_bytes) != 0) {
+        return -1;
+    }
+    size_t resp_bytes = vemb_v16_resp_encoded_len_for_fields(
+        resp_buf[0],
+        (uint8_t)(resp_buf[1] & VEMB_V16_TCP_RESP_OP_MASK));
+    if (resp_bytes > sizeof(resp_buf) ||
+        hdr.payload_len < resp_bytes ||
+        vemb_v16_net_read_full(channel->fd,
+                               resp_buf + base_bytes,
+                               resp_bytes - base_bytes) != 0 ||
         vemb_v16_resp_decode(resp, resp_buf, resp_bytes) != 0) {
         return -1;
     }
-    uint32_t extra = hdr.payload_len - resp_bytes;
+    uint32_t extra = hdr.payload_len - (uint32_t)resp_bytes;
     if (extra != 0) {
         if (!inline_vector || extra > inline_vector_cap ||
             vemb_v16_net_read_full(channel->fd, inline_vector, extra) != 0) {
@@ -319,8 +294,7 @@ static int prefill_vectors(const bench_cfg_t *cfg, tcp_channel_t *channel) {
         fill_vector(req.vector, cfg->dim, i);
         if (send_req_tcp(channel,
                          &req,
-                         vemb_v16_req_inline_len(req.vector_bytes),
-                         cfg->tcp_encoded_payloads) != 0 ||
+                         vemb_v16_req_inline_len(req.vector_bytes)) != 0 ||
             recv_resp_tcp(channel, &resp, NULL, 0, NULL) != 0 ||
             resp.status != VEMB_V16_STATUS_OK) {
             return -1;
@@ -369,8 +343,7 @@ static void *slow_thread_main(void *arg) {
                     cfg->dim);
         if (send_req_tcp(channel,
                          &req,
-                         vemb_v16_req_handle_len(),
-                         cfg->tcp_encoded_payloads) != 0) {
+                         vemb_v16_req_handle_len()) != 0) {
             ctx->fail += cfg->slow_ops - i;
             atomic_store_explicit(ctx->burst_ready, 1, memory_order_release);
             zfree(inline_vector);
@@ -414,8 +387,7 @@ static void *probe_thread_main(void *arg) {
         uint64_t start = now_ns();
         if (send_req_tcp(channel,
                          &req,
-                         vemb_v16_req_handle_len(),
-                         cfg->tcp_encoded_payloads) != 0 ||
+                         vemb_v16_req_handle_len()) != 0 ||
             recv_resp_tcp(channel, &resp, NULL, 0, NULL) != 0 ||
             resp.status != VEMB_V16_STATUS_OK) {
             ctx->fail += cfg->probe_ops - i;
@@ -450,7 +422,6 @@ int main(int argc, char **argv) {
         .stall_ms = 2000,
         .timeout_ms = 10000,
         .assumed_proxy_io_threads = 1,
-        .tcp_encoded_payloads = 0,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -462,11 +433,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--probe-ops") && i + 1 < argc) cfg.probe_ops = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--stall-ms") && i + 1 < argc) cfg.stall_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) cfg.timeout_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--tcp-encoded-payloads")) cfg.tcp_encoded_payloads = 1;
-        else if (!strcmp(argv[i], "--no-tcp-encoded-payloads")) cfg.tcp_encoded_payloads = 0;
         else if (!strcmp(argv[i], "--proxy-io-threads") && i + 1 < argc) cfg.assumed_proxy_io_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--host HOST] [--port PORT] [--dim N] [--prefill N] [--slow-ops N] [--probe-ops N] [--stall-ms N] [--timeout-ms N] [--proxy-io-threads N] [--tcp-encoded-payloads]\n", argv[0]);
+            printf("usage: %s [--host HOST] [--port PORT] [--dim N] [--prefill N] [--slow-ops N] [--probe-ops N] [--stall-ms N] [--timeout-ms N] [--proxy-io-threads N]\n", argv[0]);
             return 0;
         }
     }
@@ -508,11 +477,10 @@ int main(int argc, char **argv) {
 
     tcp_channel_t *slow = &channels[0];
     tcp_channel_t *probe = &channels[channel_count - 1];
-    printf("[setup] slow_channel_id=%llu index=%u probe_channel_id=%llu index=%u assumed_proxy_io_threads=%u tcp_encoded=%s\n",
+    printf("[setup] slow_channel_id=%llu index=%u probe_channel_id=%llu index=%u assumed_proxy_io_threads=%u\n",
            (unsigned long long)slow->desc.channel_id, slow->desc.channel_index,
            (unsigned long long)probe->desc.channel_id, probe->desc.channel_index,
-           cfg.assumed_proxy_io_threads,
-           cfg.tcp_encoded_payloads ? "yes" : "no");
+           cfg.assumed_proxy_io_threads);
     if (probe->desc.channel_index != slow->desc.channel_index + cfg.assumed_proxy_io_threads) {
         printf("[warn] channel indexes are not spaced by proxy_io_threads; same-worker assumption may not hold\n");
     }
