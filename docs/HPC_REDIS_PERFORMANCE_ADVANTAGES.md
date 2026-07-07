@@ -428,211 +428,6 @@ Redis 的 GET/模块读路径通常围绕通用 dict、robj、SDS/module value �
 
 也就是说，在 `TCP` 模式下如果只看 `SuperNode` 内部 lookup 阶段，`location_cache` 带来的收益大约是 `6.2ns/op`，相对提升约 `6.26%`。这个数字明显小于端到端 QPS 提升，原因是 `TCP vector-inline` 路径里还包含 payload snapshot、response encode/write 等额外固定成本；但它仍然说明 **cached handle 先命中，再做稳定校验** 的设计，在热点读场景下可以稳定压低 metadata lookup 开销。
 
-#### 3.6.1 proxy/supernode 消息瘦身：先缩 job/completion，再考虑 `slot-id`
-
-这一节的详细设计已拆到独立文档：[docs/VEMB_PROXY_SUPERNODE_MESSAGE_SLIMMING.md](./VEMB_PROXY_SUPERNODE_MESSAGE_SLIMMING.md)。
-
-这里保留结论版：
-
-1. 当前 `proxy -> SuperNode -> proxy` 热路径的主要额外成本，来自 `job_shard_queue` 和 `completion_ring` 上“大而全结构体”的整 slot `memcpy`。
-2. 优先级应该是**先把 read job 和 completion 按语义裁小**，减少 copy 体积和 cache footprint，而不是一开始就把 queue 改成 `slot-id` / pool 生命周期管理。
-3. `job` 侧重点是把 `vemb-handle` / `vemb-inline` 从通用 `job_base` 中拆出来，去掉 `key2`、`topology_epoch`、`dim`、`vector_bytes` 等热读不需要的字段。
-4. `completion` 侧重点是把 handle、inline payload、VSIM score 分开承载，避免所有 completion slot 都为少数语义背固定布局成本。
-5. `2026-07-06` 新增的 UB backing 只落在 `job_pool->slots` 上；`job_shard_queue`、`job_return_queue`、`completion_ring` 和 `free_stack` 仍保留本地 heap/ring 语义，因此这轮 UB 改动的目的不是把整个 proxy/supernode 消息面共享化，而是验证“真实 job payload 存储移到 UB”本身的成本。
-
-这轮实现边界可以概括为：
-
-1. queue 上继续只搬小 `job_ref`
-2. 真实 job payload 可选 heap-backed 或 UB-backed
-3. slot 分配/释放所有权仍在 owner proxy worker
-
-同一台 `192.168.90.111`、同一组 TCP `mixed-80r20w` 参数下，`shared-plane` 方案约为 `307w QPS`，而“本地 ring/free-stack + 仅 slot payload 可选 UB backing”的实现，在移除 read-pool 热路径诊断原子更新后已经回到 `346w ~ 349w QPS`。这说明当前阶段的主要收益仍然来自**消息瘦身和本地调度面保持轻量**，而不是“只要上 UB 就会更快”。
-
-也就是说，更稳的演进顺序是：**先瘦消息，再评估 `slot-id`**。
-
-`2026-07-06` 还做了一次同口径的小步验证：在已经使用 `job pool + slot_id` 的 TCP `mixed-80r20w` 路径上，把 `channel_read_tcp_request()` 里的临时 `req` 和 `payload` 从“每请求 `zmalloc/zfree`”改成栈上对象后，按 [benchmark/test_host.md](/Users/szza/codespace/work/hpc-redis/benchmark/test_host.md) 在 `192.168.90.111` 上补跑 3 轮：
-
-| Run | QPS | Fail |
-| --- | ---: | ---: |
-| 1 | `3,579,030.17` | `0` |
-| 2 | `3,543,132.82` | `0` |
-| 3 | `3,601,439.96` | `0` |
-
-三轮均值为 `3,574,534.32 QPS`，相对同文档里此前的 `job pool + slot_id` 六轮均值 `3,491,019.48 QPS` 再提升 `83,514.84 QPS`，约 **2.39%**。这说明在 queue payload 已经瘦身、真实 job 生命周期也已经从 heap 挪到 pool 之后，**TCP ingress 上最后一小段短生命周期分配**仍然是能测出来的固定成本。
-
-#### 3.6.2 `job pool + slot_id`：保留小 queue payload，同时去掉每请求 `zmalloc/zfree`
-
-`proxy -> SuperNode` 的消息瘦身第一阶段已经把大 job slot 改成了小 `job_desc { job_ptr }`，证明：
-
-1. `job_shard_queue` 上的整块大 `memcpy` 确实可以拿掉
-2. 同一 channel 的 mixed 顺序语义可以保持不变
-3. 真实瓶颈会从 queue copy 前移到 payload slice/load 和固定分配成本
-
-但第一阶段也引入了一个新的固定成本：**每请求 `zmalloc/zfree`**。在 `mixed-80r20w` 这类高频短生命周期 workload 下，这部分开销不再是边角料，而是会稳定出现在每一条 job 上。
-
-因此第二阶段进一步把：
-
-```text
-job_desc { job_ptr }
-```
-
-改成：
-
-```text
-job_ref { proxy_worker_id, pool_id, slot_id, generation }
-```
-
-整体模型变成：
-
-```text
-proxy worker
-  -> 从本地 job pool 取 slot
-  -> 填充真实 job
-  -> 向 shard queue 发布小 job_ref
-
-supernode worker
-  -> 消费 job_ref
-  -> 用 (proxy_worker_id, pool_id, slot_id) 定位真实 job
-  -> 执行
-  -> 向 return queue 发布 slot_id
-
-owner proxy worker
-  -> drain return queue
-  -> 回收 slot
-```
-
-这里最关键的设计点有三个：
-
-1. **queue 仍然只搬小对象**：`job_shard_queue` 不回退到大 struct 值传递
-2. **真实 job 不再走 heap**：改成 per-proxy-worker 本地 pool
-3. **回收不做跨线程 free-list push**：SuperNode 只发 `job_return`，真正回收由 owner proxy worker 完成
-
-这种做法把“消息瘦身”和“生命周期稳定存储”分开处理：
-
-1. 小 queue payload 负责减少线程间 copy
-2. pool slot 负责替代 heap alloc/free
-3. return queue 负责把所有权重新交回 owner
-
-#### 测试数据
-
-`2026-07-06` 按 [benchmark/test_host.md](/Users/szza/codespace/work/hpc-redis/benchmark/test_host.md) 的 TCP `mixed-80r20w` 口径，在 `192.168.90.111` 上把三代实现放到同一条演进线上看：
-
-1. **原始 pooled 基线**
-   `job_shard_queue` 仍按大 job slot 传值，均值约 `2.84M QPS`
-2. **`job_ptr descriptor`**
-   ring 里改传小 descriptor，但真实 job 仍是每请求 `zmalloc/zfree`
-3. **`job pool + slot_id`**
-   ring 里传 `job_ref`，真实 job 改为 per-proxy-worker pool slot
-
-对比基线：
-
-| 版本 | 测试日期 | 有效样本 | 平均 QPS | 说明 |
-| --- | --- | ---: | ---: | --- |
-| 原始 pooled 基线 | `2026-07-03` | `5` | `2,843,824.98` | 旧实现仍按较大 job slot 过 ring，是本轮优化前的主基线 |
-| `job_ptr descriptor` | `2026-07-06` 之前 | `3` | `2,944,068.16` | ring 里传小 descriptor，但真实 job 仍是每请求 `zmalloc/zfree` |
-| `job pool + slot_id` | `2026-07-06` | `6` | `3,491,019.48` | ring 里传 `job_ref`，真实 job 落到 per-proxy-worker pool；同机型补跑 6 轮复测 |
-
-`job pool + slot_id` 版六轮原始结果：
-
-| Run | QPS | Fail |
-| --- | ---: | ---: |
-| 1 | `3,514,139.84` | `0` |
-| 2 | `3,459,060.78` | `0` |
-| 3 | `3,444,057.37` | `0` |
-| 4 | `3,498,825.91` | `0` |
-| 5 | `3,501,914.53` | `0` |
-| 6 | `3,482,587.95` | `0` |
-
-相对 `job_ptr descriptor` 版：
-
-1. 平均提升 `546,951.32 QPS`
-2. 相对提升约 **18.58%**
-3. 六轮 `fail=0`
-4. `job_ring_vemb=0`、`job_ring_vadd=0`、`completion_ring=0`
-
-相对更早的原始 `2.84M` pooled 基线：
-
-1. 平均提升 `647,194.50 QPS`
-2. 相对提升约 **22.76%**
-
-也就是说，这次收益不是因为 queue 堵住后偶然解开，而是沿着同一条热路径连续吃掉了两块固定成本：
-
-1. 先吃掉大 job slot `memcpy`
-2. 再吃掉每请求 heap alloc/free
-
-#### 数据分析
-
-这组数据的意义比“又快了一点”更强，因为它回答了一个关键问题：**在小 descriptor 已经生效后，剩下的固定成本里谁更重。**
-
-如果把三代实现放在一起看，阶段收益会更清楚：
-
-1. 原始 pooled 基线 `2.84M QPS`
-2. `job_ptr descriptor` 升到 `2.94M QPS`
-3. `job pool + slot_id` 再升到 `3.49M QPS`
-
-按均值拆开看：
-
-1. **原始 pooled -> `job_ptr descriptor`**
-   提升 `100,243.18 QPS`，约 **3.52%**
-2. **`job_ptr descriptor` -> `job pool + slot_id`**
-   提升 `546,951.32 QPS`，约 **18.58%**
-3. **原始 pooled -> `job pool + slot_id`**
-   总提升 `647,194.50 QPS`，约 **22.76%**
-
-这说明两件事：
-
-1. 第一阶段的小 descriptor 是有效的，但收益相对温和，主要是在消掉 queue 上的大 struct 搬运
-2. 第二阶段的 pool/slot_id 收益更大，说明在 descriptor 版里，`zmalloc/zfree` 已经成为更显著的固定成本
-
-这也解释了为什么单看 sampled timing：
-
-1. `primary_lookup_avg_ns` 仍然大约在 `189ns - 195ns`
-2. `payload_local_slice_avg_ns` 仍然大约在 `620ns - 630ns`
-3. `completion_publish_avg_ns` 仍然只有 `27ns - 29ns`
-
-也就是说：
-
-1. `location_cache` / primary lookup 不是这次收益来源
-2. completion ring 也不是这次收益来源
-3. 主要改善的是 **job ingress 固定成本**
-
-换一个更直观的说法：
-
-```text
-原始 pooled
-  -> 大 job memcpy + 生命周期固定成本 都还在
-
-job_ptr descriptor
-  -> 吃掉大 job memcpy
-  -> 但每请求 malloc/free 仍在
-
-job pool + slot_id
-  -> 再吃掉每请求 malloc/free
-  -> payload slice/load 继续留在最显眼的位置
-```
-
-所以这组结果说明两件事：
-
-1. `proxy -> SuperNode` 热路径优化不能只看 queue slot 大小，也要看真实 job 生命周期管理
-2. 在 fixed-shape 高 QPS workload 下，**稳定对象池** 本身就是吞吐优化，而不只是工程整洁度优化
-3. 如果只拿 `job_ptr descriptor` 和 pool 版相比，会低估这条优化链路相对最初 `2.84M` 基线的累计收益；完整口径下，这一轮累计提升已经超过 **22%**
-
-#### 当前瓶颈位置
-
-完成 `job pool + slot_id` 后，剩下更显眼的成本已经更集中在：
-
-1. `VEMB_INLINE` 的 payload slice/load
-2. 1200B vector-inline payload 的 TCP response 返回
-3. completion side 仍然按固定 `vemb_v16_completion_t` slot 搬运
-
-因此下一阶段如果继续追吞吐，优先级更合理的方向是：
-
-1. 继续压 `payload_local_slice`
-2. 评估 `completion_ring` 的 pool/ref 化
-3. 再看 batch execute / batch slice 是否值得推进
-
-这也意味着，`job pool + slot_id` 已经把 job ingress 的固定成本压到了一个更低的位置，后续优化空间会更多集中在 **真实 payload 路径**，而不是 queue 生命周期本身。
-
 ### 3.7 VADD 写路径：inline 写入、分片串行、same-key overwrite
 
 VADD request 本身携带 inline vector payload，SuperNode 直接把 payload 写入 TLC warm slot：
@@ -671,7 +466,80 @@ VREM 与 VADD 一样属于写侧拓扑/迁移语义，但它不携带 vector pay
 
 这类语义拆分能避免 server 为了复用代码而把所有 op 都当成“带 vector 的请求”处理。
 
-### 3.9 TLC/UB：metadata 私有，payload packed 共享
+### 3.9 proxy/supernode 消息瘦身：先缩 job/completion，再考虑 `slot-id`
+
+这一节的详细设计已拆到独立文档：[docs/VEMB_PROXY_SUPERNODE_MESSAGE_SLIMMING.md](./VEMB_PROXY_SUPERNODE_MESSAGE_SLIMMING.md)。
+
+这里保留结论版：
+
+1. 当前 `proxy -> SuperNode -> proxy` 热路径的主要额外成本，来自 `job_shard_queue` 和 `completion_ring` 上“大而全结构体”的整 slot `memcpy`。
+2. 优先级应该是**先把 read job 和 completion 按语义裁小**，减少 copy 体积和 cache footprint，而不是一开始就把 queue 改成 `slot-id` / pool 生命周期管理。
+3. `job` 侧重点是把 `vemb-handle` / `vemb-inline` 从通用 `job_base` 中拆出来，去掉 `key2`、`topology_epoch`、`dim`、`vector_bytes` 等热读不需要的字段。
+4. `completion` 侧重点是把 handle、inline payload、VSIM score 分开承载，避免所有 completion slot 都为少数语义背固定布局成本。
+5. `2026-07-06` 新增的 UB backing 只落在 `job_pool->slots` 上；`job_shard_queue`、`job_return_queue`、`completion_ring` 和 `free_stack` 仍保留本地 heap/ring 语义，因此这轮 UB 改动的目的不是把整个 proxy/supernode 消息面共享化，而是验证“真实 job payload 存储移到 UB”本身的成本。
+
+这轮实现边界可以概括为：
+
+1. queue 上继续只搬小 `job_ref`
+2. 真实 job payload 可选 heap-backed 或 UB-backed
+3. slot 分配/释放所有权仍在 owner proxy worker
+
+同一台 `192.168.90.111`、同一组 TCP `mixed-80r20w` 参数下，`shared-plane` 方案约为 `307w QPS`，而“本地 ring/free-stack + 仅 slot payload 可选 UB backing”的实现，在移除 read-pool 热路径诊断原子更新后已经回到 `346w ~ 349w QPS`。这说明当前阶段的主要收益仍然来自**消息瘦身和本地调度面保持轻量**，而不是“只要上 UB 就会更快”。
+
+也就是说，更稳的演进顺序是：**先瘦消息，再评估 `slot-id`**。
+
+`2026-07-06` 按 [benchmark/test_host.md](/Users/szza/codespace/work/hpc-redis/benchmark/test_host.md) 的 TCP `mixed-80r20w` 口径，在 `192.168.90.111` 上把三代实现放到同一条演进线上看：
+
+| 版本 | 测试日期 | 有效样本 | 平均 QPS | 说明 |
+| --- | --- | ---: | ---: | --- |
+| baseline | `2026-07-03` | `5` | `2,843,824.98` | 旧实现仍按较大 job slot 过 ring，是本轮优化前的主基线 |
+| `job_ptr descriptor` | `2026-07-06` 之前 | `3` | `2,944,068.16` | ring 里传小 descriptor，但真实 job 仍是每请求 `zmalloc/zfree` |
+| `job pool + slot_id` | `2026-07-06` | `6` | `3,491,019.48` | ring 里传 `job_ref`，真实 job 落到 per-proxy-worker pool；同机型补跑 6 轮复测 |
+
+相对原始 pooled 基线：
+
+1. `job_ptr descriptor` 平均提升 `100,243.18 QPS`，约 **3.52%**
+2. `job pool + slot_id` 平均提升 `647,194.50 QPS`，约 **22.76%**
+
+相对 `job_ptr descriptor`：
+
+1. `job pool + slot_id` 平均提升 `546,951.32 QPS`
+2. 相对提升约 **18.58%**
+3. 六轮 `fail=0`
+4. `job_ring_vemb=0`、`job_ring_vadd=0`、`completion_ring=0`
+
+这说明第一阶段的小 descriptor 确实吃掉了 queue 上的大 struct 搬运，但更显著的收益来自第二阶段把真实 job 生命周期从每请求 `zmalloc/zfree` 改成稳定 pool slot。换句话说，这条链路的优化收益是沿着同一条热路径连续累加出来的：
+
+1. 先吃掉大 job slot `memcpy`
+2. 再吃掉每请求 heap alloc/free
+
+`2026-07-06` 还做了一次同口径的小步验证：在已经使用 `job pool + slot_id` 的 TCP `mixed-80r20w` 路径上，把 `channel_read_tcp_request()` 里的临时 `req` 和 `payload` 从“每请求 `zmalloc/zfree`”改成栈上对象后，在 `192.168.90.111` 上补跑 3 轮：
+
+| Run | QPS | Fail |
+| --- | ---: | ---: |
+| 1 | `3,579,030.17` | `0` |
+| 2 | `3,543,132.82` | `0` |
+| 3 | `3,601,439.96` | `0` |
+
+三轮均值为 `3,574,534.32 QPS`，相对同文档里此前的 `job pool + slot_id` 六轮均值 `3,491,019.48 QPS` 再提升 `83,514.84 QPS`，约 **2.39%**。这说明在 queue payload 已经瘦身、真实 job 生命周期也已经从 heap 挪到 pool 之后，**TCP ingress 上最后一小段短生命周期分配**仍然是能测出来的固定成本。
+
+#### 当前瓶颈位置
+
+完成 `job pool + slot_id` 后，剩下更显眼的成本已经更集中在：
+
+1. `VEMB_INLINE` 的 payload slice/load
+2. 1200B vector-inline payload 的 TCP response 返回
+3. completion side 仍然按固定 `vemb_v16_completion_t` slot 搬运
+
+因此下一阶段如果继续追吞吐，优先级更合理的方向是：
+
+1. 继续压 `payload_local_slice`
+2. 评估 `completion_ring` 的 pool/ref 化
+3. 再看 batch execute / batch slice 是否值得推进
+
+这也意味着，`job pool + slot_id` 已经把 job ingress 的固定成本压到了一个更低的位置，后续优化空间会更多集中在 **真实 payload 路径**，而不是 queue 生命周期本身。
+
+### 3.10 TLC/UB：metadata 私有，payload packed 共享
 
 TLC 的关键设计是把控制面 metadata 和大块用户 payload 分开：
 
@@ -708,7 +576,7 @@ key
 
 这条链路既要承载 string/hash/zset/module 等类型语义，也要参与 Redis 的引用计数、释放、替换、淘汰和 module callback 等对象生命周期。TLC/UB 把 vector workload 最重的 payload 从通用对象系统里拿出来，改成 `key -> metadata -> {region_id, offset, bytes} -> packed vector bytes`。
 
-### 3.10 并发一致性靠轻量 slot 版本 与 seqlock
+### 3.11 并发一致性靠轻量 slot 版本 与 seqlock
 
 VEMB 的读写一致性不是依赖 Redis object 引用计数或全局对象生命周期，而是 slot 级别的轻量版本：
 
@@ -751,7 +619,7 @@ reader:
 
 此外，迁移场景中的 `CUTOVER/SOURCE_GC` source fence 和 tombstone 会阻断旧 source location，普通未迁移路径则通过 active counter 快速跳过额外检查。
 
-### 3.11 VSIM 和 remote meta 让跨 owner 查询保持窄接口
+### 3.12 VSIM 和 remote meta 让跨 owner 查询保持窄接口
 
 `vsim-inline` 和 `vsim-key-key` 都在 SuperNode 内部直接拿 payload slice 做 SVE cosine，不进入 Redis Search/HNSW/filter 的通用路径。
 
@@ -764,7 +632,7 @@ reader:
 
 这个接口很窄：跨 owner 传递的是 handle metadata，而不是完整 Redis object、vector-inline payload 或通用查询计划。它保留了 scale-out 能力，但普通同 owner 快路径仍然很短。
 
-### 3.12 低扰动统计让优化可以继续推进
+### 3.13 低扰动统计让优化可以继续推进
 
 当前 SuperNode timing 已经按 sampled request 统计，并拆出：
 
@@ -780,7 +648,7 @@ completion_publish
 
 这不是直接的业务性能优化，但它避免了每请求都打时间戳的热路径污染，同时保留定位瓶颈的能力。对这种百万级 QPS 数据面来说，观测代码本身如果不采样，很容易变成新的瓶颈。
 
-### 3.13 Bitmap CAS microbench
+### 3.14 Bitmap CAS microbench
 
 bitmap acquire 最原始的设计是 CAS：先读 bitmap word，确认目标 bit 仍为空，再通过 compare-exchange 抢占。后续在远端 aarch64 机器上做 hotspot microbench 后，生产路径优化为当前 `fetch_or` 实现；测试结果显示 `fetch_or` 在该场景下优于两种 CAS 版本：
 
@@ -793,7 +661,7 @@ bitmap acquire 最原始的设计是 CAS：先读 bitmap word，确认目标 bit
 
 bitmap acquire 已从 CAS 路线收敛到当前 `fetch_or`，后续收益应来自减少 bitmap word 竞争，而不是退回 CAS acquire 原语。
 
-### 3.14 对 Redis 的收益来源总结
+### 3.15 对 Redis 的收益来源总结
 因此，hpc-redis 的性能不是单点 trick，而是一整条 server 数据面把 Redis 的通用性成本系统性移除：proxy 只搬运，SuperNode 只执行固定 op，TLC 只管理 vector location 和一致性，UB 只承载 packed payload。
 
 ## 4. 已实现的主要收益点
@@ -839,3 +707,8 @@ bitmap acquire 已从 CAS 路线收敛到当前 `fetch_or`，后续收益应来�
 | P2 | VSIM norm 预计算 | 尚未落地。 | VADD 写入时维护 norm，VSIM 时少算一次 norm。 |
 | P2 | remote meta lookup batch 化 | remote meta 和 UB RPC 已具备功能路径，批量化尚未做。 | 降低跨 owner VSIM 查询成本。 |
 | P2 | COLD / WARM-first overflow 完整化 | cold layer 默认关闭，no-eviction manifest 是当前主测法。 | 提升容量和恢复能力，短期吞吐收益低于热路径优化。 |
+
+
+
+todo:
+补充数据 batch row > batch column
