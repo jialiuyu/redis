@@ -745,6 +745,16 @@ static void publish_response(vemb_v16_channel_t *ch,
     if (ch->transport_type == VEMB_V16_TRANSPORT_TCP) {
         if (ch->net_fd < 0 ||
             vemb_v16_tcp_publish_response(ch, &resp) != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 tcp publish response failed: channel_index=%u channel_id=%llu req_id=%u op=%u status=%u flags=%u net_fd=%d active=%d",
+                      ch->index,
+                      (unsigned long long)ch->channel_id,
+                      resp.req_id,
+                      resp.op,
+                      resp.status,
+                      resp.flags,
+                      ch->net_fd,
+                      atomic_load_explicit(&ch->active, memory_order_acquire));
             if (ch->net_fd >= 0) {
                 shutdown(ch->net_fd, SHUT_RDWR);
                 close(ch->net_fd);
@@ -793,6 +803,20 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
                                                 ready_indices,
                                                 ready_count,
                                                 &published) != 0) {
+            uint16_t first = ready_count ? ready_indices[0] : 0;
+            const vemb_v16_completion_t *completion =
+                ready_count ? &completions[first] : NULL;
+            serverLog(LL_WARNING,
+                      "vemb_v16 tcp publish response batch failed: channel_index=%u channel_id=%llu ready_count=%u published=%u first_req_id=%u first_op=%u first_status=%u net_fd=%d active=%d",
+                      ch->index,
+                      (unsigned long long)ch->channel_id,
+                      ready_count,
+                      published,
+                      completion ? completion->req_id : 0,
+                      completion ? completion->op : 0,
+                      completion ? completion->status : 0,
+                      ch->net_fd,
+                      atomic_load_explicit(&ch->active, memory_order_acquire));
             for (uint32_t i = 0; i < ready_count; i++)
                 completion_release_payload(&completions[ready_indices[i]]);
             if (ch->net_fd >= 0) {
@@ -1339,8 +1363,13 @@ static void close_channel(vemb_v16_channel_t *ch) {
     if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
         return;
     }
-    serverLog(LL_VERBOSE, "vemb_v16 channel closing: index=%u channel_id=%llu",
-              ch->index, (unsigned long long)ch->channel_id);
+    serverLog(LL_NOTICE,
+              "vemb_v16 channel closing: index=%u channel_id=%llu transport=%u net_fd=%d active=%d",
+              ch->index,
+              (unsigned long long)ch->channel_id,
+              ch->transport_type,
+              ch->net_fd,
+              atomic_load_explicit(&ch->active, memory_order_acquire));
     int pooled_proxy_io = ch->proxy->proxy_io_worker_count != 0;
     int pooled_supernode = ch->proxy->supernode_worker_count != 0;
     atomic_exchange_explicit(&ch->active, 0, memory_order_acq_rel);

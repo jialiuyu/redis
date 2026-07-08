@@ -1,6 +1,6 @@
 # VEMB V16 扩容节点迁移设计
 
-更新日期：2026-06-22
+更新日期：2026-07-08
 
 本文描述当前 P0 扩容设计和实现口径。核心路径已经从“外部工具逐 key
 驱动迁移”收敛为：
@@ -600,19 +600,40 @@ make -C benchmark vemb_v16_scaleout_coordinated_server_smoke
 - 代码目录：`/root/szz/codespace/hpc-redis`
 - server 监听端口：`6391`
 - top_ctl coordinator 监听端口：`7391`
+- UB 设备映射：
+
+| 语义 | node0 (`192.168.90.111`) | node1 (`192.168.90.112`) |
+| --- | --- | --- |
+| 本地 payload export | `/dev/obmm_shmdev1` | `/dev/obmm_shmdev1` |
+| 对端 payload import | `/dev/obmm_shmdev5` | `/dev/obmm_shmdev5` |
+| 本地 request export | `/dev/obmm_shmdev2` | `/dev/obmm_shmdev2` |
+| 对端 request import | `/dev/obmm_shmdev6` | `/dev/obmm_shmdev6` |
+| 本地 response export | `/dev/obmm_shmdev4` | `/dev/obmm_shmdev4` |
+| 对端 response import | `/dev/obmm_shmdev8` | `/dev/obmm_shmdev8` |
+
+对应关系：
+
+| 本地设备 | 对端导入设备 | 用途 |
+| --- | --- | --- |
+| `1` | `5` | payload / remote meta view |
+| `2` | `6` | request lane |
+| `4` | `8` | response lane |
 - payload UB path：
   - 本地 CC：`/dev/obmm_shmdev1`
-  - 远端 NC view：`/dev/obmm_shmdev3`
+  - 远端 NC view：`/dev/obmm_shmdev5`
 - remote meta UB path：
   - 本地 meta owner view：`/dev/obmm_shmdev1@268435456`
-  - 对端 meta view：`/dev/obmm_shmdev3@268435456`
+  - 对端 meta view：`/dev/obmm_shmdev5@268435456`
 - UB RPC ring path：
-  - request/response：`/dev/obmm_shmdev5`、`/dev/obmm_shmdev6`
+  - request lane：`/dev/obmm_shmdev2`
+  - inbound request lane：`/dev/obmm_shmdev6`
+  - response lane：`/dev/obmm_shmdev8`
+  - outbound response lane：`/dev/obmm_shmdev4`
 
 注意：
 
 - `--tcp-host` 必须使用真实 IP，不能使用 `0.0.0.0`，否则 client topology 会返回不可路由 endpoint。
-- 当前 baseline/delta payload 仍要求 target 能看到 source warm payload，因此 manifest 中仍需同时保留 `region100` 与 `region101` 的 `warm_regions` 映射，不能把 `/dev/obmm_shmdev3` 仅配置成 meta-only。
+- 当前 baseline/delta payload 仍要求 target 能看到 source warm payload，因此 manifest 中仍需同时保留 `region100` 与 `region101` 的 `warm_regions` 映射，不能把 `/dev/obmm_shmdev5` 仅配置成 meta-only。
 - 当前 `--reset-warm-regions` 会 reset manifest 中列出的 region/meta backing。实际执行时仅让 `node0` 首次启动带 `--reset-warm-regions`。
 
 ### 1. 两台机器编译
@@ -654,7 +675,7 @@ warm_regions:
     weight: 1
   - region_id: 101
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 0
     bytes: 67108864
     value_size: 64
@@ -664,7 +685,7 @@ warm_regions:
 remote_meta_views:
   - owner_id: 1
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 268435456
     entries: 8192
     buckets: 16384
@@ -672,13 +693,13 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 1
     provider: ub
-    request_path: /dev/obmm_shmdev5
+    request_path: /dev/obmm_shmdev2
     request_mmap_offset: 8388608
-    response_path: /dev/obmm_shmdev6
+    response_path: /dev/obmm_shmdev8
     response_mmap_offset: 16777216
     inbound_request_path: /dev/obmm_shmdev6
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_path: /dev/obmm_shmdev4
     outbound_response_mmap_offset: 16777216
 YAML
 ```
@@ -710,7 +731,7 @@ warm_regions:
     weight: 1
   - region_id: 100
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 0
     bytes: 67108864
     value_size: 64
@@ -720,7 +741,7 @@ warm_regions:
 remote_meta_views:
   - owner_id: 0
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 268435456
     entries: 8192
     buckets: 16384
@@ -728,13 +749,13 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 0
     provider: ub
-    request_path: /dev/obmm_shmdev5
+    request_path: /dev/obmm_shmdev2
     request_mmap_offset: 8388608
-    response_path: /dev/obmm_shmdev6
+    response_path: /dev/obmm_shmdev8
     response_mmap_offset: 16777216
     inbound_request_path: /dev/obmm_shmdev6
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_path: /dev/obmm_shmdev4
     outbound_response_mmap_offset: 16777216
 YAML
 ```
@@ -859,7 +880,7 @@ nohup ./benchmark/vemb_v16_bench \
   --pipeline 1 \
   --mode vadd \
   --client-topology \
-  --timeout-ms 60000 \
+  --timeout-ms 180000 \
   >/tmp/v16_live_write.out 2>&1 &
 ```
 
@@ -873,7 +894,7 @@ nohup ./benchmark/vemb_v16_topology_ctl \
   --transport tcp \
   --host 192.168.90.111 \
   --port 7391 \
-  --expected-sources 1 \
+  --expected-sources 0 \
   --migration-epoch 23 \
   --cutover-epoch 24 \
   --standby 0,1 \
@@ -1051,6 +1072,9 @@ chmod +x benchmark/vemb_v16_scaleout_real_2node.sh
 可选环境变量：
 
 - `RUN_LIVE_WRITE=1`：迁移期间开启持续写压
+- `LIVE_MODE=mixed-80r20w`：迁移期间同时持续查询和写入
+- `LIVE_THREADS=2`：live workload 线程数
+- `LIVE_TIMEOUT_MS=180000`：live workload 超时时间
 - `RUN_POST_READ=0`：跳过 cutover 后读验证
 - `MAX_VECTORS=65536`：提升容量，便于更大 keyspace 压测
 - `PREFILL_KEYS=2048`：调整初始灌数
@@ -1068,6 +1092,94 @@ cat /tmp/v16_post_read.out
 cat /tmp/v16_coordinator.out
 cat /tmp/v16_coordinator.err
 ```
+
+### 15. 2026-07-08 远端验证结果
+
+基于上面的两机环境，按当前仓库脚本和 bench 代码在远端复测：
+
+#### 15.1 基本扩容流程
+
+执行：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+./benchmark/vemb_v16_scaleout_real_2node.sh
+```
+
+结果：
+
+```text
+scaleout_all_sources_done=1
+scaleout_full_active_published=2 errors=0 targets=2
+current_topology_epoch=24
+min_write_epoch=24
+active_owners=0,1
+standby_owners=0,1
+```
+
+post-cutover 校验：
+
+```text
+[done] mode=vadd threads=2 ok=4000 fail=0
+[done] mode=vemb-inline threads=2 ok=4000 fail=0
+```
+
+说明当前单 source `node0 -> node0,node1` 扩容主流程已经可以稳定完成：
+
+- source 自动生成 migration plan
+- coordinator 收到 `local done`
+- full active topology 成功发布
+- cutover 后 node1 可以接管部分写流量和读流量
+
+#### 15.2 扩容期间持续写入和查询
+
+执行：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+RUN_LIVE_WRITE=1 \
+LIVE_MODE=mixed-80r20w \
+LIVE_THREADS=2 \
+LIVE_TIMEOUT_MS=180000 \
+PREFILL_KEYS=4000 \
+LIVE_WRITE_OPS=50000 \
+./benchmark/vemb_v16_scaleout_real_2node.sh
+```
+
+结果：
+
+```text
+[done] mode=mixed-80r20w threads=2 ok=100000 fail=0
+[client-topology] dual_write_sent=0 stale_refreshes=0
+```
+
+本轮验证覆盖了：
+
+- 扩容前已有 4000 条存量数据
+- candidate topology 发布后 workload 持续运行
+- cutover 过程中同时有读和写
+- workload 在 full active 发布后继续跑完，不依赖人工停压
+
+#### 15.3 本轮踩坑与修正
+
+这次真实双机验证里，主要补了三类问题：
+
+1. bench read/write 的 client-topology TCP 容错：
+   - 读路径补齐 `MOVED/ASK/STALE` refresh/retry
+   - 读写路径都补齐 send/recv 失败后的 channel reconnect
+   - topology refresh 后重建 client TCP channels，避免继续复用 cutover 前 channel
+
+2. bench 进程级稳定性：
+   - `benchmark/vemb_v16_bench` 现在忽略 `SIGPIPE`
+   - 避免 cutover/reconnect 时对端先关连接，bench 因写死连接被信号直接打死
+
+3. 真实两机脚本校验闭环：
+   - live workload 不再只是在后台启动，而是会等待结束并检查退出码
+   - live timeout 参数化为 `LIVE_TIMEOUT_MS`
+   - coordinator `--expected-sources` 改为 owner 列表语义下的 `0`
+
+其中第 3 点非常重要：如果脚本不等待 live workload，只看到扩容主流程结束，
+会出现“cutover 成功但后台压测其实已经失败退出”的假阳性。
 
 ## 手动控制命令
 

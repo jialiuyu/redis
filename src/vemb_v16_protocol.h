@@ -29,7 +29,7 @@
 #define VEMB_V16_NET_STATUS_ENCODED_LEN 9u
 #define VEMB_V16_EPOCH_CONTROL_REQ_ENCODED_LEN 20u
 #define VEMB_V16_EPOCH_CONTROL_RESP_ENCODED_LEN 17u
-#define VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN 180u
+#define VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN 184u
 #define VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN 56u
 #define VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN 33u
 #define VEMB_V16_MIGRATION_CONTROL_RESP_ENCODED_LEN 73u
@@ -1026,7 +1026,7 @@ static inline size_t vemb_v16_topology_control_req_encoded_len(
                   req->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
                   req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
               0);
-    size_t len = 32u + (size_t)req->active_owner_count * 4u +
+    size_t len = 40u + (size_t)req->active_owner_count * 4u +
                  (size_t)req->standby_owner_count * 4u;
     if (req->coordinator_endpoint_valid)
         len += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
@@ -1083,7 +1083,7 @@ static inline int vemb_v16_topology_control_req_decode(
     vemb_v16_topology_control_req_t *req,
     const uint8_t *src,
     size_t len) {
-    RETURN_IF(len < 32u, -1);
+    RETURN_IF(len < 40u, -1);
     const uint8_t *p = src;
     memset(req, 0, sizeof(*req));
     req->current_topology_epoch = vemb_v16_proto_get_u64(&p);
@@ -1129,7 +1129,7 @@ static inline size_t vemb_v16_topology_control_resp_encoded_len(
                   resp->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
                   resp->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS,
               0);
-    size_t len = 33u + (size_t)resp->active_owner_count * 4u +
+    size_t len = 41u + (size_t)resp->active_owner_count * 4u +
                  (size_t)resp->standby_owner_count * 4u;
     if (resp->coordinator_endpoint_valid)
         len += VEMB_V16_TOPOLOGY_ENDPOINT_ENCODED_LEN;
@@ -1187,7 +1187,7 @@ static inline int vemb_v16_topology_control_resp_decode(
     vemb_v16_topology_control_resp_t *resp,
     const uint8_t *src,
     size_t len) {
-    RETURN_IF(len < 33u, -1);
+    RETURN_IF(len < 41u, -1);
     const uint8_t *p = src;
     memset(resp, 0, sizeof(*resp));
     resp->status = vemb_v16_proto_get_u8(&p);

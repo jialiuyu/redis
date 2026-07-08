@@ -814,11 +814,17 @@ static int coordinator_handle_tcp_fd(const topology_ctl_cfg_t *cfg,
     vemb_v16_net_hdr_t hdr;
     vemb_v16_scaleout_local_done_req_t req;
     vemb_v16_scaleout_local_done_resp_t resp;
+    uint8_t req_buf[VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN];
+    uint8_t resp_buf[VEMB_V16_SCALEOUT_LOCAL_DONE_RESP_ENCODED_LEN];
+    size_t resp_len = 0;
     memset(&req, 0, sizeof(req));
     if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
         hdr.type != VEMB_V16_NET_SCALEOUT_LOCAL_DONE ||
-        hdr.payload_len != sizeof(req) ||
-        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        hdr.payload_len != VEMB_V16_SCALEOUT_LOCAL_DONE_REQ_ENCODED_LEN ||
+        vemb_v16_net_read_full(fd, req_buf, hdr.payload_len) != 0 ||
+        vemb_v16_scaleout_local_done_req_decode(&req,
+                                                req_buf,
+                                                hdr.payload_len) != 0) {
         coordinator_fill_resp(NULL, VEMB_V16_STATUS_ERR, &resp);
     } else {
         uint8_t status = coordinator_record_done(cfg,
@@ -827,14 +833,19 @@ static int coordinator_handle_tcp_fd(const topology_ctl_cfg_t *cfg,
                                                  done_count);
         coordinator_fill_resp(&req, status, &resp);
     }
-    (void)vemb_v16_net_write_frame(
-        fd,
-        VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE,
-        0,
-        0,
-        0,
-        &resp,
-        (uint32_t)sizeof(resp));
+    if (vemb_v16_scaleout_local_done_resp_encode(resp_buf,
+                                                 sizeof(resp_buf),
+                                                 &resp,
+                                                 &resp_len) != 0) {
+        return -1;
+    }
+    (void)vemb_v16_net_write_frame(fd,
+                                   VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE,
+                                   0,
+                                   0,
+                                   0,
+                                   resp_buf,
+                                   (uint32_t)resp_len);
     return resp.status == VEMB_V16_STATUS_OK ? 0 : -1;
 }
 

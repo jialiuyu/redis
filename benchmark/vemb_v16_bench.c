@@ -12,6 +12,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -138,6 +139,8 @@ typedef struct pending_req {
 } pending_req_t;
 
 static const char *mode_name(int mode);
+static void close_node_channel(const char *socket_path,
+                               bench_node_channel_t *node);
 static int setup_node_channel(const bench_cfg_t *cfg,
                               uint32_t node_index,
                               int open_region,
@@ -853,9 +856,26 @@ static int recv_channel_resp(bench_node_channel_t *node,
         (void)timeout_ms;
         if (node->net_fd < 0) return -1;
         vemb_v16_net_hdr_t hdr;
-        if (vemb_v16_net_read_header(node->net_fd, &hdr) != 0 ||
-            hdr.type != VEMB_V16_NET_RESPONSE ||
+        if (vemb_v16_net_read_header(node->net_fd, &hdr) != 0) {
+            fprintf(stderr,
+                    "tcp recv failed: stage=read_header host=%s port=%u channel=%llu\n",
+                    node->tcp_host ? node->tcp_host : "(null)",
+                    node->tcp_port,
+                    (unsigned long long)node->desc.channel_id);
+            return -1;
+        }
+        if (hdr.type != VEMB_V16_NET_RESPONSE ||
             hdr.channel_id != node->desc.channel_id) {
+            fprintf(stderr,
+                    "tcp recv failed: stage=bad_header host=%s port=%u expected_channel=%llu got_type=%u got_channel=%llu payload_len=%u req_id=%u flags=%u\n",
+                    node->tcp_host ? node->tcp_host : "(null)",
+                    node->tcp_port,
+                    (unsigned long long)node->desc.channel_id,
+                    hdr.type,
+                    (unsigned long long)hdr.channel_id,
+                    hdr.payload_len,
+                    hdr.req_id,
+                    hdr.flags);
             return -1;
         }
         uint8_t resp_buf[64];
@@ -863,6 +883,14 @@ static int recv_channel_resp(bench_node_channel_t *node,
         if (hdr.flags != 0 ||
             hdr.payload_len < base_bytes ||
             vemb_v16_net_read_full(node->net_fd, resp_buf, base_bytes) != 0) {
+            fprintf(stderr,
+                    "tcp recv failed: stage=read_base host=%s port=%u channel=%llu payload_len=%u base_bytes=%u flags=%u\n",
+                    node->tcp_host ? node->tcp_host : "(null)",
+                    node->tcp_port,
+                    (unsigned long long)node->desc.channel_id,
+                    hdr.payload_len,
+                    base_bytes,
+                    hdr.flags);
             return -1;
         }
         size_t resp_bytes = vemb_v16_resp_encoded_len_for_fields(
@@ -874,12 +902,31 @@ static int recv_channel_resp(bench_node_channel_t *node,
                                    resp_buf + base_bytes,
                                    resp_bytes - base_bytes) != 0 ||
             vemb_v16_resp_decode(resp, resp_buf, resp_bytes) != 0) {
+            fprintf(stderr,
+                    "tcp recv failed: stage=decode_resp host=%s port=%u channel=%llu status=%u op=%u payload_len=%u resp_bytes=%zu base_bytes=%u\n",
+                    node->tcp_host ? node->tcp_host : "(null)",
+                    node->tcp_port,
+                    (unsigned long long)node->desc.channel_id,
+                    resp_buf[0],
+                    (unsigned)(resp_buf[1] & VEMB_V16_TCP_RESP_OP_MASK),
+                    hdr.payload_len,
+                    resp_bytes,
+                    base_bytes);
             return -1;
         }
         uint32_t extra = hdr.payload_len - (uint32_t)resp_bytes;
         if (extra) {
             if (!inline_vector || extra > inline_vector_cap ||
                 vemb_v16_net_read_full(node->net_fd, inline_vector, extra) != 0) {
+                fprintf(stderr,
+                        "tcp recv failed: stage=read_inline host=%s port=%u channel=%llu extra=%u inline_cap=%u resp_op=%u resp_status=%u\n",
+                        node->tcp_host ? node->tcp_host : "(null)",
+                        node->tcp_port,
+                        (unsigned long long)node->desc.channel_id,
+                        extra,
+                        inline_vector_cap,
+                        resp->op,
+                        resp->status);
                 return -1;
             }
             if (inline_vector_bytes) *inline_vector_bytes = extra;
@@ -904,6 +951,29 @@ static int send_write_single_and_wait(bench_node_channel_t *node,
                           NULL,
                           0,
                           NULL,
+                          NULL,
+                          timeout_ms) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int send_read_single_and_wait(bench_node_channel_t *node,
+                                     vemb_v16_req_t *req,
+                                     size_t req_len,
+                                     uint8_t *inline_vector,
+                                     uint32_t inline_vector_cap,
+                                     uint32_t *inline_vector_bytes,
+                                     uint32_t timeout_ms,
+                                     vemb_v16_resp_t *resp) {
+    req->channel_id = node->desc.channel_id;
+    if (send_channel_req(node, req, req_len, NULL, timeout_ms) != 0)
+        return -1;
+    if (recv_channel_resp(node,
+                          resp,
+                          inline_vector,
+                          inline_vector_cap,
+                          inline_vector_bytes,
                           NULL,
                           timeout_ms) != 0) {
         return -1;
@@ -940,7 +1010,74 @@ static int ensure_client_topology_channels(bench_cfg_t *cfg,
     return 0;
 }
 
-static int write_status_needs_topology_refresh(uint8_t status) {
+static void close_client_topology_channels(bench_cfg_t *cfg,
+                                           bench_node_channel_t *nodes,
+                                           uint32_t *node_count) {
+    if (!cfg || !nodes || !node_count)
+        return;
+    for (uint32_t n = 0; n < *node_count && n < cfg->node_count; n++) {
+        if (node_channel_open(&nodes[n]))
+            close_node_channel(cfg->socket_paths[n], &nodes[n]);
+    }
+    *node_count = 0;
+}
+
+static int reconnect_client_topology_channel(bench_cfg_t *cfg,
+                                             bench_node_channel_t *nodes,
+                                             uint32_t *node_count,
+                                             uint32_t node_index,
+                                             int open_region) {
+    if (!cfg || !nodes || !node_count || node_index >= cfg->node_count)
+        return -1;
+    close_node_channel(cfg->socket_paths[node_index], &nodes[node_index]);
+    if (setup_node_channel(cfg, node_index, open_region, &nodes[node_index]) != 0)
+        return -1;
+    if (node_index + 1 > *node_count)
+        *node_count = node_index + 1;
+    return 0;
+}
+
+static int refresh_client_topology_and_channels(
+        bench_cfg_t *cfg,
+        bench_node_channel_t *nodes,
+        uint32_t *node_count,
+        int open_region,
+        const char *reason) {
+    int had_topology = 0;
+    uint64_t old_epoch = 0;
+    if (!cfg)
+        return -1;
+    had_topology = cfg->client_topology_valid;
+    if (had_topology)
+        old_epoch = cfg->client_topology.current_topology_epoch;
+    if (refresh_client_topology(cfg) != 0)
+        return -1;
+    if (cfg->transport_type == VEMB_V16_TRANSPORT_TCP &&
+        nodes &&
+        node_count &&
+        (*node_count != 0 ||
+         (had_topology &&
+          old_epoch != cfg->client_topology.current_topology_epoch))) {
+        fprintf(stderr,
+                "client-topology channel reopen reason=%s old_epoch=%llu new_epoch=%llu open_region=%d\n",
+                reason ? reason : "refresh",
+                (unsigned long long)old_epoch,
+                (unsigned long long)cfg->client_topology.current_topology_epoch,
+                open_region);
+        close_client_topology_channels(cfg, nodes, node_count);
+    }
+    if (nodes && node_count) {
+        if (ensure_client_topology_channels(cfg,
+                                            nodes,
+                                            node_count,
+                                            open_region) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int status_needs_topology_refresh(uint8_t status) {
     return status == VEMB_V16_STATUS_STALE_TOPOLOGY ||
            status == VEMB_V16_STATUS_MOVED ||
            status == VEMB_V16_STATUS_ASK;
@@ -996,7 +1133,11 @@ static uint8_t send_write_with_client_topology(
     vemb_v16_client_write_plan_t plan;
     memset(&plan, 0, sizeof(plan));
     if (!cfg->client_topology_valid &&
-        refresh_client_topology(cfg) != 0) {
+        refresh_client_topology_and_channels(cfg,
+                                             nodes,
+                                             node_count,
+                                             0,
+                                             "write-initial") != 0) {
         return VEMB_V16_STATUS_ERR;
     }
     if (ensure_client_topology_channels(cfg, nodes, node_count, 0) != 0)
@@ -1017,7 +1158,43 @@ static uint8_t send_write_with_client_topology(
                                        req_len,
                                        cfg->timeout_ms,
                                        &resp) != 0) {
-            return VEMB_V16_STATUS_ERR;
+            fprintf(stderr,
+                    "client-topology write send/recv failed req_id=%u key_hash=%llu op=%u owner=%u epoch=%llu attempt=%u, reconnecting\n",
+                    req->req_id,
+                    (unsigned long long)req->key_hash,
+                    req->op,
+                    plan.active_owner,
+                    (unsigned long long)req->topology_epoch,
+                    attempt);
+            if (reconnect_client_topology_channel(cfg,
+                                                  nodes,
+                                                  node_count,
+                                                  plan.active_owner,
+                                                  0) != 0) {
+                fprintf(stderr,
+                        "client-topology write reconnect failed req_id=%u key_hash=%llu owner=%u attempt=%u\n",
+                        req->req_id,
+                        (unsigned long long)req->key_hash,
+                        plan.active_owner,
+                        attempt);
+                return VEMB_V16_STATUS_ERR;
+            }
+            memset(&resp, 0, sizeof(resp));
+            if (send_write_single_and_wait(&nodes[plan.active_owner],
+                                           req,
+                                           req_len,
+                                           cfg->timeout_ms,
+                                           &resp) != 0) {
+                fprintf(stderr,
+                        "client-topology write send/recv failed after reconnect req_id=%u key_hash=%llu op=%u owner=%u epoch=%llu attempt=%u\n",
+                        req->req_id,
+                        (unsigned long long)req->key_hash,
+                        req->op,
+                        plan.active_owner,
+                        (unsigned long long)req->topology_epoch,
+                        attempt);
+                return VEMB_V16_STATUS_ERR;
+            }
         }
         if (resp.status == VEMB_V16_STATUS_ASK) {
             vemb_v16_resp_t redirect_resp;
@@ -1033,35 +1210,31 @@ static uint8_t send_write_with_client_topology(
                     (void)dual_write_sent;
                     return VEMB_V16_STATUS_OK;
                 }
-                if (!write_status_needs_topology_refresh(
+                if (!status_needs_topology_refresh(
                         redirect_resp.status)) {
                     return redirect_resp.status;
                 }
             }
             if (stale_topology_refreshes)
                 (*stale_topology_refreshes)++;
-            if (refresh_client_topology(cfg) != 0)
+            if (refresh_client_topology_and_channels(cfg,
+                                                     nodes,
+                                                     node_count,
+                                                     0,
+                                                     "write-ask") != 0)
                 return resp.status;
-            if (ensure_client_topology_channels(cfg,
-                                                nodes,
-                                                node_count,
-                                                0) != 0) {
-                return VEMB_V16_STATUS_ERR;
-            }
             usleep(1000);
             continue;
         }
-        if (write_status_needs_topology_refresh(resp.status)) {
+        if (status_needs_topology_refresh(resp.status)) {
             if (stale_topology_refreshes)
                 (*stale_topology_refreshes)++;
-            if (refresh_client_topology(cfg) != 0)
+            if (refresh_client_topology_and_channels(cfg,
+                                                     nodes,
+                                                     node_count,
+                                                     0,
+                                                     "write-status") != 0)
                 return resp.status;
-            if (ensure_client_topology_channels(cfg,
-                                                nodes,
-                                                node_count,
-                                                0) != 0) {
-                return VEMB_V16_STATUS_ERR;
-            }
             usleep(1000);
             continue;
         }
@@ -1070,6 +1243,191 @@ static uint8_t send_write_with_client_topology(
 
         (void)dual_write_sent;
         return VEMB_V16_STATUS_OK;
+    }
+    return VEMB_V16_STATUS_STALE_TOPOLOGY;
+}
+
+static uint8_t send_read_with_client_topology(
+        bench_cfg_t *cfg,
+        bench_node_channel_t *nodes,
+        uint32_t *node_count,
+        vemb_v16_req_t *req,
+        size_t req_len,
+        uint8_t *inline_vector,
+        uint32_t inline_vector_cap,
+        uint32_t *inline_vector_bytes,
+        vemb_v16_resp_t *resp,
+        uint64_t *stale_topology_refreshes) {
+    int open_region = req->op == VEMB_V16_OP_VEMB_HANDLE;
+    if (!cfg->client_topology_valid &&
+        refresh_client_topology_and_channels(cfg,
+                                             nodes,
+                                             node_count,
+                                             open_region,
+                                             "read-initial") != 0) {
+        fprintf(stderr,
+                "client-topology read refresh failed before send req_id=%u key_hash=%llu op=%u\n",
+                req->req_id,
+                (unsigned long long)req->key_hash,
+                req->op);
+        return VEMB_V16_STATUS_ERR;
+    }
+    if (ensure_client_topology_channels(cfg,
+                                        nodes,
+                                        node_count,
+                                        open_region) != 0) {
+        fprintf(stderr,
+                "client-topology read ensure channels failed before send req_id=%u key_hash=%llu op=%u open_region=%d\n",
+                req->req_id,
+                (unsigned long long)req->key_hash,
+                req->op,
+                open_region);
+        return VEMB_V16_STATUS_ERR;
+    }
+
+    for (uint32_t attempt = 0; attempt < 256; attempt++) {
+        uint32_t active_owner = route_hash(cfg, (uint32_t)req->key_hash);
+        if (active_owner >= *node_count)
+            return VEMB_V16_STATUS_ERR;
+        req->topology_epoch = cfg->client_topology.current_topology_epoch;
+        memset(resp, 0, sizeof(*resp));
+        if (send_read_single_and_wait(&nodes[active_owner],
+                                      req,
+                                      req_len,
+                                      inline_vector,
+                                      inline_vector_cap,
+                                      inline_vector_bytes,
+                                      cfg->timeout_ms,
+                                      resp) != 0) {
+            fprintf(stderr,
+                    "client-topology read send/recv failed req_id=%u key_hash=%llu op=%u owner=%u epoch=%llu attempt=%u, reconnecting\n",
+                    req->req_id,
+                    (unsigned long long)req->key_hash,
+                    req->op,
+                    active_owner,
+                    (unsigned long long)req->topology_epoch,
+                    attempt);
+            if (reconnect_client_topology_channel(cfg,
+                                                  nodes,
+                                                  node_count,
+                                                  active_owner,
+                                                  open_region) != 0) {
+                fprintf(stderr,
+                        "client-topology read reconnect failed req_id=%u key_hash=%llu owner=%u attempt=%u\n",
+                        req->req_id,
+                        (unsigned long long)req->key_hash,
+                        active_owner,
+                        attempt);
+                return VEMB_V16_STATUS_ERR;
+            }
+            memset(resp, 0, sizeof(*resp));
+            if (send_read_single_and_wait(&nodes[active_owner],
+                                          req,
+                                          req_len,
+                                          inline_vector,
+                                          inline_vector_cap,
+                                          inline_vector_bytes,
+                                          cfg->timeout_ms,
+                                          resp) != 0) {
+                fprintf(stderr,
+                        "client-topology read send/recv failed after reconnect req_id=%u key_hash=%llu op=%u owner=%u epoch=%llu attempt=%u\n",
+                        req->req_id,
+                        (unsigned long long)req->key_hash,
+                        req->op,
+                        active_owner,
+                        (unsigned long long)req->topology_epoch,
+                        attempt);
+                return VEMB_V16_STATUS_ERR;
+            }
+        }
+        if (resp->status == VEMB_V16_STATUS_OK)
+            return VEMB_V16_STATUS_OK;
+        if (resp->status == VEMB_V16_STATUS_ASK &&
+            resp->redirect_owner != UINT32_MAX &&
+            resp->redirect_owner < VEMB_V16_BENCH_MAX_NODES) {
+            uint8_t original_flags = req->flags;
+            uint64_t original_topology_epoch = req->topology_epoch;
+            req->flags = (uint8_t)(req->flags | VEMB_V16_REQ_F_ASK_REDIRECT);
+            req->topology_epoch = cfg->client_topology.current_topology_epoch;
+            if (resp->redirect_owner >= *node_count ||
+                !node_channel_open(&nodes[resp->redirect_owner])) {
+                if (ensure_client_topology_channels(cfg,
+                                                    nodes,
+                                                    node_count,
+                                                    open_region) != 0) {
+                    fprintf(stderr,
+                            "client-topology read ensure channels failed for ask redirect req_id=%u key_hash=%llu redirect_owner=%u attempt=%u\n",
+                            req->req_id,
+                            (unsigned long long)req->key_hash,
+                            resp->redirect_owner,
+                            attempt);
+                    req->flags = original_flags;
+                    req->topology_epoch = original_topology_epoch;
+                    return VEMB_V16_STATUS_ERR;
+                }
+            }
+            if (resp->redirect_owner < *node_count &&
+                node_channel_open(&nodes[resp->redirect_owner])) {
+                vemb_v16_resp_t redirect_resp;
+                memset(&redirect_resp, 0, sizeof(redirect_resp));
+                if (send_read_single_and_wait(&nodes[resp->redirect_owner],
+                                              req,
+                                              req_len,
+                                              inline_vector,
+                                              inline_vector_cap,
+                                              inline_vector_bytes,
+                                              cfg->timeout_ms,
+                                              &redirect_resp) != 0) {
+                    fprintf(stderr,
+                            "client-topology read ask redirect send/recv failed req_id=%u key_hash=%llu redirect_owner=%u epoch=%llu attempt=%u\n",
+                            req->req_id,
+                            (unsigned long long)req->key_hash,
+                            resp->redirect_owner,
+                            (unsigned long long)req->topology_epoch,
+                            attempt);
+                    req->flags = original_flags;
+                    req->topology_epoch = original_topology_epoch;
+                    return VEMB_V16_STATUS_ERR;
+                }
+                req->flags = original_flags;
+                req->topology_epoch = original_topology_epoch;
+                *resp = redirect_resp;
+                if (resp->status == VEMB_V16_STATUS_OK)
+                    return VEMB_V16_STATUS_OK;
+                if (!status_needs_topology_refresh(resp->status))
+                    return resp->status;
+            } else {
+                fprintf(stderr,
+                        "client-topology read redirect owner unavailable req_id=%u key_hash=%llu redirect_owner=%u attempt=%u\n",
+                        req->req_id,
+                        (unsigned long long)req->key_hash,
+                        resp->redirect_owner,
+                        attempt);
+                req->flags = original_flags;
+                req->topology_epoch = original_topology_epoch;
+                return VEMB_V16_STATUS_ERR;
+            }
+        } else if (!status_needs_topology_refresh(resp->status)) {
+            return resp->status;
+        }
+        if (stale_topology_refreshes)
+            (*stale_topology_refreshes)++;
+        if (refresh_client_topology_and_channels(cfg,
+                                                 nodes,
+                                                 node_count,
+                                                 open_region,
+                                                 "read-status") != 0) {
+            fprintf(stderr,
+                    "client-topology read refresh failed after status=%u req_id=%u key_hash=%llu op=%u owner=%u attempt=%u\n",
+                    resp->status,
+                    req->req_id,
+                    (unsigned long long)req->key_hash,
+                    req->op,
+                    active_owner,
+                    attempt);
+            return resp->status;
+        }
+        usleep(1000);
     }
     return VEMB_V16_STATUS_STALE_TOPOLOGY;
 }
@@ -1308,6 +1666,89 @@ static void *worker_main(void *arg) {
                     expect_inline_vector = 1;
                 }
                 w->vemb_sent++;
+                if (w->cfg.client_topology_enabled) {
+                    vemb_v16_resp_t resp;
+                    uint32_t inline_vector_bytes = 0;
+                    uint8_t status = send_read_with_client_topology(
+                        &w->cfg,
+                        w->nodes,
+                        &w->node_count,
+                        &req,
+                        req_len,
+                        inline_vector,
+                        inline_vector_cap,
+                        &inline_vector_bytes,
+                        &resp,
+                        &w->stale_topology_refreshes);
+                    if (status != VEMB_V16_STATUS_OK) {
+                        fprintf(stderr,
+                                "worker %d topology read error at op=%u key_id=%u status=%u\n",
+                                w->tid,
+                                i,
+                                key_id,
+                                status);
+                        w->fail++;
+                        sent++;
+                        completed++;
+                        continue;
+                    }
+                    if (req.op == VEMB_V16_OP_VEMB_HANDLE) {
+                        bench_region_map_t *warm_region =
+                            find_warm_region(w, resp.region_id);
+                        if (!warm_region ||
+                            resp.vector_offset + resp.vector_bytes >
+                                warm_region->region_bytes ||
+                            resp.vector_bytes != warm_region->value_size) {
+                            fprintf(stderr,
+                                    "worker %d invalid vector handle at op=%u region=%u offset=%llu bytes=%u expected_req_id=%u expected_op=%u resp_req_id=%u resp_op=%u\n",
+                                    w->tid,
+                                    i,
+                                    resp.region_id,
+                                    (unsigned long long)resp.vector_offset,
+                                    resp.vector_bytes,
+                                    req.req_id,
+                                    req.op,
+                                    resp.req_id,
+                                    resp.op);
+                            w->fail += w->cfg.ops - completed;
+                            goto worker_done;
+                        }
+                        volatile const uint8_t *p =
+                            warm_region->mapped_addr + resp.vector_offset;
+                        uint8_t checksum = 0;
+                        for (uint32_t j = 0; j < resp.vector_bytes; j += 64)
+                            checksum ^= p[j];
+                        w->read_bytes += resp.vector_bytes + checksum * 0u;
+                    } else {
+                        if (inline_vector_bytes != resp.vector_bytes ||
+                            resp.vector_bytes != inline_vector_cap) {
+                            fprintf(stderr,
+                                    "worker %d invalid inline vector at op=%u bytes=%u expected=%u resp_bytes=%u expected_req_id=%u expected_op=%u resp_req_id=%u resp_op=%u pending_expect_inline=%d\n",
+                                    w->tid,
+                                    i,
+                                    inline_vector_bytes,
+                                    inline_vector_cap,
+                                    resp.vector_bytes,
+                                    req.req_id,
+                                    req.op,
+                                    resp.req_id,
+                                    resp.op,
+                                    1);
+                            w->fail += w->cfg.ops - completed;
+                            goto worker_done;
+                        }
+                        {
+                            uint8_t checksum = 0;
+                            for (uint32_t j = 0; j < inline_vector_bytes; j += 64)
+                                checksum ^= inline_vector[j];
+                            w->read_bytes += inline_vector_bytes + checksum * 0u;
+                        }
+                    }
+                    w->ok++;
+                    sent++;
+                    completed++;
+                    continue;
+                }
                 if (send_channel_req(node, &req, req_len,
                                      &w->request_publish_spins,
                                      w->cfg.timeout_ms) != 0) {
@@ -2052,6 +2493,7 @@ int main(int argc, char **argv) {
     strncpy(cfg.tcp_hosts[0], cfg.tcp_host, sizeof(cfg.tcp_hosts[0]) - 1);
     cfg.tcp_ports[0] = cfg.tcp_port;
     build_hash_ring(&cfg);
+    signal(SIGPIPE, SIG_IGN);
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc) {

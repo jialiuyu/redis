@@ -14,6 +14,9 @@ DIM="${DIM:-16}"
 MAX_VECTORS="${MAX_VECTORS:-8192}"
 PREFILL_KEYS="${PREFILL_KEYS:-1024}"
 LIVE_WRITE_OPS="${LIVE_WRITE_OPS:-50000}"
+LIVE_MODE="${LIVE_MODE:-vadd}"
+LIVE_THREADS="${LIVE_THREADS:-2}"
+LIVE_TIMEOUT_MS="${LIVE_TIMEOUT_MS:-180000}"
 MIGRATION_EPOCH="${MIGRATION_EPOCH:-23}"
 CUTOVER_EPOCH="${CUTOVER_EPOCH:-24}"
 
@@ -26,6 +29,8 @@ NODE0_LOG="/tmp/v16_node0.log"
 NODE1_LOG="/tmp/v16_node1.log"
 PREFILL_OUT="/tmp/v16_prefill.out"
 LIVE_WRITE_OUT="/tmp/v16_live_write.out"
+LIVE_WRITE_PID="/tmp/v16_live_write.pid"
+LIVE_WRITE_RC="/tmp/v16_live_write.rc"
 COORD_OUT="/tmp/v16_coordinator.out"
 COORD_ERR="/tmp/v16_coordinator.err"
 POST_WRITE_OUT="/tmp/v16_post_write.out"
@@ -68,7 +73,7 @@ warm_regions:
     weight: 1
   - region_id: 101
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 0
     bytes: 67108864
     value_size: 64
@@ -78,7 +83,7 @@ warm_regions:
 remote_meta_views:
   - owner_id: 1
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 268435456
     entries: 8192
     buckets: 16384
@@ -86,13 +91,13 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 1
     provider: ub
-    request_path: /dev/obmm_shmdev5
+    request_path: /dev/obmm_shmdev2
     request_mmap_offset: 8388608
-    response_path: /dev/obmm_shmdev6
+    response_path: /dev/obmm_shmdev8
     response_mmap_offset: 16777216
     inbound_request_path: /dev/obmm_shmdev6
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_path: /dev/obmm_shmdev4
     outbound_response_mmap_offset: 16777216
 YAML"
 
@@ -119,7 +124,7 @@ warm_regions:
     weight: 1
   - region_id: 100
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 0
     bytes: 67108864
     value_size: 64
@@ -129,7 +134,7 @@ warm_regions:
 remote_meta_views:
   - owner_id: 0
     provider: ub
-    path: /dev/obmm_shmdev3
+    path: /dev/obmm_shmdev5
     mmap_offset: 268435456
     entries: 8192
     buckets: 16384
@@ -137,25 +142,25 @@ remote_meta_views:
 ub_rpc_peers:
   - owner_id: 0
     provider: ub
-    request_path: /dev/obmm_shmdev5
+    request_path: /dev/obmm_shmdev2
     request_mmap_offset: 8388608
-    response_path: /dev/obmm_shmdev6
+    response_path: /dev/obmm_shmdev8
     response_mmap_offset: 16777216
     inbound_request_path: /dev/obmm_shmdev6
     inbound_request_mmap_offset: 8388608
-    outbound_response_path: /dev/obmm_shmdev5
+    outbound_response_path: /dev/obmm_shmdev4
     outbound_response_mmap_offset: 16777216
 YAML"
 
 step "Stop old processes"
-ssh_run "${NODE0_HOST}" "pkill -f vemb_v16_server || true; pkill -f vemb_v16_topology_ctl || true; pkill -f vemb_v16_bench || true"
-ssh_run "${NODE1_HOST}" "pkill -f vemb_v16_server || true; pkill -f vemb_v16_topology_ctl || true; pkill -f vemb_v16_bench || true"
+ssh_run "${NODE0_HOST}" "pkill -x vemb_v16_server || true; pkill -x vemb_v16_topology_ctl || true; pkill -x vemb_v16_bench || true"
+ssh_run "${NODE1_HOST}" "pkill -x vemb_v16_server || true; pkill -x vemb_v16_topology_ctl || true; pkill -x vemb_v16_bench || true"
 
 step "Start node0"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE0_LOG} ${PREFILL_OUT} ${LIVE_WRITE_OUT} ${COORD_OUT} ${COORD_ERR} ${POST_WRITE_OUT} ${POST_READ_OUT} && nohup ./src/vemb_v16_server --transport tcp --tcp-host ${NODE0_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE0_MANIFEST} --reset-warm-regions --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE0_LOG} 2>&1 &"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE0_LOG} ${PREFILL_OUT} ${LIVE_WRITE_OUT} ${LIVE_WRITE_PID} ${LIVE_WRITE_RC} ${COORD_OUT} ${COORD_ERR} ${POST_WRITE_OUT} ${POST_READ_OUT} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${NODE0_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE0_MANIFEST} --reset-warm-regions --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE0_LOG} 2>&1 </dev/null"
 
 step "Start node1"
-ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE1_LOG} && nohup ./src/vemb_v16_server --transport tcp --tcp-host ${NODE1_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE1_MANIFEST} --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE1_LOG} 2>&1 &"
+ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && rm -f ${NODE1_LOG} && setsid -f ./src/vemb_v16_server --transport tcp --tcp-host ${NODE1_HOST} --tcp-port ${SERVER_PORT} --proxy-io-threads 1 --supernode-workers 1 --warm-regions-manifest ${NODE1_MANIFEST} --dim ${DIM} --max-vectors ${MAX_VECTORS} --loglevel notice >${NODE1_LOG} 2>&1 </dev/null"
 
 sleep 2
 
@@ -171,11 +176,11 @@ ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transp
 
 if [[ "${RUN_LIVE_WRITE}" == "1" ]]; then
     step "Start live write pressure during scaleout"
-    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && nohup ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${PREFILL_KEYS} --ops ${LIVE_WRITE_OPS} --threads 2 --pipeline 1 --mode vadd --client-topology --timeout-ms 60000 >${LIVE_WRITE_OUT} 2>&1 &"
+    ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && setsid -f sh -lc 'echo \$\$ >${LIVE_WRITE_PID}; ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace ${PREFILL_KEYS} --ops ${LIVE_WRITE_OPS} --threads ${LIVE_THREADS} --pipeline 1 --mode ${LIVE_MODE} --client-topology --timeout-ms ${LIVE_TIMEOUT_MS} >${LIVE_WRITE_OUT} 2>&1 </dev/null; rc=\$?; echo \$rc >${LIVE_WRITE_RC}; exit \$rc'"
 fi
 
 step "Start coordinator listener"
-ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && nohup ./benchmark/vemb_v16_topology_ctl --coordinator-listen --transport tcp --host ${NODE0_HOST} --port ${COORD_PORT} --expected-sources 1 --migration-epoch ${MIGRATION_EPOCH} --cutover-epoch ${CUTOVER_EPOCH} --standby 0,1 --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --wait-ms 60000 --timeout-ms 5000 >${COORD_OUT} 2>${COORD_ERR} &"
+ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && setsid -f ./benchmark/vemb_v16_topology_ctl --coordinator-listen --transport tcp --host ${NODE0_HOST} --port ${COORD_PORT} --expected-sources 0 --migration-epoch ${MIGRATION_EPOCH} --cutover-epoch ${CUTOVER_EPOCH} --standby 0,1 --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --wait-ms 60000 --timeout-ms 5000 >${COORD_OUT} 2>${COORD_ERR} </dev/null"
 sleep 1
 
 step "Publish candidate topology to node1 then node0"
@@ -183,7 +188,7 @@ ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl -
 ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_topology_ctl --set --transport tcp --host ${NODE0_HOST} --port ${SERVER_PORT} --epoch ${MIGRATION_EPOCH} --min-write-epoch ${MIGRATION_EPOCH} --active 0 --standby 0,1 --dual-write --auto-scaleout --coordinated-scaleout --owner-endpoints 0=${NODE0_HOST}:${SERVER_PORT},1=${NODE1_HOST}:${SERVER_PORT} --coordinator-endpoint ${NODE0_HOST}:${COORD_PORT} --timeout-ms 5000"
 
 step "Show coordinator result"
-sleep 2
+ssh_run "${NODE0_HOST}" "for _ in \$(seq 1 60); do if grep -q '^scaleout_all_sources_done=1$' ${COORD_OUT} && grep -q '^scaleout_full_active_published=' ${COORD_OUT}; then exit 0; fi; sleep 1; done; exit 1"
 ssh_run "${NODE0_HOST}" "cat ${COORD_OUT}; echo '---'; cat ${COORD_ERR} || true"
 
 step "Show source migration summary"
@@ -199,6 +204,12 @@ ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transp
 if [[ "${RUN_POST_READ}" == "1" ]]; then
     step "Post-cutover read validation"
     ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && ./benchmark/vemb_v16_bench --transport tcp --endpoints ${NODE0_HOST}:${SERVER_PORT},${NODE1_HOST}:${SERVER_PORT} --dim ${DIM} --prefill 0 --keyspace 2000 --ops 2000 --threads 2 --pipeline 1 --mode vemb-inline --client-topology --timeout-ms 10000 >${POST_READ_OUT} 2>&1 && cat ${POST_READ_OUT}"
+fi
+
+if [[ "${RUN_LIVE_WRITE}" == "1" ]]; then
+    step "Wait live write pressure result"
+    ssh_run "${NODE0_HOST}" "pid=\$(cat ${LIVE_WRITE_PID}); for _ in \$(seq 1 240); do if ! kill -0 \$pid 2>/dev/null; then break; fi; sleep 1; done; if kill -0 \$pid 2>/dev/null; then echo 'live write still running'; exit 1; fi; grep -q '^\\[done\\]' ${LIVE_WRITE_OUT}; test \"\$(cat ${LIVE_WRITE_RC})\" = \"0\""
+    ssh_run "${NODE0_HOST}" "cat ${LIVE_WRITE_OUT}"
 fi
 
 step "Done"

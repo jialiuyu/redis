@@ -364,10 +364,12 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
     vemb_v16_timing_acc_t payload_local_slice = {0};
     vemb_v16_timing_acc_t payload_remote_slice = {0};
     vemb_v16_timing_acc_t compute = {0};
+    const char *err_reason = NULL;
     int migration_active = vemb_v16_storage_migration_active(storage);
     int needs_payload_snapshot = job->op == VEMB_V16_OP_VEMB_INLINE;
     if (!job_shape_matches_tlc(vemb_job->dim, vemb_job->vector_bytes, tlc)) {
         completion.status = VEMB_V16_STATUS_ERR;
+        err_reason = "shape_mismatch";
         goto finish_vemb_job;
     }
 
@@ -432,11 +434,49 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
                                       sample) != 0) {
                 completion.status = VEMB_V16_STATUS_ERR;
                 completion.vector_bytes = 0;
+                err_reason = "snapshot_payload_failed";
             }
         }
     }
 
 finish_vemb_job:
+    if (completion.status == VEMB_V16_STATUS_ERR) {
+        uint64_t current_epoch = 0;
+        uint64_t min_write_epoch = 0;
+        tlc_core_key_migration_info_t info = {
+            .source_owner = UINT32_MAX,
+            .target_owner = UINT32_MAX,
+        };
+        int info_rc = tlc_core_get_migration_info(tlc->core,
+                                                  vemb_job->key,
+                                                  vemb_job->key_len,
+                                                  job->key_hash,
+                                                  &info);
+        vemb_v16_storage_epoch_get(storage, &current_epoch, &min_write_epoch);
+        serverLog(LL_WARNING,
+                  "vemb_v16 vemb request failed: req_id=%u op=%u key_hash=%llu key_len=%u reason=%s dim=%u/%u vector_bytes=%u/%u request_epoch=%llu current_epoch=%llu min_write_epoch=%llu migration_active=%d needs_payload_snapshot=%d info_rc=%d state=%u info_epoch=%llu owner_epoch=%llu source=%u target=%u shard=%u",
+                  job->req_id,
+                  job->op,
+                  (unsigned long long)job->key_hash,
+                  vemb_job->key_len,
+                  err_reason ? err_reason : "unknown",
+                  vemb_job->dim,
+                  tlc->vector_dim,
+                  vemb_job->vector_bytes,
+                  tlc->value_size,
+                  (unsigned long long)job->topology_epoch,
+                  (unsigned long long)current_epoch,
+                  (unsigned long long)min_write_epoch,
+                  migration_active,
+                  needs_payload_snapshot,
+                  info_rc,
+                  info.migration_state,
+                  (unsigned long long)info.topology_epoch,
+                  (unsigned long long)info.owner_epoch,
+                  info.source_owner,
+                  info.target_owner,
+                  info.shard_id);
+    }
     if (sample) {
         vemb_v16_timing_acc_t job_total = {0};
         atomic_fetch_add_explicit(&ctx->stats->sample_count, 1, memory_order_relaxed);
@@ -805,11 +845,13 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
     vemb_v16_timing_acc_t payload_local_slice = {0};
     vemb_v16_timing_acc_t payload_remote_slice = {0};
     vemb_v16_timing_acc_t compute = {0};
+    const char *err_reason = NULL;
 
     if ((job->op == VEMB_V16_OP_VADD ||
          job->op == VEMB_V16_OP_VSIM_INLINE) &&
         !job_shape_matches_tlc(vadd_job->dim, vadd_job->vector_bytes, tlc)) {
         completion.status = VEMB_V16_STATUS_ERR;
+        err_reason = "shape_mismatch";
         goto finish_vadd_job;
     }
 
@@ -932,6 +974,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                   info.shard_id);
                     }
                     completion.status = VEMB_V16_STATUS_ERR;
+                    err_reason = "tlc_put";
                 } else {
                     completion_set_vector_handle(&completion, &handle);
                     if (!ask_redirect &&
@@ -953,6 +996,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                       (unsigned long long)handle.offset,
                                       handle.bytes);
                         }
+                        err_reason = "delta_publish";
                     }
                     if (handle.bytes > 0 &&
                         completion.status == VEMB_V16_STATUS_OK &&
@@ -1035,6 +1079,41 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
     }
 
 finish_vadd_job:
+    if (completion.status == VEMB_V16_STATUS_ERR &&
+        job->op == VEMB_V16_OP_VADD) {
+        uint64_t current_epoch = 0;
+        uint64_t min_write_epoch = 0;
+        tlc_core_key_migration_info_t info = {
+            .source_owner = UINT32_MAX,
+            .target_owner = UINT32_MAX,
+        };
+        int info_rc = tlc_core_get_migration_info(tlc->core,
+                                                  vadd_job->key,
+                                                  vadd_job->key_len,
+                                                  job->key_hash,
+                                                  &info);
+        vemb_v16_storage_epoch_get(storage, &current_epoch, &min_write_epoch);
+        serverLog(LL_WARNING,
+                  "vemb_v16 vadd request failed: req_id=%u key_hash=%llu key_len=%u reason=%s dim=%u/%u vector_bytes=%u/%u request_epoch=%llu current_epoch=%llu min_write_epoch=%llu info_rc=%d state=%u info_epoch=%llu owner_epoch=%llu source=%u target=%u shard=%u",
+                  job->req_id,
+                  (unsigned long long)job->key_hash,
+                  vadd_job->key_len,
+                  err_reason ? err_reason : "unknown",
+                  vadd_job->dim,
+                  tlc->vector_dim,
+                  vadd_job->vector_bytes,
+                  tlc->value_size,
+                  (unsigned long long)job->topology_epoch,
+                  (unsigned long long)current_epoch,
+                  (unsigned long long)min_write_epoch,
+                  info_rc,
+                  info.migration_state,
+                  (unsigned long long)info.topology_epoch,
+                  (unsigned long long)info.owner_epoch,
+                  info.source_owner,
+                  info.target_owner,
+                  info.shard_id);
+    }
     if (job->op == VEMB_V16_OP_VSIM_INLINE) {
         atomic_fetch_add_explicit(&ctx->stats->vsim_requests, 1, memory_order_relaxed);
     } else if (job->op == VEMB_V16_OP_VADD) {
