@@ -46,11 +46,7 @@ static int diag_should_log_req(uint32_t req_id) {
 }
 
 static void completion_release_payload(vemb_v16_completion_t *completion) {
-    if (!completion || !completion->inline_vector)
-        return;
-    zfree(completion->inline_vector);
-    completion->inline_vector = NULL;
-    completion->inline_vector_bytes = 0;
+    vemb_v16_completion_release_inline_snapshot(completion);
 }
 
 uint64_t vemb_v16_channel_id(vemb_v16_channel_t *ch) {
@@ -784,16 +780,21 @@ static void publish_status_response(vemb_v16_channel_t *ch,
 
 static int publish_completion_batch(vemb_v16_channel_t *ch,
                                     vemb_v16_completion_t *completions,
-                                    uint32_t n) {
-    if (n == 0)
+                                    const uint16_t *ready_indices,
+                                    uint32_t ready_count) {
+    if (ready_count == 0)
         return 0;
 
     if (ch->transport_type == VEMB_V16_TRANSPORT_TCP) {
         uint32_t published = 0;
         if (ch->net_fd < 0 ||
-            vemb_v16_tcp_publish_response_batch(ch, completions, n, &published) != 0) {
-            for (uint32_t i = 0; i < n; i++)
-                completion_release_payload(&completions[i]);
+            vemb_v16_tcp_publish_response_batch(ch,
+                                                completions,
+                                                ready_indices,
+                                                ready_count,
+                                                &published) != 0) {
+            for (uint32_t i = 0; i < ready_count; i++)
+                completion_release_payload(&completions[ready_indices[i]]);
             if (ch->net_fd >= 0) {
                 shutdown(ch->net_fd, SHUT_RDWR);
                 close(ch->net_fd);
@@ -801,21 +802,16 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
             }
             return -1;
         }
-        for (uint32_t i = 0; i < n; i++) {
-            if (completions[i].channel_id == ch->channel_id &&
-                atomic_load_explicit(&ch->active, memory_order_acquire)) {
-                channel_note_response_status(ch, completions[i].status);
-            }
-        }
-        for (uint32_t i = 0; i < n; i++)
-            completion_release_payload(&completions[i]);
+        for (uint32_t i = 0; i < ready_count; i++)
+            channel_note_response_status(ch,
+                                         completions[ready_indices[i]].status);
+        for (uint32_t i = 0; i < ready_count; i++)
+            completion_release_payload(&completions[ready_indices[i]]);
     } else {
-        for (uint32_t i = 0; i < n; i++) {
-            if (completions[i].channel_id == ch->channel_id &&
-                atomic_load_explicit(&ch->active, memory_order_acquire)) {
-                publish_response(ch, &completions[i]);
-            }
-            completion_release_payload(&completions[i]);
+        for (uint32_t i = 0; i < ready_count; i++) {
+            uint16_t idx = ready_indices[i];
+            publish_response(ch, &completions[idx]);
+            completion_release_payload(&completions[idx]);
         }
     }
     return 0;
@@ -1130,6 +1126,7 @@ error_response:
 /// Response scheduling: drain SuperNode completions and publish by transport.
 static int drain_completions(vemb_v16_channel_t *ch) {
     vemb_v16_completion_t completions[VEMB_V16_PROXY_BATCH];
+    uint16_t ready_indices[VEMB_V16_PROXY_BATCH];
     uint32_t n;
     uint32_t total = 0;
     while ((n = vemb_v16_aeron_poll_batch(&ch->completion_ring,
@@ -1159,11 +1156,12 @@ static int drain_completions(vemb_v16_channel_t *ch) {
                 completion_release_payload(&completions[i]);
                 continue;
             }
-            if (ready_count != i)
-                completions[ready_count] = completions[i];
-            ready_count++;
+            ready_indices[ready_count++] = (uint16_t)i;
         }
-        if (publish_completion_batch(ch, completions, ready_count) != 0) {
+        if (publish_completion_batch(ch,
+                                     completions,
+                                     ready_indices,
+                                     ready_count) != 0) {
             return -1;
         }
     }
@@ -1892,8 +1890,8 @@ static void apply_vadd_job(vemb_v16_supernode_ctx_t *ctx,
 
 static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx) {
 #ifdef __linux__
-    if (!ctx->completion_notify_armed || !ctx->completion_notify_fd)
-        return;
+    assert(ctx->completion_notify_armed != NULL);
+    assert(ctx->completion_notify_fd != NULL);
     int expected = 1;
     if (!atomic_compare_exchange_strong_explicit(ctx->completion_notify_armed,
                                                  &expected,

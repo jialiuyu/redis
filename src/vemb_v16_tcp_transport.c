@@ -453,9 +453,10 @@ int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp)
 
 /// TCP transport: batch completion responses into writev/backlog output.
 int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
-                               const vemb_v16_completion_t *completions,
-                               uint32_t n,
-                               uint32_t *published) {
+                                        const vemb_v16_completion_t *completions,
+                                        const uint16_t *completion_indices,
+                                        uint32_t ready_count,
+                                        uint32_t *published) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
         uint32_t net_flags = 0;
         vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
@@ -465,16 +466,15 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
         int iovcnt = 0;
         uint32_t out = 0;
 
-        for (uint32_t i = 0; i < n; i++) {
-            if (completions[i].channel_id != vemb_v16_channel_id(ch) ||
-                !vemb_v16_channel_active(ch)) {
-                continue;
-            }
+        for (uint32_t i = 0; i < ready_count; i++) {
+            uint16_t completion_index = completion_indices[i];
+            const vemb_v16_completion_t *completion =
+                &completions[completion_index];
 
-            vemb_v16_make_response_from(&responses[out], &completions[i]);
+            vemb_v16_make_response_from(&responses[out], completion);
             const uint8_t *vector = NULL;
             uint32_t vector_bytes = 0;
-            if (tcp_completion_inline_vector(&completions[i],
+            if (tcp_completion_inline_vector(completion,
                                              &responses[out],
                                              &vector,
                                              &vector_bytes) != 0)
@@ -494,9 +494,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 serverLog(LL_DEBUG,
                           "vemb_v16 diag tcp writev batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
                           (unsigned long long)vemb_v16_channel_id(ch),
-                          i,
+                          completion_index,
                           out,
-                          n,
+                          ready_count,
                           responses[out].req_id,
                           responses[out].op,
                           responses[out].status,
@@ -543,16 +543,15 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
     uint32_t out = 0;
     size_t total_bytes = 0;
 
-    for (uint32_t i = 0; i < n; i++) {
-        if (completions[i].channel_id != vemb_v16_channel_id(ch) ||
-            !vemb_v16_channel_active(ch)) {
-            continue;
-        }
+    for (uint32_t i = 0; i < ready_count; i++) {
+        uint16_t completion_index = completion_indices[i];
+        const vemb_v16_completion_t *completion =
+            &completions[completion_index];
 
-        vemb_v16_make_response_from(&responses[out], &completions[i]);
+        vemb_v16_make_response_from(&responses[out], completion);
         const uint8_t *vector = NULL;
         uint32_t vector_bytes = 0;
-        if (tcp_completion_inline_vector(&completions[i],
+        if (tcp_completion_inline_vector(completion,
                                          &responses[out],
                                          &vector,
                                          &vector_bytes) != 0)
@@ -572,9 +571,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
             serverLog(LL_DEBUG,
                       "vemb_v16 diag tcp writev batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
                       (unsigned long long)vemb_v16_channel_id(ch),
-                      i,
+                      completion_index,
                       out,
-                      n,
+                      ready_count,
                       responses[out].req_id,
                       responses[out].op,
                       responses[out].status,

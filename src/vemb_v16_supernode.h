@@ -26,6 +26,8 @@ typedef struct vemb_v16_supernode_scratch {
     vemb_v16_job_ref_t *job_refs;
 } vemb_v16_supernode_scratch_t;
 
+void vemb_v16_completion_release_inline_snapshot(
+    vemb_v16_completion_t *completion);
 int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch);
 void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch);
 void vemb_v16_supernode_handle_base_job(vemb_v16_supernode_ctx_t *ctx,

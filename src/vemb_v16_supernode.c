@@ -23,6 +23,12 @@
 #define VEMB_V16_SUPERNODE_BATCH 32u
 #define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
 
+typedef struct vemb_v16_inline_snapshot {
+    uint32_t payload_bytes;
+    uint32_t reserved;
+    uint8_t payload[];
+} vemb_v16_inline_snapshot_t;
+
 static int diag_should_log_req(uint32_t req_id) {
     return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
 }
@@ -136,6 +142,34 @@ static void completion_set_vector_handle(
     completion->owner_generation = handle->owner_generation;
 }
 
+static vemb_v16_inline_snapshot_t *inline_snapshot_from_payload(
+    const uint8_t *payload) {
+    assert(payload != NULL);
+    return (vemb_v16_inline_snapshot_t *)(payload -
+                                          offsetof(vemb_v16_inline_snapshot_t,
+                                                   payload));
+}
+
+static uint8_t *completion_alloc_inline_snapshot(uint32_t vector_bytes) {
+    size_t bytes = sizeof(vemb_v16_inline_snapshot_t) + vector_bytes;
+    vemb_v16_inline_snapshot_t *snapshot = zmalloc(bytes);
+    RETURN_IF(!snapshot, NULL);
+    snapshot->payload_bytes = vector_bytes;
+    snapshot->reserved = 0;
+    return snapshot->payload;
+}
+
+void vemb_v16_completion_release_inline_snapshot(
+    vemb_v16_completion_t *completion) {
+    RETURN_IF(!completion || !completion->inline_vector);
+    vemb_v16_inline_snapshot_t *snapshot =
+        inline_snapshot_from_payload(completion->inline_vector);
+    assert(snapshot->payload_bytes == completion->inline_vector_bytes);
+    zfree(snapshot);
+    completion->inline_vector = NULL;
+    completion->inline_vector_bytes = 0;
+}
+
 static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
                                  vemb_v16_tlc_t *tlc,
                                  uint8_t op,
@@ -146,7 +180,8 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
                                  vemb_v16_timing_acc_t *payload_remote_slice,
                                  int sample) {
     RETURN_IF(op != VEMB_V16_OP_VEMB_INLINE, -1);
-    completion->inline_vector = zmalloc(vector_bytes);
+    completion->inline_vector =
+        completion_alloc_inline_snapshot(vector_bytes);
     RETURN_IF(!completion->inline_vector, -1);
 
     uint32_t vector_len = 0;
@@ -163,9 +198,7 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
                                               sample,
                                               vector_load_start);
     if (copy_rc != 0 || vector_len != vector_bytes) {
-        zfree(completion->inline_vector);
-        completion->inline_vector = NULL;
-        completion->inline_vector_bytes = 0;
+        vemb_v16_completion_release_inline_snapshot(completion);
         return -1;
     }
 
