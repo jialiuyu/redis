@@ -30,7 +30,7 @@
 #define VEMB_V16_BENCH_PATH_MAX 256
 
 typedef struct bench_hash_node {
-    uint32_t hash_value;
+    uint64_t hash_value;
     uint32_t node_index;
 } bench_hash_node_t;
 
@@ -676,7 +676,8 @@ static int build_hash_ring(bench_cfg_t *cfg) {
             snprintf(vnode_key, sizeof(vnode_key),
                      "supernode_%u_vnode_%u", node, vnode_id);
             cfg->hash_nodes[cfg->hash_node_count++] = (bench_hash_node_t){
-                .hash_value = vemb_v16_murmur3(vnode_key, strlen(vnode_key)),
+                .hash_value = vemb_v16_xxh3_64_str(vnode_key,
+                                                   strlen(vnode_key)),
                 .node_index = node,
             };
         }
@@ -688,7 +689,7 @@ static int build_hash_ring(bench_cfg_t *cfg) {
     return 0;
 }
 
-static uint32_t route_hash(const bench_cfg_t *cfg, uint32_t hash) {
+static uint32_t route_hash(const bench_cfg_t *cfg, uint64_t hash) {
     if (cfg && cfg->client_topology_valid) {
         uint32_t owner =
             vemb_v16_topology_ring_owner(&cfg->client_topology.active_ring,
@@ -711,7 +712,7 @@ static uint32_t route_hash(const bench_cfg_t *cfg, uint32_t hash) {
 }
 
 static uint32_t route_key(const bench_cfg_t *cfg, const char *key) {
-    return route_hash(cfg, vemb_v16_murmur3(key, strlen(key)));
+    return route_hash(cfg, vemb_v16_xxh3_64_str(key, strlen(key)));
 }
 
 static uint32_t workload_keyspace(const bench_cfg_t *cfg) {
@@ -766,7 +767,7 @@ static void prepare_req(vemb_v16_req_t *req,
     req->req_id = req_id;
     req->channel_id = channel_id;
     req->key_len = (uint32_t)strlen(key);
-    req->key_hash = vemb_v16_murmur3(key, req->key_len);
+    req->key_hash = vemb_v16_xxh3_64_str(key, req->key_len);
     req->dim = dim;
     req->vector_bytes = dim * sizeof(float);
     memcpy(req->key, key, req->key_len);
@@ -774,7 +775,7 @@ static void prepare_req(vemb_v16_req_t *req,
 
 static void prepare_req_key2(vemb_v16_req_t *req, const char *key2) {
     req->key2_len = (uint32_t)strlen(key2);
-    req->key2_hash = vemb_v16_murmur3(key2, req->key2_len);
+    req->key2_hash = vemb_v16_xxh3_64_str(key2, req->key2_len);
     memcpy(req->key2, key2, req->key2_len);
 }
 
@@ -1286,7 +1287,7 @@ static uint8_t send_read_with_client_topology(
     }
 
     for (uint32_t attempt = 0; attempt < 256; attempt++) {
-        uint32_t active_owner = route_hash(cfg, (uint32_t)req->key_hash);
+        uint32_t active_owner = route_hash(cfg, req->key_hash);
         if (active_owner >= *node_count)
             return VEMB_V16_STATUS_ERR;
         req->topology_epoch = cfg->client_topology.current_topology_epoch;

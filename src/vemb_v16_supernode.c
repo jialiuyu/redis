@@ -1000,7 +1000,7 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                     }
                     if (handle.bytes > 0 &&
                         completion.status == VEMB_V16_STATUS_OK &&
-                        tlc->remote_meta_view_count > 1 &&
+                        vemb_v16_tlc_remote_meta_owner_view_count(tlc) > 1 &&
                         enqueue_remote_meta_publish(tlc,
                                                     tlc->remote_meta_view,
                                                     vadd_job->key,

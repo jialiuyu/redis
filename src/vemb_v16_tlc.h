@@ -17,6 +17,9 @@ typedef struct vemb_v16_remote_meta_view vemb_v16_remote_meta_view_t;
 typedef struct vemb_v16_tlc vemb_v16_tlc_t;
 typedef struct vemb_v16_tlc_remote_meta_publisher
     vemb_v16_tlc_remote_meta_publisher_t;
+typedef struct vemb_v16_ub_rpc vemb_v16_ub_rpc_t;
+typedef struct vemb_v16_tlc_access_snapshot
+    vemb_v16_tlc_access_snapshot_t;
 typedef uint32_t (*vemb_v16_tlc_owner_resolver_fn)(uint64_t key_hash,
                                                    const char *key,
                                                    uint32_t key_len,
@@ -108,20 +111,33 @@ struct vemb_v16_tlc {
     uint32_t backend_type;
     uint32_t warm_region_count;
     vemb_v16_tlc_warm_region_t *warm_regions;
+    atomic_uint_fast32_t runtime_warm_region_count;
+    vemb_v16_tlc_warm_region_t runtime_warm_regions[TLC_CORE_MAX_WARM_REGIONS];
     uint32_t region_index_id_mapping_count;
     vemb_v16_tlc_region_index_id_mapping_t
         region_index_id_mappings[TLC_CORE_MAX_WARM_REGIONS];
+    vemb_v16_tlc_region_index_id_mapping_t
+        runtime_region_index_id_mappings[TLC_CORE_MAX_WARM_REGIONS];
     state_bitmap_t bitmap;
     sve_operation_stats_t sve_stats;
     tlc_core_t *core;
     vemb_v16_remote_meta_view_t *remote_meta_view;
     uint32_t remote_meta_retry_budget;
+    /*
+     * Legacy mirrors of the currently published access snapshot.
+     * Read paths should acquire the snapshot instead of touching these fields.
+     */
     uint32_t remote_meta_view_count;
     vemb_v16_tlc_remote_meta_owner_view_t remote_meta_views[VEMB_V16_TLC_MAX_REMOTE_META_VIEWS];
     vemb_v16_tlc_owner_resolver_fn owner_resolver;
     void *owner_resolver_arg;
     vemb_v16_tlc_lookup_rpc_fn lookup_rpc;
     void *lookup_rpc_arg;
+    vemb_v16_ub_rpc_t *lookup_rpc_runtime;
+    _Atomic(vemb_v16_ub_rpc_t *) current_lookup_rpc_runtime;
+    _Atomic(vemb_v16_tlc_access_snapshot_t *) access_snapshot;
+    pthread_mutex_t access_snapshot_update_lock;
+    uint32_t access_snapshot_update_lock_init;
     pthread_mutex_t migration_progress_lock;
     uint32_t migration_progress_lock_init;
     uint32_t migration_progress_count;
@@ -163,6 +179,8 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
                         const vemb_v16_tlc_warm_region_t *warm_regions,
                         uint32_t warm_region_count,
                         uint32_t local_region_weight);
+int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
+                                    const vemb_v16_tlc_warm_region_t *warm_region);
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc);
 
 int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
@@ -209,9 +227,17 @@ int enqueue_remote_meta_publish(vemb_v16_tlc_t *tlc,
                                 int is_repair);
 uint32_t vemb_v16_tlc_flush_remote_meta_publishes(vemb_v16_tlc_t *tlc,
                                                   uint32_t budget);
+uint32_t vemb_v16_tlc_remote_meta_owner_view_count(vemb_v16_tlc_t *tlc);
 void vemb_v16_tlc_set_lookup_rpc(vemb_v16_tlc_t *tlc,
                                  vemb_v16_tlc_lookup_rpc_fn fn,
                                  void *arg);
+void vemb_v16_tlc_install_lookup_runtime(vemb_v16_tlc_t *tlc,
+                                         vemb_v16_ub_rpc_t *rpc,
+                                         vemb_v16_tlc_lookup_rpc_fn fn,
+                                         void *arg,
+                                         vemb_v16_ub_rpc_t **old_out);
+void vemb_v16_tlc_clear_lookup_runtime(vemb_v16_tlc_t *tlc,
+                                       vemb_v16_ub_rpc_t *rpc);
 int vemb_v16_tlc_lookup_rpc_local_handler(
     void *arg,
     const vemb_v16_ub_lookup_rpc_req_t *req,

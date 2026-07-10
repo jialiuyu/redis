@@ -3,6 +3,7 @@
 #include "macro.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
+#include "vemb_v16_net.h"
 #include "vemb_v16_util.h"
 #include "zmalloc.h"
 
@@ -13,7 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
+#include <unistd.h>
 
 static char *trim_ws(char *s) {
     while (*s && isspace((unsigned char)*s)) s++;
@@ -71,22 +75,26 @@ static uint32_t storage_owner_resolver(uint64_t key_hash,
     (void)key;
     (void)key_len;
     const vemb_v16_storage_ctx_t *storage = arg;
-    if (storage->owner_ring.node_count > 0)
-        return vemb_v16_topology_ring_owner(&storage->owner_ring, key_hash);
+    const vemb_v16_storage_owner_resolver_snapshot_t *snapshot =
+        &storage->owner_resolver_snapshots[atomic_load_explicit(
+            &storage->owner_resolver_active_snapshot,
+            memory_order_acquire)];
+    if (snapshot->owner_ring.node_count > 0)
+        return vemb_v16_topology_ring_owner(&snapshot->owner_ring, key_hash);
 
     uint32_t hash = (uint32_t)key_hash;
     uint32_t left = 0;
-    uint32_t right = storage->owner_hash_node_count;
+    uint32_t right = snapshot->owner_hash_node_count;
     while (left < right) {
         uint32_t mid = left + (right - left) / 2;
-        if (storage->owner_hash_nodes[mid].hash_value < hash)
+        if (snapshot->owner_hash_nodes[mid].hash_value < hash)
             left = mid + 1;
         else
             right = mid;
     }
-    if (left >= storage->owner_hash_node_count)
+    if (left >= snapshot->owner_hash_node_count)
         left = 0;
-    return storage->owner_hash_nodes[left].owner_id;
+    return snapshot->owner_hash_nodes[left].owner_id;
 }
 
 static int parse_bool_value(const char *s, uint32_t *out) {
@@ -112,6 +120,68 @@ static int parse_backend_value(const char *s, uint32_t *out) {
         return 0;
     }
     return -1;
+}
+
+static int storage_owner_snapshot_build(
+        vemb_v16_storage_owner_resolver_snapshot_t *snapshot,
+        const vemb_v16_topology_ring_t *ring) {
+    RETURN_IF(!snapshot || !ring, -1);
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->owner_ring = *ring;
+    RETURN_IF(snapshot->owner_ring.node_count >
+              VEMB_V16_STORAGE_MAX_OWNER_HASH_NODES,
+              -1);
+    snapshot->owner_hash_node_count = snapshot->owner_ring.node_count;
+    for (uint32_t i = 0; i < snapshot->owner_hash_node_count; i++) {
+        snapshot->owner_hash_nodes[i] = (vemb_v16_storage_owner_hash_node_t){
+            .hash_value = snapshot->owner_ring.nodes[i].hash_value,
+            .owner_id = snapshot->owner_ring.nodes[i].owner_id,
+        };
+    }
+    return 0;
+}
+
+static int storage_owner_snapshot_publish(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_topology_ring_t *ring) {
+    RETURN_IF(!storage || !ring, -1);
+    uint32_t active = atomic_load_explicit(&storage->owner_resolver_active_snapshot,
+                                           memory_order_relaxed);
+    uint32_t publish_slot = active ^ 1u;
+    RETURN_IF(storage_owner_snapshot_build(
+                  &storage->owner_resolver_snapshots[publish_slot],
+                  ring) != 0,
+              -1);
+    atomic_store_explicit(&storage->owner_resolver_active_snapshot,
+                          publish_slot,
+                          memory_order_release);
+    return 0;
+}
+
+static int storage_owner_snapshot_stage_pending(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_topology_ring_t *ring) {
+    RETURN_IF(!storage || !ring, -1);
+    uint32_t active = atomic_load_explicit(&storage->owner_resolver_active_snapshot,
+                                           memory_order_relaxed);
+    uint32_t pending_slot = active ^ 1u;
+    RETURN_IF(storage_owner_snapshot_build(
+                  &storage->owner_resolver_snapshots[pending_slot],
+                  ring) != 0,
+              -1);
+    storage->owner_resolver_pending_snapshot = pending_slot;
+    storage->owner_resolver_pending_valid = 1;
+    return 0;
+}
+
+static int storage_owner_snapshot_publish_pending(
+        vemb_v16_storage_ctx_t *storage) {
+    RETURN_IF(!storage || !storage->owner_resolver_pending_valid, -1);
+    atomic_store_explicit(&storage->owner_resolver_active_snapshot,
+                          storage->owner_resolver_pending_snapshot,
+                          memory_order_release);
+    storage->owner_resolver_pending_valid = 0;
+    return 0;
 }
 
 static void manifest_region_defaults(vemb_v16_manifest_region_t *region,
@@ -196,6 +266,10 @@ static int manifest_push_ub_rpc_peer(
     manifest->ub_rpc_peers[manifest->ub_rpc_peer_count++] = *peer;
     return 0;
 }
+
+static int storage_cache_ub_rpc_peer_config(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_manifest_ub_rpc_peer_t *src);
 
 static int storage_remote_meta_open_view(vemb_v16_storage_ctx_t *storage,
                                          uint32_t owner_supernode_id,
@@ -477,38 +551,38 @@ static int storage_owner_resolver_init(
         return 0;
 
     qsort(owners, owner_count, sizeof(owners[0]), cmp_u32);
+    vemb_v16_topology_ring_t owner_ring;
     RETURN_IF(vemb_v16_topology_ring_build(
-                  &storage->owner_ring,
+                  &owner_ring,
                   0,
                   owners,
                   owner_count,
                   VEMB_V16_STORAGE_OWNER_HASH_VNODES) !=
               VEMB_V16_TOPOLOGY_OK,
               -1);
-    RETURN_IF(storage->owner_ring.node_count >
+    RETURN_IF(owner_ring.node_count >
               VEMB_V16_STORAGE_MAX_OWNER_HASH_NODES,
               -1);
-    storage->owner_hash_node_count = storage->owner_ring.node_count;
-    for (uint32_t i = 0; i < storage->owner_hash_node_count; i++) {
-        storage->owner_hash_nodes[i] =
-            (vemb_v16_storage_owner_hash_node_t){
-                .hash_value = storage->owner_ring.nodes[i].hash_value,
-                .owner_id = storage->owner_ring.nodes[i].owner_id,
-            };
-    }
+    RETURN_IF(storage_owner_snapshot_publish(storage, &owner_ring) != 0, -1);
     vemb_v16_tlc_set_owner_resolver(storage->tlc,
                                     storage_owner_resolver,
                                     storage);
     serverLog(LL_NOTICE,
               "vemb_v16 storage owner resolver ready: owners=%u hash_nodes=%u local_owner=%u",
               owner_count,
-              storage->owner_hash_node_count,
+              owner_ring.node_count,
               manifest->has_local_ub_node_id ? manifest->local_ub_node_id : 0);
     return 0;
 }
 
 static int storage_ub_rpc_init(vemb_v16_storage_ctx_t *storage,
                                const vemb_v16_warm_regions_manifest_t *manifest) {
+    storage->ub_rpc_timeout_ms = manifest->ub_rpc_timeout_ms;
+    storage->ub_rpc_peer_config_count = 0;
+    for (uint32_t i = 0; i < manifest->ub_rpc_peer_count; i++) {
+        RETURN_IF(!!storage_cache_ub_rpc_peer_config(storage, &manifest->ub_rpc_peers[i]),
+                  -1);
+    }
     if (manifest->ub_rpc_peer_count == 0)
         return 0;
 
@@ -538,11 +612,299 @@ static int storage_ub_rpc_init(vemb_v16_storage_ctx_t *storage,
                   manifest->ub_rpc_peer_count);
         return -1;
     }
+    vemb_v16_ub_rpc_install_lookup_runtime(storage->tlc, storage->ub_rpc, NULL);
     serverLog(LL_NOTICE,
               "vemb_v16 ub rpc ready: local_owner=%u peers=%u timeout_ms=%u",
               local_owner_id,
               manifest->ub_rpc_peer_count,
               manifest->ub_rpc_timeout_ms);
+    return 0;
+}
+
+static int storage_has_region_id(const vemb_v16_storage_ctx_t *storage,
+                                 uint32_t region_id) {
+    for (uint32_t i = 0; i < storage->warm_region_count; i++) {
+        if (storage->warm_providers[i].region.region_id == region_id)
+            return 1;
+    }
+    return 0;
+}
+
+static int storage_has_region_for_owner(const vemb_v16_storage_ctx_t *storage,
+                                        uint32_t owner_id) {
+    for (uint32_t i = 0; i < storage->warm_region_count; i++) {
+        if (storage->warm_providers[i].region.home_ub_node_id == owner_id)
+            return 1;
+    }
+    return 0;
+}
+
+static int storage_has_remote_meta_owner_view(const vemb_v16_storage_ctx_t *storage,
+                                              uint32_t owner_id) {
+    for (uint32_t i = 0; i < storage->remote_meta_owner_view_count; i++) {
+        if (storage->remote_meta_owner_views[i].owner_id == owner_id)
+            return 1;
+    }
+    return 0;
+}
+
+static const vemb_v16_manifest_remote_meta_view_t *
+storage_find_remote_meta_view_config(const vemb_v16_storage_ctx_t *storage,
+                                     uint32_t owner_id) {
+    for (uint32_t i = 0; i < storage->peer_remote_meta_view_config_count; i++) {
+        if (storage->peer_remote_meta_view_configs[i].owner_id == owner_id)
+            return &storage->peer_remote_meta_view_configs[i];
+    }
+    return NULL;
+}
+
+static const vemb_v16_manifest_ub_rpc_peer_t *
+storage_find_ub_rpc_peer_config(const vemb_v16_storage_ctx_t *storage,
+                                uint32_t owner_id) {
+    for (uint32_t i = 0; i < storage->ub_rpc_peer_config_count; i++) {
+        if (storage->ub_rpc_peer_configs[i].owner_id == owner_id)
+            return &storage->ub_rpc_peer_configs[i];
+    }
+    return NULL;
+}
+
+static int storage_cache_peer_region_config(vemb_v16_storage_ctx_t *storage,
+                                            const vemb_v16_manifest_region_t *src) {
+    for (uint32_t i = 0; i < storage->peer_region_config_count; i++) {
+        vemb_v16_manifest_region_t *dst = &storage->peer_region_configs[i];
+        if (dst->region_id != src->region_id)
+            continue;
+        RETURN_IF(memcmp(dst, src, sizeof(*src)) != 0, -1);
+        return 0;
+    }
+    RETURN_IF(storage->peer_region_config_count >= VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS, -1);
+    storage->peer_region_configs[storage->peer_region_config_count++] = *src;
+    return 0;
+}
+
+static int storage_cache_remote_meta_view_config(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_manifest_remote_meta_view_t *src) {
+    RETURN_IF(!storage || !src || !src->has_owner_id, -1);
+    for (uint32_t i = 0; i < storage->peer_remote_meta_view_config_count; i++) {
+        vemb_v16_manifest_remote_meta_view_t *dst =
+            &storage->peer_remote_meta_view_configs[i];
+        if (dst->owner_id != src->owner_id)
+            continue;
+        RETURN_IF(memcmp(dst, src, sizeof(*src)) != 0, -1);
+        return 0;
+    }
+    RETURN_IF(storage->peer_remote_meta_view_config_count >=
+                  VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS,
+              -1);
+    storage->peer_remote_meta_view_configs
+        [storage->peer_remote_meta_view_config_count++] = *src;
+    return 0;
+}
+
+static int storage_cache_ub_rpc_peer_config(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_manifest_ub_rpc_peer_t *src) {
+    RETURN_IF(!storage || !src || !src->has_owner_id, -1);
+    for (uint32_t i = 0; i < storage->ub_rpc_peer_config_count; i++) {
+        vemb_v16_manifest_ub_rpc_peer_t *dst =
+            &storage->ub_rpc_peer_configs[i];
+        if (dst->owner_id != src->owner_id)
+            continue;
+        RETURN_IF(memcmp(dst, src, sizeof(*src)) != 0, -1);
+        return 0;
+    }
+    RETURN_IF(storage->ub_rpc_peer_config_count >=
+                  VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS,
+              -1);
+    storage->ub_rpc_peer_configs[storage->ub_rpc_peer_config_count++] = *src;
+    return 0;
+}
+
+static int storage_attach_remote_meta_owner_view_config(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_manifest_remote_meta_view_t *src) {
+    RETURN_IF(!storage || !src || !src->has_owner_id || !src->path[0], -1);
+    if (storage_has_remote_meta_owner_view(storage, src->owner_id))
+        return 0;
+    RETURN_IF(storage->remote_meta_owner_view_count >=
+                  VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS,
+              -1);
+    vemb_v16_storage_remote_meta_view_t *dst =
+        &storage->remote_meta_owner_views[storage->remote_meta_owner_view_count];
+    memset(dst, 0, sizeof(*dst));
+    dst->mapping.fd = -1;
+    dst->owner_id = src->owner_id;
+    dst->backend_type = src->has_backend_type ?
+        src->backend_type : VEMB_V16_REGION_LOCAL_SHM;
+    dst->mmap_offset = src->mmap_offset;
+    dst->entry_count = src->entry_count;
+    dst->bucket_count = src->bucket_count;
+    dst->set_count = src->set_count;
+    dst->ways = src->ways;
+    strncpy(dst->path, src->path, sizeof(dst->path) - 1);
+    RETURN_IF(storage_remote_meta_open_view(storage,
+                                            dst->owner_id,
+                                            dst->backend_type,
+                                            dst->path,
+                                            dst->mmap_offset,
+                                            dst->entry_count,
+                                            dst->bucket_count,
+                                            dst->set_count,
+                                            dst->ways,
+                                            0,
+                                            &dst->mapping,
+                                            &dst->is_mapped,
+                                            &dst->base,
+                                            &dst->bytes,
+                                            &dst->entry_count,
+                                            &dst->bucket_count,
+                                            &dst->set_count,
+                                            &dst->ways,
+                                            &dst->view) != 0,
+              -1);
+    RETURN_IF(vemb_v16_tlc_set_remote_meta_owner_view(storage->tlc,
+                                                      dst->owner_id,
+                                                      &dst->view) != 0,
+              -1);
+    storage->remote_meta_owner_view_count++;
+    serverLog(LL_NOTICE,
+              "vemb_v16 runtime remote_meta owner view attached: local_owner=%u peer_owner=%u path=%s",
+              storage->local_owner_id,
+              dst->owner_id,
+              dst->path);
+    return 0;
+}
+
+static int reset_ub_rpc_ring_backing(
+        const vemb_v16_ub_rpc_ring_config_t *ring,
+        int is_response_ring);
+
+static int storage_attach_ub_rpc_peer_config(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_manifest_ub_rpc_peer_t *src) {
+    RETURN_IF(!storage || !src || !src->has_owner_id, -1);
+    if (vemb_v16_ub_rpc_has_peer(storage->ub_rpc, src->owner_id))
+        return 0;
+    vemb_v16_ub_rpc_peer_t peer = {
+        .owner_id = src->owner_id,
+        .request = src->request,
+        .response = src->response,
+        .inbound_request = src->inbound_request,
+        .outbound_response = src->outbound_response,
+    };
+    RETURN_IF(vemb_v16_ub_rpc_attach_peer(&storage->ub_rpc,
+                                          storage->tlc,
+                                          storage->local_owner_id,
+                                          storage->ub_rpc_timeout_ms,
+                                          &peer) != 0,
+              -1);
+    if (!storage->migration_retry_thread_started) {
+        RETURN_IF(vemb_v16_storage_migration_retry_start(storage, 0, 0) != 0,
+                  -1);
+    }
+    serverLog(LL_NOTICE,
+              "vemb_v16 runtime ub rpc peer attached: local_owner=%u peer_owner=%u req=%s resp=%s",
+              storage->local_owner_id,
+              peer.owner_id,
+              peer.request.path,
+              peer.response.path);
+    return 0;
+}
+
+static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
+                                             const vemb_v16_manifest_region_t *src) {
+    RETURN_IF(src->region_id == 0 || !src->path[0], -1);
+    RETURN_IF(src->backend_type != VEMB_V16_REGION_UB, -1);
+    RETURN_IF(storage_has_region_id(storage, src->region_id), 0);
+    RETURN_IF(storage->warm_region_count >= VEMB_V16_MAX_MANIFEST_REGIONS, -1);
+
+    uint32_t i = storage->warm_region_count;
+    uint32_t capacity_slots = (uint32_t)(src->region_bytes / src->value_size);
+    size_t allocator_layout_bytes = vemb_v16_shared_allocator_layout_bytes(capacity_slots);
+
+    storage->warm_providers[i].fd = -1;
+    storage->warm_allocators[i].fd = -1;
+    storage->warm_data_mappings[i].fd = -1;
+    storage->warm_allocator_mappings[i].fd = -1;
+
+    if (src->is_local) {
+        RETURN_IF(vemb_v16_shared_allocator_reset(src->backend_type,
+                                                  src->path,
+                                                  src->mmap_offset,
+                                                  src->region_id,
+                                                  capacity_slots) != 0,
+                  -1);
+    }
+    RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
+                                          src->backend_type,
+                                          src->path,
+                                          src->mmap_offset,
+                                          allocator_layout_bytes +
+                                              (size_t)src->region_bytes) != 0,
+              -1);
+    RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
+                                            &storage->warm_data_mappings[i],
+                                            allocator_layout_bytes,
+                                            src->region_id,
+                                            src->backend_type,
+                                            src->path,
+                                            src->mmap_offset +
+                                                allocator_layout_bytes,
+                                            src->value_size,
+                                            src->region_bytes,
+                                            src->home_ub_node_id,
+                                            src->is_local,
+                                            src->weight ? src->weight : 1) != 0,
+              -1);
+    RETURN_IF(vemb_v16_shared_allocator_attach(&storage->warm_allocators[i],
+                                               &storage->warm_data_mappings[i],
+                                               0,
+                                               src->backend_type,
+                                               src->path,
+                                               src->mmap_offset,
+                                               src->region_id,
+                                               capacity_slots) != 0,
+              -1);
+
+    vemb_v16_tlc_warm_region_t warm_region = storage->warm_providers[i].region;
+    warm_region.shared_allocator = storage->warm_allocators[i].allocator;
+    RETURN_IF(vemb_v16_tlc_attach_warm_region(storage->tlc, &warm_region) != 0, -1);
+    storage->warm_region_count++;
+    serverLog(LL_NOTICE,
+              "vemb_v16 runtime warm region attached: local_owner=%u peer_owner=%u region_id=%u backend=%u path=%s bytes=%llu",
+              storage->local_owner_id,
+              src->home_ub_node_id,
+              src->region_id,
+              src->backend_type,
+              src->path,
+              (unsigned long long)src->region_bytes);
+    return 0;
+}
+
+static int storage_attach_peer_owner_from_mapping(
+        vemb_v16_storage_ctx_t *storage,
+        uint32_t owner_id) {
+    RETURN_IF(!storage || owner_id == UINT32_MAX, -1);
+    for (uint32_t i = 0; i < storage->peer_region_config_count; i++) {
+        const vemb_v16_manifest_region_t *region = &storage->peer_region_configs[i];
+        if (region->home_ub_node_id != owner_id)
+            continue;
+        RETURN_IF(storage_attach_warm_region_config(storage, region) != 0, -1);
+    }
+    const vemb_v16_manifest_remote_meta_view_t *view =
+        storage_find_remote_meta_view_config(storage, owner_id);
+    if (view) {
+        RETURN_IF(storage_attach_remote_meta_owner_view_config(storage,
+                                                               view) != 0,
+                  -1);
+    }
+    const vemb_v16_manifest_ub_rpc_peer_t *rpc =
+        storage_find_ub_rpc_peer_config(storage, owner_id);
+    if (rpc) {
+        RETURN_IF(storage_attach_ub_rpc_peer_config(storage, rpc) != 0,
+                  -1);
+    }
     return 0;
 }
 
@@ -998,7 +1360,8 @@ static int reset_remote_meta_backing(uint32_t owner_id,
 }
 
 static int reset_ub_rpc_ring_backing(
-        const vemb_v16_ub_rpc_ring_config_t *ring) {
+        const vemb_v16_ub_rpc_ring_config_t *ring,
+        int is_response_ring) {
     if (!ring || !ring->path[0])
         return 0;
     if (ring->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
@@ -1013,10 +1376,18 @@ static int reset_ub_rpc_ring_backing(
         return 0;
     }
     if (ring->backend_type == VEMB_V16_REGION_UB) {
+        int rc = is_response_ring ?
+            vemb_v16_ub_rpc_reset_response_ring(ring) :
+            vemb_v16_ub_rpc_reset_request_ring(ring);
+        int reset_errno = errno;
         serverLog(LL_NOTICE,
-                  "skip reset ub rpc ub ring: path=%s offset=%llu",
+                  "reset ub rpc ub ring: path=%s offset=%llu rc=%d status=%s kind=%s",
                   ring->path,
-                  (unsigned long long)ring->mmap_offset);
+                  (unsigned long long)ring->mmap_offset,
+                  rc,
+                  strerror(reset_errno),
+                  is_response_ring ? "response" : "request");
+        RETURN_IF(rc != 0, -1);
         return 0;
     }
     serverLog(LL_WARNING,
@@ -1122,10 +1493,10 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
     for (uint32_t i = 0; i < manifest->ub_rpc_peer_count; i++) {
         const vemb_v16_manifest_ub_rpc_peer_t *peer =
             &manifest->ub_rpc_peers[i];
-        if (reset_ub_rpc_ring_backing(&peer->request) != 0 ||
-            reset_ub_rpc_ring_backing(&peer->response) != 0 ||
-            reset_ub_rpc_ring_backing(&peer->inbound_request) != 0 ||
-            reset_ub_rpc_ring_backing(&peer->outbound_response) != 0) {
+        if (reset_ub_rpc_ring_backing(&peer->request, 0) != 0 ||
+            reset_ub_rpc_ring_backing(&peer->response, 1) != 0 ||
+            reset_ub_rpc_ring_backing(&peer->inbound_request, 0) != 0 ||
+            reset_ub_rpc_ring_backing(&peer->outbound_response, 1) != 0) {
             RETURN_IF(1, -1);
         }
     }
@@ -1170,6 +1541,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     atomic_init(&storage->migration_baseline_retry_queued_count, 0);
     atomic_init(&storage->migration_baseline_retry_sent_count, 0);
     atomic_init(&storage->migration_retry_stop, 0);
+    atomic_init(&storage->owner_resolver_active_snapshot, 0);
     storage->migration_retry_interval_us =
         VEMB_V16_STORAGE_MIGRATION_RETRY_INTERVAL_US;
     storage->migration_retry_batch_size =
@@ -1178,13 +1550,13 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     storage->local_region_weight = manifest->local_region_weight ?
         manifest->local_region_weight : 4;
     storage->warm_providers =
-        zcalloc(sizeof(*storage->warm_providers) * storage->warm_region_count);
+        zcalloc(sizeof(*storage->warm_providers) * VEMB_V16_MAX_MANIFEST_REGIONS);
     storage->warm_data_mappings =
-        zcalloc(sizeof(*storage->warm_data_mappings) * storage->warm_region_count);
+        zcalloc(sizeof(*storage->warm_data_mappings) * VEMB_V16_MAX_MANIFEST_REGIONS);
     storage->warm_allocator_mappings =
-        zcalloc(sizeof(*storage->warm_allocator_mappings) * storage->warm_region_count);
+        zcalloc(sizeof(*storage->warm_allocator_mappings) * VEMB_V16_MAX_MANIFEST_REGIONS);
     storage->warm_allocators =
-        zcalloc(sizeof(*storage->warm_allocators) * storage->warm_region_count);
+        zcalloc(sizeof(*storage->warm_allocators) * VEMB_V16_MAX_MANIFEST_REGIONS);
     if (!storage->warm_providers || !storage->warm_data_mappings ||
         !storage->warm_allocator_mappings || !storage->warm_allocators) {
         if (storage->warm_providers)
@@ -1200,7 +1572,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         zfree(storage);
         return -1;
     }
-    for (uint32_t i = 0; i < storage->warm_region_count; i++) {
+    for (uint32_t i = 0; i < VEMB_V16_MAX_MANIFEST_REGIONS; i++) {
         storage->warm_providers[i].fd = -1;
         storage->warm_allocators[i].fd = -1;
         storage->warm_data_mappings[i].fd = -1;
@@ -1331,6 +1703,14 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         warm_regions[i] = storage->warm_providers[i].region;
         warm_regions[i].shared_allocator =
             storage->warm_allocators[i].allocator;
+        if (!src->is_local &&
+            storage_cache_peer_region_config(storage, src) != 0) {
+            serverLog(LL_WARNING,
+                      "failed to cache peer warm region config: region_id=%u owner=%u",
+                      src->region_id,
+                      src->home_ub_node_id);
+            GOTO_IF(1, err);
+        }
     }
 
     vemb_v16_warm_provider_t *first = &storage->warm_providers[0];
@@ -1363,6 +1743,15 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                                       VEMB_V16_REMOTE_META_DEFAULT_RETRIES);
     if (storage_remote_meta_owner_views_init(storage, manifest) != 0) {
         GOTO_IF(1, err);
+    }
+    for (uint32_t i = 0; i < manifest->remote_meta_view_count; i++) {
+        if (storage_cache_remote_meta_view_config(storage,
+                                                  &manifest->remote_meta_views[i]) != 0) {
+            serverLog(LL_WARNING,
+                      "failed to cache remote meta owner view config: owner=%u",
+                      manifest->remote_meta_views[i].owner_id);
+            GOTO_IF(1, err);
+        }
     }
     if (storage_owner_resolver_init(storage, manifest) != 0) {
         GOTO_IF(1, err);
@@ -1469,8 +1858,18 @@ void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
     desc->warm_backend_type = provider->region.backend_type;
     desc->warm_region_bytes = provider->region.region_bytes;
     desc->warm_mmap_offset = provider->region.mmap_offset;
+    desc->local_owner_id = storage->local_owner_id;
+    desc->remote_meta_backend_type = storage->remote_meta_backend_type;
+    desc->remote_meta_mmap_offset = storage->remote_meta_mmap_offset;
+    desc->remote_meta_entry_count = storage->remote_meta_entry_count;
+    desc->remote_meta_bucket_count = storage->remote_meta_bucket_count;
+    desc->remote_meta_set_count = storage->remote_meta_set_count;
+    desc->remote_meta_ways = storage->remote_meta_ways;
+    desc->ub_rpc_timeout_ms = storage->ub_rpc_timeout_ms;
     strncpy(desc->vector_region_name, storage->vector_region_name,
             sizeof(desc->vector_region_name) - 1);
+    strncpy(desc->remote_meta_path, storage->remote_meta_path,
+            sizeof(desc->remote_meta_path) - 1);
     uint32_t count = storage->warm_region_count;
     if (count > VEMB_V16_MAX_DESC_WARM_REGIONS)
         count = VEMB_V16_MAX_DESC_WARM_REGIONS;
@@ -1483,6 +1882,37 @@ void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
         desc->warm_regions[i].mmap_offset = p->region.mmap_offset;
         strncpy(desc->warm_regions[i].path, p->path,
                 sizeof(desc->warm_regions[i].path) - 1);
+    }
+    uint32_t peer_count = storage->ub_rpc_peer_config_count;
+    if (peer_count > VEMB_V16_MAX_DESC_UB_RPC_PEERS)
+        peer_count = VEMB_V16_MAX_DESC_UB_RPC_PEERS;
+    desc->ub_rpc_peer_count = peer_count;
+    for (uint32_t i = 0; i < peer_count; i++) {
+        const vemb_v16_manifest_ub_rpc_peer_t *src =
+            &storage->ub_rpc_peer_configs[i];
+        desc->ub_rpc_peers[i].owner_id = src->owner_id;
+        desc->ub_rpc_peers[i].request_backend_type = src->request.backend_type;
+        desc->ub_rpc_peers[i].request_mmap_offset = src->request.mmap_offset;
+        strncpy(desc->ub_rpc_peers[i].request_path, src->request.path,
+                sizeof(desc->ub_rpc_peers[i].request_path) - 1);
+        desc->ub_rpc_peers[i].response_backend_type = src->response.backend_type;
+        desc->ub_rpc_peers[i].response_mmap_offset = src->response.mmap_offset;
+        strncpy(desc->ub_rpc_peers[i].response_path, src->response.path,
+                sizeof(desc->ub_rpc_peers[i].response_path) - 1);
+        desc->ub_rpc_peers[i].inbound_request_backend_type =
+            src->inbound_request.backend_type;
+        desc->ub_rpc_peers[i].inbound_request_mmap_offset =
+            src->inbound_request.mmap_offset;
+        strncpy(desc->ub_rpc_peers[i].inbound_request_path,
+                src->inbound_request.path,
+                sizeof(desc->ub_rpc_peers[i].inbound_request_path) - 1);
+        desc->ub_rpc_peers[i].outbound_response_backend_type =
+            src->outbound_response.backend_type;
+        desc->ub_rpc_peers[i].outbound_response_mmap_offset =
+            src->outbound_response.mmap_offset;
+        strncpy(desc->ub_rpc_peers[i].outbound_response_path,
+                src->outbound_response.path,
+                sizeof(desc->ub_rpc_peers[i].outbound_response_path) - 1);
     }
 }
 
@@ -1734,10 +2164,14 @@ static void topology_resp_copy_ring_owners(
 static void topology_resp_copy_default_ring(
         vemb_v16_storage_ctx_t *storage,
         vemb_v16_topology_control_resp_t *resp) {
-    if (storage->owner_ring.owner_count > 0) {
-        topology_resp_copy_ring_owners(resp, &storage->owner_ring, 1);
-        topology_resp_copy_ring_owners(resp, &storage->owner_ring, 0);
-        resp->vnode_count = storage->owner_ring.vnode_count;
+    const vemb_v16_storage_owner_resolver_snapshot_t *snapshot =
+        &storage->owner_resolver_snapshots[atomic_load_explicit(
+            &storage->owner_resolver_active_snapshot,
+            memory_order_acquire)];
+    if (snapshot->owner_ring.owner_count > 0) {
+        topology_resp_copy_ring_owners(resp, &snapshot->owner_ring, 1);
+        topology_resp_copy_ring_owners(resp, &snapshot->owner_ring, 0);
+        resp->vnode_count = snapshot->owner_ring.vnode_count;
         return;
     }
 
@@ -1898,6 +2332,14 @@ static int scaleout_auto_publish_full_active(
     if (!storage->scaleout_auto_enabled ||
         storage->scaleout_auto_migration_epoch != migration_epoch ||
         storage->scaleout_auto_cutover_epoch != cutover_epoch) {
+        pthread_mutex_unlock(&storage->topology_lock);
+        return 0;
+    }
+
+    /* Defer owner-resolver publication until the full-active cutover point so
+     * VSIM key2 lookups keep using the pre-cutover owner view during migration. */
+    if (storage->owner_resolver_pending_valid &&
+        storage_owner_snapshot_publish_pending(storage) != 0) {
         pthread_mutex_unlock(&storage->topology_lock);
         return 0;
     }
@@ -2320,6 +2762,140 @@ static int storage_auto_mark_migrating_for_topology(
     return errors == 0 ? 0 : -1;
 }
 
+static int peer_view_region_desc_to_manifest(
+        vemb_v16_manifest_region_t *dst,
+        const vemb_v16_peer_view_region_desc_t *src,
+        uint32_t local_owner_id) {
+    RETURN_IF(!dst || !src || src->region_id == 0 || !src->path[0] ||
+              src->value_size == 0 || src->region_bytes < src->value_size,
+              -1);
+    manifest_region_defaults(dst, src->value_size);
+    dst->region_id = src->region_id;
+    dst->backend_type = src->backend_type;
+    dst->home_ub_node_id = src->home_ub_node_id;
+    dst->is_local = src->home_ub_node_id == local_owner_id;
+    dst->has_is_local = 1;
+    dst->weight = src->weight ? src->weight : 1;
+    dst->mmap_offset = src->mmap_offset;
+    dst->region_bytes = src->region_bytes;
+    strncpy(dst->path, src->path, sizeof(dst->path) - 1);
+    return 0;
+}
+
+static int peer_view_remote_meta_desc_to_manifest(
+        vemb_v16_manifest_remote_meta_view_t *dst,
+        const vemb_v16_peer_view_remote_meta_desc_t *src) {
+    RETURN_IF(!dst || !src || !src->path[0], -1);
+    manifest_remote_meta_view_defaults(dst);
+    dst->owner_id = src->owner_id;
+    dst->has_owner_id = 1;
+    dst->backend_type = src->backend_type;
+    dst->has_backend_type = 1;
+    dst->entry_count = src->entry_count;
+    dst->bucket_count = src->bucket_count;
+    dst->set_count = src->set_count;
+    dst->ways = src->ways;
+    dst->mmap_offset = src->mmap_offset;
+    strncpy(dst->path, src->path, sizeof(dst->path) - 1);
+    RETURN_IF(dst->entry_count == 0 &&
+                  (dst->set_count == 0 || dst->ways == 0),
+              -1);
+    return 0;
+}
+
+static void peer_view_ring_desc_to_config(
+        vemb_v16_ub_rpc_ring_config_t *dst,
+        const vemb_v16_peer_view_ring_desc_t *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->backend_type = src->backend_type;
+    dst->mmap_offset = src->mmap_offset;
+    strncpy(dst->path, src->path, sizeof(dst->path) - 1);
+}
+
+static int peer_view_ub_rpc_desc_to_manifest(
+        vemb_v16_manifest_ub_rpc_peer_t *dst,
+        const vemb_v16_peer_view_ub_rpc_peer_desc_t *src) {
+    manifest_ub_rpc_peer_defaults(dst);
+    dst->owner_id = src->owner_id;
+    dst->has_owner_id = 1;
+    peer_view_ring_desc_to_config(&dst->request, &src->request);
+    peer_view_ring_desc_to_config(&dst->response, &src->response);
+    peer_view_ring_desc_to_config(&dst->inbound_request,
+                                  &src->inbound_request);
+    peer_view_ring_desc_to_config(&dst->outbound_response,
+                                  &src->outbound_response);
+    RETURN_IF(!manifest_ring_config_valid(&dst->request) ||
+              !manifest_ring_config_valid(&dst->response) ||
+              !manifest_ring_config_valid(&dst->inbound_request) ||
+              !manifest_ring_config_valid(&dst->outbound_response),
+              -1);
+    return 0;
+}
+
+int vemb_v16_storage_apply_peer_view_map(
+        vemb_v16_storage_ctx_t *storage,
+        const vemb_v16_peer_view_map_req_t *req,
+        vemb_v16_peer_view_map_resp_t *resp) {
+    RETURN_IF(req->expected_local_owner_valid &&
+              req->expected_local_owner_id != storage->local_owner_id,
+              -1);
+    RETURN_IF(req->region_count > VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS ||
+              req->remote_meta_view_count > VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS ||
+              req->ub_rpc_peer_count > VEMB_V16_PEER_VIEW_MAP_MAX_UB_RPC_PEERS,
+              -1);
+    if (req->ub_rpc_timeout_ms)
+        storage->ub_rpc_timeout_ms = req->ub_rpc_timeout_ms;
+
+    for (uint32_t i = 0; i < req->region_count; i++) {
+        vemb_v16_manifest_region_t region;
+        RETURN_IF(!!peer_view_region_desc_to_manifest(&region,
+                                                    &req->regions[i],
+                                                    storage->local_owner_id),
+                  -1);
+        RETURN_IF(storage_cache_peer_region_config(storage, &region) != 0, -1);
+        resp->applied_region_count++;
+        if ((req->flags & VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW) != 0) {
+            RETURN_IF(!!storage_attach_warm_region_config(storage, &region), -1);
+        }
+    }
+
+    for (uint32_t i = 0; i < req->remote_meta_view_count; i++) {
+        vemb_v16_manifest_remote_meta_view_t view;
+        RETURN_IF(peer_view_remote_meta_desc_to_manifest(
+                    &view, &req->remote_meta_views[i]) != 0, -1);
+        RETURN_IF(storage_cache_remote_meta_view_config(storage, &view) != 0, -1);
+        resp->applied_remote_meta_view_count++;
+        if ((req->flags & VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW) != 0) {
+            RETURN_IF(storage_attach_remote_meta_owner_view_config(
+                        storage, &view) != 0, -1);
+        }
+    }
+
+    for (uint32_t i = 0; i < req->ub_rpc_peer_count; i++) {
+        vemb_v16_manifest_ub_rpc_peer_t peer;
+        RETURN_IF(peer_view_ub_rpc_desc_to_manifest(&peer,
+                                                    &req->ub_rpc_peers[i]) != 0,
+                  -1);
+        RETURN_IF(storage_cache_ub_rpc_peer_config(storage, &peer) != 0, -1);
+        resp->applied_ub_rpc_peer_count++;
+        if ((req->flags & VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW) != 0) {
+            RETURN_IF(storage_attach_ub_rpc_peer_config(storage,
+                                                        &peer) != 0,
+                      -1);
+        }
+    }
+
+    resp->status = VEMB_V16_STATUS_OK;
+    serverLog(LL_NOTICE,
+              "vemb_v16 peer view map applied: local_owner=%u regions=%u remote_meta_views=%u ub_rpc_peers=%u attach_now=%u",
+              storage->local_owner_id,
+              resp->applied_region_count,
+              resp->applied_remote_meta_view_count,
+              resp->applied_ub_rpc_peer_count,
+              (req->flags & VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW) != 0);
+    return 0;
+}
+
 int vemb_v16_storage_topology_set(
     vemb_v16_storage_ctx_t *storage,
     const vemb_v16_topology_control_req_t *req) {
@@ -2348,11 +2924,10 @@ int vemb_v16_storage_topology_set(
         !topology_owner_subset(&active_ring, &standby_ring)) {
         return -1;
     }
-    if (req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS)
-        return -1;
+    RETURN_IF(req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS, -1);
     for (uint32_t i = 0; i < req->endpoint_count; i++) {
-        if (!topology_endpoint_valid(&req->endpoints[i], &standby_ring))
-            return -1;
+        int valid = topology_endpoint_valid(&req->endpoints[i], &standby_ring);
+        RETURN_IF(!valid, -1);
     }
     if (req->coordinator_endpoint_valid &&
         !topology_coordinator_endpoint_valid(&req->coordinator_endpoint)) {
@@ -2366,7 +2941,46 @@ int vemb_v16_storage_topology_set(
         return -1;
     }
 
+    for (uint32_t i = 0; i < req->endpoint_count; i++) {
+        const vemb_v16_topology_endpoint_t *endpoint = &req->endpoints[i];
+        if (!vemb_v16_topology_owner_exists(&standby_ring, endpoint->owner_id) ||
+            endpoint->owner_id == storage->local_owner_id ||
+            storage_has_region_for_owner(storage, endpoint->owner_id)) {
+            continue;
+        }
+        /* Refreshing topology currently requires both peer owner endpoint
+         * metadata and its peer-view UB region mapping to be present. */
+        if (storage_attach_peer_owner_from_mapping(storage, endpoint->owner_id) != 0 ||
+            !storage_has_region_for_owner(storage, endpoint->owner_id)) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 peer-view map attach failed: local_owner=%u peer_owner=%u transport=%u",
+                      storage->local_owner_id,
+                      endpoint->owner_id,
+                      endpoint->transport_type);
+            return -1;
+        }
+    }
+
+    int owner_sets_changed = !topology_owner_sets_equal(&active_ring,
+                                                        &standby_ring);
+
     pthread_mutex_lock(&storage->topology_lock);
+    if (owner_sets_changed) {
+        /* Stage the post-expand resolver snapshot now, but keep the current
+         * snapshot live until full-active publish/cutover. */
+        if (storage_owner_snapshot_stage_pending(storage, &standby_ring) != 0) {
+            pthread_mutex_unlock(&storage->topology_lock);
+            return -1;
+        }
+    } else {
+        /* Non-expand refreshes can publish immediately because there is no
+         * migration window that needs the old owner view to stay visible. */
+        if (storage_owner_snapshot_publish(storage, &standby_ring) != 0) {
+            pthread_mutex_unlock(&storage->topology_lock);
+            return -1;
+        }
+        storage->owner_resolver_pending_valid = 0;
+    }
     storage->active_topology_ring = active_ring;
     storage->standby_topology_ring = standby_ring;
     storage->published_topology_flags =
@@ -2374,6 +2988,7 @@ int vemb_v16_storage_topology_set(
     storage->published_endpoint_count = req->endpoint_count;
     storage->published_coordinator_endpoint_valid =
         req->coordinator_endpoint_valid;
+    // TODO: remove the check
     if (req->coordinator_endpoint_valid) {
         storage->published_coordinator_endpoint =
             req->coordinator_endpoint;
@@ -2402,7 +3017,7 @@ int vemb_v16_storage_topology_set(
         req->current_topology_epoch,
         req->flags);
     if (auto_mark_rc == 0 &&
-        !topology_owner_sets_equal(&active_ring, &standby_ring) &&
+        owner_sets_changed &&
         vemb_v16_topology_owner_exists(&active_ring,
                                        storage->local_owner_id) &&
         scaleout_auto_arm_for_topology(storage, req, &standby_ring) != 0) {
@@ -3196,6 +3811,13 @@ int vemb_v16_storage_scaleout_auto_step(
         scaleout_auto_set_phase(storage,
                                 VEMB_V16_STORAGE_SCALEOUT_DRAINING,
                                 0);
+        serverLog(LL_NOTICE,
+                  "vemb_v16 scaleout auto draining: local_owner=%u migration_epoch=%llu ranges=%u sent=%u acked=%u",
+                  storage->local_owner_id,
+                  (unsigned long long)migration_epoch,
+                  range_count,
+                  sent_count,
+                  acked_count);
         for (uint32_t i = 0; i < range_count; i++) {
             vemb_v16_migration_range_control_resp_t barrier_resp;
             memset(&barrier_resp, 0, sizeof(barrier_resp));
@@ -3207,6 +3829,16 @@ int vemb_v16_storage_scaleout_auto_step(
                     0,
                     &barrier_resp) != 0 ||
                 !scaleout_auto_range_ready(&barrier_resp)) {
+                serverLog(LL_NOTICE,
+                          "vemb_v16 scaleout auto barrier wait: local_owner=%u migration_epoch=%llu target_owner=%u shard_id=%u status=%u range_ready=%u pending_delta=%u remaining_keys=%u",
+                          storage->local_owner_id,
+                          (unsigned long long)migration_epoch,
+                          ranges[i].target_owner,
+                          ranges[i].shard_id,
+                          barrier_resp.status,
+                          barrier_resp.range_ready,
+                          barrier_resp.pending_delta,
+                          barrier_resp.remaining_keys);
                 continue;
             }
 
@@ -3230,8 +3862,14 @@ int vemb_v16_storage_scaleout_auto_step(
     }
 
     if (coordinated) {
-        if (!topology_publish_lease_guard_passed(storage))
+        if (!topology_publish_lease_guard_passed(storage)) {
+            serverLog(LL_NOTICE,
+                      "vemb_v16 scaleout auto waiting lease guard: local_owner=%u migration_epoch=%llu cutover_epoch=%llu",
+                      storage->local_owner_id,
+                      (unsigned long long)migration_epoch,
+                      (unsigned long long)cutover_epoch);
             return 0;
+        }
         if (!scaleout_auto_full_active_published(storage,
                                                  migration_epoch,
                                                  cutover_epoch)) {
@@ -4001,24 +4639,43 @@ int vemb_v16_storage_migration_range_mark_cutover(
     uint32_t error_count = 0;
     for (uint32_t i = 0; i < key_count; i++) {
         tlc_core_key_migration_info_t current = {0};
-        if (tlc_core_get_migration_info(storage->tlc->core,
-                                            keys[i].key,
-                                            keys[i].key_len,
-                                            keys[i].key_hash,
-                                            &current) != 0 ||
+        int info_rc = tlc_core_get_migration_info(storage->tlc->core,
+                                                  keys[i].key,
+                                                  keys[i].key_len,
+                                                  keys[i].key_hash,
+                                                  &current);
+        int target_ready = info_rc == 0 &&
+            migration_target_barrier_ready(storage,
+                                           keys[i].key,
+                                           keys[i].key_len,
+                                           keys[i].key_hash,
+                                           migration_topology_epoch,
+                                           target_owner,
+                                           shard_id,
+                                           stats.barrier_seq,
+                                           NULL);
+        if (info_rc != 0 ||
             current.migration_state != TLC_CORE_KEY_MIGRATING ||
             current.target_owner != target_owner ||
             current.topology_epoch != migration_topology_epoch ||
             current.shard_id != shard_id ||
-            !migration_target_barrier_ready(storage,
-                                            keys[i].key,
-                                            keys[i].key_len,
-                                            keys[i].key_hash,
-                                            migration_topology_epoch,
-                                            target_owner,
-                                            shard_id,
-                                            stats.barrier_seq,
-                                            NULL)) {
+            !target_ready) {
+            if (error_count < 4) {
+                serverLog(LL_NOTICE,
+                          "vemb_v16 range cutover precheck failed: local_owner=%u migration_epoch=%llu target_owner=%u shard_id=%u key_hash=%llu info_rc=%d state=%u current_target=%u current_epoch=%llu current_shard=%u barrier_seq=%llu target_ready=%d",
+                          storage->local_owner_id,
+                          (unsigned long long)migration_topology_epoch,
+                          target_owner,
+                          shard_id,
+                          (unsigned long long)keys[i].key_hash,
+                          info_rc,
+                          current.migration_state,
+                          current.target_owner,
+                          (unsigned long long)current.topology_epoch,
+                          current.shard_id,
+                          (unsigned long long)stats.barrier_seq,
+                          target_ready);
+            }
             error_count++;
         }
     }
@@ -4047,21 +4704,34 @@ int vemb_v16_storage_migration_range_mark_cutover(
 
     for (uint32_t i = 0; i < key_count; i++) {
         tlc_core_key_migration_info_t info = {0};
-        if (!migration_target_commit_lease(storage,
-                                           keys[i].key,
-                                           keys[i].key_len,
-                                           keys[i].key_hash,
-                                           cutover_topology_epoch,
-                                           cutover_topology_epoch,
-                                           target_owner,
-                                           shard_id) ||
+        int lease_ok = migration_target_commit_lease(storage,
+                                                     keys[i].key,
+                                                     keys[i].key_len,
+                                                     keys[i].key_hash,
+                                                     cutover_topology_epoch,
+                                                     cutover_topology_epoch,
+                                                     target_owner,
+                                                     shard_id);
+        int mark_ok = lease_ok &&
             tlc_core_mark_cutover(storage->tlc->core,
-                                      keys[i].key,
-                                      keys[i].key_len,
-                                      keys[i].key_hash,
-                                      cutover_topology_epoch,
-                                      target_owner,
-                                      &info) != 0) {
+                                  keys[i].key,
+                                  keys[i].key_len,
+                                  keys[i].key_hash,
+                                  cutover_topology_epoch,
+                                  target_owner,
+                                  &info) == 0;
+        if (!mark_ok) {
+            if (error_count < 4) {
+                serverLog(LL_NOTICE,
+                          "vemb_v16 range cutover apply failed: local_owner=%u migration_epoch=%llu cutover_epoch=%llu target_owner=%u shard_id=%u key_hash=%llu lease_ok=%d",
+                          storage->local_owner_id,
+                          (unsigned long long)migration_topology_epoch,
+                          (unsigned long long)cutover_topology_epoch,
+                          target_owner,
+                          shard_id,
+                          (unsigned long long)keys[i].key_hash,
+                          lease_ok);
+            }
             error_count++;
             break;
         }

@@ -22,6 +22,10 @@ static void cleanup_region_and_allocator(const char *path, uint32_t region_id) {
     }
 }
 
+static void cleanup_shm_path(const char *path) {
+    shm_unlink(path);
+}
+
 static uint32_t manifest_ut_route_owner(vemb_v16_storage_ctx_t *storage,
                                         uint32_t key_hash) {
     uint32_t left = 0;
@@ -93,7 +97,7 @@ static void test_manifest_shm_mock_ub_create_and_put(void) {
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
     const char *key = "manifest-key";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
 
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_manifest_%ld.yaml", (long)getpid());
@@ -225,7 +229,7 @@ static void test_manifest_remote_meta_shm_attach_existing(void) {
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
     const char *key = "remote-meta-persist-key";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
 
     snprintf(manifest_path, sizeof(manifest_path),
              "/tmp/vemb_v16_manifest_%ld_remote_meta.yaml", (long)getpid());
@@ -415,7 +419,7 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
     uint32_t routed_owner = UINT32_MAX;
     for (uint32_t i = 0; i < 10000; i++) {
         snprintf(key, sizeof(key), "remote-owner-auto-key:%u", i);
-        key_hash = vemb_v16_murmur3(key, strlen(key));
+        key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         routed_owner = manifest_ut_route_owner(storage, (uint32_t)key_hash);
         if (routed_owner == 2)
             break;
@@ -500,7 +504,7 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
     const char *cutover_key = "manifest-cutover-key";
     uint32_t cutover_key_len = (uint32_t)strlen(cutover_key);
     uint64_t cutover_key_hash =
-        vemb_v16_murmur3(cutover_key, cutover_key_len);
+        vemb_v16_xxh3_64_str(cutover_key, cutover_key_len);
     tlc_core_key_migration_info_t info = {0};
     vemb_v16_migration_outbox_stats_t outbox_stats = {0};
 
@@ -577,6 +581,23 @@ static void test_manifest_ub_rpc_peer_parse_and_storage_init(void) {
                                                      &manifest) == 0);
     assert(storage->ub_rpc != NULL);
     assert(storage->owner_hash_node_count == 20);
+    {
+        vemb_v16_channel_desc_t desc;
+        memset(&desc, 0, sizeof(desc));
+        vemb_v16_storage_fill_channel_desc(storage, &desc);
+        assert(desc.local_owner_id == 0);
+        assert(desc.remote_meta_backend_type == VEMB_V16_REGION_LOCAL_SHM);
+        assert(!strcmp(desc.remote_meta_path, remote_meta_default));
+        assert(desc.remote_meta_entry_count == max_vectors);
+        assert(desc.remote_meta_bucket_count == max_vectors * 2);
+        assert(desc.ub_rpc_timeout_ms == 123);
+        assert(desc.ub_rpc_peer_count == 1);
+        assert(desc.ub_rpc_peers[0].owner_id == 1);
+        assert(!strcmp(desc.ub_rpc_peers[0].request_path, req0_1));
+        assert(!strcmp(desc.ub_rpc_peers[0].response_path, resp1_0));
+        assert(!strcmp(desc.ub_rpc_peers[0].inbound_request_path, req1_0));
+        assert(!strcmp(desc.ub_rpc_peers[0].outbound_response_path, resp0_1));
+    }
     fill_vector(vector, dim, 1234);
     assert(vemb_v16_tlc_put(storage->tlc,
                             cutover_key,
@@ -731,6 +752,241 @@ static void test_storage_reset_clears_payload_and_allocator(void) {
     cleanup_region_and_allocator(shm_name, 401);
 }
 
+static void test_peer_view_map_can_attach_local_region(void) {
+    enum { dim = 2, max_vectors = 4, slots = 2 };
+    char manifest_path[128];
+    char local0[64];
+    char local1[64];
+    vemb_v16_storage_ctx_t *storage = NULL;
+    vemb_v16_warm_regions_manifest_t manifest;
+    vemb_v16_peer_view_map_req_t req;
+    vemb_v16_peer_view_map_resp_t resp;
+    float vector[dim];
+    vemb_v16_vector_handle_t handle = {0};
+    uint32_t warm_slot = UINT32_MAX;
+    const char *key = "peer-view-local-expand";
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+
+    snprintf(manifest_path, sizeof(manifest_path),
+             "/tmp/vemb_v16_manifest_%ld_peer_view_local.yaml",
+             (long)getpid());
+    snprintf(local0, sizeof(local0), "/v16pvlocal0_%ld", (long)getpid());
+    snprintf(local1, sizeof(local1), "/v16pvlocal1_%ld", (long)getpid());
+    cleanup_region_and_allocator(local0, 901);
+    cleanup_region_and_allocator(local1, 902);
+
+    FILE *fp = fopen(manifest_path, "w");
+    assert(fp != NULL);
+    fprintf(fp,
+            "local_ub_node_id: 1\n"
+            "warm_regions:\n"
+            "  - region_id: 901\n"
+            "    provider: shm\n"
+            "    path: %s\n"
+            "    mmap_offset: 0\n"
+            "    bytes: %u\n"
+            "    value_size: %u\n"
+            "    home_ub_node_id: 1\n"
+            "    is_local: true\n"
+            "    weight: 1\n",
+            local0,
+            (unsigned)(sizeof(float) * dim * slots),
+            (unsigned)(sizeof(float) * dim));
+    fclose(fp);
+
+    assert(vemb_v16_parse_warm_regions_manifest(manifest_path,
+                                                dim * sizeof(float),
+                                                &manifest) == 0);
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                     dim,
+                                                     dim * sizeof(float),
+                                                     max_vectors,
+                                                     &manifest) == 0);
+    assert(storage->warm_region_count == 1);
+    assert(storage->tlc->warm_region_count == 1);
+    assert(vemb_v16_tlc_find_region(storage->tlc, 901) != NULL);
+    assert(vemb_v16_tlc_find_region(storage->tlc, 902) == NULL);
+
+    memset(&req, 0, sizeof(req));
+    req.flags = VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+    req.expected_local_owner_id = 1;
+    req.expected_local_owner_valid = 1;
+    req.region_count = 1;
+    req.regions[0].region_id = 902;
+    req.regions[0].backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    req.regions[0].home_ub_node_id = 1;
+    req.regions[0].weight = 1;
+    req.regions[0].value_size = dim * sizeof(float);
+    req.regions[0].region_bytes = sizeof(float) * dim * slots;
+    snprintf(req.regions[0].path,
+             sizeof(req.regions[0].path),
+             "%s",
+             local1);
+
+    assert(vemb_v16_storage_apply_peer_view_map(storage, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_STATUS_OK);
+    assert(resp.applied_region_count == 1);
+    assert(storage->warm_region_count == 2);
+    assert(vemb_v16_tlc_find_region(storage->tlc, 902) != NULL);
+
+    {
+        vemb_v16_channel_desc_t desc;
+        memset(&desc, 0, sizeof(desc));
+        vemb_v16_storage_fill_channel_desc(storage, &desc);
+        assert(desc.warm_region_count == 2);
+        assert(desc.warm_regions[0].region_id == 901);
+        assert(desc.warm_regions[1].region_id == 902);
+    }
+
+    fill_vector(vector, dim, 222);
+    assert(vemb_v16_tlc_put(storage->tlc,
+                            key,
+                            (uint32_t)strlen(key),
+                            key_hash,
+                            vector,
+                            sizeof(vector),
+                            &handle,
+                            &warm_slot) == 0);
+    assert(handle.region_id == 901 || handle.region_id == 902);
+
+    vemb_v16_storage_ctx_destroy(storage);
+    unlink(manifest_path);
+    cleanup_region_and_allocator(local0, 901);
+    cleanup_region_and_allocator(local1, 902);
+}
+
+static void test_peer_view_map_attach_ub_rpc_peer_keeps_lookup_registered(void) {
+    enum { dim = 2, max_vectors = 4, slots = 2 };
+    char manifest_path[128];
+    char local0[64];
+    char req0_1[64], resp1_0[64], req1_0[64], resp0_1[64];
+    char req0_2[64], resp2_0[64], req2_0[64], resp0_2[64];
+    vemb_v16_storage_ctx_t *storage = NULL;
+    vemb_v16_warm_regions_manifest_t manifest;
+    vemb_v16_peer_view_map_req_t req;
+    vemb_v16_peer_view_map_resp_t resp;
+
+    snprintf(manifest_path, sizeof(manifest_path),
+             "/tmp/vemb_v16_manifest_%ld_peer_view_rpc.yaml",
+             (long)getpid());
+    snprintf(local0, sizeof(local0), "/v16pvrpc_local0_%ld", (long)getpid());
+    snprintf(req0_1, sizeof(req0_1), "/v16pvrpc_req0_1_%ld", (long)getpid());
+    snprintf(resp1_0, sizeof(resp1_0), "/v16pvrpc_resp1_0_%ld", (long)getpid());
+    snprintf(req1_0, sizeof(req1_0), "/v16pvrpc_req1_0_%ld", (long)getpid());
+    snprintf(resp0_1, sizeof(resp0_1), "/v16pvrpc_resp0_1_%ld", (long)getpid());
+    snprintf(req0_2, sizeof(req0_2), "/v16pvrpc_req0_2_%ld", (long)getpid());
+    snprintf(resp2_0, sizeof(resp2_0), "/v16pvrpc_resp2_0_%ld", (long)getpid());
+    snprintf(req2_0, sizeof(req2_0), "/v16pvrpc_req2_0_%ld", (long)getpid());
+    snprintf(resp0_2, sizeof(resp0_2), "/v16pvrpc_resp0_2_%ld", (long)getpid());
+
+    cleanup_region_and_allocator(local0, 911);
+    cleanup_shm_path(req0_1);
+    cleanup_shm_path(resp1_0);
+    cleanup_shm_path(req1_0);
+    cleanup_shm_path(resp0_1);
+    cleanup_shm_path(req0_2);
+    cleanup_shm_path(resp2_0);
+    cleanup_shm_path(req2_0);
+    cleanup_shm_path(resp0_2);
+
+    FILE *fp = fopen(manifest_path, "w");
+    assert(fp != NULL);
+    fprintf(fp,
+            "local_ub_node_id: 0\n"
+            "ub_rpc_timeout_ms: 123\n"
+            "warm_regions:\n"
+            "  - region_id: 911\n"
+            "    provider: shm\n"
+            "    path: %s\n"
+            "    mmap_offset: 0\n"
+            "    bytes: %u\n"
+            "    value_size: %u\n"
+            "    home_ub_node_id: 0\n"
+            "    is_local: true\n"
+            "    weight: 1\n"
+            "ub_rpc_peers:\n"
+            "  - owner_id: 1\n"
+            "    provider: shm\n"
+            "    request_path: %s\n"
+            "    response_path: %s\n"
+            "    inbound_request_path: %s\n"
+            "    outbound_response_path: %s\n",
+            local0,
+            (unsigned)(sizeof(float) * dim * slots),
+            (unsigned)(sizeof(float) * dim),
+            req0_1,
+            resp1_0,
+            req1_0,
+            resp0_1);
+    fclose(fp);
+
+    assert(vemb_v16_parse_warm_regions_manifest(manifest_path,
+                                                dim * sizeof(float),
+                                                &manifest) == 0);
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                     dim,
+                                                     dim * sizeof(float),
+                                                     max_vectors,
+                                                     &manifest) == 0);
+    assert(storage->ub_rpc != NULL);
+    assert(storage->tlc->lookup_rpc == vemb_v16_ub_rpc_lookup);
+    assert(storage->tlc->lookup_rpc_arg == storage->tlc);
+    assert(storage->tlc->lookup_rpc_runtime == storage->ub_rpc);
+    assert(vemb_v16_ub_rpc_has_peer(storage->ub_rpc, 1) == 1);
+    assert(vemb_v16_ub_rpc_has_peer(storage->ub_rpc, 2) == 0);
+
+    memset(&req, 0, sizeof(req));
+    req.flags = VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+    req.expected_local_owner_id = 0;
+    req.expected_local_owner_valid = 1;
+    req.ub_rpc_timeout_ms = 456;
+    req.ub_rpc_peer_count = 1;
+    req.ub_rpc_peers[0].owner_id = 2;
+    req.ub_rpc_peers[0].request.backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    req.ub_rpc_peers[0].response.backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    req.ub_rpc_peers[0].inbound_request.backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    req.ub_rpc_peers[0].outbound_response.backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    snprintf(req.ub_rpc_peers[0].request.path,
+             sizeof(req.ub_rpc_peers[0].request.path),
+             "%s",
+             req0_2);
+    snprintf(req.ub_rpc_peers[0].response.path,
+             sizeof(req.ub_rpc_peers[0].response.path),
+             "%s",
+             resp2_0);
+    snprintf(req.ub_rpc_peers[0].inbound_request.path,
+             sizeof(req.ub_rpc_peers[0].inbound_request.path),
+             "%s",
+             req2_0);
+    snprintf(req.ub_rpc_peers[0].outbound_response.path,
+             sizeof(req.ub_rpc_peers[0].outbound_response.path),
+             "%s",
+             resp0_2);
+
+    assert(vemb_v16_storage_apply_peer_view_map(storage, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_STATUS_OK);
+    assert(resp.applied_ub_rpc_peer_count == 1);
+    assert(storage->ub_rpc_timeout_ms == 456);
+    assert(storage->tlc->lookup_rpc == vemb_v16_ub_rpc_lookup);
+    assert(storage->tlc->lookup_rpc_arg == storage->tlc);
+    assert(storage->tlc->lookup_rpc_runtime == storage->ub_rpc);
+    assert(vemb_v16_ub_rpc_has_peer(storage->ub_rpc, 1) == 1);
+    assert(vemb_v16_ub_rpc_has_peer(storage->ub_rpc, 2) == 1);
+
+    vemb_v16_storage_ctx_destroy(storage);
+    assert(vemb_v16_storage_reset_manifest_regions(&manifest) == 0);
+    unlink(manifest_path);
+    cleanup_region_and_allocator(local0, 911);
+    cleanup_shm_path(req0_1);
+    cleanup_shm_path(resp1_0);
+    cleanup_shm_path(req1_0);
+    cleanup_shm_path(resp0_1);
+    cleanup_shm_path(req0_2);
+    cleanup_shm_path(resp2_0);
+    cleanup_shm_path(req2_0);
+    cleanup_shm_path(resp0_2);
+}
+
 int main(void) {
     monotonicInit();
 
@@ -740,6 +996,8 @@ int main(void) {
     test_manifest_remote_meta_owner_views_route_key2();
     test_manifest_ub_rpc_peer_parse_and_storage_init();
     test_storage_reset_clears_payload_and_allocator();
+    test_peer_view_map_can_attach_local_region();
+    test_peer_view_map_attach_ub_rpc_peer_keeps_lookup_registered();
     printf("vemb_v16_manifest_ut: all tests passed\n");
     return 0;
 }

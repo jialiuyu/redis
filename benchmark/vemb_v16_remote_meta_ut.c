@@ -19,7 +19,7 @@ static void *alloc_meta_region(uint32_t entries,
 }
 
 static uint64_t hash_key(const char *key) {
-    return vemb_v16_murmur3(key, strlen(key));
+    return vemb_v16_xxh3_64_str(key, strlen(key));
 }
 
 static void test_layout_and_attach(void) {

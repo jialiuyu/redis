@@ -149,6 +149,8 @@ typedef struct tlc_core_warm_layer {
     tlc_core_warm_entry_t *entries;
     int32_t *hash_table;
     tlc_core_warm_region_runtime_t *regions;
+    atomic_uint_fast32_t runtime_region_count;
+    tlc_core_warm_region_runtime_t runtime_regions[TLC_CORE_MAX_WARM_REGIONS];
     tlc_core_warm_region_vnode_t *vnodes;
     atomic_uint_fast32_t count;
     uint32_t capacity;
@@ -413,6 +415,75 @@ static uint32_t vnode_lower_bound(const tlc_core_warm_layer_t *warm,
 
 static int key_valid(const char * _, uint32_t key_len) {
     return likely(key_len > 0 && key_len <= VEMB_V16_MAX_KEY_LEN);
+}
+
+static uint32_t warm_runtime_region_count(const tlc_core_warm_layer_t *warm) {
+    return (uint32_t)atomic_load_explicit(
+        (const atomic_uint_fast32_t *)&warm->runtime_region_count,
+        memory_order_acquire);
+}
+
+static tlc_core_warm_region_runtime_t *warm_region_by_index(
+        tlc_core_warm_layer_t *warm,
+        uint32_t region_index) {
+    if (region_index < warm->region_count)
+        return &warm->regions[region_index];
+    uint32_t runtime_index = region_index - warm->region_count;
+    uint32_t runtime_count = warm_runtime_region_count(warm);
+    if (runtime_index < runtime_count)
+        return &warm->runtime_regions[runtime_index];
+    return NULL;
+}
+
+static int warm_region_init_one(tlc_core_t *core,
+                                tlc_core_warm_region_runtime_t *dst,
+                                const tlc_core_warm_region_config_t *src,
+                                uint32_t region_index) {
+    RETURN_IF(!dst || !src || !src->mapped_addr ||
+              !src->shared_allocator ||
+              src->value_size != core->value_size ||
+              src->region_bytes < src->value_size,
+              -1);
+    uint64_t capacity_slots = src->region_bytes / src->value_size;
+    RETURN_IF(capacity_slots > UINT32_MAX, -1);
+    uint32_t weight = src->weight ? src->weight : 1u;
+
+    memset(dst, 0, sizeof(*dst));
+    *dst = (tlc_core_warm_region_runtime_t){
+        .region_id = src->region_id,
+        .backend_type = src->backend_type,
+        .is_local = src->is_local,
+        .weight = weight,
+        .value_size = src->value_size,
+        .capacity_slots = (uint32_t)capacity_slots,
+        .shared_allocator = src->shared_allocator,
+        .region_bytes = src->region_bytes,
+        .mapped_addr = src->mapped_addr,
+    };
+    dst->slot_meta = vemb_v16_shared_allocator_slot_meta(src->shared_allocator);
+    if (!dst->slot_meta) {
+        dst->slot_meta =
+            fallback_slot_meta_acquire(src->shared_allocator,
+                                       src->region_id,
+                                       (uint32_t)capacity_slots);
+        dst->owns_slot_meta = 1;
+    }
+    RETURN_IF(!dst->slot_meta, -1);
+    serverLog(LL_NOTICE,
+              "tlc warm region init: region_index=%u region_id=%u backend_type=%u is_local=%u weight=%u value_size=%u region_bytes=%llu capacity_slots=%u mapped_addr=%p shared_allocator=%p slot_meta=%p slot_meta_shared=%u",
+              region_index,
+              dst->region_id,
+              dst->backend_type,
+              dst->is_local,
+              dst->weight,
+              dst->value_size,
+              (unsigned long long)dst->region_bytes,
+              dst->capacity_slots,
+              dst->mapped_addr,
+              (void *)dst->shared_allocator,
+              (void *)dst->slot_meta,
+              dst->owns_slot_meta ? 0u : 1u);
+    return 0;
 }
 
 static int key_matches(uint64_t key_hash,
@@ -828,6 +899,7 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
     warm->regions = zcalloc(sizeof(*warm->regions) * region_count);
     RETURN_IF(!warm->regions, -1);
     warm->region_count = region_count;
+    atomic_init(&warm->runtime_region_count, 0);
 
     uint32_t total_vnodes = 0;
     uint32_t local_region_weight = config->local_region_weight ?
@@ -852,42 +924,13 @@ static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) 
         RETURN_IF(total_vnodes > UINT32_MAX - 32u * effective_weight, -1);
         total_vnodes += 32u * effective_weight;
 
-        warm->regions[i] = (tlc_core_warm_region_runtime_t){
-            .region_id = src->region_id,
-            .backend_type = src->backend_type,
-            .is_local = src->is_local,
-            .weight = weight,
-            .value_size = src->value_size,
-            .capacity_slots = (uint32_t)capacity_slots,
-            .shared_allocator = src->shared_allocator,
-            .region_bytes = src->region_bytes,
-            .mapped_addr = src->mapped_addr,
-        };
-        warm->regions[i].slot_meta =
-            vemb_v16_shared_allocator_slot_meta(src->shared_allocator);
-        if (!warm->regions[i].slot_meta) {
-            warm->regions[i].slot_meta =
-                fallback_slot_meta_acquire(src->shared_allocator,
-                                           src->region_id,
-                                           (uint32_t)capacity_slots);
-            warm->regions[i].owns_slot_meta = 1;
-        }
-        RETURN_IF(!warm->regions[i].slot_meta, -1);
+        RETURN_IF(warm_region_init_one(core, &warm->regions[i], src, i) != 0,
+                  -1);
         serverLog(LL_NOTICE,
-                  "tlc warm region init: region_index=%u region_id=%u backend_type=%u is_local=%u weight=%u effective_weight=%u value_size=%u region_bytes=%llu capacity_slots=%u mapped_addr=%p shared_allocator=%p slot_meta=%p slot_meta_shared=%u",
+                  "tlc warm region effective weight: region_index=%u region_id=%u effective_weight=%u",
                   i,
                   warm->regions[i].region_id,
-                  warm->regions[i].backend_type,
-                  warm->regions[i].is_local,
-                  warm->regions[i].weight,
-                  effective_weight,
-                  warm->regions[i].value_size,
-                  (unsigned long long)warm->regions[i].region_bytes,
-                  warm->regions[i].capacity_slots,
-                  warm->regions[i].mapped_addr,
-                  (void *)warm->regions[i].shared_allocator,
-                  (void *)warm->regions[i].slot_meta,
-                  warm->regions[i].owns_slot_meta ? 0u : 1u);
+                  effective_weight);
     }
 
     warm->vnodes = zcalloc(sizeof(*warm->vnodes) * total_vnodes);
@@ -1193,15 +1236,26 @@ static int resolve_warm_region_for_location(
     tlc_core_warm_layer_t *warm = &core->warm;
     tlc_core_warm_region_runtime_t *region = NULL;
     uint32_t region_index = location->region_index;
-    if (region_index < warm->region_count &&
-        warm->regions[region_index].region_id == location->region_id) {
-        region = &warm->regions[region_index];
+    region = warm_region_by_index(warm, region_index);
+    if (region && region->region_id == location->region_id) {
+        /* fast path */
     } else {
+        region = NULL;
         for (uint32_t i = 0; i < warm->region_count; i++) {
             if (warm->regions[i].region_id == location->region_id) {
                 region = &warm->regions[i];
                 region_index = i;
                 break;
+            }
+        }
+        if (!region) {
+            uint32_t runtime_count = warm_runtime_region_count(warm);
+            for (uint32_t i = 0; i < runtime_count; i++) {
+                if (warm->runtime_regions[i].region_id == location->region_id) {
+                    region = &warm->runtime_regions[i];
+                    region_index = warm->region_count + i;
+                    break;
+                }
             }
         }
     }
@@ -1660,6 +1714,17 @@ static int warm_lookup(tlc_core_t *core,
                 return 0;
             }
         }
+        uint32_t runtime_count = warm_runtime_region_count(warm);
+        for (uint32_t i = 0; i < runtime_count; i++) {
+            uint32_t region_index = warm->region_count + i;
+            tlc_core_warm_region_runtime_t *region = &warm->runtime_regions[i];
+            if ((region->is_local ? 1u : 0u) != want_local)
+                continue;
+            if (warm_lookup_region(region, region_index, key_hash, fp,
+                                   core->value_size, location) == 0) {
+                return 0;
+            }
+        }
     }
     return -1;
 }
@@ -1706,6 +1771,36 @@ static int warm_put(tlc_core_t *core,
                                    want_local,
                                    attempted_regions,
                                    vnode_pos,
+                                   region_index,
+                                   region,
+                                   VEMB_V16_SHARED_ALLOCATOR_FULL);
+        }
+        uint32_t runtime_count = warm_runtime_region_count(warm);
+        for (uint32_t i = 0; i < runtime_count; i++) {
+            uint32_t region_index = warm->region_count + i;
+            tlc_core_warm_region_runtime_t *region = &warm->runtime_regions[i];
+            if ((region->is_local ? 1u : 0u) != want_local)
+                continue;
+            attempted_regions++;
+            if (!region->mapped_addr || value_size != region->value_size)
+                continue;
+            if (warm_place_in_region(region, core, region_index, key_hash, fp,
+                                     value, value_size, location) == 0) {
+                atomic_fetch_add_explicit(region->is_local ?
+                                          &core->warm_alloc_local :
+                                          &core->warm_alloc_remote,
+                                          1, memory_order_relaxed);
+                if (attempted_regions > 1) {
+                    atomic_fetch_add_explicit(&core->warm_alloc_fallback,
+                                              1, memory_order_relaxed);
+                }
+                return 0;
+            }
+            log_warm_region_switch("set_no_place_runtime",
+                                   key_hash,
+                                   want_local,
+                                   attempted_regions,
+                                   i,
                                    region_index,
                                    region,
                                    VEMB_V16_SHARED_ALLOCATOR_FULL);
@@ -2060,7 +2155,47 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
     return 0;
 }
 
+int tlc_core_attach_warm_region(tlc_core_t *core,
+                                const tlc_core_warm_region_config_t *region,
+                                uint32_t *region_index) {
+    RETURN_IF(!core || !region, -1);
+    tlc_core_warm_layer_t *warm = &core->warm;
+
+    for (uint32_t i = 0; i < warm->region_count; i++) {
+        if (warm->regions[i].region_id == region->region_id) {
+            if (region_index)
+                *region_index = i;
+            return 0;
+        }
+    }
+
+    uint32_t runtime_count = warm_runtime_region_count(warm);
+    for (uint32_t i = 0; i < runtime_count; i++) {
+        if (warm->runtime_regions[i].region_id == region->region_id) {
+            if (region_index)
+                *region_index = warm->region_count + i;
+            return 0;
+        }
+    }
+
+    RETURN_IF(runtime_count >= TLC_CORE_MAX_WARM_REGIONS, -1);
+    RETURN_IF(warm_region_init_one(core,
+                                   &warm->runtime_regions[runtime_count],
+                                   region,
+                                   warm->region_count + runtime_count) != 0,
+              -1);
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&warm->runtime_region_count,
+                          runtime_count + 1u,
+                          memory_order_release);
+    if (region_index)
+        *region_index = warm->region_count + runtime_count;
+    return 0;
+}
+
 void tlc_core_destroy(tlc_core_t *core) {
+    if (!core)
+        return;
     bitmap_destroy(&core->warm.locks);
     bitmap_destroy(&core->cold.locks);
     if (core->hold.table) zfree(core->hold.table);
@@ -2073,6 +2208,13 @@ void tlc_core_destroy(tlc_core_t *core) {
                 fallback_slot_meta_release(
                     core->warm.regions[i].shared_allocator,
                     core->warm.regions[i].slot_meta);
+        }
+    }
+    for (uint32_t i = 0; i < warm_runtime_region_count(&core->warm); i++) {
+        if (core->warm.runtime_regions[i].owns_slot_meta) {
+            fallback_slot_meta_release(
+                core->warm.runtime_regions[i].shared_allocator,
+                core->warm.runtime_regions[i].slot_meta);
         }
     }
     if (core->warm.regions) zfree(core->warm.regions);
@@ -3020,9 +3162,16 @@ void tlc_core_note_remote_meta_stale(tlc_core_t *core) {
 void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats) {
     memset(stats, 0, sizeof(*stats));
     tlc_core_warm_layer_t *warm = &core->warm;
-    stats->warm_region_count = warm->region_count;
+    uint32_t runtime_count = warm_runtime_region_count(warm);
+    stats->warm_region_count = warm->region_count + runtime_count;
     for (uint32_t i = 0; i < warm->region_count; i++) {
         if (vemb_v16_shared_allocator_full(warm->regions[i].shared_allocator)) {
+            stats->warm_region_full_count++;
+        }
+    }
+    for (uint32_t i = 0; i < runtime_count; i++) {
+        if (vemb_v16_shared_allocator_full(
+                warm->runtime_regions[i].shared_allocator)) {
             stats->warm_region_full_count++;
         }
     }
@@ -3046,12 +3195,15 @@ uint32_t tlc_core_get_region_stats(tlc_core_t *core,
                                    tlc_core_region_stats_t *regions,
                                    uint32_t max_regions) {
     tlc_core_warm_layer_t *warm = &core->warm;
-    uint32_t n = warm->region_count;
+    uint32_t runtime_count = warm_runtime_region_count(warm);
+    uint32_t n = warm->region_count + runtime_count;
     RETURN_IF (!regions || max_regions == 0, n);
     if (n > max_regions)
         n = max_regions;
     for (uint32_t i = 0; i < n; i++) {
-        tlc_core_warm_region_runtime_t *region = &warm->regions[i];
+        tlc_core_warm_region_runtime_t *region =
+            i < warm->region_count ? &warm->regions[i] :
+                &warm->runtime_regions[i - warm->region_count];
         regions[i] = (tlc_core_region_stats_t){
             .region_id = region->region_id,
             .is_local = region->is_local,

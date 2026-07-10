@@ -953,6 +953,54 @@ static void tcp_handle_topology_control(vemb_v16_proxy_t *proxy,
     close(fd);
 }
 
+static void tcp_handle_peer_view_map_control(vemb_v16_proxy_t *proxy,
+                                             int fd,
+                                             uint32_t payload_len) {
+    vemb_v16_peer_view_map_req_t req;
+    vemb_v16_peer_view_map_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (payload_len != sizeof(req) ||
+        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        close(fd);
+        return;
+    }
+    (void)vemb_v16_proxy_apply_peer_view_map(proxy, &req, &resp);
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_PEER_VIEW_MAP_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
+static void tcp_handle_peer_view_topology_control(vemb_v16_proxy_t *proxy,
+                                                  int fd,
+                                                  uint32_t payload_len) {
+    vemb_v16_peer_view_topology_control_req_t req;
+    vemb_v16_peer_view_topology_control_resp_t resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    if (payload_len != sizeof(req) ||
+        vemb_v16_net_read_full(fd, &req, sizeof(req)) != 0) {
+        close(fd);
+        return;
+    }
+    (void)vemb_v16_proxy_apply_peer_view_map_and_topology_set(proxy,
+                                                              &req,
+                                                              &resp);
+    vemb_v16_net_write_frame(fd,
+                             VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE,
+                             0,
+                             0,
+                             0,
+                             &resp,
+                             sizeof(resp));
+    close(fd);
+}
+
 /// TCP control plane: process one accepted TCP control or channel setup socket.
 void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     assert(proxy != NULL);
@@ -1045,6 +1093,14 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     if (hdr.type == VEMB_V16_NET_TOPOLOGY_SET ||
         hdr.type == VEMB_V16_NET_TOPOLOGY_GET) {
         tcp_handle_topology_control(proxy, fd, hdr.type, hdr.payload_len);
+        return;
+    }
+    if (hdr.type == VEMB_V16_NET_PEER_VIEW_MAP_APPLY) {
+        tcp_handle_peer_view_map_control(proxy, fd, hdr.payload_len);
+        return;
+    }
+    if (hdr.type == VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET) {
+        tcp_handle_peer_view_topology_control(proxy, fd, hdr.payload_len);
         return;
     }
 

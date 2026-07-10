@@ -26,6 +26,8 @@ typedef enum topology_ctl_action {
     TOPOLOGY_CTL_RANGE_WAIT_CUTOVER = 5,
     TOPOLOGY_CTL_RANGE_SOURCE_GC = 6,
     TOPOLOGY_CTL_COORDINATOR_LISTEN = 7,
+    TOPOLOGY_CTL_APPLY_PEER_VIEW_MAP = 8,
+    TOPOLOGY_CTL_SET_WITH_PEER_VIEW_MAP = 9,
 } topology_ctl_action_t;
 
 typedef struct topology_ctl_cfg {
@@ -61,11 +63,21 @@ typedef struct topology_ctl_cfg {
     vemb_v16_topology_endpoint_t coordinator_endpoint;
     uint32_t expected_source_count;
     uint32_t expected_sources[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    vemb_v16_peer_view_map_req_t peer_view_map_req;
 } topology_ctl_cfg_t;
 
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s --get|--set [--transport tcp|aeron] "
+            "[--host HOST --port PORT | --socket PATH] "
+            "[--epoch N] [--min-write-epoch N] "
+            "[--active 0,1] [--standby 0,1,2] [--dual-write] "
+            "[--auto-scaleout] [--coordinated-scaleout] "
+            "[--owner-endpoints 0=HOST:PORT,1=HOST:PORT] "
+            "[--owner-sockets 0=PATH,1=PATH] "
+            "[--coordinator-endpoint HOST:PORT | --coordinator-socket PATH] "
+            "[--vnode-count N] [--timeout-ms N]\n"
+            "       %s --set-with-peer-view-map FILE [--transport tcp|aeron] "
             "[--host HOST --port PORT | --socket PATH] "
             "[--epoch N] [--min-write-epoch N] "
             "[--active 0,1] [--standby 0,1,2] [--dual-write] "
@@ -83,7 +95,12 @@ static void usage(const char *prog) {
             "--expected-sources 0,1 [--migration-epoch N] [--cutover-epoch N] "
             "[--active 0,1,2 | --standby 0,1,2] "
             "[--owner-endpoints 0=HOST:PORT,1=HOST:PORT | --owner-sockets 0=PATH,1=PATH] "
-            "[--wait-ms N] [--timeout-ms N]\n",
+            "[--wait-ms N] [--timeout-ms N]\n"
+            "       %s --apply-peer-view-map FILE [--attach-now] "
+            "[--transport tcp|aeron] [--host HOST --port PORT | --socket PATH] "
+            "[--timeout-ms N]\n",
+            prog,
+            prog,
             prog,
             prog,
             prog);
@@ -112,6 +129,352 @@ static int parse_u16_arg(const char *arg, uint16_t *out) {
     if (parse_u32_arg(arg, &value) != 0 || value == 0 || value > UINT16_MAX)
         return -1;
     *out = (uint16_t)value;
+    return 0;
+}
+
+static void trim_trailing_ws(char *s) {
+    size_t len = strlen(s);
+    while (len > 0) {
+        char c = s[len - 1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+            break;
+        s[--len] = '\0';
+    }
+}
+
+static char *trim_ws(char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    trim_trailing_ws(s);
+    return s;
+}
+
+static void strip_comment(char *line) {
+    char *hash = strchr(line, '#');
+    if (hash)
+        *hash = '\0';
+}
+
+static int parse_backend_name(const char *value, uint32_t *out) {
+    if (!strcmp(value, "shm") || !strcmp(value, "local_shm")) {
+        *out = VEMB_V16_REGION_LOCAL_SHM;
+        return 0;
+    }
+    if (!strcmp(value, "ub")) {
+        *out = VEMB_V16_REGION_UB;
+        return 0;
+    }
+    return -1;
+}
+
+static int parse_u64_value(const char *value, uint64_t *out) {
+    return parse_u64_arg(value, out);
+}
+
+static int parse_u32_value(const char *value, uint32_t *out) {
+    return parse_u32_arg(value, out);
+}
+
+static int parse_peer_view_ring_field(vemb_v16_peer_view_ring_desc_t *ring,
+                                      const char *prefix,
+                                      const char *key,
+                                      const char *value) {
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(key, prefix, prefix_len) != 0 || key[prefix_len] != '_')
+        return 1;
+    const char *suffix = key + prefix_len + 1;
+    if (!strcmp(suffix, "path")) {
+        if (strlen(value) >= sizeof(ring->path))
+            return -1;
+        strcpy(ring->path, value);
+        return 0;
+    }
+    if (!strcmp(suffix, "mmap_offset"))
+        return parse_u64_value(value, &ring->mmap_offset);
+    return 1;
+}
+
+static int parse_peer_view_map_file(
+        const char *path,
+        vemb_v16_peer_view_map_req_t *req) {
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+    memset(req, 0, sizeof(*req));
+    req->flags = VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+    char line[512];
+    enum {
+        MAP_SECTION_TOP = 0,
+        MAP_SECTION_WARM_REGIONS,
+        MAP_SECTION_REMOTE_META_VIEWS,
+        MAP_SECTION_UB_RPC_PEERS,
+    } section = MAP_SECTION_TOP;
+    vemb_v16_peer_view_region_desc_t current_region;
+    vemb_v16_peer_view_remote_meta_desc_t current_meta;
+    vemb_v16_peer_view_ub_rpc_peer_desc_t current_rpc;
+    int in_region = 0, in_meta = 0, in_rpc = 0;
+    memset(&current_region, 0, sizeof(current_region));
+    memset(&current_meta, 0, sizeof(current_meta));
+    memset(&current_rpc, 0, sizeof(current_rpc));
+    while (fgets(line, sizeof(line), fp)) {
+        strip_comment(line);
+        char *p = trim_ws(line);
+        if (!p[0])
+            continue;
+        if (!strncmp(p, "- ", 2)) {
+            if (section == MAP_SECTION_WARM_REGIONS) {
+                if (in_region) {
+                    if (req->region_count >= VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS) {
+                        fclose(fp);
+                        return -1;
+                    }
+                    req->regions[req->region_count++] = current_region;
+                }
+                memset(&current_region, 0, sizeof(current_region));
+                current_region.weight = 1;
+                in_region = 1;
+            } else if (section == MAP_SECTION_REMOTE_META_VIEWS) {
+                if (in_meta) {
+                    if (req->remote_meta_view_count >=
+                        VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS) {
+                        fclose(fp);
+                        return -1;
+                    }
+                    req->remote_meta_views[req->remote_meta_view_count++] =
+                        current_meta;
+                }
+                memset(&current_meta, 0, sizeof(current_meta));
+                in_meta = 1;
+            } else if (section == MAP_SECTION_UB_RPC_PEERS) {
+                if (in_rpc) {
+                    if (req->ub_rpc_peer_count >=
+                        VEMB_V16_PEER_VIEW_MAP_MAX_UB_RPC_PEERS) {
+                        fclose(fp);
+                        return -1;
+                    }
+                    req->ub_rpc_peers[req->ub_rpc_peer_count++] = current_rpc;
+                }
+                memset(&current_rpc, 0, sizeof(current_rpc));
+                in_rpc = 1;
+            } else {
+                fclose(fp);
+                return -1;
+            }
+            p = trim_ws(p + 2);
+        }
+
+        char *colon = strchr(p, ':');
+        if (!colon)
+            continue;
+        *colon = '\0';
+        char *key = trim_ws(p);
+        char *value = trim_ws(colon + 1);
+        if (!*key)
+            continue;
+        if (!strcmp(key, "warm_regions")) {
+            section = MAP_SECTION_WARM_REGIONS;
+            continue;
+        }
+        if (!strcmp(key, "remote_meta_views")) {
+            section = MAP_SECTION_REMOTE_META_VIEWS;
+            continue;
+        }
+        if (!strcmp(key, "ub_rpc_peers")) {
+            section = MAP_SECTION_UB_RPC_PEERS;
+            continue;
+        }
+        if (!strcmp(key, "attach_now")) {
+            if (!strcmp(value, "false") || !strcmp(value, "0"))
+                req->flags &= ~VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+            else
+                req->flags |= VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+            continue;
+        }
+        if (!strcmp(key, "expected_local_owner_id")) {
+            if (parse_u32_value(value, &req->expected_local_owner_id) != 0) {
+                fclose(fp);
+                return -1;
+            }
+            req->expected_local_owner_valid = 1;
+            continue;
+        }
+        if (!strcmp(key, "ub_rpc_timeout_ms")) {
+            if (parse_u32_value(value, &req->ub_rpc_timeout_ms) != 0) {
+                fclose(fp);
+                return -1;
+            }
+            continue;
+        }
+
+        if (section == MAP_SECTION_WARM_REGIONS && in_region) {
+            if (!strcmp(key, "region_id")) {
+                if (parse_u32_value(value, &current_region.region_id) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "provider") || !strcmp(key, "backend")) {
+                if (parse_backend_name(value, &current_region.backend_type) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "path")) {
+                if (strlen(value) >= sizeof(current_region.path)) {
+                    fclose(fp);
+                    return -1;
+                }
+                strcpy(current_region.path, value);
+            } else if (!strcmp(key, "mmap_offset")) {
+                if (parse_u64_value(value, &current_region.mmap_offset) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "bytes")) {
+                if (parse_u64_value(value, &current_region.region_bytes) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "value_size")) {
+                if (parse_u32_value(value, &current_region.value_size) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "home_ub_node_id")) {
+                if (parse_u32_value(value,
+                                    &current_region.home_ub_node_id) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "weight")) {
+                if (parse_u32_value(value, &current_region.weight) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            }
+            continue;
+        }
+
+        if (section == MAP_SECTION_REMOTE_META_VIEWS && in_meta) {
+            if (!strcmp(key, "owner_id")) {
+                if (parse_u32_value(value, &current_meta.owner_id) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "provider") || !strcmp(key, "backend")) {
+                if (parse_backend_name(value, &current_meta.backend_type) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "path")) {
+                if (strlen(value) >= sizeof(current_meta.path)) {
+                    fclose(fp);
+                    return -1;
+                }
+                strcpy(current_meta.path, value);
+            } else if (!strcmp(key, "mmap_offset")) {
+                if (parse_u64_value(value, &current_meta.mmap_offset) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "entries")) {
+                if (parse_u32_value(value, &current_meta.entry_count) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "buckets")) {
+                if (parse_u32_value(value, &current_meta.bucket_count) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "sets")) {
+                if (parse_u32_value(value, &current_meta.set_count) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "ways")) {
+                if (parse_u32_value(value, &current_meta.ways) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            }
+            continue;
+        }
+
+        if (section == MAP_SECTION_UB_RPC_PEERS && in_rpc) {
+            if (!strcmp(key, "owner_id")) {
+                if (parse_u32_value(value, &current_rpc.owner_id) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            } else if (!strcmp(key, "provider") || !strcmp(key, "backend")) {
+                uint32_t backend_type = 0;
+                if (parse_backend_name(value, &backend_type) != 0) {
+                    fclose(fp);
+                    return -1;
+                }
+                current_rpc.request.backend_type = backend_type;
+                current_rpc.response.backend_type = backend_type;
+                current_rpc.inbound_request.backend_type = backend_type;
+                current_rpc.outbound_response.backend_type = backend_type;
+            } else {
+                int parsed = parse_peer_view_ring_field(&current_rpc.request,
+                                                        "request",
+                                                        key,
+                                                        value);
+                if (parsed < 0) {
+                    fclose(fp);
+                    return -1;
+                }
+                if (parsed == 0)
+                    continue;
+                parsed = parse_peer_view_ring_field(&current_rpc.response,
+                                                    "response",
+                                                    key,
+                                                    value);
+                if (parsed < 0) {
+                    fclose(fp);
+                    return -1;
+                }
+                if (parsed == 0)
+                    continue;
+                parsed = parse_peer_view_ring_field(&current_rpc.inbound_request,
+                                                    "inbound_request",
+                                                    key,
+                                                    value);
+                if (parsed < 0) {
+                    fclose(fp);
+                    return -1;
+                }
+                if (parsed == 0)
+                    continue;
+                parsed = parse_peer_view_ring_field(
+                    &current_rpc.outbound_response,
+                    "outbound_response",
+                    key,
+                    value);
+                if (parsed < 0) {
+                    fclose(fp);
+                    return -1;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    if (in_region) {
+        if (req->region_count >= VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS)
+            return -1;
+        req->regions[req->region_count++] = current_region;
+    }
+    if (in_meta) {
+        if (req->remote_meta_view_count >=
+            VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS)
+            return -1;
+        req->remote_meta_views[req->remote_meta_view_count++] = current_meta;
+    }
+    if (in_rpc) {
+        if (req->ub_rpc_peer_count >= VEMB_V16_PEER_VIEW_MAP_MAX_UB_RPC_PEERS)
+            return -1;
+        req->ub_rpc_peers[req->ub_rpc_peer_count++] = current_rpc;
+    }
     return 0;
 }
 
@@ -374,6 +737,100 @@ static int topology_control_endpoint(
     return -1;
 }
 
+static int peer_view_map_control_tcp(
+        const topology_ctl_cfg_t *cfg,
+        const vemb_v16_peer_view_map_req_t *req,
+        vemb_v16_peer_view_map_resp_t *resp) {
+    int fd = vemb_v16_net_connect(cfg->host, cfg->port, cfg->timeout_ms);
+    if (fd < 0)
+        return -1;
+    if (vemb_v16_net_write_frame(fd,
+                                 VEMB_V16_NET_PEER_VIEW_MAP_APPLY,
+                                 0,
+                                 0,
+                                 0,
+                                 req,
+                                 sizeof(*req)) != 0) {
+        close(fd);
+        return -1;
+    }
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_PEER_VIEW_MAP_RESPONSE ||
+        hdr.payload_len != sizeof(*resp) ||
+        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int peer_view_map_control_uds(
+        const topology_ctl_cfg_t *cfg,
+        const vemb_v16_peer_view_map_req_t *req,
+        vemb_v16_peer_view_map_resp_t *resp) {
+    int fd = connect_uds(cfg->socket_path, cfg->timeout_ms);
+    if (fd < 0)
+        return -1;
+    uint8_t op = VEMB_V16_CTRL_PEER_VIEW_MAP_APPLY;
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
+        vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0 ||
+        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int peer_view_topology_control_tcp(
+        const topology_ctl_cfg_t *cfg,
+        const vemb_v16_peer_view_topology_control_req_t *req,
+        vemb_v16_peer_view_topology_control_resp_t *resp) {
+    int fd = vemb_v16_net_connect(cfg->host, cfg->port, cfg->timeout_ms);
+    if (fd < 0)
+        return -1;
+    if (vemb_v16_net_write_frame(fd,
+                                 VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET,
+                                 0,
+                                 0,
+                                 0,
+                                 req,
+                                 sizeof(*req)) != 0) {
+        close(fd);
+        return -1;
+    }
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE ||
+        hdr.payload_len != sizeof(*resp) ||
+        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int peer_view_topology_control_uds(
+        const topology_ctl_cfg_t *cfg,
+        const vemb_v16_peer_view_topology_control_req_t *req,
+        vemb_v16_peer_view_topology_control_resp_t *resp) {
+    int fd = connect_uds(cfg->socket_path, cfg->timeout_ms);
+    if (fd < 0)
+        return -1;
+    uint8_t op = VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET;
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0 ||
+        vemb_v16_net_write_full(fd, req, sizeof(*req)) != 0 ||
+        vemb_v16_net_read_full(fd, resp, sizeof(*resp)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
 static uint64_t monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -532,6 +989,28 @@ static void print_range_response(
     printf("range_done=%u\n", resp->range_done);
     printf("range_ready=%u\n", resp->range_ready);
     printf("page_limit=%u\n", resp->page_limit);
+}
+
+static void print_peer_view_map_response(
+        const vemb_v16_peer_view_map_resp_t *resp) {
+    printf("status=%u\n", resp->status);
+    printf("applied_region_count=%u\n", resp->applied_region_count);
+    printf("applied_remote_meta_view_count=%u\n",
+           resp->applied_remote_meta_view_count);
+    printf("applied_ub_rpc_peer_count=%u\n",
+           resp->applied_ub_rpc_peer_count);
+}
+
+static void print_peer_view_topology_response(
+        const vemb_v16_peer_view_topology_control_resp_t *resp) {
+    printf("status=%u\n", resp->status);
+    printf("peer_view_map_status=%u\n", resp->peer_view_map_status);
+    printf("topology_status=%u\n", resp->topology_status);
+    printf("topology_attempted=%u\n", resp->topology_attempted);
+    printf("peer_view_map_response:\n");
+    print_peer_view_map_response(&resp->peer_view_map_resp);
+    printf("topology_response:\n");
+    print_response(&resp->topology_resp);
 }
 
 static int range_resp_cutover_ready(
@@ -1053,6 +1532,14 @@ int main(int argc, char **argv) {
             cfg.action = TOPOLOGY_CTL_GET;
         } else if (!strcmp(argv[i], "--set")) {
             cfg.action = TOPOLOGY_CTL_SET;
+        } else if (!strcmp(argv[i], "--set-with-peer-view-map") &&
+                   i + 1 < argc) {
+            cfg.action = TOPOLOGY_CTL_SET_WITH_PEER_VIEW_MAP;
+            if (parse_peer_view_map_file(argv[++i],
+                                         &cfg.peer_view_map_req) != 0) {
+                usage(argv[0]);
+                return 1;
+            }
         } else if (!strcmp(argv[i], "--range-barrier")) {
             cfg.action = TOPOLOGY_CTL_RANGE_BARRIER;
         } else if (!strcmp(argv[i], "--range-cutover")) {
@@ -1065,6 +1552,18 @@ int main(int argc, char **argv) {
             cfg.action = TOPOLOGY_CTL_RANGE_WAIT_CUTOVER;
         } else if (!strcmp(argv[i], "--coordinator-listen")) {
             cfg.action = TOPOLOGY_CTL_COORDINATOR_LISTEN;
+        } else if (!strcmp(argv[i], "--apply-peer-view-map") &&
+                   i + 1 < argc) {
+            cfg.action = TOPOLOGY_CTL_APPLY_PEER_VIEW_MAP;
+            if (parse_peer_view_map_file(argv[++i],
+                                         &cfg.peer_view_map_req) != 0) {
+                usage(argv[0]);
+                return 1;
+            }
+        } else if (!strcmp(argv[i], "--attach-now")) {
+            cfg.peer_view_map_req.flags |= VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+        } else if (!strcmp(argv[i], "--no-attach-now")) {
+            cfg.peer_view_map_req.flags &= ~VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
         } else if (!strcmp(argv[i], "--transport") && i + 1 < argc) {
             const char *transport = argv[++i];
             if (!strcmp(transport, "tcp")) {
@@ -1233,15 +1732,46 @@ int main(int argc, char **argv) {
     if (cfg.action == TOPOLOGY_CTL_COORDINATOR_LISTEN) {
         return run_coordinator_listen(&cfg);
     }
+    if (cfg.action == TOPOLOGY_CTL_APPLY_PEER_VIEW_MAP) {
+        vemb_v16_peer_view_map_resp_t resp;
+        int rc = cfg.transport_type == VEMB_V16_TRANSPORT_TCP ?
+            peer_view_map_control_tcp(&cfg, &cfg.peer_view_map_req, &resp) :
+            peer_view_map_control_uds(&cfg, &cfg.peer_view_map_req, &resp);
+        if (rc != 0) {
+            fprintf(stderr, "peer view map apply failed\n");
+            return 1;
+        }
+        print_peer_view_map_response(&resp);
+        return resp.status == VEMB_V16_STATUS_OK ? 0 : 1;
+    }
 
     vemb_v16_topology_control_req_t req;
     vemb_v16_topology_control_req_t *req_ptr = NULL;
-    if (cfg.action == TOPOLOGY_CTL_SET) {
+    if (cfg.action == TOPOLOGY_CTL_SET ||
+        cfg.action == TOPOLOGY_CTL_SET_WITH_PEER_VIEW_MAP) {
         if (build_request(&cfg, &req) != 0) {
             usage(argv[0]);
             return 1;
         }
         req_ptr = &req;
+    }
+
+    if (cfg.action == TOPOLOGY_CTL_SET_WITH_PEER_VIEW_MAP) {
+        vemb_v16_peer_view_topology_control_req_t combo_req;
+        vemb_v16_peer_view_topology_control_resp_t combo_resp;
+        memset(&combo_req, 0, sizeof(combo_req));
+        memset(&combo_resp, 0, sizeof(combo_resp));
+        combo_req.peer_view_map_req = cfg.peer_view_map_req;
+        combo_req.topology_req = *req_ptr;
+        int rc = cfg.transport_type == VEMB_V16_TRANSPORT_TCP ?
+            peer_view_topology_control_tcp(&cfg, &combo_req, &combo_resp) :
+            peer_view_topology_control_uds(&cfg, &combo_req, &combo_resp);
+        if (rc != 0) {
+            fprintf(stderr, "peer view + topology control request failed\n");
+            return 1;
+        }
+        print_peer_view_topology_response(&combo_resp);
+        return combo_resp.status == VEMB_V16_STATUS_OK ? 0 : 1;
     }
 
     vemb_v16_topology_control_resp_t resp;

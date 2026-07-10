@@ -2960,6 +2960,52 @@ int vemb_v16_proxy_topology_get(
     return 0;
 }
 
+int vemb_v16_proxy_apply_peer_view_map(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_peer_view_map_req_t *req,
+    vemb_v16_peer_view_map_resp_t *resp) {
+    int rc = vemb_v16_storage_apply_peer_view_map(proxy_storage(proxy),
+                                                  req,
+                                                  resp);
+    if (rc != 0 && resp)
+        resp->status = VEMB_V16_STATUS_ERR;
+    return rc;
+}
+
+int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_peer_view_topology_control_req_t *req,
+    vemb_v16_peer_view_topology_control_resp_t *resp) {
+    resp->status = VEMB_V16_STATUS_ERR;
+    resp->peer_view_map_status = VEMB_V16_STATUS_ERR;
+    resp->topology_status = VEMB_V16_STATUS_ERR;
+
+    int rc = vemb_v16_storage_apply_peer_view_map(proxy_storage(proxy),
+                                                  &req->peer_view_map_req,
+                                                  &resp->peer_view_map_resp);
+    if (rc != 0) {
+        resp->peer_view_map_resp.status = VEMB_V16_STATUS_ERR;
+        return -1;
+    }
+    resp->peer_view_map_status = resp->peer_view_map_resp.status;
+    if (resp->peer_view_map_status != VEMB_V16_STATUS_OK)
+        return -1;
+
+    resp->topology_attempted = 1;
+    rc = vemb_v16_storage_topology_set(proxy_storage(proxy),
+                                       &req->topology_req);
+    topology_control_fill_resp(proxy,
+                               &resp->topology_resp,
+                               rc == 0 ? 
+                                  VEMB_V16_STATUS_OK :
+                                  VEMB_V16_STATUS_ERR);
+    resp->topology_status = resp->topology_resp.status;
+    if (rc != 0)
+        return -1;
+    resp->status = VEMB_V16_STATUS_OK;
+    return 0;
+}
+
 void vemb_v16_proxy_get_stats(vemb_v16_proxy_t *proxy, vemb_v16_stats_t *stats) {
     assert(proxy != NULL);
     assert(stats != NULL);

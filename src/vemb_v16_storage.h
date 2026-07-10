@@ -2,6 +2,7 @@
 #define __VEMB_V16_STORAGE_H
 
 #include "vemb_v16_protocol.h"
+#include "vemb_v16_peer_view_map.h"
 #include "vemb_v16_migration_outbox.h"
 #include "vemb_v16_remote_meta.h"
 #include "vemb_v16_shared_allocator.h"
@@ -123,6 +124,13 @@ typedef struct vemb_v16_storage_owner_hash_node {
     uint32_t owner_id;
 } vemb_v16_storage_owner_hash_node_t;
 
+typedef struct vemb_v16_storage_owner_resolver_snapshot {
+    uint32_t owner_hash_node_count;
+    vemb_v16_storage_owner_hash_node_t
+        owner_hash_nodes[VEMB_V16_STORAGE_MAX_OWNER_HASH_NODES];
+    vemb_v16_topology_ring_t owner_ring;
+} vemb_v16_storage_owner_resolver_snapshot_t;
+
 typedef struct vemb_v16_storage_migration_baseline_retry {
     uint32_t valid;
     uint32_t key_len;
@@ -218,10 +226,21 @@ typedef struct vemb_v16_storage_ctx {
     uint32_t remote_meta_owner_view_count;
     vemb_v16_storage_remote_meta_view_t
         remote_meta_owner_views[VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS];
-    uint32_t owner_hash_node_count;
-    vemb_v16_storage_owner_hash_node_t
-        owner_hash_nodes[VEMB_V16_STORAGE_MAX_OWNER_HASH_NODES];
-    vemb_v16_topology_ring_t owner_ring;
+    uint32_t peer_region_config_count;
+    vemb_v16_manifest_region_t
+        peer_region_configs[VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS];
+    uint32_t peer_remote_meta_view_config_count;
+    vemb_v16_manifest_remote_meta_view_t
+        peer_remote_meta_view_configs
+            [VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS];
+    uint32_t ub_rpc_timeout_ms;
+    uint32_t ub_rpc_peer_config_count;
+    vemb_v16_manifest_ub_rpc_peer_t
+        ub_rpc_peer_configs[VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS];
+    atomic_uint owner_resolver_active_snapshot;
+    uint32_t owner_resolver_pending_valid;
+    uint32_t owner_resolver_pending_snapshot;
+    vemb_v16_storage_owner_resolver_snapshot_t owner_resolver_snapshots[2];
     vemb_v16_topology_ring_t active_topology_ring;
     vemb_v16_topology_ring_t standby_topology_ring;
     vemb_v16_topology_endpoint_t
@@ -284,6 +303,10 @@ int vemb_v16_storage_topology_set(
 void vemb_v16_storage_topology_get(
     vemb_v16_storage_ctx_t *storage,
     vemb_v16_topology_control_resp_t *resp);
+int vemb_v16_storage_apply_peer_view_map(
+    vemb_v16_storage_ctx_t *storage,
+    const vemb_v16_peer_view_map_req_t *req,
+    vemb_v16_peer_view_map_resp_t *resp);
 int vemb_v16_storage_migration_mark_cutover(
     vemb_v16_storage_ctx_t *storage,
     const char *key,

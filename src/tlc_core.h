@@ -142,6 +142,9 @@ typedef struct tlc_core tlc_core_t;
 int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config);
 void tlc_core_destroy(tlc_core_t *core);
 int tlc_core_source_fence_active(const tlc_core_t *core);
+int tlc_core_attach_warm_region(tlc_core_t *core,
+                                const tlc_core_warm_region_config_t *region,
+                                uint32_t *region_index);
 
 int tlc_core_get_warm_slot(tlc_core_t *core,
                            const char *key,

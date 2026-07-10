@@ -18,7 +18,7 @@ enum vemb_v16_topology_rc {
 };
 
 typedef struct vemb_v16_topology_ring_node {
-    uint32_t hash_value;
+    uint64_t hash_value;
     uint32_t owner_id;
     uint32_t vnode_id;
 } vemb_v16_topology_ring_node_t;

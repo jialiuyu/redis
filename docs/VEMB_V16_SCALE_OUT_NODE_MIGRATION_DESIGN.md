@@ -610,6 +610,8 @@ make -C benchmark vemb_v16_scaleout_coordinated_server_smoke
 | 对端 request import | `/dev/obmm_shmdev6` | `/dev/obmm_shmdev6` |
 | 本地 response export | `/dev/obmm_shmdev4` | `/dev/obmm_shmdev4` |
 | 对端 response import | `/dev/obmm_shmdev8` | `/dev/obmm_shmdev8` |
+| 预留扩展 payload export | `/dev/obmm_shmdev3` | `/dev/obmm_shmdev3` |
+| 预留扩展 payload import | `/dev/obmm_shmdev7` | `/dev/obmm_shmdev7` |
 
 对应关系：
 
@@ -617,6 +619,7 @@ make -C benchmark vemb_v16_scaleout_coordinated_server_smoke
 | --- | --- | --- |
 | `1` | `5` | payload / remote meta view |
 | `2` | `6` | request lane |
+| `3` | `7` | extra payload region |
 | `4` | `8` | response lane |
 - payload UB path：
   - 本地 CC：`/dev/obmm_shmdev1`
@@ -1061,7 +1064,21 @@ cat /tmp/v16_post_read.out
 
 ### 13. 一键脚本
 
-仓库内提供了可从 `node0` 直接发起的完整脚本：
+仓库内提供了可从 `node0` 直接发起的完整脚本。
+
+当前推荐配置策略：
+
+- 启动阶段使用 `manifest`
+- 扩容阶段使用 `topology_ctl --apply-peer-view-map` 刷新增 peer-view 配置
+
+也就是：
+
+- `node0` 先按旧 manifest 启动
+- `node1` 按自己的 startup manifest 启动
+- 再由 `node0` 用 `topology_ctl` 刷入 owner1 的本机视角 UB 映射
+- attach 成功后再发布 candidate topology
+
+执行：
 
 ```bash
 cd /root/szz/codespace/hpc-redis
@@ -1130,6 +1147,7 @@ post-cutover 校验：
 - coordinator 收到 `local done`
 - full active topology 成功发布
 - cutover 后 node1 可以接管部分写流量和读流量
+- 新增 owner1 的 UB 可见性通过 `--apply-peer-view-map` 在 scaleout 前完成刷新
 
 #### 15.2 扩容期间持续写入和查询
 

@@ -3,6 +3,7 @@
 
 #include "macro.h"
 #include "vemb_v16_hash.h"
+#include "vemb_v16_peer_view_map.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -56,6 +57,7 @@
     VEMB_V16_MIGRATION_RANGE_CONTROL_RESP_ENCODED_LEN
 #define vemb_v16_resp_encoded_base_len() VEMB_V16_RESP_ENCODED_BASE_LEN
 #define VEMB_V16_MAX_DESC_WARM_REGIONS 16u
+#define VEMB_V16_MAX_DESC_UB_RPC_PEERS 16u
 #define VEMB_V16_MIGRATION_CONTROL_MAX_BATCH 16u
 #define VEMB_V16_MIGRATION_CONTROL_MAX_RANGE_KEYS 64u
 #define VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS 64u
@@ -106,6 +108,8 @@ enum vemb_v16_ctrl_op {
     VEMB_V16_CTRL_TOPOLOGY_SET = 0x42,
     VEMB_V16_CTRL_TOPOLOGY_GET = 0x43,
     VEMB_V16_CTRL_SCALEOUT_LOCAL_DONE = 0x44,
+    VEMB_V16_CTRL_PEER_VIEW_MAP_APPLY = 0x45,
+    VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET = 0x46,
 };
 
 enum vemb_v16_net_frame_type {
@@ -137,6 +141,10 @@ enum vemb_v16_net_frame_type {
     VEMB_V16_NET_MIGRATION_RANGE_SOURCE_GC = 0x1a,
     VEMB_V16_NET_SCALEOUT_LOCAL_DONE = 0x1b,
     VEMB_V16_NET_SCALEOUT_LOCAL_DONE_RESPONSE = 0x1c,
+    VEMB_V16_NET_PEER_VIEW_MAP_APPLY = 0x1d,
+    VEMB_V16_NET_PEER_VIEW_MAP_RESPONSE = 0x1e,
+    VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET = 0x1f,
+    VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE = 0x20,
 };
 
 enum vemb_v16_data_op {
@@ -214,11 +222,20 @@ typedef struct vemb_v16_channel_desc {
     uint32_t warm_backend_type;
     uint64_t warm_region_bytes;
     uint64_t warm_mmap_offset;
+    uint32_t local_owner_id;
+    uint32_t remote_meta_backend_type;
+    uint64_t remote_meta_mmap_offset;
+    uint32_t remote_meta_entry_count;
+    uint32_t remote_meta_bucket_count;
+    uint32_t remote_meta_set_count;
+    uint32_t remote_meta_ways;
+    uint32_t ub_rpc_timeout_ms;
     char request_ring_name[64];
     char response_ring_name[64];
     char vector_region_name[256];
+    char remote_meta_path[256];
     uint32_t warm_region_count;
-    uint32_t reserved0;
+    uint32_t ub_rpc_peer_count;
     struct {
         uint32_t region_id;
         uint32_t backend_type;
@@ -226,6 +243,21 @@ typedef struct vemb_v16_channel_desc {
         uint64_t mmap_offset;
         char path[256];
     } warm_regions[VEMB_V16_MAX_DESC_WARM_REGIONS];
+    struct {
+        uint32_t owner_id;
+        uint32_t request_backend_type;
+        uint64_t request_mmap_offset;
+        char request_path[256];
+        uint32_t response_backend_type;
+        uint64_t response_mmap_offset;
+        char response_path[256];
+        uint32_t inbound_request_backend_type;
+        uint64_t inbound_request_mmap_offset;
+        char inbound_request_path[256];
+        uint32_t outbound_response_backend_type;
+        uint64_t outbound_response_mmap_offset;
+        char outbound_response_path[256];
+    } ub_rpc_peers[VEMB_V16_MAX_DESC_UB_RPC_PEERS];
 } vemb_v16_channel_desc_t;
 
 typedef struct vemb_v16_net_hdr {
@@ -301,6 +333,21 @@ typedef struct vemb_v16_topology_control_resp {
     vemb_v16_topology_endpoint_t
         endpoints[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
 } vemb_v16_topology_control_resp_t;
+
+typedef struct vemb_v16_peer_view_topology_control_req {
+    vemb_v16_peer_view_map_req_t peer_view_map_req;
+    vemb_v16_topology_control_req_t topology_req;
+} vemb_v16_peer_view_topology_control_req_t;
+
+// TODO: reduce the status
+typedef struct vemb_v16_peer_view_topology_control_resp {
+    uint8_t status;
+    uint8_t peer_view_map_status;
+    uint8_t topology_status;
+    uint8_t topology_attempted;
+    vemb_v16_peer_view_map_resp_t peer_view_map_resp;
+    vemb_v16_topology_control_resp_t topology_resp;
+} vemb_v16_peer_view_topology_control_resp_t;
 
 typedef struct vemb_v16_scaleout_local_done_req {
     uint64_t migration_topology_epoch;
@@ -810,9 +857,14 @@ static inline int vemb_v16_alloc_req_decode(vemb_v16_alloc_req_t *req,
 static inline size_t vemb_v16_channel_desc_encoded_len(
     const vemb_v16_channel_desc_t *desc) {
     uint32_t warm_region_count = desc->warm_region_count;
+    uint32_t ub_rpc_peer_count = desc->ub_rpc_peer_count;
     if (warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
         warm_region_count = VEMB_V16_MAX_DESC_WARM_REGIONS;
-    return 452u + (size_t)warm_region_count * 280u;
+    if (ub_rpc_peer_count > VEMB_V16_MAX_DESC_UB_RPC_PEERS)
+        ub_rpc_peer_count = VEMB_V16_MAX_DESC_UB_RPC_PEERS;
+    return 748u +
+           (size_t)warm_region_count * 280u +
+           (size_t)ub_rpc_peer_count * 1076u;
 }
 
 static inline int vemb_v16_channel_desc_encode(
@@ -824,8 +876,11 @@ static inline int vemb_v16_channel_desc_encode(
     RETURN_IF(cap < need, -1);
     uint8_t *p = dst;
     uint32_t warm_region_count = desc->warm_region_count;
+    uint32_t ub_rpc_peer_count = desc->ub_rpc_peer_count;
     if (warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
         warm_region_count = VEMB_V16_MAX_DESC_WARM_REGIONS;
+    if (ub_rpc_peer_count > VEMB_V16_MAX_DESC_UB_RPC_PEERS)
+        ub_rpc_peer_count = VEMB_V16_MAX_DESC_UB_RPC_PEERS;
     vemb_v16_proto_put_u32(&p, desc->magic);
     vemb_v16_proto_put_u32(&p, desc->version);
     vemb_v16_proto_put_u64(&p, desc->channel_id);
@@ -839,6 +894,14 @@ static inline int vemb_v16_channel_desc_encode(
     vemb_v16_proto_put_u32(&p, desc->warm_backend_type);
     vemb_v16_proto_put_u64(&p, desc->warm_region_bytes);
     vemb_v16_proto_put_u64(&p, desc->warm_mmap_offset);
+    vemb_v16_proto_put_u32(&p, desc->local_owner_id);
+    vemb_v16_proto_put_u32(&p, desc->remote_meta_backend_type);
+    vemb_v16_proto_put_u64(&p, desc->remote_meta_mmap_offset);
+    vemb_v16_proto_put_u32(&p, desc->remote_meta_entry_count);
+    vemb_v16_proto_put_u32(&p, desc->remote_meta_bucket_count);
+    vemb_v16_proto_put_u32(&p, desc->remote_meta_set_count);
+    vemb_v16_proto_put_u32(&p, desc->remote_meta_ways);
+    vemb_v16_proto_put_u32(&p, desc->ub_rpc_timeout_ms);
     vemb_v16_proto_put_bytes(&p,
                              desc->request_ring_name,
                              sizeof(desc->request_ring_name));
@@ -848,7 +911,11 @@ static inline int vemb_v16_channel_desc_encode(
     vemb_v16_proto_put_bytes(&p,
                              desc->vector_region_name,
                              sizeof(desc->vector_region_name));
+    vemb_v16_proto_put_bytes(&p,
+                             desc->remote_meta_path,
+                             sizeof(desc->remote_meta_path));
     vemb_v16_proto_put_u32(&p, warm_region_count);
+    vemb_v16_proto_put_u32(&p, ub_rpc_peer_count);
     for (uint32_t i = 0; i < warm_region_count; i++) {
         vemb_v16_proto_put_u32(&p, desc->warm_regions[i].region_id);
         vemb_v16_proto_put_u32(&p, desc->warm_regions[i].backend_type);
@@ -858,6 +925,25 @@ static inline int vemb_v16_channel_desc_encode(
                                  desc->warm_regions[i].path,
                                  sizeof(desc->warm_regions[i].path));
     }
+    for (uint32_t i = 0; i < ub_rpc_peer_count; i++) {
+        vemb_v16_proto_put_u32(&p, desc->ub_rpc_peers[i].owner_id);
+        vemb_v16_proto_put_u32(&p, desc->ub_rpc_peers[i].request_backend_type);
+        vemb_v16_proto_put_u64(&p, desc->ub_rpc_peers[i].request_mmap_offset);
+        vemb_v16_proto_put_bytes(&p, desc->ub_rpc_peers[i].request_path,
+                                 sizeof(desc->ub_rpc_peers[i].request_path));
+        vemb_v16_proto_put_u32(&p, desc->ub_rpc_peers[i].response_backend_type);
+        vemb_v16_proto_put_u64(&p, desc->ub_rpc_peers[i].response_mmap_offset);
+        vemb_v16_proto_put_bytes(&p, desc->ub_rpc_peers[i].response_path,
+                                 sizeof(desc->ub_rpc_peers[i].response_path));
+        vemb_v16_proto_put_u32(&p, desc->ub_rpc_peers[i].inbound_request_backend_type);
+        vemb_v16_proto_put_u64(&p, desc->ub_rpc_peers[i].inbound_request_mmap_offset);
+        vemb_v16_proto_put_bytes(&p, desc->ub_rpc_peers[i].inbound_request_path,
+                                 sizeof(desc->ub_rpc_peers[i].inbound_request_path));
+        vemb_v16_proto_put_u32(&p, desc->ub_rpc_peers[i].outbound_response_backend_type);
+        vemb_v16_proto_put_u64(&p, desc->ub_rpc_peers[i].outbound_response_mmap_offset);
+        vemb_v16_proto_put_bytes(&p, desc->ub_rpc_peers[i].outbound_response_path,
+                                 sizeof(desc->ub_rpc_peers[i].outbound_response_path));
+    }
     if (out_len) *out_len = (size_t)(p - dst);
     return 0;
 }
@@ -865,7 +951,7 @@ static inline int vemb_v16_channel_desc_encode(
 static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
                                                const uint8_t *src,
                                                size_t len) {
-    if (len < 452u)
+    if (len < 748u)
         return -1;
     const uint8_t *p = src;
     memset(desc, 0, sizeof(*desc));
@@ -882,6 +968,14 @@ static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
     desc->warm_backend_type = vemb_v16_proto_get_u32(&p);
     desc->warm_region_bytes = vemb_v16_proto_get_u64(&p);
     desc->warm_mmap_offset = vemb_v16_proto_get_u64(&p);
+    desc->local_owner_id = vemb_v16_proto_get_u32(&p);
+    desc->remote_meta_backend_type = vemb_v16_proto_get_u32(&p);
+    desc->remote_meta_mmap_offset = vemb_v16_proto_get_u64(&p);
+    desc->remote_meta_entry_count = vemb_v16_proto_get_u32(&p);
+    desc->remote_meta_bucket_count = vemb_v16_proto_get_u32(&p);
+    desc->remote_meta_set_count = vemb_v16_proto_get_u32(&p);
+    desc->remote_meta_ways = vemb_v16_proto_get_u32(&p);
+    desc->ub_rpc_timeout_ms = vemb_v16_proto_get_u32(&p);
     vemb_v16_proto_get_bytes(&p,
                              desc->request_ring_name,
                              sizeof(desc->request_ring_name));
@@ -891,8 +985,14 @@ static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
     vemb_v16_proto_get_bytes(&p,
                              desc->vector_region_name,
                              sizeof(desc->vector_region_name));
+    vemb_v16_proto_get_bytes(&p,
+                             desc->remote_meta_path,
+                             sizeof(desc->remote_meta_path));
     desc->warm_region_count = vemb_v16_proto_get_u32(&p);
+    desc->ub_rpc_peer_count = vemb_v16_proto_get_u32(&p);
     if (desc->warm_region_count > VEMB_V16_MAX_DESC_WARM_REGIONS)
+        return -1;
+    if (desc->ub_rpc_peer_count > VEMB_V16_MAX_DESC_UB_RPC_PEERS)
         return -1;
     if (len != vemb_v16_channel_desc_encoded_len(desc))
         return -1;
@@ -904,6 +1004,25 @@ static inline int vemb_v16_channel_desc_decode(vemb_v16_channel_desc_t *desc,
         vemb_v16_proto_get_bytes(&p,
                                  desc->warm_regions[i].path,
                                  sizeof(desc->warm_regions[i].path));
+    }
+    for (uint32_t i = 0; i < desc->ub_rpc_peer_count; i++) {
+        desc->ub_rpc_peers[i].owner_id = vemb_v16_proto_get_u32(&p);
+        desc->ub_rpc_peers[i].request_backend_type = vemb_v16_proto_get_u32(&p);
+        desc->ub_rpc_peers[i].request_mmap_offset = vemb_v16_proto_get_u64(&p);
+        vemb_v16_proto_get_bytes(&p, desc->ub_rpc_peers[i].request_path,
+                                 sizeof(desc->ub_rpc_peers[i].request_path));
+        desc->ub_rpc_peers[i].response_backend_type = vemb_v16_proto_get_u32(&p);
+        desc->ub_rpc_peers[i].response_mmap_offset = vemb_v16_proto_get_u64(&p);
+        vemb_v16_proto_get_bytes(&p, desc->ub_rpc_peers[i].response_path,
+                                 sizeof(desc->ub_rpc_peers[i].response_path));
+        desc->ub_rpc_peers[i].inbound_request_backend_type = vemb_v16_proto_get_u32(&p);
+        desc->ub_rpc_peers[i].inbound_request_mmap_offset = vemb_v16_proto_get_u64(&p);
+        vemb_v16_proto_get_bytes(&p, desc->ub_rpc_peers[i].inbound_request_path,
+                                 sizeof(desc->ub_rpc_peers[i].inbound_request_path));
+        desc->ub_rpc_peers[i].outbound_response_backend_type = vemb_v16_proto_get_u32(&p);
+        desc->ub_rpc_peers[i].outbound_response_mmap_offset = vemb_v16_proto_get_u64(&p);
+        vemb_v16_proto_get_bytes(&p, desc->ub_rpc_peers[i].outbound_response_path,
+                                 sizeof(desc->ub_rpc_peers[i].outbound_response_path));
     }
     return 0;
 }
@@ -1756,9 +1875,9 @@ static inline int vemb_v16_req_decode(vemb_v16_req_t *req,
     default:
         return -1;
     }
-    req->key_hash = vemb_v16_murmur3(req->key, req->key_len);
+    req->key_hash = vemb_v16_xxh3_64_str(req->key, req->key_len);
     if (req->key2_len != 0)
-        req->key2_hash = vemb_v16_murmur3(req->key2, req->key2_len);
+        req->key2_hash = vemb_v16_xxh3_64_str(req->key2, req->key2_len);
     return 0;
 }
 

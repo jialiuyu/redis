@@ -111,7 +111,51 @@ struct vemb_v16_ub_rpc {
     atomic_uint_fast32_t timeout_logs;
     atomic_uint_fast32_t ring_full_logs;
     atomic_uint_fast32_t error_logs;
+    atomic_uint_fast32_t request_logs;
+    atomic_uint_fast32_t response_logs;
+    atomic_uint_fast32_t refcount;
+    atomic_uint retired;
 };
+
+static void vemb_v16_ub_rpc_destroy_final(vemb_v16_ub_rpc_t *rpc);
+void vemb_v16_ub_rpc_release(vemb_v16_ub_rpc_t *rpc);
+
+static vemb_v16_ub_rpc_t *lookup_runtime_acquire(vemb_v16_tlc_t *tlc) {
+    if (!tlc)
+        return NULL;
+    for (;;) {
+        vemb_v16_ub_rpc_t *rpc = atomic_load_explicit(
+            &tlc->current_lookup_rpc_runtime,
+            memory_order_acquire);
+        if (!rpc)
+            return NULL;
+        atomic_fetch_add_explicit(&rpc->refcount, 1, memory_order_acq_rel);
+        if (rpc == atomic_load_explicit(&tlc->current_lookup_rpc_runtime,
+                                        memory_order_acquire)) {
+            return rpc;
+        }
+        vemb_v16_ub_rpc_release(rpc);
+    }
+}
+
+void vemb_v16_ub_rpc_release(vemb_v16_ub_rpc_t *rpc) {
+    if (!rpc)
+        return;
+    uint32_t prev = atomic_fetch_sub_explicit(&rpc->refcount,
+                                              1,
+                                              memory_order_acq_rel);
+    if (prev == 1 &&
+        atomic_load_explicit(&rpc->retired, memory_order_acquire)) {
+        vemb_v16_ub_rpc_destroy_final(rpc);
+    }
+}
+
+static void vemb_v16_ub_rpc_retire(vemb_v16_ub_rpc_t *rpc) {
+    if (!rpc)
+        return;
+    atomic_store_explicit(&rpc->retired, 1, memory_order_release);
+    vemb_v16_ub_rpc_release(rpc);
+}
 
 static uint64_t timeout_from_req_ns(const vemb_v16_ub_rpc_t *rpc,
                                     const vemb_v16_ub_lookup_rpc_req_t *req) {
@@ -371,6 +415,27 @@ static void ring_close(vemb_v16_ub_rpc_ring_t *ring) {
     ring->bytes = 0;
 }
 
+static int ring_reset(const vemb_v16_ub_rpc_ring_config_t *config,
+                      uint32_t slot_size) {
+    if (!ring_config_valid(config) || slot_size == 0)
+        return -1;
+    vemb_v16_mapped_region_t mapping;
+    memset(&mapping, 0, sizeof(mapping));
+    mapping.fd = -1;
+    size_t bytes = rpc_ring_bytes(slot_size);
+    if (vemb_v16_mapped_region_open(&mapping,
+                                    config->backend_type,
+                                    config->path,
+                                    config->mmap_offset,
+                                    bytes) != 0) {
+        return -1;
+    }
+    rpc_ring_init((vemb_v16_ub_rpc_shared_ring_t *)mapping.mapped_addr,
+                  slot_size);
+    vemb_v16_mapped_region_close(&mapping);
+    return 0;
+}
+
 static vemb_v16_ub_rpc_peer_state_t *find_peer(vemb_v16_ub_rpc_t *rpc,
                                                uint32_t owner_id) {
     for (uint32_t i = 0; i < rpc->peer_count; i++) {
@@ -582,15 +647,21 @@ static int publish_with_deadline(vemb_v16_ub_rpc_t *rpc,
 int vemb_v16_ub_rpc_lookup(void *arg,
                            const vemb_v16_ub_lookup_rpc_req_t *req,
                            vemb_v16_ub_lookup_rpc_resp_t *resp) {
-    vemb_v16_ub_rpc_t *rpc = arg;
-    if (!rpc || !req || !resp)
+    vemb_v16_tlc_t *tlc = arg;
+    if (!tlc || !req || !resp)
+        return -1;
+    vemb_v16_ub_rpc_t *rpc = lookup_runtime_acquire(tlc);
+    if (!rpc)
         return -1;
     memset(resp, 0, sizeof(*resp));
     resp->request_id = req->request_id;
     resp->key_hash = req->key_hash;
 
-    if (req->dst_owner_id == rpc->local_owner_id)
-        return vemb_v16_tlc_lookup_rpc_local_handler(rpc->tlc, req, resp);
+    if (req->dst_owner_id == rpc->local_owner_id) {
+        int local_rc = vemb_v16_tlc_lookup_rpc_local_handler(rpc->tlc, req, resp);
+        vemb_v16_ub_rpc_release(rpc);
+        return local_rc;
+    }
 
     vemb_v16_ub_rpc_peer_state_t *peer = find_peer(rpc, req->dst_owner_id);
     if (!peer) {
@@ -603,6 +674,7 @@ int vemb_v16_ub_rpc_lookup(void *arg,
                     req->key_hash,
                     NULL,
                     ENOENT);
+        vemb_v16_ub_rpc_release(rpc);
         return 0;
     }
 
@@ -618,6 +690,7 @@ int vemb_v16_ub_rpc_lookup(void *arg,
                     req->key_hash,
                     NULL,
                     EAGAIN);
+        vemb_v16_ub_rpc_release(rpc);
         return 0;
     }
 
@@ -641,6 +714,7 @@ int vemb_v16_ub_rpc_lookup(void *arg,
     if (rc != 0) {
         pending_release_waiting(pending);
         resp->status = status;
+        vemb_v16_ub_rpc_release(rpc);
         return 0;
     }
 
@@ -652,6 +726,7 @@ int vemb_v16_ub_rpc_lookup(void *arg,
         *resp = wire_resp.u.lookup;
     else
         resp->status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
+    vemb_v16_ub_rpc_release(rpc);
     return 0;
 }
 
@@ -748,6 +823,21 @@ int vemb_v16_ub_rpc_migrate_snapshot(
 static void process_response(vemb_v16_ub_rpc_t *rpc,
                              vemb_v16_ub_rpc_peer_state_t *peer,
                              const vemb_v16_ub_rpc_wire_resp_t *wire_resp) {
+    uint32_t response_log_count = atomic_fetch_add_explicit(
+        &rpc->response_logs, 1, memory_order_relaxed);
+    if (response_log_count < 16) {
+        serverLog(LL_NOTICE,
+                  "vemb_v16 ub rpc response observed: local_owner=%u peer_owner=%u request_id=%llu key_hash=%llu kind=%u status=%u response_path=%s",
+                  rpc->local_owner_id,
+                  peer->owner_id,
+                  (unsigned long long)wire_resp_request_id(wire_resp),
+                  (unsigned long long)wire_resp_key_hash(wire_resp),
+                  wire_resp->kind,
+                  wire_resp->kind == VEMB_V16_UB_RPC_FRAME_MIGRATION ?
+                      wire_resp->u.migration.status :
+                      wire_resp->u.lookup.status,
+                  peer->response.config.path);
+    }
     if (wire_resp->magic != VEMB_V16_UB_RPC_MAGIC ||
         wire_resp->version != VEMB_V16_UB_RPC_VERSION ||
         (wire_resp->kind != VEMB_V16_UB_RPC_FRAME_LOOKUP &&
@@ -777,6 +867,21 @@ static void process_response(vemb_v16_ub_rpc_t *rpc,
 static void process_request(vemb_v16_ub_rpc_t *rpc,
                             vemb_v16_ub_rpc_peer_state_t *peer,
                             const vemb_v16_ub_rpc_wire_req_t *wire_req) {
+    uint32_t request_log_count = atomic_fetch_add_explicit(
+        &rpc->request_logs, 1, memory_order_relaxed);
+    if (request_log_count < 16) {
+        serverLog(LL_NOTICE,
+                  "vemb_v16 ub rpc request observed: local_owner=%u peer_owner=%u src_owner=%u dst_owner=%u request_id=%llu key_hash=%llu kind=%u inbound_path=%s outbound_path=%s",
+                  rpc->local_owner_id,
+                  peer->owner_id,
+                  wire_req_src_owner(wire_req),
+                  wire_req_dst_owner(wire_req),
+                  (unsigned long long)wire_req_request_id(wire_req),
+                  (unsigned long long)wire_req_key_hash(wire_req),
+                  wire_req->kind,
+                  peer->inbound_request.config.path,
+                  peer->outbound_response.config.path);
+    }
     vemb_v16_ub_rpc_wire_resp_t wire_resp;
     memset(&wire_resp, 0, sizeof(wire_resp));
     wire_resp.magic = VEMB_V16_UB_RPC_MAGIC;
@@ -920,6 +1025,26 @@ static void peer_close(vemb_v16_ub_rpc_peer_state_t *peer) {
     ring_close(&peer->outbound_response);
 }
 
+static void peer_state_export_config(vemb_v16_ub_rpc_peer_t *dst,
+                                     const vemb_v16_ub_rpc_peer_state_t *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->owner_id = src->owner_id;
+    dst->request = src->request.config;
+    dst->response = src->response.config;
+    dst->inbound_request = src->inbound_request.config;
+    dst->outbound_response = src->outbound_response.config;
+}
+
+void vemb_v16_ub_rpc_install_lookup_runtime(vemb_v16_tlc_t *tlc,
+                                            vemb_v16_ub_rpc_t *rpc,
+                                            vemb_v16_ub_rpc_t **old_out) {
+    vemb_v16_tlc_install_lookup_runtime(tlc,
+                                        rpc,
+                                        rpc ? vemb_v16_ub_rpc_lookup : NULL,
+                                        tlc,
+                                        old_out);
+}
+
 int vemb_v16_ub_rpc_create(vemb_v16_ub_rpc_t **out,
                            vemb_v16_tlc_t *tlc,
                            uint32_t local_owner_id,
@@ -945,6 +1070,10 @@ int vemb_v16_ub_rpc_create(vemb_v16_ub_rpc_t **out,
     atomic_init(&rpc->timeout_logs, 0);
     atomic_init(&rpc->ring_full_logs, 0);
     atomic_init(&rpc->error_logs, 0);
+    atomic_init(&rpc->request_logs, 0);
+    atomic_init(&rpc->response_logs, 0);
+    atomic_init(&rpc->refcount, 1);
+    atomic_init(&rpc->retired, 0);
 
     for (uint32_t i = 0; i < peer_count; i++) {
         if (peer_open(&rpc->peers[rpc->peer_count], &peers[i]) != 0) {
@@ -965,20 +1094,84 @@ int vemb_v16_ub_rpc_create(vemb_v16_ub_rpc_t **out,
         return -1;
     }
     rpc->thread_started = 1;
-    vemb_v16_tlc_set_lookup_rpc(tlc, vemb_v16_ub_rpc_lookup, rpc);
+    /*
+     * Keep the historical create() behavior for standalone TLC tests:
+     * first runtime install happens automatically, while later hot-swap
+     * callers still publish explicitly through attach/install.
+     */
+    if (!atomic_load_explicit(&tlc->current_lookup_rpc_runtime,
+                              memory_order_acquire)) {
+        vemb_v16_ub_rpc_install_lookup_runtime(tlc, rpc, NULL);
+    }
     *out = rpc;
     return 0;
 }
 
-void vemb_v16_ub_rpc_destroy(vemb_v16_ub_rpc_t *rpc) {
+int vemb_v16_ub_rpc_attach_peer(vemb_v16_ub_rpc_t **rpc_io,
+                                vemb_v16_tlc_t *tlc,
+                                uint32_t local_owner_id,
+                                uint32_t timeout_ms,
+                                const vemb_v16_ub_rpc_peer_t *peer) {
+    RETURN_IF(!rpc_io || !tlc || !peer || peer->owner_id == UINT32_MAX, -1);
+    vemb_v16_ub_rpc_peer_t peers[VEMB_V16_UB_RPC_MAX_PEERS];
+    uint32_t peer_count = 0;
+    vemb_v16_ub_rpc_t *rpc = *rpc_io;
+    if (rpc) {
+        for (uint32_t i = 0; i < rpc->peer_count; i++) {
+            if (rpc->peers[i].owner_id == peer->owner_id)
+                return 0;
+            peer_state_export_config(&peers[peer_count++], &rpc->peers[i]);
+        }
+    }
+    RETURN_IF(peer_count >= VEMB_V16_UB_RPC_MAX_PEERS, -1);
+    peers[peer_count++] = *peer;
+    vemb_v16_ub_rpc_t *new_rpc = NULL;
+    RETURN_IF(vemb_v16_ub_rpc_create(&new_rpc,
+                                     tlc,
+                                     local_owner_id,
+                                     timeout_ms,
+                                     peers,
+                                     peer_count) != 0,
+              -1);
+    vemb_v16_ub_rpc_t *old_rpc = NULL;
+    vemb_v16_ub_rpc_install_lookup_runtime(tlc, new_rpc, &old_rpc);
+    if (old_rpc)
+        vemb_v16_ub_rpc_destroy(old_rpc);
+    *rpc_io = new_rpc;
+    return 0;
+}
+
+int vemb_v16_ub_rpc_reset_request_ring(
+        const vemb_v16_ub_rpc_ring_config_t *config) {
+    return ring_reset(config, sizeof(vemb_v16_ub_rpc_wire_req_t));
+}
+
+int vemb_v16_ub_rpc_reset_response_ring(
+        const vemb_v16_ub_rpc_ring_config_t *config) {
+    return ring_reset(config, sizeof(vemb_v16_ub_rpc_wire_resp_t));
+}
+
+int vemb_v16_ub_rpc_has_peer(vemb_v16_ub_rpc_t *rpc, uint32_t owner_id) {
+    if (!rpc || owner_id == UINT32_MAX)
+        return 0;
+    return find_peer(rpc, owner_id) != NULL;
+}
+
+static void vemb_v16_ub_rpc_destroy_final(vemb_v16_ub_rpc_t *rpc) {
     if (!rpc)
         return;
     atomic_store_explicit(&rpc->running, 0, memory_order_release);
     if (rpc->thread_started)
         pthread_join(rpc->thread, NULL);
-    if (rpc->tlc)
-        vemb_v16_tlc_set_lookup_rpc(rpc->tlc, NULL, NULL);
     for (uint32_t i = 0; i < rpc->peer_count; i++)
         peer_close(&rpc->peers[i]);
     zfree(rpc);
+}
+
+void vemb_v16_ub_rpc_destroy(vemb_v16_ub_rpc_t *rpc) {
+    if (!rpc)
+        return;
+    if (rpc->tlc)
+        vemb_v16_tlc_clear_lookup_runtime(rpc->tlc, rpc);
+    vemb_v16_ub_rpc_retire(rpc);
 }
