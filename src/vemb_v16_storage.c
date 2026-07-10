@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "cpu_relax.h"
 #include "macro.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
@@ -118,6 +119,83 @@ static int parse_backend_value(const char *s, uint32_t *out) {
     if (!strcmp(s, "ub")) {
         *out = VEMB_V16_REGION_UB;
         return 0;
+    }
+    return -1;
+}
+
+static vemb_v16_warm_slot_meta_t *warm_slot_meta_from_mapping(
+        const vemb_v16_mapped_region_t *mapping,
+        uint32_t capacity_slots) {
+    RETURN_IF(!mapping || !mapping->mapped_addr, NULL);
+    size_t layout_bytes =
+        vemb_v16_warm_region_layout_bytes(capacity_slots);
+    RETURN_IF(mapping->requested_size < layout_bytes, NULL);
+    return vemb_v16_warm_region_slot_meta(mapping->mapped_addr);
+}
+
+static void warm_region_layout_init_slot_meta(
+        vemb_v16_warm_region_header_t *header,
+        uint32_t region_id,
+        uint32_t capacity_slots) {
+    vemb_v16_warm_slot_meta_t *slots =
+        vemb_v16_warm_region_slot_meta(header);
+    memset(slots, 0, sizeof(*slots) * capacity_slots);
+    for (uint32_t slot = 0; slot < capacity_slots; slot++) {
+        slots[slot].region_id = region_id;
+        slots[slot].local_slot = slot;
+        atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slots[slot].owner_generation, 0);
+        atomic_init(&slots[slot].write_seq, 0);
+        atomic_init(&slots[slot].last_access_ns, 0);
+        atomic_init(&slots[slot].clock_bit, 0);
+        atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+    }
+}
+
+static int warm_region_layout_ensure_initialized(
+        const vemb_v16_mapped_region_t *mapping,
+        uint32_t region_id,
+        uint32_t capacity_slots,
+        uint32_t value_size,
+        uint64_t region_bytes) {
+    RETURN_IF(!mapping || !mapping->mapped_addr || capacity_slots == 0, -1);
+    vemb_v16_warm_region_header_t *header =
+        (vemb_v16_warm_region_header_t *)mapping->mapped_addr;
+    for (uint32_t spin = 0; spin < 1000000u; spin++) {
+        uint32_t magic =
+            atomic_load_explicit(&header->magic, memory_order_acquire);
+        if (magic == VEMB_V16_WARM_REGION_LAYOUT_MAGIC) {
+            RETURN_IF(header->version != VEMB_V16_WARM_REGION_LAYOUT_VERSION ||
+                          header->region_id != region_id ||
+                          header->capacity_slots != capacity_slots,
+                      -1);
+            return 0;
+        }
+        if (magic == 0) {
+            uint32_t expected = 0;
+            if (atomic_compare_exchange_strong_explicit(
+                    &header->magic,
+                    &expected,
+                    VEMB_V16_WARM_REGION_LAYOUT_INITIALIZING,
+                    memory_order_acq_rel,
+                    memory_order_acquire)) {
+                memset(header, 0, sizeof(*header));
+                header->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
+                header->region_id = region_id;
+                header->capacity_slots = capacity_slots;
+                header->value_size = value_size;
+                header->region_bytes = region_bytes;
+                warm_region_layout_init_slot_meta(header,
+                                                  region_id,
+                                                  capacity_slots);
+                atomic_thread_fence(memory_order_release);
+                atomic_store_explicit(&header->magic,
+                                      VEMB_V16_WARM_REGION_LAYOUT_MAGIC,
+                                      memory_order_release);
+                return 0;
+            }
+        }
+        cpu_relax();
     }
     return -1;
 }
@@ -815,60 +893,98 @@ static int storage_attach_ub_rpc_peer_config(
 static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
                                              const vemb_v16_manifest_region_t *src) {
     RETURN_IF(src->region_id == 0 || !src->path[0], -1);
-    RETURN_IF(src->backend_type != VEMB_V16_REGION_UB, -1);
+    RETURN_IF(src->backend_type != VEMB_V16_REGION_UB &&
+              src->backend_type != VEMB_V16_REGION_LOCAL_SHM,
+              -1);
     RETURN_IF(storage_has_region_id(storage, src->region_id), 0);
     RETURN_IF(storage->warm_region_count >= VEMB_V16_MAX_MANIFEST_REGIONS, -1);
 
     uint32_t i = storage->warm_region_count;
     uint32_t capacity_slots = (uint32_t)(src->region_bytes / src->value_size);
-    size_t allocator_layout_bytes = vemb_v16_shared_allocator_layout_bytes(capacity_slots);
+    size_t allocator_layout_bytes = vemb_v16_warm_region_layout_bytes(capacity_slots);
 
     storage->warm_providers[i].fd = -1;
-    storage->warm_allocators[i].fd = -1;
     storage->warm_data_mappings[i].fd = -1;
     storage->warm_allocator_mappings[i].fd = -1;
 
-    if (src->is_local) {
-        RETURN_IF(vemb_v16_shared_allocator_reset(src->backend_type,
+    if (src->backend_type == VEMB_V16_REGION_UB && src->is_local) {
+        RETURN_IF(vemb_v16_warm_region_layout_reset(src->backend_type,
                                                   src->path,
                                                   src->mmap_offset,
                                                   src->region_id,
                                                   capacity_slots) != 0,
                   -1);
     }
-    RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
-                                          src->backend_type,
-                                          src->path,
-                                          src->mmap_offset,
-                                          allocator_layout_bytes +
-                                              (size_t)src->region_bytes) != 0,
-              -1);
-    RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
-                                            &storage->warm_data_mappings[i],
-                                            allocator_layout_bytes,
-                                            src->region_id,
-                                            src->backend_type,
-                                            src->path,
-                                            src->mmap_offset +
+    if (src->backend_type == VEMB_V16_REGION_UB) {
+        RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
+                                              src->backend_type,
+                                              src->path,
+                                              src->mmap_offset,
+                                              allocator_layout_bytes +
+                                                  (size_t)src->region_bytes) != 0,
+                  -1);
+        RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
+                                                &storage->warm_data_mappings[i],
                                                 allocator_layout_bytes,
-                                            src->value_size,
-                                            src->region_bytes,
-                                            src->home_ub_node_id,
-                                            src->is_local,
-                                            src->weight ? src->weight : 1) != 0,
-              -1);
-    RETURN_IF(vemb_v16_shared_allocator_attach(&storage->warm_allocators[i],
-                                               &storage->warm_data_mappings[i],
-                                               0,
-                                               src->backend_type,
-                                               src->path,
-                                               src->mmap_offset,
-                                               src->region_id,
-                                               capacity_slots) != 0,
-              -1);
-
+                                                src->region_id,
+                                                src->backend_type,
+                                                src->path,
+                                                src->mmap_offset +
+                                                    allocator_layout_bytes,
+                                                src->value_size,
+                                                src->region_bytes,
+                                                src->home_ub_node_id,
+                                                src->is_local,
+                                                src->weight ? src->weight : 1) != 0,
+                  -1);
+    } else {
+        char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
+        RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
+                                              src->backend_type,
+                                              src->path,
+                                              src->mmap_offset,
+                                              (size_t)src->region_bytes) != 0,
+                  -1);
+        RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
+                                                &storage->warm_data_mappings[i],
+                                                0,
+                                                src->region_id,
+                                                src->backend_type,
+                                                src->path,
+                                                src->mmap_offset,
+                                                src->value_size,
+                                                src->region_bytes,
+                                                src->home_ub_node_id,
+                                                src->is_local,
+                                                src->weight ? src->weight : 1) != 0,
+                  -1);
+        RETURN_IF(vemb_v16_warm_region_layout_name_from_region_path(
+                      src->path,
+                      src->region_id,
+                      layout_name,
+                      sizeof(layout_name)) != 0,
+                  -1);
+        RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_allocator_mappings[i],
+                                              src->backend_type,
+                                              layout_name,
+                                              0,
+                                              allocator_layout_bytes) != 0,
+                  -1);
+        RETURN_IF(warm_region_layout_ensure_initialized(
+                      &storage->warm_allocator_mappings[i],
+                      src->region_id,
+                      capacity_slots,
+                      src->value_size,
+                      src->region_bytes) != 0,
+                  -1);
+    }
     vemb_v16_tlc_warm_region_t warm_region = storage->warm_providers[i].region;
-    warm_region.shared_allocator = storage->warm_allocators[i].allocator;
+    warm_region.slot_meta = src->backend_type == VEMB_V16_REGION_UB ?
+        warm_slot_meta_from_mapping(&storage->warm_data_mappings[i],
+                                    capacity_slots) :
+        warm_slot_meta_from_mapping(&storage->warm_allocator_mappings[i],
+                                    capacity_slots);
+    RETURN_IF(!warm_region.slot_meta, -1);
     RETURN_IF(vemb_v16_tlc_attach_warm_region(storage->tlc, &warm_region) != 0, -1);
     storage->warm_region_count++;
     serverLog(LL_NOTICE,
@@ -1402,12 +1518,12 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
         const vemb_v16_manifest_region_t *region = &manifest->regions[i];
         uint32_t capacity_slots = (uint32_t)(region->region_bytes / region->value_size);
         if (region->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
-            char allocator_name[VEMB_V16_SHARED_ALLOCATOR_NAME_MAX];
-            int rc = vemb_v16_shared_allocator_name_from_region_path(
+            char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
+            int rc = vemb_v16_warm_region_layout_name_from_region_path(
                 region->path,
                 region->region_id,
-                allocator_name,
-                sizeof(allocator_name));
+                layout_name,
+                sizeof(layout_name));
             serverLog(LL_NOTICE,
                       "reset warm allocator shm name: region_id=%u path=%s rc=%d status=%s",
                       region->region_id,
@@ -1416,12 +1532,12 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
                       strerror(errno));
             RETURN_IF(rc != 0, -1);
 
-            rc = unlink_shm_if_exists(allocator_name);
+            rc = unlink_shm_if_exists(layout_name);
             int unlink_allocator_errno = errno;
             serverLog(LL_NOTICE,
                       "reset warm allocator shm: region_id=%u allocator=%s rc=%d status=%s",
                       region->region_id,
-                      allocator_name,
+                      layout_name,
                       rc,
                       strerror(unlink_allocator_errno));
             RETURN_IF(rc != 0, -1);
@@ -1436,7 +1552,7 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
                       strerror(unlink_payload_errno));
             RETURN_IF(rc != 0, -1);
         } else if (region->backend_type == VEMB_V16_REGION_UB) {
-            int rc = vemb_v16_shared_allocator_reset(region->backend_type,
+            int rc = vemb_v16_warm_region_layout_reset(region->backend_type,
                                                      region->path,
                                                      region->mmap_offset,
                                                      region->region_id,
@@ -1458,8 +1574,7 @@ int vemb_v16_storage_reset_manifest_regions(const vemb_v16_warm_regions_manifest
             return -1;
         }
     }
-    uint32_t owner_id = manifest->has_local_ub_node_id ?
-        manifest->local_ub_node_id : 0;
+    uint32_t owner_id = manifest->has_local_ub_node_id ?  manifest->local_ub_node_id : 0;
     uint32_t backend_type = manifest->has_remote_meta_backend_type ?
         manifest->remote_meta_backend_type : VEMB_V16_REGION_LOCAL_SHM;
     if (reset_remote_meta_backing(owner_id,
@@ -1555,18 +1670,14 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         zcalloc(sizeof(*storage->warm_data_mappings) * VEMB_V16_MAX_MANIFEST_REGIONS);
     storage->warm_allocator_mappings =
         zcalloc(sizeof(*storage->warm_allocator_mappings) * VEMB_V16_MAX_MANIFEST_REGIONS);
-    storage->warm_allocators =
-        zcalloc(sizeof(*storage->warm_allocators) * VEMB_V16_MAX_MANIFEST_REGIONS);
     if (!storage->warm_providers || !storage->warm_data_mappings ||
-        !storage->warm_allocator_mappings || !storage->warm_allocators) {
+        !storage->warm_allocator_mappings) {
         if (storage->warm_providers)
             zfree(storage->warm_providers);
         if (storage->warm_data_mappings)
             zfree(storage->warm_data_mappings);
         if (storage->warm_allocator_mappings)
             zfree(storage->warm_allocator_mappings);
-        if (storage->warm_allocators)
-            zfree(storage->warm_allocators);
         pthread_mutex_destroy(&storage->migration_outbox_lock);
         pthread_mutex_destroy(&storage->topology_lock);
         zfree(storage);
@@ -1574,7 +1685,6 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     }
     for (uint32_t i = 0; i < VEMB_V16_MAX_MANIFEST_REGIONS; i++) {
         storage->warm_providers[i].fd = -1;
-        storage->warm_allocators[i].fd = -1;
         storage->warm_data_mappings[i].fd = -1;
         storage->warm_allocator_mappings[i].fd = -1;
     }
@@ -1586,9 +1696,12 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
         uint32_t capacity_slots =
             (uint32_t)(src->region_bytes / src->value_size);
         size_t allocator_layout_bytes =
-            vemb_v16_shared_allocator_layout_bytes(capacity_slots);
+            vemb_v16_warm_region_layout_bytes(capacity_slots);
         if (src->backend_type == VEMB_V16_REGION_UB) {
-            /* One UB backing region: [allocator + slot_meta][payload bytes...] */
+            /*
+             * UB packs one warm-region layout into a single mapping:
+             *   [warm_region_header][slot_meta][payload]
+             */
             if (vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
                                             src->backend_type,
                                             src->path,
@@ -1598,7 +1711,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                 serverLog(LL_WARNING,
                           "failed to open warm ub backing region: region_id=%u path=%s",
                           src->region_id, src->path);
-                GOTO_IF(1, err);
+                goto err;
             }
             if (vemb_v16_warm_provider_attach(&storage->warm_providers[i],
                                               &storage->warm_data_mappings[i],
@@ -1616,20 +1729,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                 serverLog(LL_WARNING,
                           "failed to attach warm ub provider: region_id=%u path=%s",
                           src->region_id, src->path);
-                GOTO_IF(1, err);
-            }
-            if (vemb_v16_shared_allocator_attach(&storage->warm_allocators[i],
-                                                 &storage->warm_data_mappings[i],
-                                                 0,
-                                                 src->backend_type,
-                                                 src->path,
-                                                 src->mmap_offset,
-                                                 src->region_id,
-                                                 capacity_slots) != 0) {
-                serverLog(LL_WARNING,
-                          "failed to attach warm ub shared allocator: region_id=%u path=%s",
-                          src->region_id, src->path);
-                GOTO_IF(1, err);
+                goto err;
             }
         } else if (src->backend_type == VEMB_V16_REGION_LOCAL_SHM) {
             if (vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
@@ -1640,7 +1740,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                 serverLog(LL_WARNING,
                           "failed to open warm shm payload region: region_id=%u path=%s",
                           src->region_id, src->path);
-                GOTO_IF(1, err);
+                goto err;
             }
             if (vemb_v16_warm_provider_attach(&storage->warm_providers[i],
                                               &storage->warm_data_mappings[i],
@@ -1657,42 +1757,40 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                 serverLog(LL_WARNING,
                           "failed to attach warm shm provider: region_id=%u path=%s",
                           src->region_id, src->path);
-                GOTO_IF(1, err);
+                goto err;
             }
 
-            char allocator_name[VEMB_V16_SHARED_ALLOCATOR_NAME_MAX];
-            if (vemb_v16_shared_allocator_name_from_region_path(
+            char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
+            if (vemb_v16_warm_region_layout_name_from_region_path(
                     src->path,
                     src->region_id,
-                    allocator_name,
-                    sizeof(allocator_name)) != 0) {
+                    layout_name,
+                    sizeof(layout_name)) != 0) {
                 serverLog(LL_WARNING,
-                          "failed to derive warm shared allocator name: region_id=%u path=%s",
+                          "failed to derive warm region layout name: region_id=%u path=%s",
                           src->region_id, src->path);
-                GOTO_IF(1, err);
+                goto err;
             }
             if (vemb_v16_mapped_region_open(&storage->warm_allocator_mappings[i],
                                             src->backend_type,
-                                            allocator_name,
+                                            layout_name,
                                             0,
                                             allocator_layout_bytes) != 0) {
                 serverLog(LL_WARNING,
                           "failed to open warm shm allocator backing: region_id=%u path=%s allocator=%s",
-                          src->region_id, src->path, allocator_name);
-                GOTO_IF(1, err);
+                          src->region_id, src->path, layout_name);
+                 goto err;   
             }
-            if (vemb_v16_shared_allocator_attach(&storage->warm_allocators[i],
-                                                 &storage->warm_allocator_mappings[i],
-                                                 0,
-                                                 src->backend_type,
-                                                 allocator_name,
-                                                 0,
-                                                 src->region_id,
-                                                 capacity_slots) != 0) {
+            if (warm_region_layout_ensure_initialized(
+                    &storage->warm_allocator_mappings[i],
+                    src->region_id,
+                    capacity_slots,
+                    src->value_size,
+                    src->region_bytes) != 0) {
                 serverLog(LL_WARNING,
-                          "failed to attach warm shm shared allocator: region_id=%u path=%s allocator=%s",
-                          src->region_id, src->path, allocator_name);
-                GOTO_IF(1, err);
+                          "failed to initialize warm shm layout: region_id=%u path=%s allocator=%s",
+                          src->region_id, src->path, layout_name);
+                goto err;
             }
         } else {
             // Should not happen due to manifest validation, but just in case.
@@ -1701,15 +1799,24 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                         src->region_id, src->backend_type);
         }
         warm_regions[i] = storage->warm_providers[i].region;
-        warm_regions[i].shared_allocator =
-            storage->warm_allocators[i].allocator;
+        warm_regions[i].slot_meta = src->backend_type == VEMB_V16_REGION_UB ?
+            warm_slot_meta_from_mapping(&storage->warm_data_mappings[i],
+                                        capacity_slots) :
+            warm_slot_meta_from_mapping(&storage->warm_allocator_mappings[i],
+                                        capacity_slots);
+        if (!warm_regions[i].slot_meta) {
+            serverLog(LL_WARNING,
+                      "failed to resolve warm region slot meta: region_id=%u path=%s backend=%u",
+                      src->region_id, src->path, src->backend_type);
+            goto err;
+        }
         if (!src->is_local &&
             storage_cache_peer_region_config(storage, src) != 0) {
             serverLog(LL_WARNING,
                       "failed to cache peer warm region config: region_id=%u owner=%u",
                       src->region_id,
                       src->home_ub_node_id);
-            GOTO_IF(1, err);
+            goto err;
         }
     }
 
@@ -1722,7 +1829,7 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     strncpy(storage->vector_region_name, first->path, sizeof(storage->vector_region_name) - 1);
 
     if (storage_remote_meta_init(storage, manifest) != 0) {
-        GOTO_IF(1, err);
+        goto err;
     }
 
     if (vemb_v16_tlc_create(&storage->tlc,
@@ -1736,13 +1843,13 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
                   storage->vector_dim,
                   storage->max_vectors,
                   storage->warm_region_count);
-        GOTO_IF(1, err);
+        goto err;
     }
     vemb_v16_tlc_set_remote_meta_view(storage->tlc,
                                       &storage->remote_meta_view,
                                       VEMB_V16_REMOTE_META_DEFAULT_RETRIES);
     if (storage_remote_meta_owner_views_init(storage, manifest) != 0) {
-        GOTO_IF(1, err);
+        goto err;
     }
     for (uint32_t i = 0; i < manifest->remote_meta_view_count; i++) {
         if (storage_cache_remote_meta_view_config(storage,
@@ -1750,14 +1857,14 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
             serverLog(LL_WARNING,
                       "failed to cache remote meta owner view config: owner=%u",
                       manifest->remote_meta_views[i].owner_id);
-            GOTO_IF(1, err);
+            goto err;
         }
     }
     if (storage_owner_resolver_init(storage, manifest) != 0) {
-        GOTO_IF(1, err);
+        goto err;
     }
     if (storage_ub_rpc_init(storage, manifest) != 0) {
-        GOTO_IF(1, err);
+        goto err;
     }
     if (storage->ub_rpc &&
         vemb_v16_storage_migration_retry_start(storage, 0, 0) != 0) {
@@ -1792,11 +1899,6 @@ void vemb_v16_storage_ctx_destroy(vemb_v16_storage_ctx_t *storage) {
             zfree(storage->warm_providers);
     } else {
         vemb_v16_warm_provider_close(&storage->warm_provider);
-    }
-    if (storage->warm_allocators) {
-        for (uint32_t i = 0; i < storage->warm_region_count; i++)
-            vemb_v16_shared_allocator_close(&storage->warm_allocators[i]);
-        zfree(storage->warm_allocators);
     }
     if (storage->warm_data_mappings) {
         for (uint32_t i = 0; i < storage->warm_region_count; i++)
@@ -2836,6 +2938,8 @@ int vemb_v16_storage_apply_peer_view_map(
         vemb_v16_storage_ctx_t *storage,
         const vemb_v16_peer_view_map_req_t *req,
         vemb_v16_peer_view_map_resp_t *resp) {
+    RETURN_IF(!storage || !req || !resp, -1);
+    memset(resp, 0, sizeof(*resp));
     RETURN_IF(req->expected_local_owner_valid &&
               req->expected_local_owner_id != storage->local_owner_id,
               -1);

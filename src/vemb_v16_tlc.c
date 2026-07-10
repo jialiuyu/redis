@@ -689,7 +689,7 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
             .value_size = warm_regions[i].value_size,
             .region_bytes = warm_regions[i].region_bytes,
             .mapped_addr = warm_regions[i].mapped_addr,
-            .shared_allocator = warm_regions[i].shared_allocator,
+            .slot_meta = warm_regions[i].slot_meta,
         };
     }
     tlc_core_config_t core_config = {
@@ -731,7 +731,7 @@ int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
         .value_size = warm_region->value_size,
         .region_bytes = warm_region->region_bytes,
         .mapped_addr = warm_region->mapped_addr,
-        .shared_allocator = warm_region->shared_allocator,
+        .slot_meta = warm_region->slot_meta,
     };
     uint32_t region_index = UINT32_MAX;
     RETURN_IF(tlc_core_attach_warm_region(tlc->core,

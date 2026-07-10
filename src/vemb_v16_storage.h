@@ -5,7 +5,7 @@
 #include "vemb_v16_peer_view_map.h"
 #include "vemb_v16_migration_outbox.h"
 #include "vemb_v16_remote_meta.h"
-#include "vemb_v16_shared_allocator.h"
+#include "vemb_v16_warm_region_layout.h"
 #include "vemb_v16_tlc.h"
 #include "vemb_v16_topology.h"
 #include "vemb_v16_ub_rpc.h"
@@ -207,7 +207,6 @@ typedef struct vemb_v16_storage_ctx {
     vemb_v16_mapped_region_t *warm_data_mappings;
     vemb_v16_mapped_region_t *warm_allocator_mappings;
     vemb_v16_warm_provider_t *warm_providers;
-    vemb_v16_shared_allocator_mapping_t *warm_allocators;
     vemb_v16_warm_provider_t warm_provider;
     vemb_v16_tlc_t *tlc;
     vemb_v16_mapped_region_t remote_meta_mapping;

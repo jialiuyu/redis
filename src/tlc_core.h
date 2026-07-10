@@ -1,7 +1,7 @@
 #ifndef __TLC_CORE_H
 #define __TLC_CORE_H
 
-#include "vemb_v16_shared_allocator.h"
+#include "vemb_v16_warm_region_layout.h"
 #include "vemb_v16_protocol.h"
 
 #include <stddef.h>
@@ -99,7 +99,7 @@ typedef struct tlc_core_warm_region_config {
     uint32_t value_size;
     uint64_t region_bytes;
     uint8_t *mapped_addr;
-    vemb_v16_shared_region_allocator_t *shared_allocator;
+    vemb_v16_warm_slot_meta_t *slot_meta;
 } tlc_core_warm_region_config_t;
 
 typedef struct tlc_core_region_stats {

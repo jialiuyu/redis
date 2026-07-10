@@ -20,17 +20,14 @@ static void fill_vector(float *vector, uint32_t dim, uint32_t seed) {
         vector[i] = (float)(seed + i);
 }
 
-static void init_test_allocator(vemb_v16_shared_region_allocator_t *allocator,
+static void init_test_allocator(vemb_v16_warm_region_header_t *allocator,
                                 uint32_t region_id,
                                 uint32_t capacity_slots) {
     memset(allocator, 0, sizeof(*allocator));
-    atomic_init(&allocator->magic, VEMB_V16_SHARED_ALLOCATOR_MAGIC);
-    allocator->version = VEMB_V16_SHARED_ALLOCATOR_VERSION;
+    atomic_init(&allocator->magic, VEMB_V16_WARM_REGION_LAYOUT_MAGIC);
+    allocator->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
     allocator->region_id = region_id;
     allocator->capacity_slots = capacity_slots;
-    atomic_init(&allocator->next_slot, 0);
-    atomic_init(&allocator->full, 0);
-    atomic_init(&allocator->used_slots, 0);
 }
 
 static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
@@ -73,13 +70,13 @@ static void make_rpc_peers(vemb_v16_ub_rpc_peer_t *peer_a_to_b,
     set_rpc_ring(&peer_b_to_a->outbound_response, resp_b_a);
 }
 
-static void cleanup_region_and_allocator(const char *path,
+static void cleanup_region_and_layout(const char *path,
                                          uint32_t region_id) {
-    char allocator_name[VEMB_V16_SHARED_ALLOCATOR_NAME_MAX];
+    char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
     shm_unlink(path);
-    if (vemb_v16_shared_allocator_name_from_region_path(
-            path, region_id, allocator_name, sizeof(allocator_name)) == 0) {
-        vemb_v16_shared_allocator_unlink(allocator_name);
+    if (vemb_v16_warm_region_layout_name_from_region_path(
+            path, region_id, layout_name, sizeof(layout_name)) == 0) {
+        shm_unlink(layout_name);
     }
 }
 
@@ -890,7 +887,7 @@ static void test_proxy_migration_control_primitives(void) {
              (long)getpid());
 
     unlink(uds_path);
-    cleanup_region_and_allocator(shm1, 901);
+    cleanup_region_and_layout(shm1, 901);
     shm_unlink(remote_meta_default);
     shm_unlink(req0_1);
     shm_unlink(req1_0);
@@ -1450,14 +1447,14 @@ static void test_proxy_migration_control_primitives(void) {
     shm_unlink(req1_0);
     shm_unlink(resp0_1);
     shm_unlink(resp1_0);
-    cleanup_region_and_allocator(shm1, 901);
+    cleanup_region_and_layout(shm1, 901);
 }
 
 static void test_storage_topology_auto_marks_migrating_keys(void) {
     enum { dim = 2, max_vectors = 16 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 911,
@@ -1467,7 +1464,7 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_storage_ctx_t storage;
     vemb_v16_topology_control_req_t topology_req = {0};
@@ -1599,8 +1596,8 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
              "/v16combo_meta_%ld", (long)getpid());
     unlink(manifest_path);
     unlink(uds_path);
-    cleanup_region_and_allocator(shm1, 801);
-    cleanup_region_and_allocator(combo_region, 802);
+    cleanup_region_and_layout(shm1, 801);
+    cleanup_region_and_layout(combo_region, 802);
     shm_unlink(remote_meta_default);
 
     FILE *fp = fopen(manifest_path, "w");
@@ -1697,8 +1694,8 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
 
     vemb_v16_proxy_destroy(proxy);
     unlink(manifest_path);
-    cleanup_region_and_allocator(shm1, 801);
-    cleanup_region_and_allocator(combo_region, 802);
+    cleanup_region_and_layout(shm1, 801);
+    cleanup_region_and_layout(combo_region, 802);
     shm_unlink(remote_meta_default);
 }
 
@@ -1707,8 +1704,8 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
     float source_region[dim * max_vectors];
     float target_region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -1721,7 +1718,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -1732,7 +1729,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 923,
@@ -1742,7 +1739,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -1912,8 +1909,8 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
     float source_region[dim * max_vectors];
     float target_region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -1926,7 +1923,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -1937,7 +1934,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 933,
@@ -1947,7 +1944,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -2150,8 +2147,8 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
     float target_region[dim * max_vectors];
     float initial[dim];
     float updated[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2164,7 +2161,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -2175,7 +2172,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 943,
@@ -2185,7 +2182,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -2396,8 +2393,8 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
     float target_region[dim * max_vectors];
     float initial[dim];
     float updated[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2410,7 +2407,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -2421,7 +2418,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 947,
@@ -2431,7 +2428,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -2736,8 +2733,8 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     char large_range_keys[large_range_key_count][64];
     uint32_t large_range_key_lens[large_range_key_count];
     uint64_t large_range_key_hashes[large_range_key_count];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2751,7 +2748,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_regions[] = {
         {
@@ -2762,7 +2759,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 953,
@@ -2772,7 +2769,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
             .mapped_addr = dest_region,
             .region_bytes = sizeof(dest_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &dest_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_dest[64];
@@ -4617,8 +4614,8 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
     float dest_region[dim * max_vectors];
     float initial[dim];
     float updated[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -4631,7 +4628,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_regions[] = {
         {
@@ -4642,7 +4639,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 973,
@@ -4652,7 +4649,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
             .mapped_addr = dest_region,
             .region_bytes = sizeof(dest_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &dest_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_dest[64];
