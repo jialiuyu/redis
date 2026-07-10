@@ -2696,7 +2696,7 @@ cleanup:
 }
 
 void vemb_v16_proxy_stop(vemb_v16_proxy_t *proxy) {
-    assert(proxy != NULL);
+    RETURN_IF(!proxy);
     int was_running = atomic_exchange_explicit(&proxy->running, 0,
                                                memory_order_relaxed);
     if (!was_running) return;

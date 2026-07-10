@@ -180,9 +180,14 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
                                  vemb_v16_timing_acc_t *payload_remote_slice,
                                  int sample) {
     RETURN_IF(op != VEMB_V16_OP_VEMB_INLINE, -1);
-    completion->inline_vector =
-        completion_alloc_inline_snapshot(vector_bytes);
+    completion->inline_vector = completion_alloc_inline_snapshot(vector_bytes);
     RETURN_IF(!completion->inline_vector, -1);
+    /*
+     * Release may run on the copy-failed path below, so publish the snapshot
+     * length as soon as the snapshot exists instead of waiting for load
+     * success.
+     */
+    completion->inline_vector_bytes = vector_bytes;
 
     uint32_t vector_len = 0;
     monotime vector_load_start = timing_start_if_sampled(sample);
@@ -201,8 +206,6 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
         vemb_v16_completion_release_inline_snapshot(completion);
         return -1;
     }
-
-    completion->inline_vector_bytes = vector_len;
     if (sample) {
         atomic_fetch_add_explicit(&ctx->stats->sample_vector_load_ns,
                                   payload_local_slice->ns +
