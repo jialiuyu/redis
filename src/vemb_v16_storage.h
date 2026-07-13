@@ -225,14 +225,17 @@ typedef struct vemb_v16_storage_ctx {
     uint32_t remote_meta_owner_view_count;
     vemb_v16_storage_remote_meta_view_t
         remote_meta_owner_views[VEMB_V16_MAX_MANIFEST_REMOTE_META_VIEWS];
+    // Cached peer-view region configs, attached later on demand.
     uint32_t peer_region_config_count;
     vemb_v16_manifest_region_t
         peer_region_configs[VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS];
+    // Cached peer-view remote-meta configs, not runtime views yet.
     uint32_t peer_remote_meta_view_config_count;
     vemb_v16_manifest_remote_meta_view_t
         peer_remote_meta_view_configs
             [VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS];
     uint32_t ub_rpc_timeout_ms;
+    // Cached peer-view UB-RPC peer configs, attached later on demand.
     uint32_t ub_rpc_peer_config_count;
     vemb_v16_manifest_ub_rpc_peer_t
         ub_rpc_peer_configs[VEMB_V16_MAX_MANIFEST_UB_RPC_PEERS];
@@ -299,13 +302,28 @@ int vemb_v16_storage_ask_redirect_write_ready(
 int vemb_v16_storage_topology_set(
     vemb_v16_storage_ctx_t *storage,
     const vemb_v16_topology_control_req_t *req);
+int vemb_v16_storage_build_topology_rings(
+    const vemb_v16_topology_control_req_t *req,
+    vemb_v16_topology_ring_t *active_ring,
+    vemb_v16_topology_ring_t *standby_ring);
+int vemb_v16_storage_topology_set_with_rings(
+    vemb_v16_storage_ctx_t *storage,
+    const vemb_v16_topology_control_req_t *req,
+    const vemb_v16_topology_ring_t *active_ring,
+    const vemb_v16_topology_ring_t *standby_ring);
 void vemb_v16_storage_topology_get(
     vemb_v16_storage_ctx_t *storage,
     vemb_v16_topology_control_resp_t *resp);
-int vemb_v16_storage_apply_peer_view_map(
+int vemb_v16_storage_store_peer_view_map(
     vemb_v16_storage_ctx_t *storage,
     const vemb_v16_peer_view_map_req_t *req,
     vemb_v16_peer_view_map_resp_t *resp);
+int vemb_v16_storage_has_region_for_owner(
+    const vemb_v16_storage_ctx_t *storage,
+    uint32_t owner_id);
+int vemb_v16_storage_attach_peer_owner_from_mapping(
+    vemb_v16_storage_ctx_t *storage,
+    uint32_t owner_id);
 int vemb_v16_storage_migration_mark_cutover(
     vemb_v16_storage_ctx_t *storage,
     const char *key,

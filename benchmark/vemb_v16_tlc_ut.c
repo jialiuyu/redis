@@ -58,6 +58,106 @@ static vemb_v16_warm_region_header_t *init_test_allocator_with_slot_meta(
     return allocator;
 }
 
+typedef struct tlc_ut_slot_meta_entry {
+    void *mapped_addr;
+    uint32_t region_id;
+    uint32_t capacity_slots;
+    vemb_v16_warm_slot_meta_t *slot_meta;
+} tlc_ut_slot_meta_entry_t;
+
+#define TLC_UT_SLOT_META_REGISTRY_MAX 128u
+
+static tlc_ut_slot_meta_entry_t
+    tlc_ut_slot_meta_registry[TLC_UT_SLOT_META_REGISTRY_MAX];
+
+static vemb_v16_warm_slot_meta_t *tlc_ut_slot_meta_acquire(
+        void *mapped_addr,
+        uint32_t region_id,
+        uint32_t capacity_slots) {
+    for (uint32_t i = 0; i < TLC_UT_SLOT_META_REGISTRY_MAX; i++) {
+        tlc_ut_slot_meta_entry_t *entry = &tlc_ut_slot_meta_registry[i];
+        if (entry->mapped_addr == mapped_addr &&
+            entry->region_id == region_id &&
+            entry->capacity_slots == capacity_slots) {
+            return entry->slot_meta;
+        }
+    }
+
+    for (uint32_t i = 0; i < TLC_UT_SLOT_META_REGISTRY_MAX; i++) {
+        tlc_ut_slot_meta_entry_t *entry = &tlc_ut_slot_meta_registry[i];
+        if (entry->mapped_addr)
+            continue;
+
+        vemb_v16_warm_slot_meta_t *slots =
+            calloc(capacity_slots, sizeof(*slots));
+        assert(slots);
+        for (uint32_t slot = 0; slot < capacity_slots; slot++) {
+            slots[slot].region_id = region_id;
+            slots[slot].local_slot = slot;
+            atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+            atomic_init(&slots[slot].owner_generation, 0);
+            atomic_init(&slots[slot].write_seq, 0);
+            atomic_init(&slots[slot].last_access_ns, 0);
+            atomic_init(&slots[slot].clock_bit, 0);
+            atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+        }
+        *entry = (tlc_ut_slot_meta_entry_t){
+            .mapped_addr = mapped_addr,
+            .region_id = region_id,
+            .capacity_slots = capacity_slots,
+            .slot_meta = slots,
+        };
+        return slots;
+    }
+
+    assert(!"tlc_ut slot_meta registry exhausted");
+    return NULL;
+}
+
+static void tlc_ut_ensure_slot_meta(vemb_v16_tlc_warm_region_t *warm_region) {
+    if (warm_region->slot_meta)
+        return;
+    assert(warm_region->mapped_addr);
+    assert(warm_region->value_size > 0);
+    assert(warm_region->region_bytes >= warm_region->value_size);
+    uint32_t capacity_slots =
+        (uint32_t)(warm_region->region_bytes / warm_region->value_size);
+    warm_region->slot_meta = tlc_ut_slot_meta_acquire(warm_region->mapped_addr,
+                                                      warm_region->region_id,
+                                                      capacity_slots);
+}
+
+static void tlc_ut_ensure_regions_slot_meta(
+        vemb_v16_tlc_warm_region_t *warm_regions,
+        uint32_t warm_region_count) {
+    for (uint32_t i = 0; i < warm_region_count; i++)
+        tlc_ut_ensure_slot_meta(&warm_regions[i]);
+}
+
+static int tlc_ut_create(vemb_v16_tlc_t **out,
+                         uint32_t vector_dim,
+                         uint32_t max_vectors,
+                         vemb_v16_tlc_warm_region_t *warm_regions,
+                         uint32_t warm_region_count,
+                         uint32_t local_region_weight) {
+    tlc_ut_ensure_regions_slot_meta(warm_regions, warm_region_count);
+    return vemb_v16_tlc_create(out,
+                               vector_dim,
+                               max_vectors,
+                               warm_regions,
+                               warm_region_count,
+                               local_region_weight);
+}
+
+static int tlc_ut_attach_warm_region(vemb_v16_tlc_t *tlc,
+                                     vemb_v16_tlc_warm_region_t *warm_region) {
+    tlc_ut_ensure_slot_meta(warm_region);
+    return vemb_v16_tlc_attach_warm_region(tlc, warm_region);
+}
+
+#define vemb_v16_tlc_create tlc_ut_create
+#define vemb_v16_tlc_attach_warm_region tlc_ut_attach_warm_region
+
 static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
                          const char *path) {
     memset(ring, 0, sizeof(*ring));
@@ -327,6 +427,9 @@ static void test_disabled_cold_append_is_noop(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 42, max_vectors);
+    warm.slot_meta = tlc_ut_slot_meta_acquire(warm.mapped_addr,
+                                              warm.region_id,
+                                              max_vectors);
     assert(tlc_core_create(&core, &config) == 0);
     fill_vector(vector, dim, 42);
     assert(tlc_core_cold_append(core,
@@ -377,6 +480,9 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 77, max_vectors);
+    warm.slot_meta = tlc_ut_slot_meta_acquire(warm.mapped_addr,
+                                              warm.region_id,
+                                              max_vectors);
     assert(tlc_core_create(&core, &config) == 0);
     for (uint32_t i = 0; i < 16; i++) {
         fill_vector(vector, dim, 1000 + i);

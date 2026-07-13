@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -29,6 +30,101 @@ static void init_test_allocator(vemb_v16_warm_region_header_t *allocator,
     allocator->region_id = region_id;
     allocator->capacity_slots = capacity_slots;
 }
+
+typedef struct migration_ut_slot_meta_entry {
+    void *mapped_addr;
+    uint32_t region_id;
+    uint32_t capacity_slots;
+    vemb_v16_warm_slot_meta_t *slot_meta;
+} migration_ut_slot_meta_entry_t;
+
+#define MIGRATION_UT_SLOT_META_REGISTRY_MAX 128u
+
+static migration_ut_slot_meta_entry_t
+    migration_ut_slot_meta_registry[MIGRATION_UT_SLOT_META_REGISTRY_MAX];
+
+static vemb_v16_warm_slot_meta_t *migration_ut_slot_meta_acquire(
+        void *mapped_addr,
+        uint32_t region_id,
+        uint32_t capacity_slots) {
+    for (uint32_t i = 0; i < MIGRATION_UT_SLOT_META_REGISTRY_MAX; i++) {
+        migration_ut_slot_meta_entry_t *entry = &migration_ut_slot_meta_registry[i];
+        if (entry->mapped_addr == mapped_addr &&
+            entry->region_id == region_id &&
+            entry->capacity_slots == capacity_slots) {
+            return entry->slot_meta;
+        }
+    }
+
+    for (uint32_t i = 0; i < MIGRATION_UT_SLOT_META_REGISTRY_MAX; i++) {
+        migration_ut_slot_meta_entry_t *entry = &migration_ut_slot_meta_registry[i];
+        if (entry->mapped_addr)
+            continue;
+
+        vemb_v16_warm_slot_meta_t *slots =
+            calloc(capacity_slots, sizeof(*slots));
+        assert(slots);
+        for (uint32_t slot = 0; slot < capacity_slots; slot++) {
+            slots[slot].region_id = region_id;
+            slots[slot].local_slot = slot;
+            atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+            atomic_init(&slots[slot].owner_generation, 0);
+            atomic_init(&slots[slot].write_seq, 0);
+            atomic_init(&slots[slot].last_access_ns, 0);
+            atomic_init(&slots[slot].clock_bit, 0);
+            atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+        }
+        *entry = (migration_ut_slot_meta_entry_t){
+            .mapped_addr = mapped_addr,
+            .region_id = region_id,
+            .capacity_slots = capacity_slots,
+            .slot_meta = slots,
+        };
+        return slots;
+    }
+
+    assert(!"migration_ut slot_meta registry exhausted");
+    return NULL;
+}
+
+static void migration_ut_ensure_slot_meta(
+        vemb_v16_tlc_warm_region_t *warm_region) {
+    if (warm_region->slot_meta)
+        return;
+    assert(warm_region->mapped_addr);
+    assert(warm_region->value_size > 0);
+    assert(warm_region->region_bytes >= warm_region->value_size);
+    uint32_t capacity_slots =
+        (uint32_t)(warm_region->region_bytes / warm_region->value_size);
+    warm_region->slot_meta =
+        migration_ut_slot_meta_acquire(warm_region->mapped_addr,
+                                       warm_region->region_id,
+                                       capacity_slots);
+}
+
+static void migration_ut_ensure_regions_slot_meta(
+        vemb_v16_tlc_warm_region_t *warm_regions,
+        uint32_t warm_region_count) {
+    for (uint32_t i = 0; i < warm_region_count; i++)
+        migration_ut_ensure_slot_meta(&warm_regions[i]);
+}
+
+static int migration_ut_create(vemb_v16_tlc_t **out,
+                               uint32_t vector_dim,
+                               uint32_t max_vectors,
+                               vemb_v16_tlc_warm_region_t *warm_regions,
+                               uint32_t warm_region_count,
+                               uint32_t local_region_weight) {
+    migration_ut_ensure_regions_slot_meta(warm_regions, warm_region_count);
+    return vemb_v16_tlc_create(out,
+                               vector_dim,
+                               max_vectors,
+                               warm_regions,
+                               warm_region_count,
+                               local_region_weight);
+}
+
+#define vemb_v16_tlc_create migration_ut_create
 
 static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
                          const char *path) {
@@ -78,6 +174,23 @@ static void cleanup_region_and_layout(const char *path,
             path, region_id, layout_name, sizeof(layout_name)) == 0) {
         shm_unlink(layout_name);
     }
+}
+
+static void create_test_ub_region_file(const char *path,
+                                       uint32_t region_id,
+                                       uint32_t capacity_slots,
+                                       uint32_t value_size) {
+    size_t layout_bytes = vemb_v16_warm_region_layout_bytes(capacity_slots);
+    size_t total_bytes = layout_bytes + ((size_t)capacity_slots * value_size);
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    assert(fd >= 0);
+    assert(ftruncate(fd, (off_t)total_bytes) == 0);
+    close(fd);
+    assert(vemb_v16_warm_region_layout_reset(VEMB_V16_REGION_UB,
+                                             path,
+                                             0,
+                                             region_id,
+                                             capacity_slots) == 0);
 }
 
 static int wait_for_outbox_progress(vemb_v16_storage_ctx_t *storage,
@@ -209,6 +322,9 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
     int sv[2];
     control_thread_arg_t handler_arg;
     pthread_t handler;
+    uint8_t req_buf[128];
+    uint8_t resp_buf[128];
+    size_t req_len = 0;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
     if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
@@ -216,13 +332,21 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
         close(sv[1]);
         return -1;
     }
+    if (vemb_v16_migration_control_req_encode(req_buf,
+                                              sizeof(req_buf),
+                                              req,
+                                              &req_len) != 0) {
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(sv[0],
                                  type,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
@@ -232,11 +356,15 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
         (hdr.type != VEMB_V16_NET_MIGRATION_CONTROL_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+         hdr.payload_len > sizeof(resp_buf))) {
         rc = -1;
     }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_migration_control_resp_decode(resp,
+                                                    resp_buf,
+                                                    hdr.payload_len);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -276,6 +404,9 @@ static int tcp_migration_batch_control(
     int sv[2];
     control_thread_arg_t handler_arg;
     pthread_t handler;
+    uint8_t *req_buf = NULL;
+    uint8_t *resp_buf = NULL;
+    size_t req_len = 0;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
     if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
@@ -283,27 +414,50 @@ static int tcp_migration_batch_control(
         close(sv[1]);
         return -1;
     }
+    req_buf = malloc(vemb_v16_migration_control_batch_req_encoded_len(req));
+    if (!req_buf ||
+        vemb_v16_migration_control_batch_req_encode(
+            req_buf,
+            vemb_v16_migration_control_batch_req_encoded_len(req),
+            req,
+            &req_len) != 0) {
+        free(req_buf);
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(sv[0],
                                  VEMB_V16_NET_MIGRATION_MARK_MIGRATING_BATCH,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
+        free(req_buf);
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
     }
+    free(req_buf);
 
     vemb_v16_net_hdr_t hdr;
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
-        (hdr.type != VEMB_V16_NET_MIGRATION_CONTROL_BATCH_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+        hdr.type != VEMB_V16_NET_MIGRATION_CONTROL_BATCH_RESPONSE) {
         rc = -1;
     }
+    if (rc == 0) {
+        resp_buf = malloc(hdr.payload_len);
+        if (!resp_buf)
+            rc = -1;
+    }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_migration_control_batch_resp_decode(resp,
+                                                          resp_buf,
+                                                          hdr.payload_len);
+    free(resp_buf);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -357,6 +511,9 @@ static int tcp_migration_range_control(
     int sv[2];
     control_thread_arg_t handler_arg;
     pthread_t handler;
+    uint8_t req_buf[32];
+    uint8_t resp_buf[128];
+    size_t req_len = 0;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
     if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
@@ -364,13 +521,21 @@ static int tcp_migration_range_control(
         close(sv[1]);
         return -1;
     }
+    if (vemb_v16_migration_range_control_req_encode(req_buf,
+                                                    sizeof(req_buf),
+                                                    req,
+                                                    &req_len) != 0) {
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(sv[0],
                                  type,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
@@ -380,11 +545,15 @@ static int tcp_migration_range_control(
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
         (hdr.type != VEMB_V16_NET_MIGRATION_RANGE_CONTROL_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+         hdr.payload_len > sizeof(resp_buf))) {
         rc = -1;
     }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_migration_range_control_resp_decode(resp,
+                                                          resp_buf,
+                                                          hdr.payload_len);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -449,9 +618,18 @@ static int tcp_epoch_control(vemb_v16_proxy_t *proxy,
     pthread_t handler;
     const void *payload = NULL;
     uint32_t payload_len = 0;
+    uint8_t req_buf[32];
+    uint8_t resp_buf[32];
+    size_t req_len = 0;
     if (type == VEMB_V16_NET_EPOCH_SET) {
-        payload = req;
-        payload_len = sizeof(*req);
+        if (vemb_v16_epoch_control_req_encode(req_buf,
+                                              sizeof(req_buf),
+                                              req,
+                                              &req_len) != 0) {
+            return -1;
+        }
+        payload = req_buf;
+        payload_len = (uint32_t)req_len;
     }
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
@@ -476,11 +654,15 @@ static int tcp_epoch_control(vemb_v16_proxy_t *proxy,
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
         (hdr.type != VEMB_V16_NET_EPOCH_CONTROL_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+         hdr.payload_len != vemb_v16_epoch_control_resp_encoded_len())) {
         rc = -1;
     }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_epoch_control_resp_decode(resp,
+                                                resp_buf,
+                                                hdr.payload_len);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -595,9 +777,22 @@ static int tcp_topology_control(vemb_v16_proxy_t *proxy,
     pthread_t handler;
     const void *payload = NULL;
     uint32_t payload_len = 0;
+    uint8_t *req_buf = NULL;
+    uint8_t *resp_buf = NULL;
+    size_t req_len = 0;
     if (type == VEMB_V16_NET_TOPOLOGY_SET) {
-        payload = req;
-        payload_len = sizeof(*req);
+        req_buf = malloc(vemb_v16_topology_control_req_encoded_len(req));
+        if (!req_buf ||
+            vemb_v16_topology_control_req_encode(
+                req_buf,
+                vemb_v16_topology_control_req_encoded_len(req),
+                req,
+                &req_len) != 0) {
+            free(req_buf);
+            return -1;
+        }
+        payload = req_buf;
+        payload_len = (uint32_t)req_len;
     }
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
@@ -613,20 +808,30 @@ static int tcp_topology_control(vemb_v16_proxy_t *proxy,
                                  0,
                                  payload,
                                  payload_len) != 0) {
+        free(req_buf);
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
     }
+    free(req_buf);
 
     vemb_v16_net_hdr_t hdr;
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
-    if (rc == 0 &&
-        (hdr.type != VEMB_V16_NET_TOPOLOGY_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+    if (rc == 0 && hdr.type != VEMB_V16_NET_TOPOLOGY_RESPONSE) {
         rc = -1;
     }
+    if (rc == 0) {
+        resp_buf = malloc(hdr.payload_len);
+        if (!resp_buf)
+            rc = -1;
+    }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_topology_control_resp_decode(resp,
+                                                   resp_buf,
+                                                   hdr.payload_len);
+    free(resp_buf);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -735,15 +940,19 @@ static void run_write_job(vemb_v16_storage_ctx_t *storage,
     job.base.req_id = 7001;
     job.base.channel_id = 1001;
     job.base.key_hash = key_hash;
-    job.base.key_len = key_len;
     job.base.topology_epoch = topology_epoch;
-    job.base.dim = op == VEMB_V16_OP_VREM ? 0 : dim;
-    job.base.vector_bytes = op == VEMB_V16_OP_VREM ? 0 : dim * sizeof(float);
-    memcpy(job.base.key, key, key_len);
-    if (job.base.vector_bytes > 0)
-        memcpy(job.vector, vector, job.base.vector_bytes);
+    job.key_len = key_len;
+    job.dim = op == VEMB_V16_OP_VREM ? 0 : dim;
+    job.vector_bytes = op == VEMB_V16_OP_VREM ? 0 : dim * sizeof(float);
+    memcpy(job.key, key, key_len);
+    if (job.vector_bytes > 0)
+        memcpy(job.vector, vector, job.vector_bytes);
 
-    vemb_v16_supernode_handle_vadd_job(&ctx, &job);
+    if (op == VEMB_V16_OP_VREM)
+        vemb_v16_supernode_handle_vrem_job(&ctx,
+                                           (const vemb_v16_vemb_job_t *)&job);
+    else
+        vemb_v16_supernode_handle_vadd_job(&ctx, &job);
     assert(vemb_v16_aeron_poll(&completion_ring, completion) == 1);
 }
 
@@ -1591,14 +1800,17 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
              "/tmp/vemb_v16_combo_%ld.sock",
              (long)getpid());
     snprintf(shm1, sizeof(shm1), "/v16combo_r1_%ld", (long)getpid());
-    snprintf(combo_region, sizeof(combo_region), "/v16combo_r2_%ld", (long)getpid());
+    snprintf(combo_region, sizeof(combo_region),
+             "/tmp/v16combo_r2_%ld.ub",
+             (long)getpid());
     snprintf(remote_meta_default, sizeof(remote_meta_default),
              "/v16combo_meta_%ld", (long)getpid());
     unlink(manifest_path);
     unlink(uds_path);
     cleanup_region_and_layout(shm1, 801);
-    cleanup_region_and_layout(combo_region, 802);
+    unlink(combo_region);
     shm_unlink(remote_meta_default);
+    create_test_ub_region_file(combo_region, 802, slots, dim * sizeof(float));
 
     FILE *fp = fopen(manifest_path, "w");
     assert(fp != NULL);
@@ -1647,7 +1859,7 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     req.peer_view_map_req.expected_local_owner_valid = 1;
     req.peer_view_map_req.region_count = 1;
     req.peer_view_map_req.regions[0].region_id = 802;
-    req.peer_view_map_req.regions[0].backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    req.peer_view_map_req.regions[0].backend_type = VEMB_V16_REGION_UB;
     req.peer_view_map_req.regions[0].home_ub_node_id = 2;
     req.peer_view_map_req.regions[0].weight = 1;
     req.peer_view_map_req.regions[0].value_size = dim * sizeof(float);
@@ -1695,7 +1907,7 @@ static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
     vemb_v16_proxy_destroy(proxy);
     unlink(manifest_path);
     cleanup_region_and_layout(shm1, 801);
-    cleanup_region_and_layout(combo_region, 802);
+    unlink(combo_region);
     shm_unlink(remote_meta_default);
 }
 

@@ -1557,14 +1557,19 @@ static inline int vemb_v16_migration_control_batch_req_decode(
     req->entry_count = vemb_v16_proto_get_u32(&p);
     RETURN_IF(req->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH, -1);
     for (uint32_t i = 0; i < req->entry_count; i++) {
-        RETURN_IF((size_t)(p - src) >= len, -1);
-        size_t remaining = len - (size_t)(p - src);
-        RETURN_IF(vemb_v16_migration_control_req_decode(
-                      &req->entries[i],
-                      p,
-                      remaining) != 0,
-                  -1);
-        p += vemb_v16_migration_control_req_encoded_len(&req->entries[i]);
+        RETURN_IF(len - (size_t)(p - src) < 28u, -1);
+        const uint8_t *entry_src = p;
+        req->entries[i].key_hash = vemb_v16_proto_get_u64(&p);
+        req->entries[i].topology_epoch = vemb_v16_proto_get_u64(&p);
+        req->entries[i].key_len = vemb_v16_proto_get_u32(&p);
+        req->entries[i].target_owner = vemb_v16_proto_get_u32(&p);
+        req->entries[i].shard_id = vemb_v16_proto_get_u32(&p);
+        RETURN_IF(req->entries[i].key_len > VEMB_V16_MAX_KEY_LEN, -1);
+        size_t entry_len = 28u + (size_t)req->entries[i].key_len;
+        RETURN_IF(len - (size_t)(entry_src - src) < entry_len, -1);
+        vemb_v16_proto_get_bytes(&p,
+                                 req->entries[i].key,
+                                 req->entries[i].key_len);
     }
     RETURN_IF((size_t)(p - src) != len, -1);
     return 0;

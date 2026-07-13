@@ -1,5 +1,6 @@
 #include "vemb_v16_topology.h"
 
+#include "macro.h"
 #include "vemb_v16_hash.h"
 
 #include <stdio.h>
@@ -29,8 +30,6 @@ static int ring_node_cmp(const void *a, const void *b) {
 int vemb_v16_topology_owner_exists(
     const vemb_v16_topology_ring_t *ring,
     uint32_t owner_id) {
-    if (!ring)
-        return 0;
     for (uint32_t i = 0; i < ring->owner_count; i++) {
         if (ring->owners[i] == owner_id)
             return 1;

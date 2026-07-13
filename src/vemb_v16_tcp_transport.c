@@ -965,7 +965,7 @@ static void tcp_handle_peer_view_map_control(vemb_v16_proxy_t *proxy,
         close(fd);
         return;
     }
-    (void)vemb_v16_proxy_apply_peer_view_map(proxy, &req, &resp);
+    (void)vemb_v16_proxy_store_peer_view_map(proxy, &req, &resp);
     vemb_v16_net_write_frame(fd,
                              VEMB_V16_NET_PEER_VIEW_MAP_RESPONSE,
                              0,

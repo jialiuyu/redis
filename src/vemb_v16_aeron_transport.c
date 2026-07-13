@@ -256,7 +256,7 @@ void vemb_v16_aeron_handle_control_fd(vemb_v16_proxy_t *proxy, int fd) {
         memset(&req, 0, sizeof(req));
         memset(&resp, 0, sizeof(resp));
         GOTO_IF(read_full(fd, &req, sizeof(req)) != 0, close_fd);
-        vemb_v16_proxy_apply_peer_view_map(proxy, &req, &resp);
+        vemb_v16_proxy_store_peer_view_map(proxy, &req, &resp);
         write_full(fd, &resp, sizeof(resp));
     } else if (op == VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET) {
         vemb_v16_peer_view_topology_control_req_t req;

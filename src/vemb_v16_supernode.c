@@ -804,17 +804,20 @@ void vemb_v16_supernode_handle_vrem_job(vemb_v16_supernode_ctx_t *ctx,
                 completion.region_id = UINT32_MAX;
                 completion.local_slot = UINT32_MAX;
             } else {
-                memset(&redirect_info, 0, sizeof(redirect_info));
-                if (!ask_redirect &&
-                    migration_active &&
-                    job_key_is_source_cutover(tlc,
-                                              vrem_job->key,
-                                              vrem_job->key_len,
-                                              job->key_hash,
-                                              &redirect_info)) {
-                    completion_set_moved(&completion, &redirect_info);
+                if (ask_redirect) {
+                    completion_set_ask(&completion, &redirect_info);
                 } else {
-                    completion.status = VEMB_V16_STATUS_ERR;
+                    memset(&redirect_info, 0, sizeof(redirect_info));
+                    if (migration_active &&
+                        job_key_is_source_cutover(tlc,
+                                                  vrem_job->key,
+                                                  vrem_job->key_len,
+                                                  job->key_hash,
+                                                  &redirect_info)) {
+                        completion_set_moved(&completion, &redirect_info);
+                    } else {
+                        completion.status = VEMB_V16_STATUS_ERR;
+                    }
                 }
             }
         }

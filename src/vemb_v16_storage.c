@@ -708,8 +708,9 @@ static int storage_has_region_id(const vemb_v16_storage_ctx_t *storage,
     return 0;
 }
 
-static int storage_has_region_for_owner(const vemb_v16_storage_ctx_t *storage,
-                                        uint32_t owner_id) {
+// Check whether one owner's warm region is already attached in runtime state.
+int vemb_v16_storage_has_region_for_owner(const vemb_v16_storage_ctx_t *storage,
+                                          uint32_t owner_id) {
     for (uint32_t i = 0; i < storage->warm_region_count; i++) {
         if (storage->warm_providers[i].region.home_ub_node_id == owner_id)
             return 1;
@@ -893,9 +894,7 @@ static int storage_attach_ub_rpc_peer_config(
 static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
                                              const vemb_v16_manifest_region_t *src) {
     RETURN_IF(src->region_id == 0 || !src->path[0], -1);
-    RETURN_IF(src->backend_type != VEMB_V16_REGION_UB &&
-              src->backend_type != VEMB_V16_REGION_LOCAL_SHM,
-              -1);
+    RETURN_IF(src->backend_type != VEMB_V16_REGION_UB, -1);
     RETURN_IF(storage_has_region_id(storage, src->region_id), 0);
     RETURN_IF(storage->warm_region_count >= VEMB_V16_MAX_MANIFEST_REGIONS, -1);
 
@@ -915,76 +914,31 @@ static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
                                                   capacity_slots) != 0,
                   -1);
     }
-    if (src->backend_type == VEMB_V16_REGION_UB) {
-        RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
-                                              src->backend_type,
-                                              src->path,
-                                              src->mmap_offset,
-                                              allocator_layout_bytes +
-                                                  (size_t)src->region_bytes) != 0,
-                  -1);
-        RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
-                                                &storage->warm_data_mappings[i],
-                                                allocator_layout_bytes,
-                                                src->region_id,
-                                                src->backend_type,
-                                                src->path,
-                                                src->mmap_offset +
-                                                    allocator_layout_bytes,
-                                                src->value_size,
-                                                src->region_bytes,
-                                                src->home_ub_node_id,
-                                                src->is_local,
-                                                src->weight ? src->weight : 1) != 0,
-                  -1);
-    } else {
-        char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
-        RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
-                                              src->backend_type,
-                                              src->path,
-                                              src->mmap_offset,
+    RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_data_mappings[i],
+                                          src->backend_type,
+                                          src->path,
+                                          src->mmap_offset,
+                                          allocator_layout_bytes +
                                               (size_t)src->region_bytes) != 0,
-                  -1);
-        RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
-                                                &storage->warm_data_mappings[i],
-                                                0,
-                                                src->region_id,
-                                                src->backend_type,
-                                                src->path,
-                                                src->mmap_offset,
-                                                src->value_size,
-                                                src->region_bytes,
-                                                src->home_ub_node_id,
-                                                src->is_local,
-                                                src->weight ? src->weight : 1) != 0,
-                  -1);
-        RETURN_IF(vemb_v16_warm_region_layout_name_from_region_path(
-                      src->path,
-                      src->region_id,
-                      layout_name,
-                      sizeof(layout_name)) != 0,
-                  -1);
-        RETURN_IF(vemb_v16_mapped_region_open(&storage->warm_allocator_mappings[i],
-                                              src->backend_type,
-                                              layout_name,
-                                              0,
-                                              allocator_layout_bytes) != 0,
-                  -1);
-        RETURN_IF(warm_region_layout_ensure_initialized(
-                      &storage->warm_allocator_mappings[i],
-                      src->region_id,
-                      capacity_slots,
-                      src->value_size,
-                      src->region_bytes) != 0,
-                  -1);
-    }
+              -1);
+    RETURN_IF(vemb_v16_warm_provider_attach(&storage->warm_providers[i],
+                                            &storage->warm_data_mappings[i],
+                                            allocator_layout_bytes,
+                                            src->region_id,
+                                            src->backend_type,
+                                            src->path,
+                                            src->mmap_offset +
+                                                allocator_layout_bytes,
+                                            src->value_size,
+                                            src->region_bytes,
+                                            src->home_ub_node_id,
+                                            src->is_local,
+                                            src->weight ? src->weight : 1) != 0,
+              -1);
     vemb_v16_tlc_warm_region_t warm_region = storage->warm_providers[i].region;
-    warm_region.slot_meta = src->backend_type == VEMB_V16_REGION_UB ?
-        warm_slot_meta_from_mapping(&storage->warm_data_mappings[i],
-                                    capacity_slots) :
-        warm_slot_meta_from_mapping(&storage->warm_allocator_mappings[i],
-                                    capacity_slots);
-    RETURN_IF(!warm_region.slot_meta, -1);
+    warm_region.slot_meta = warm_slot_meta_from_mapping(
+        &storage->warm_data_mappings[i],
+        capacity_slots);
     RETURN_IF(vemb_v16_tlc_attach_warm_region(storage->tlc, &warm_region) != 0, -1);
     storage->warm_region_count++;
     serverLog(LL_NOTICE,
@@ -998,29 +952,27 @@ static int storage_attach_warm_region_config(vemb_v16_storage_ctx_t *storage,
     return 0;
 }
 
-static int storage_attach_peer_owner_from_mapping(
-        vemb_v16_storage_ctx_t *storage,
-        uint32_t owner_id) {
-    RETURN_IF(!storage || owner_id == UINT32_MAX, -1);
+// Attach cached peer-view mapping for one owner into runtime state.
+int vemb_v16_storage_attach_peer_owner_from_mapping(
+        vemb_v16_storage_ctx_t *storage, uint32_t owner_id) {
+    RETURN_IF(owner_id == UINT32_MAX, -1);
     for (uint32_t i = 0; i < storage->peer_region_config_count; i++) {
         const vemb_v16_manifest_region_t *region = &storage->peer_region_configs[i];
-        if (region->home_ub_node_id != owner_id)
-            continue;
+        if (region->home_ub_node_id != owner_id) continue;
         RETURN_IF(storage_attach_warm_region_config(storage, region) != 0, -1);
     }
     const vemb_v16_manifest_remote_meta_view_t *view =
         storage_find_remote_meta_view_config(storage, owner_id);
+    // Remote-meta view is optional here; RPC is the required peer-runtime path.
     if (view) {
-        RETURN_IF(storage_attach_remote_meta_owner_view_config(storage,
-                                                               view) != 0,
-                  -1);
+        RETURN_IF(storage_attach_remote_meta_owner_view_config(
+            storage, view) != 0, -1);
     }
     const vemb_v16_manifest_ub_rpc_peer_t *rpc =
         storage_find_ub_rpc_peer_config(storage, owner_id);
-    if (rpc) {
-        RETURN_IF(storage_attach_ub_rpc_peer_config(storage, rpc) != 0,
-                  -1);
-    }
+    // Peer owners must have UB-RPC attached for migration and fallback paths.
+    RETURN_IF(!rpc, -1);
+    RETURN_IF(storage_attach_ub_rpc_peer_config(storage, rpc) != 0, -1);
     return 0;
 }
 
@@ -2202,6 +2154,37 @@ static int topology_owner_subset(const vemb_v16_topology_ring_t *subset,
     return 1;
 }
 
+int vemb_v16_storage_build_topology_rings(
+    const vemb_v16_topology_control_req_t *req,
+    vemb_v16_topology_ring_t *active_ring,
+    vemb_v16_topology_ring_t *standby_ring) {
+    uint32_t vnode_count;
+
+    RETURN_IF(req->active_owner_count == 0 ||
+              req->standby_owner_count == 0 ||
+              req->active_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+              req->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
+              req->min_write_epoch > req->current_topology_epoch,
+              -1);
+
+    vnode_count = req->vnode_count ?
+        req->vnode_count : VEMB_V16_TOPOLOGY_DEFAULT_VNODES;
+    if (vemb_v16_topology_ring_build(active_ring,
+                                     req->current_topology_epoch,
+                                     req->active_owners,
+                                     req->active_owner_count,
+                                     vnode_count) != VEMB_V16_TOPOLOGY_OK ||
+        vemb_v16_topology_ring_build(standby_ring,
+                                     req->current_topology_epoch,
+                                     req->standby_owners,
+                                     req->standby_owner_count,
+                                     vnode_count) != VEMB_V16_TOPOLOGY_OK ||
+        !topology_owner_subset(active_ring, standby_ring)) {
+        return -1;
+    }
+    return 0;
+}
+
 static int topology_endpoint_string_valid(const char *s, size_t n) {
     return s && memchr(s, '\0', n) != NULL;
 }
@@ -2934,19 +2917,11 @@ static int peer_view_ub_rpc_desc_to_manifest(
     return 0;
 }
 
-int vemb_v16_storage_apply_peer_view_map(
+// Store peer-view mapping and optionally attach it into runtime state now.
+int vemb_v16_storage_store_peer_view_map(
         vemb_v16_storage_ctx_t *storage,
         const vemb_v16_peer_view_map_req_t *req,
         vemb_v16_peer_view_map_resp_t *resp) {
-    RETURN_IF(!storage || !req || !resp, -1);
-    memset(resp, 0, sizeof(*resp));
-    RETURN_IF(req->expected_local_owner_valid &&
-              req->expected_local_owner_id != storage->local_owner_id,
-              -1);
-    RETURN_IF(req->region_count > VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS ||
-              req->remote_meta_view_count > VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS ||
-              req->ub_rpc_peer_count > VEMB_V16_PEER_VIEW_MAP_MAX_UB_RPC_PEERS,
-              -1);
     if (req->ub_rpc_timeout_ms)
         storage->ub_rpc_timeout_ms = req->ub_rpc_timeout_ms;
 
@@ -3000,37 +2975,14 @@ int vemb_v16_storage_apply_peer_view_map(
     return 0;
 }
 
-int vemb_v16_storage_topology_set(
+int vemb_v16_storage_topology_set_with_rings(
     vemb_v16_storage_ctx_t *storage,
-    const vemb_v16_topology_control_req_t *req) {
-    RETURN_IF(!storage || !req ||
-              req->active_owner_count == 0 ||
-              req->standby_owner_count == 0 ||
-              req->active_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
-              req->standby_owner_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS ||
-              req->min_write_epoch > req->current_topology_epoch,
-              -1);
-
-    uint32_t vnode_count = req->vnode_count ?
-        req->vnode_count : VEMB_V16_TOPOLOGY_DEFAULT_VNODES;
-    vemb_v16_topology_ring_t active_ring;
-    vemb_v16_topology_ring_t standby_ring;
-    if (vemb_v16_topology_ring_build(&active_ring,
-                                     req->current_topology_epoch,
-                                     req->active_owners,
-                                     req->active_owner_count,
-                                     vnode_count) != VEMB_V16_TOPOLOGY_OK ||
-        vemb_v16_topology_ring_build(&standby_ring,
-                                     req->current_topology_epoch,
-                                     req->standby_owners,
-                                     req->standby_owner_count,
-                                     vnode_count) != VEMB_V16_TOPOLOGY_OK ||
-        !topology_owner_subset(&active_ring, &standby_ring)) {
-        return -1;
-    }
+    const vemb_v16_topology_control_req_t *req,
+    const vemb_v16_topology_ring_t *active_ring,
+    const vemb_v16_topology_ring_t *standby_ring) {
     RETURN_IF(req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS, -1);
     for (uint32_t i = 0; i < req->endpoint_count; i++) {
-        int valid = topology_endpoint_valid(&req->endpoints[i], &standby_ring);
+        int valid = topology_endpoint_valid(&req->endpoints[i], standby_ring);
         RETURN_IF(!valid, -1);
     }
     if (req->coordinator_endpoint_valid &&
@@ -3038,55 +2990,35 @@ int vemb_v16_storage_topology_set(
         return -1;
     }
     if (topology_publish_requires_lease_guard(storage,
-                                             &active_ring,
-                                             &standby_ring,
+                                             active_ring,
+                                             standby_ring,
                                              req->flags) &&
         !topology_publish_lease_guard_passed(storage)) {
         return -1;
     }
 
-    for (uint32_t i = 0; i < req->endpoint_count; i++) {
-        const vemb_v16_topology_endpoint_t *endpoint = &req->endpoints[i];
-        if (!vemb_v16_topology_owner_exists(&standby_ring, endpoint->owner_id) ||
-            endpoint->owner_id == storage->local_owner_id ||
-            storage_has_region_for_owner(storage, endpoint->owner_id)) {
-            continue;
-        }
-        /* Refreshing topology currently requires both peer owner endpoint
-         * metadata and its peer-view UB region mapping to be present. */
-        if (storage_attach_peer_owner_from_mapping(storage, endpoint->owner_id) != 0 ||
-            !storage_has_region_for_owner(storage, endpoint->owner_id)) {
-            serverLog(LL_WARNING,
-                      "vemb_v16 peer-view map attach failed: local_owner=%u peer_owner=%u transport=%u",
-                      storage->local_owner_id,
-                      endpoint->owner_id,
-                      endpoint->transport_type);
-            return -1;
-        }
-    }
-
-    int owner_sets_changed = !topology_owner_sets_equal(&active_ring,
-                                                        &standby_ring);
+    int owner_sets_changed = !topology_owner_sets_equal(active_ring,
+                                                        standby_ring);
 
     pthread_mutex_lock(&storage->topology_lock);
     if (owner_sets_changed) {
         /* Stage the post-expand resolver snapshot now, but keep the current
          * snapshot live until full-active publish/cutover. */
-        if (storage_owner_snapshot_stage_pending(storage, &standby_ring) != 0) {
+        if (storage_owner_snapshot_stage_pending(storage, standby_ring) != 0) {
             pthread_mutex_unlock(&storage->topology_lock);
             return -1;
         }
     } else {
         /* Non-expand refreshes can publish immediately because there is no
          * migration window that needs the old owner view to stay visible. */
-        if (storage_owner_snapshot_publish(storage, &standby_ring) != 0) {
+        if (storage_owner_snapshot_publish(storage, standby_ring) != 0) {
             pthread_mutex_unlock(&storage->topology_lock);
             return -1;
         }
         storage->owner_resolver_pending_valid = 0;
     }
-    storage->active_topology_ring = active_ring;
-    storage->standby_topology_ring = standby_ring;
+    storage->active_topology_ring = *active_ring;
+    storage->standby_topology_ring = *standby_ring;
     storage->published_topology_flags =
         req->flags | VEMB_V16_TOPOLOGY_CONTROL_F_PUBLISHED;
     storage->published_endpoint_count = req->endpoint_count;
@@ -3116,30 +3048,40 @@ int vemb_v16_storage_topology_set(
     pthread_mutex_unlock(&storage->topology_lock);
     int auto_mark_rc = storage_auto_mark_migrating_for_topology(
         storage,
-        &active_ring,
-        &standby_ring,
+        active_ring,
+        standby_ring,
         req->current_topology_epoch,
         req->flags);
     if (auto_mark_rc == 0 &&
         owner_sets_changed &&
-        vemb_v16_topology_owner_exists(&active_ring,
+        vemb_v16_topology_owner_exists(active_ring,
                                        storage->local_owner_id) &&
-        scaleout_auto_arm_for_topology(storage, req, &standby_ring) != 0) {
+        scaleout_auto_arm_for_topology(storage, req, standby_ring) != 0) {
         return -1;
     }
     return 0;
 }
 
+int vemb_v16_storage_topology_set(
+    vemb_v16_storage_ctx_t *storage,
+    const vemb_v16_topology_control_req_t *req) {
+    vemb_v16_topology_ring_t active_ring;
+    vemb_v16_topology_ring_t standby_ring;
+    if (vemb_v16_storage_build_topology_rings(req,
+                                              &active_ring,
+                                              &standby_ring) != 0) {
+        return -1;
+    }
+    return vemb_v16_storage_topology_set_with_rings(storage,
+                                                    req,
+                                                    &active_ring,
+                                                    &standby_ring);
+}
+
 void vemb_v16_storage_topology_get(
     vemb_v16_storage_ctx_t *storage,
     vemb_v16_topology_control_resp_t *resp) {
-    if (!resp)
-        return;
     memset(resp, 0, sizeof(*resp));
-    if (!storage) {
-        resp->status = VEMB_V16_STATUS_ERR;
-        return;
-    }
 
     pthread_mutex_lock(&storage->topology_lock);
     resp->status = VEMB_V16_STATUS_OK;
@@ -4050,7 +3992,6 @@ source_gc:
 int vemb_v16_storage_scaleout_auto_get_status(
     vemb_v16_storage_ctx_t *storage,
     vemb_v16_storage_scaleout_auto_status_t *status) {
-    RETURN_IF(!storage || !status, -1);
     memset(status, 0, sizeof(*status));
 
     pthread_mutex_lock(&storage->topology_lock);
@@ -4536,8 +4477,6 @@ static void migration_range_fill_resp(
         uint32_t remaining_keys,
         uint32_t range_ready,
         uint32_t page_limit) {
-    if (!resp)
-        return;
     memset(resp, 0, sizeof(*resp));
     resp->status = status;
     resp->migration_topology_epoch = migration_topology_epoch;

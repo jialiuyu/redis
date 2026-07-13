@@ -715,12 +715,12 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
 int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
                                     const vemb_v16_tlc_warm_region_t *warm_region) {
     RETURN_IF(!tlc || !warm_region, -1);
+    RETURN_IF(warm_region->backend_type != VEMB_V16_REGION_UB, -1);
     if (region_index_id_mapping(tlc, warm_region->region_id) != UINT32_MAX)
         return 0;
 
     uint32_t runtime_count = (uint32_t)atomic_load_explicit(
-        &tlc->runtime_warm_region_count,
-        memory_order_acquire);
+        &tlc->runtime_warm_region_count, memory_order_acquire);
     RETURN_IF(runtime_count >= TLC_CORE_MAX_WARM_REGIONS, -1);
 
     tlc_core_warm_region_config_t core_region = {
@@ -743,8 +743,7 @@ int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
     tlc->runtime_region_index_id_mappings[runtime_count] =
         (vemb_v16_tlc_region_index_id_mapping_t){
             .region_id = warm_region->region_id,
-            .region_index = region_index,
-        };
+            .region_index = region_index};
     atomic_thread_fence(memory_order_release);
     atomic_store_explicit(&tlc->runtime_warm_region_count,
                           runtime_count + 1u,
@@ -753,8 +752,7 @@ int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
 }
 
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {
-    if (!tlc)
-        return;
+    RETURN_IF(!tlc);
     remote_meta_publisher_stop(tlc);
     bitmap_destroy(&tlc->bitmap);
     tlc_core_destroy(tlc->core);

@@ -472,8 +472,7 @@ static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
 
 static int migration_control_req_valid(
         const vemb_v16_migration_control_req_t *req) {
-    return req &&
-           req->key_len > 0 &&
+    return req->key_len > 0 &&
            req->key_len <= VEMB_V16_MAX_KEY_LEN &&
            req->target_owner != UINT32_MAX;
 }
@@ -482,10 +481,7 @@ static void migration_control_fill_resp(
         vemb_v16_migration_control_resp_t *resp,
         uint8_t status,
         const tlc_core_key_migration_info_t *info) {
-    memset(resp, 0, sizeof(*resp));
     resp->status = status;
-    if (!info)
-        return;
     resp->key_hash = info->key_hash;
     resp->key_version = info->key_version;
     resp->topology_epoch = info->topology_epoch;
@@ -508,7 +504,6 @@ static void migration_control_fill_outbox(
 static void epoch_control_fill_resp(vemb_v16_proxy_t *proxy,
                                     vemb_v16_epoch_control_resp_t *resp,
                                     uint8_t status) {
-    memset(resp, 0, sizeof(*resp));
     resp->status = status;
     vemb_v16_storage_epoch_get(proxy_storage(proxy),
                                &resp->current_topology_epoch,
@@ -523,7 +518,6 @@ static void topology_control_fill_resp(
         vemb_v16_proxy_t *proxy,
         vemb_v16_topology_control_resp_t *resp,
         uint8_t status) {
-    memset(resp, 0, sizeof(*resp));
     vemb_v16_storage_topology_get(proxy_storage(proxy), resp);
     topology_resp_add_local_endpoint(proxy, resp);
     resp->status = status;
@@ -2365,7 +2359,6 @@ static int scaleout_notify_send(
         const vemb_v16_topology_endpoint_t *endpoint,
         const vemb_v16_scaleout_local_done_req_t *req,
         vemb_v16_scaleout_local_done_resp_t *resp) {
-    memset(resp, 0, sizeof(*resp));
     if (endpoint->transport_type == VEMB_V16_TRANSPORT_TCP)
         return scaleout_notify_send_tcp(endpoint, req, resp);
     if (endpoint->transport_type == VEMB_V16_TRANSPORT_AERON)
@@ -2414,7 +2407,6 @@ static void *scaleout_notify_main(void *arg) {
                 .range_count = status.range_count,
             };
             vemb_v16_scaleout_local_done_resp_t resp;
-            memset(&resp, 0, sizeof(resp));
             if (scaleout_notify_send(&status.coordinator_endpoint,
                                      &req,
                                      &resp) == 0 &&
@@ -2815,11 +2807,9 @@ int vemb_v16_proxy_migration_mark_migrating_batch(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_migration_control_batch_req_t *req,
     vemb_v16_migration_control_batch_resp_t *resp) {
-    memset(resp, 0, sizeof(*resp));
     resp->status = VEMB_V16_STATUS_ERR;
 
-    if (!req ||
-        req->entry_count == 0 ||
+    if (req->entry_count == 0 ||
         req->entry_count > VEMB_V16_MIGRATION_CONTROL_MAX_BATCH) {
         return -1;
     }
@@ -2843,10 +2833,7 @@ int vemb_v16_proxy_migration_mark_migrating_batch(
 static void migration_range_control_fill_error(
         vemb_v16_migration_range_control_resp_t *resp,
         const vemb_v16_migration_range_control_req_t *req) {
-    memset(resp, 0, sizeof(*resp));
     resp->status = VEMB_V16_STATUS_ERR;
-    if (!req)
-        return;
     resp->migration_topology_epoch = req->migration_topology_epoch;
     resp->cutover_topology_epoch = req->cutover_topology_epoch;
     resp->owner_epoch = req->cutover_topology_epoch;
@@ -2858,8 +2845,7 @@ static void migration_range_control_fill_error(
 static int migration_range_control_req_valid(
         const vemb_v16_migration_range_control_req_t *req,
         int need_cutover_epoch) {
-    return req &&
-           req->migration_topology_epoch != 0 &&
+    return req->migration_topology_epoch != 0 &&
            req->target_owner != UINT32_MAX &&
            (!need_cutover_epoch ||
             req->cutover_topology_epoch >= req->migration_topology_epoch);
@@ -2922,7 +2908,7 @@ int vemb_v16_proxy_epoch_set(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_epoch_control_req_t *req,
     vemb_v16_epoch_control_resp_t *resp) {
-    int rc = (!req || req->min_write_epoch > req->current_topology_epoch) ?
+    int rc = (req->min_write_epoch > req->current_topology_epoch) ?
         -1 :
         vemb_v16_storage_epoch_set(proxy_storage(proxy),
                                    req->current_topology_epoch,
@@ -2941,15 +2927,88 @@ int vemb_v16_proxy_epoch_get(
     return 0;
 }
 
+
+static int proxy_peer_view_map_req_valid(vemb_v16_proxy_t *proxy,
+                                         const vemb_v16_peer_view_map_req_t *req) {
+    vemb_v16_storage_ctx_t *storage = proxy_storage(proxy);
+    RETURN_IF(req->expected_local_owner_valid &&
+              req->expected_local_owner_id != storage->local_owner_id,
+              -1);
+    RETURN_IF(req->region_count > VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS ||
+              req->remote_meta_view_count > VEMB_V16_PEER_VIEW_MAP_MAX_REMOTE_META_VIEWS ||
+              req->ub_rpc_peer_count > VEMB_V16_PEER_VIEW_MAP_MAX_UB_RPC_PEERS,
+              -1);
+    return 0;
+}
+
+// Attach peer owners from stored mapping before the next topology publish.
+static int proxy_topology_attach_peer_owners_from_mapping(
+        vemb_v16_proxy_t *proxy,
+        const vemb_v16_topology_control_req_t *req,
+        const vemb_v16_topology_ring_t *standby_ring) {
+    RETURN_IF(req->endpoint_count > VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS, -1);
+    vemb_v16_storage_ctx_t *storage = proxy_storage(proxy);
+    for (uint32_t i = 0; i < req->endpoint_count; i++) {
+        const vemb_v16_topology_endpoint_t *endpoint = &req->endpoints[i];
+        if (!vemb_v16_topology_owner_exists(standby_ring, endpoint->owner_id) ||
+            endpoint->owner_id == storage->local_owner_id ||
+            vemb_v16_storage_has_region_for_owner(storage, endpoint->owner_id)) {
+            continue;
+        }
+        if (vemb_v16_storage_attach_peer_owner_from_mapping(storage, endpoint->owner_id) != 0 ||
+            !vemb_v16_storage_has_region_for_owner(storage, endpoint->owner_id)) {
+            serverLog(LL_WARNING,
+                      "vemb_v16 peer-view map attach failed: local_owner=%u peer_owner=%u transport=%u",
+                      storage->local_owner_id,
+                      endpoint->owner_id,
+                      endpoint->transport_type);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int vemb_v16_proxy_store_peer_view_map(
+    vemb_v16_proxy_t *proxy,
+    const vemb_v16_peer_view_map_req_t *req,
+    vemb_v16_peer_view_map_resp_t *resp) {
+    if (proxy_peer_view_map_req_valid(proxy, req) != 0) {
+        resp->status = VEMB_V16_STATUS_ERR;
+        return -1;
+    }
+    int rc = vemb_v16_storage_store_peer_view_map(proxy_storage(proxy),
+                                                  req,
+                                                  resp);
+    if (rc != 0)
+        resp->status = VEMB_V16_STATUS_ERR;
+    return rc;
+}
+
+// Call after `vemb_v16_proxy_store_peer_view_map()` for new peer owners.
 int vemb_v16_proxy_topology_set(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_topology_control_req_t *req,
     vemb_v16_topology_control_resp_t *resp) {
-    int rc = vemb_v16_storage_topology_set(proxy_storage(proxy), req);
+    vemb_v16_topology_ring_t active_ring;
+    vemb_v16_topology_ring_t standby_ring;
+    int rc = vemb_v16_storage_build_topology_rings(req,
+                                                   &active_ring,
+                                                   &standby_ring);
+    GOTO_IF(rc != 0, label);
+    rc = proxy_topology_attach_peer_owners_from_mapping(proxy,
+                                                        req,
+                                                        &standby_ring);
+    GOTO_IF(rc != 0, label);
+    rc = vemb_v16_storage_topology_set_with_rings(proxy_storage(proxy),
+                                                  req,
+                                                  &active_ring,
+                                                  &standby_ring);
+label:
     topology_control_fill_resp(proxy,
                                resp,
-                               rc == 0 ? VEMB_V16_STATUS_OK :
-                                   VEMB_V16_STATUS_ERR);
+                               rc == 0
+                                ? VEMB_V16_STATUS_OK
+                                : VEMB_V16_STATUS_ERR);
     return rc;
 }
 
@@ -2960,18 +3019,6 @@ int vemb_v16_proxy_topology_get(
     return 0;
 }
 
-int vemb_v16_proxy_apply_peer_view_map(
-    vemb_v16_proxy_t *proxy,
-    const vemb_v16_peer_view_map_req_t *req,
-    vemb_v16_peer_view_map_resp_t *resp) {
-    int rc = vemb_v16_storage_apply_peer_view_map(proxy_storage(proxy),
-                                                  req,
-                                                  resp);
-    if (rc != 0 && resp)
-        resp->status = VEMB_V16_STATUS_ERR;
-    return rc;
-}
-
 int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_peer_view_topology_control_req_t *req,
@@ -2980,7 +3027,11 @@ int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
     resp->peer_view_map_status = VEMB_V16_STATUS_ERR;
     resp->topology_status = VEMB_V16_STATUS_ERR;
 
-    int rc = vemb_v16_storage_apply_peer_view_map(proxy_storage(proxy),
+    if (proxy_peer_view_map_req_valid(proxy, &req->peer_view_map_req) != 0)
+        return -1;
+
+    // Stage-1: store peer-view mapping before any topology publish.
+    int rc = vemb_v16_storage_store_peer_view_map(proxy_storage(proxy),
                                                   &req->peer_view_map_req,
                                                   &resp->peer_view_map_resp);
     if (rc != 0) {
@@ -2991,9 +3042,26 @@ int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
     if (resp->peer_view_map_status != VEMB_V16_STATUS_OK)
         return -1;
 
+    vemb_v16_topology_ring_t active_ring;
+    vemb_v16_topology_ring_t standby_ring;
+    if (vemb_v16_storage_build_topology_rings(&req->topology_req,
+                                              &active_ring,
+                                              &standby_ring) != 0)
+        return -1;
+
+    // Stage-2: attach peer owners from stored mapping.
+    if (proxy_topology_attach_peer_owners_from_mapping(proxy,
+                                                       &req->topology_req,
+                                                       &standby_ring) != 0)
+        return -1;
+
     resp->topology_attempted = 1;
-    rc = vemb_v16_storage_topology_set(proxy_storage(proxy),
-                                       &req->topology_req);
+
+    // Stage-3: publish topology into storage runtime state.
+    rc = vemb_v16_storage_topology_set_with_rings(proxy_storage(proxy),
+                                                  &req->topology_req,
+                                                  &active_ring,
+                                                  &standby_ring);
     topology_control_fill_resp(proxy,
                                &resp->topology_resp,
                                rc == 0 ? 

@@ -896,7 +896,7 @@ static void test_peer_view_map_can_attach_local_region(void) {
              "%s",
              local1);
 
-    assert(vemb_v16_storage_apply_peer_view_map(storage, &req, &resp) == 0);
+    assert(vemb_v16_storage_store_peer_view_map(storage, &req, &resp) == 0);
     assert(resp.status == VEMB_V16_STATUS_OK);
     assert(resp.applied_region_count == 1);
     assert(storage->warm_region_count == 2);
@@ -1036,7 +1036,7 @@ static void test_peer_view_map_attach_ub_rpc_peer_keeps_lookup_registered(void) 
              "%s",
              resp0_2);
 
-    assert(vemb_v16_storage_apply_peer_view_map(storage, &req, &resp) == 0);
+    assert(vemb_v16_storage_store_peer_view_map(storage, &req, &resp) == 0);
     assert(resp.status == VEMB_V16_STATUS_OK);
     assert(resp.applied_ub_rpc_peer_count == 1);
     assert(storage->ub_rpc_timeout_ms == 456);

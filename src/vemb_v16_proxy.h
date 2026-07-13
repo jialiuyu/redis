@@ -70,7 +70,7 @@ int vemb_v16_proxy_topology_set(
 int vemb_v16_proxy_topology_get(
     vemb_v16_proxy_t *proxy,
     vemb_v16_topology_control_resp_t *resp);
-int vemb_v16_proxy_apply_peer_view_map(
+int vemb_v16_proxy_store_peer_view_map(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_peer_view_map_req_t *req,
     vemb_v16_peer_view_map_resp_t *resp);
