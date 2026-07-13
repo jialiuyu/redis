@@ -16,6 +16,10 @@ POST_KEYSPACE="${POST_KEYSPACE:-2000}"
 POST_OPS="${POST_OPS:-2000}"
 POST_THREADS="${POST_THREADS:-2}"
 
+OWNER0_REGION_BYTES="${OWNER0_REGION_BYTES:-67108864}"
+OWNER1_REGION_BYTES="${OWNER1_REGION_BYTES:-67108864}"
+REGION_VALUE_SIZE="${REGION_VALUE_SIZE:-64}"
+
 RESET_NODE0="${RESET_NODE0:-1}"
 RESET_NODE1="${RESET_NODE1:-1}"
 
@@ -33,7 +37,7 @@ NODE1_TOPO_OUT="${NODE1_TOPO_OUT:-/tmp/v16_expand_ub_node1_topology.out}"
 
 EXTRA_REGION_ID="${EXTRA_REGION_ID:-102}"
 EXTRA_REGION_BYTES="${EXTRA_REGION_BYTES:-67108864}"
-EXTRA_REGION_VALUE_SIZE="${EXTRA_REGION_VALUE_SIZE:-64}"
+EXTRA_REGION_VALUE_SIZE="${EXTRA_REGION_VALUE_SIZE:-${REGION_VALUE_SIZE}}"
 NODE1_EXTRA_LOCAL_PATH="${NODE1_EXTRA_LOCAL_PATH:-/dev/obmm_shmdev3}"
 NODE0_EXTRA_PEER_PATH="${NODE0_EXTRA_PEER_PATH:-/dev/obmm_shmdev7}"
 
@@ -57,7 +61,7 @@ ssh_run "${NODE0_HOST}" "cd ${REMOTE_DIR} && make -C src vemb_v16_server && make
 ssh_run "${NODE1_HOST}" "cd ${REMOTE_DIR} && make -C src vemb_v16_server && make -C benchmark vemb_v16_bench && make -C benchmark vemb_v16_topology_ctl"
 
 step "Write node0 startup manifest"
-ssh_run "${NODE0_HOST}" "cat >${NODE0_MANIFEST} <<'YAML'
+ssh_run "${NODE0_HOST}" "cat >${NODE0_MANIFEST} <<YAML
 local_ub_node_id: 0
 local_region_weight: 4
 
@@ -73,16 +77,16 @@ warm_regions:
     provider: ub
     path: /dev/obmm_shmdev1
     mmap_offset: 0
-    bytes: 67108864
-    value_size: 64
+    bytes: ${OWNER0_REGION_BYTES}
+    value_size: ${REGION_VALUE_SIZE}
     home_ub_node_id: 0
     weight: 1
   - region_id: 101
     provider: ub
     path: /dev/obmm_shmdev5
     mmap_offset: 0
-    bytes: 67108864
-    value_size: 64
+    bytes: ${OWNER1_REGION_BYTES}
+    value_size: ${REGION_VALUE_SIZE}
     home_ub_node_id: 1
     weight: 1
 
@@ -108,7 +112,7 @@ ub_rpc_peers:
 YAML"
 
 step "Write node1 startup manifest"
-ssh_run "${NODE1_HOST}" "cat >${NODE1_MANIFEST} <<'YAML'
+ssh_run "${NODE1_HOST}" "cat >${NODE1_MANIFEST} <<YAML
 local_ub_node_id: 1
 local_region_weight: 4
 
@@ -124,16 +128,16 @@ warm_regions:
     provider: ub
     path: /dev/obmm_shmdev1
     mmap_offset: 0
-    bytes: 67108864
-    value_size: 64
+    bytes: ${OWNER1_REGION_BYTES}
+    value_size: ${REGION_VALUE_SIZE}
     home_ub_node_id: 1
     weight: 1
   - region_id: 100
     provider: ub
     path: /dev/obmm_shmdev5
     mmap_offset: 0
-    bytes: 67108864
-    value_size: 64
+    bytes: ${OWNER0_REGION_BYTES}
+    value_size: ${REGION_VALUE_SIZE}
     home_ub_node_id: 0
     weight: 1
 

@@ -52,7 +52,13 @@ ssh root@192.168.90.112 'lsof /dev/obmm_shmdev2 /dev/obmm_shmdev4 /dev/obmm_shmd
 执行脚本：
 
 ```bash
-bash ./benchmark/vemb_v16_expand_ub_memory_2node.sh
+bash ./scripts/vemb_v16_expand_ub_memory_2node.sh
+```
+
+验证禁用 LRU eviction 后，通过缩小初始 owner1 region 触发切换到扩容 region：
+
+```bash
+bash ./scripts/vemb_v16_expand_ub_no_lru_region_switch_2node.sh
 ```
 
 ## 配置分层

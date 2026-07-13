@@ -996,17 +996,23 @@ typedef struct warm_slot_snapshot {
 } warm_slot_snapshot_t;
 
 static void warm_slot_record_read_access(vemb_v16_warm_slot_meta_t *slot_meta) {
+#if TLC_CORE_ALLOW_LRU_EVICTION
     uint32_t clock_bit = atomic_load_explicit(&slot_meta->clock_bit, memory_order_relaxed);
     if (clock_bit != 0) return;
     atomic_store_explicit(&slot_meta->last_access_ns, vemb_v16_monotonic_ns(), memory_order_relaxed);
     atomic_store_explicit(&slot_meta->clock_bit, 1, memory_order_relaxed);
+#else
+    (void)slot_meta;
+#endif
 }
 
 static void warm_slot_record_committed_access(vemb_v16_warm_slot_meta_t *slot_meta) {
     atomic_store_explicit(&slot_meta->cold_state, VEMB_V16_WARM_SLOT_COLD_COMMITTED,
                           memory_order_release);
+#if TLC_CORE_ALLOW_LRU_EVICTION
     atomic_store_explicit(&slot_meta->last_access_ns, vemb_v16_monotonic_ns(), memory_order_relaxed);
     atomic_store_explicit(&slot_meta->clock_bit, 1, memory_order_relaxed);
+#endif
 }
 
 // Read a stable slot snapshot or report that the slot is missing/busy.
@@ -1396,7 +1402,8 @@ static int warm_try_fill_free(tlc_core_warm_region_runtime_t *region,
     return 0;
 }
 
-static int warm_slot_can_evict(vemb_v16_warm_slot_meta_t *slot_meta) {
+#if TLC_CORE_ALLOW_LRU_EVICTION
+static int warm_slot_can_lru_evict(vemb_v16_warm_slot_meta_t *slot_meta) {
     if (atomic_load_explicit(&slot_meta->state, memory_order_acquire) !=
         VEMB_V16_WARM_SLOT_READY) {
         return 0;
@@ -1418,7 +1425,7 @@ static int choose_victim_slot(tlc_core_warm_region_runtime_t *region,
     uint64_t oldest_ns = UINT64_MAX;
     for (uint32_t slot = start; slot < end; slot++) {
         vemb_v16_warm_slot_meta_t *slot_meta = &region->slot_meta[slot];
-        if (!warm_slot_can_evict(slot_meta))
+        if (!warm_slot_can_lru_evict(slot_meta))
             continue;
         uint32_t clock_bit =
             atomic_load_explicit(&slot_meta->clock_bit, memory_order_relaxed);
@@ -1493,6 +1500,7 @@ static int warm_try_evict_and_fill(tlc_core_warm_region_runtime_t *region,
                               memory_order_relaxed);
     return 0;
 }
+#endif
 
 static int warm_place_in_region(tlc_core_warm_region_runtime_t *region,
                                 tlc_core_t *core,
@@ -1540,6 +1548,9 @@ static int warm_place_in_region(tlc_core_warm_region_runtime_t *region,
                 return 0;
             }
         }
+#if !TLC_CORE_ALLOW_LRU_EVICTION
+        return -1;
+#else
         uint32_t victim = UINT32_MAX;
         if (choose_victim_slot(region, start, end, &victim) == 0 &&
             warm_try_evict_and_fill(region, core, region_index, victim,
@@ -1551,6 +1562,7 @@ static int warm_place_in_region(tlc_core_warm_region_runtime_t *region,
             atomic_fetch_add_explicit(&core->warm_eviction_fail, 1, memory_order_relaxed);
         }
         cpu_relax();
+#endif
     }
     return -1;
 }

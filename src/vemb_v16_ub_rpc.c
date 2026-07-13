@@ -1135,7 +1135,7 @@ int vemb_v16_ub_rpc_attach_peer(vemb_v16_ub_rpc_t **rpc_io,
               -1);
     vemb_v16_ub_rpc_t *old_rpc = NULL;
     vemb_v16_ub_rpc_install_lookup_runtime(tlc, new_rpc, &old_rpc);
-    if (old_rpc)
+    if (old_rpc && old_rpc != new_rpc)
         vemb_v16_ub_rpc_destroy(old_rpc);
     *rpc_io = new_rpc;
     return 0;

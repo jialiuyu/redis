@@ -115,7 +115,7 @@ ub_rpc_peers:
 
 正式脚本：
 
-- `benchmark/vemb_v16_expand_ub_memory_2node.sh`
+- `scripts/vemb_v16_expand_ub_memory_2node.sh`
 
 对应操作说明：
 
@@ -296,7 +296,7 @@ NOTE:
 
 执行：
 
-- `bash ./benchmark/vemb_v16_expand_ub_memory_2node.sh`
+- `bash ./scripts/vemb_v16_expand_ub_memory_2node.sh`
 
 结果：
 

@@ -292,6 +292,7 @@ static void test_overwrite_and_capacity(void) {
                             second, sizeof(second), &handle, &warm_slot) == 0);
     assert(warm_slot == 0);
     assert(memcmp(region, second, sizeof(second)) == 0);
+#if TLC_CORE_ALLOW_LRU_EVICTION
     memset(&handle, 0xff, sizeof(handle));
     warm_slot = 0;
     assert(vemb_v16_tlc_put(tlc, evicting, (uint32_t)strlen(evicting), evicting_hash,
@@ -305,6 +306,14 @@ static void test_overwrite_and_capacity(void) {
     tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_same_key_overwrite >= 1);
     assert(stats.warm_eviction_success >= 1);
+#else
+    (void)evicting;
+    (void)evicting_hash;
+    tlc_core_stats_t stats;
+    tlc_core_get_stats(tlc->core, &stats);
+    assert(stats.warm_same_key_overwrite >= 1);
+    assert(stats.warm_eviction_success == 0);
+#endif
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -343,6 +352,7 @@ static void test_eviction_rejects_stale_handle(void) {
     assert(len == sizeof(first));
     assert(memcmp(bytes, first, sizeof(first)) == 0);
 
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(vemb_v16_tlc_put(tlc, key2, (uint32_t)strlen(key2), key2_hash,
                             second, sizeof(second), &fresh, &warm_slot) == 0);
     assert(fresh.local_slot == stale.local_slot);
@@ -354,6 +364,13 @@ static void test_eviction_rejects_stale_handle(void) {
     tlc_core_stats_t stats;
     tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_stale_handle_reject >= 1);
+#else
+    assert(vemb_v16_tlc_put(tlc, key2, (uint32_t)strlen(key2), key2_hash,
+                            second, sizeof(second), &fresh, &warm_slot) != 0);
+    assert(vemb_v16_tlc_vector_slice(tlc, &stale, &bytes, &len) == 0);
+    assert(len == sizeof(first));
+    assert(memcmp(bytes, first, sizeof(first)) == 0);
+#endif
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -616,6 +633,7 @@ typedef struct concurrent_arg {
     int tid;
     int iterations;
     uint32_t dim;
+    uint32_t max_vectors;
 } concurrent_arg_t;
 
 static void *concurrent_worker(void *arg) {
@@ -637,19 +655,19 @@ static void *concurrent_worker(void *arg) {
         assert(handle.region_id == 11);
         assert(handle.bytes == sizeof(vector));
         assert(handle.offset + handle.bytes <=
-               (uint64_t)4 * (uint64_t)128 * sizeof(float));
+               (uint64_t)a->dim * a->max_vectors * sizeof(float));
         memset(&handle, 0xff, sizeof(handle));
         warm_slot = UINT32_MAX;
         assert(vemb_v16_tlc_get_handle(a->tlc, key, (uint32_t)strlen(key),
                                        key_hash, &handle, &warm_slot) == 0);
         assert(handle.region_id == 11);
-        assert(warm_slot < 128);
+        assert(warm_slot < a->max_vectors);
     }
     return NULL;
 }
 
 static void test_concurrent_distinct_keys(void) {
-    enum { dim = 4, max_vectors = 128, threads = 4, iterations = 24 };
+    enum { dim = 4, max_vectors = 1024, threads = 4, iterations = 24 };
     float region[dim * max_vectors];
     vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
@@ -673,6 +691,7 @@ static void test_concurrent_distinct_keys(void) {
             .tid = i,
             .iterations = iterations,
             .dim = dim,
+            .max_vectors = max_vectors,
         };
         assert(pthread_create(&tids[i], NULL, concurrent_worker, &args[i]) == 0);
     }
@@ -795,9 +814,17 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     assert(vemb_v16_tlc_put(tlc, local_keys[1], (uint32_t)strlen(local_keys[1]),
                             h2_hash, second, sizeof(second),
                             &h2, &warm_slot) == 0);
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(h2.region_id == 1);
     assert(h2.offset == 0);
     assert(memcmp(local_region, second, sizeof(second)) == 0);
+#else
+    assert(h2.region_id == 2);
+    assert(h2.offset < sizeof(remote_region));
+    assert(memcmp((uint8_t *)remote_region + h2.offset,
+                  second,
+                  sizeof(second)) == 0);
+#endif
 
     assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
                             h1_hash, overwrite, sizeof(overwrite),
@@ -863,6 +890,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     memset(&handle, 0xff, sizeof(handle));
     snprintf(key, sizeof(key), "full:%u", max_vectors);
     uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                             vector, sizeof(vector),
                             &handle, &warm_slot) == 0);
@@ -874,6 +902,16 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     assert(stats.warm_region_count == 2);
     assert(stats.warm_region_full_count >= 1);
     assert(stats.warm_alloc_cold_spill == 0);
+#else
+    assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                            vector, sizeof(vector),
+                            &handle, &warm_slot) != 0);
+    tlc_core_stats_t stats;
+    tlc_core_get_stats(tlc->core, &stats);
+    assert(stats.warm_region_count == 2);
+    assert(stats.warm_region_full_count >= 1);
+    assert(stats.warm_eviction_success == 0);
+#endif
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -1938,8 +1976,20 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
                                        key1_hash,
                                        &handle,
                                        0) == 0);
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(vemb_v16_tlc_put(owner, key2, (uint32_t)strlen(key2), key2_hash,
                             second, sizeof(second), &handle, &warm_slot) == 0);
+#else
+    (void)key2_hash;
+    handle.owner_generation++;
+    assert(publish_remote_meta_to_view(owner,
+                                       owner->remote_meta_view,
+                                       key1,
+                                       (uint32_t)strlen(key1),
+                                       key1_hash,
+                                       &handle,
+                                       0) == 0);
+#endif
 
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          key1,
@@ -2166,11 +2216,20 @@ static void test_shared_slot_meta_local_set_before_remote(void) {
         if (handle.region_id == 200)
             remote_writes++;
     }
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(local_writes == 3);
     assert(remote_writes == 0);
+#else
+    assert(local_writes == 2);
+    assert(remote_writes == 1);
+#endif
     assert_region_stats(tlc, 100, 1, 1);
     assert_region_stats(tlc, 101, 1, 1);
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert_region_stats(tlc, 200, 0, 0);
+#else
+    assert_region_stats(tlc, 200, 1, 0);
+#endif
 
     vemb_v16_tlc_destroy(tlc);
 }
