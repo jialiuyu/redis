@@ -203,7 +203,7 @@ static void prepare_req(vemb_v16_req_t *req,
     req->channel_id = channel_id;
     if (key) {
         req->key_len = (uint32_t)strlen(key);
-        req->key_hash = vemb_v16_murmur3(key, req->key_len);
+        req->key_hash = vemb_v16_xxh3_64_str(key, req->key_len);
         memcpy(req->key, key, req->key_len);
     }
     req->dim = dim;

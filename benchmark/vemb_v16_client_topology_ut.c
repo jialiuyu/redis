@@ -51,7 +51,7 @@ static int find_dual_write_plan(
     for (uint32_t i = 0; i < 100000; i++) {
         char key[64];
         snprintf(key, sizeof(key), "client-topology:%u", i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         assert(vemb_v16_client_topology_plan_write(topology,
                                                    key_hash,
                                                    plan) == 0);

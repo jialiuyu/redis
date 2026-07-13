@@ -8,7 +8,7 @@
 static uint64_t hash_key_u32(const char *prefix, uint32_t i) {
     char key[64];
     snprintf(key, sizeof(key), "%s:%u", prefix, i);
-    return vemb_v16_murmur3(key, strlen(key));
+    return vemb_v16_xxh3_64_str(key, strlen(key));
 }
 
 static int ring_has_vnode(const vemb_v16_topology_ring_t *ring,

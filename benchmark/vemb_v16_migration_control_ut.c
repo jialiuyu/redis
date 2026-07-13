@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -20,18 +21,110 @@ static void fill_vector(float *vector, uint32_t dim, uint32_t seed) {
         vector[i] = (float)(seed + i);
 }
 
-static void init_test_allocator(vemb_v16_shared_region_allocator_t *allocator,
+static void init_test_allocator(vemb_v16_warm_region_header_t *allocator,
                                 uint32_t region_id,
                                 uint32_t capacity_slots) {
     memset(allocator, 0, sizeof(*allocator));
-    atomic_init(&allocator->magic, VEMB_V16_SHARED_ALLOCATOR_MAGIC);
-    allocator->version = VEMB_V16_SHARED_ALLOCATOR_VERSION;
+    atomic_init(&allocator->magic, VEMB_V16_WARM_REGION_LAYOUT_MAGIC);
+    allocator->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
     allocator->region_id = region_id;
     allocator->capacity_slots = capacity_slots;
-    atomic_init(&allocator->next_slot, 0);
-    atomic_init(&allocator->full, 0);
-    atomic_init(&allocator->used_slots, 0);
 }
+
+typedef struct migration_ut_slot_meta_entry {
+    void *mapped_addr;
+    uint32_t region_id;
+    uint32_t capacity_slots;
+    vemb_v16_warm_slot_meta_t *slot_meta;
+} migration_ut_slot_meta_entry_t;
+
+#define MIGRATION_UT_SLOT_META_REGISTRY_MAX 128u
+
+static migration_ut_slot_meta_entry_t
+    migration_ut_slot_meta_registry[MIGRATION_UT_SLOT_META_REGISTRY_MAX];
+
+static vemb_v16_warm_slot_meta_t *migration_ut_slot_meta_acquire(
+        void *mapped_addr,
+        uint32_t region_id,
+        uint32_t capacity_slots) {
+    for (uint32_t i = 0; i < MIGRATION_UT_SLOT_META_REGISTRY_MAX; i++) {
+        migration_ut_slot_meta_entry_t *entry = &migration_ut_slot_meta_registry[i];
+        if (entry->mapped_addr == mapped_addr &&
+            entry->region_id == region_id &&
+            entry->capacity_slots == capacity_slots) {
+            return entry->slot_meta;
+        }
+    }
+
+    for (uint32_t i = 0; i < MIGRATION_UT_SLOT_META_REGISTRY_MAX; i++) {
+        migration_ut_slot_meta_entry_t *entry = &migration_ut_slot_meta_registry[i];
+        if (entry->mapped_addr)
+            continue;
+
+        vemb_v16_warm_slot_meta_t *slots =
+            calloc(capacity_slots, sizeof(*slots));
+        assert(slots);
+        for (uint32_t slot = 0; slot < capacity_slots; slot++) {
+            slots[slot].region_id = region_id;
+            slots[slot].local_slot = slot;
+            atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+            atomic_init(&slots[slot].owner_generation, 0);
+            atomic_init(&slots[slot].write_seq, 0);
+            atomic_init(&slots[slot].last_access_ns, 0);
+            atomic_init(&slots[slot].clock_bit, 0);
+            atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+        }
+        *entry = (migration_ut_slot_meta_entry_t){
+            .mapped_addr = mapped_addr,
+            .region_id = region_id,
+            .capacity_slots = capacity_slots,
+            .slot_meta = slots,
+        };
+        return slots;
+    }
+
+    assert(!"migration_ut slot_meta registry exhausted");
+    return NULL;
+}
+
+static void migration_ut_ensure_slot_meta(
+        vemb_v16_tlc_warm_region_t *warm_region) {
+    if (warm_region->slot_meta)
+        return;
+    assert(warm_region->mapped_addr);
+    assert(warm_region->value_size > 0);
+    assert(warm_region->region_bytes >= warm_region->value_size);
+    uint32_t capacity_slots =
+        (uint32_t)(warm_region->region_bytes / warm_region->value_size);
+    warm_region->slot_meta =
+        migration_ut_slot_meta_acquire(warm_region->mapped_addr,
+                                       warm_region->region_id,
+                                       capacity_slots);
+}
+
+static void migration_ut_ensure_regions_slot_meta(
+        vemb_v16_tlc_warm_region_t *warm_regions,
+        uint32_t warm_region_count) {
+    for (uint32_t i = 0; i < warm_region_count; i++)
+        migration_ut_ensure_slot_meta(&warm_regions[i]);
+}
+
+static int migration_ut_create(vemb_v16_tlc_t **out,
+                               uint32_t vector_dim,
+                               uint32_t max_vectors,
+                               vemb_v16_tlc_warm_region_t *warm_regions,
+                               uint32_t warm_region_count,
+                               uint32_t local_region_weight) {
+    migration_ut_ensure_regions_slot_meta(warm_regions, warm_region_count);
+    return vemb_v16_tlc_create(out,
+                               vector_dim,
+                               max_vectors,
+                               warm_regions,
+                               warm_region_count,
+                               local_region_weight);
+}
+
+#define vemb_v16_tlc_create migration_ut_create
 
 static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
                          const char *path) {
@@ -73,14 +166,31 @@ static void make_rpc_peers(vemb_v16_ub_rpc_peer_t *peer_a_to_b,
     set_rpc_ring(&peer_b_to_a->outbound_response, resp_b_a);
 }
 
-static void cleanup_region_and_allocator(const char *path,
+static void cleanup_region_and_layout(const char *path,
                                          uint32_t region_id) {
-    char allocator_name[VEMB_V16_SHARED_ALLOCATOR_NAME_MAX];
+    char layout_name[VEMB_V16_WARM_REGION_LAYOUT_NAME_MAX];
     shm_unlink(path);
-    if (vemb_v16_shared_allocator_name_from_region_path(
-            path, region_id, allocator_name, sizeof(allocator_name)) == 0) {
-        vemb_v16_shared_allocator_unlink(allocator_name);
+    if (vemb_v16_warm_region_layout_name_from_region_path(
+            path, region_id, layout_name, sizeof(layout_name)) == 0) {
+        shm_unlink(layout_name);
     }
+}
+
+static void create_test_ub_region_file(const char *path,
+                                       uint32_t region_id,
+                                       uint32_t capacity_slots,
+                                       uint32_t value_size) {
+    size_t layout_bytes = vemb_v16_warm_region_layout_bytes(capacity_slots);
+    size_t total_bytes = layout_bytes + ((size_t)capacity_slots * value_size);
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    assert(fd >= 0);
+    assert(ftruncate(fd, (off_t)total_bytes) == 0);
+    close(fd);
+    assert(vemb_v16_warm_region_layout_reset(VEMB_V16_REGION_UB,
+                                             path,
+                                             0,
+                                             region_id,
+                                             capacity_slots) == 0);
 }
 
 static int wait_for_outbox_progress(vemb_v16_storage_ctx_t *storage,
@@ -212,6 +322,9 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
     int sv[2];
     control_thread_arg_t handler_arg;
     pthread_t handler;
+    uint8_t req_buf[128];
+    uint8_t resp_buf[128];
+    size_t req_len = 0;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
     if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
@@ -219,13 +332,21 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
         close(sv[1]);
         return -1;
     }
+    if (vemb_v16_migration_control_req_encode(req_buf,
+                                              sizeof(req_buf),
+                                              req,
+                                              &req_len) != 0) {
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(sv[0],
                                  type,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
@@ -235,11 +356,15 @@ static int tcp_migration_control(vemb_v16_proxy_t *proxy,
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
         (hdr.type != VEMB_V16_NET_MIGRATION_CONTROL_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+         hdr.payload_len > sizeof(resp_buf))) {
         rc = -1;
     }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_migration_control_resp_decode(resp,
+                                                    resp_buf,
+                                                    hdr.payload_len);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -279,6 +404,9 @@ static int tcp_migration_batch_control(
     int sv[2];
     control_thread_arg_t handler_arg;
     pthread_t handler;
+    uint8_t *req_buf = NULL;
+    uint8_t *resp_buf = NULL;
+    size_t req_len = 0;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
     if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
@@ -286,27 +414,50 @@ static int tcp_migration_batch_control(
         close(sv[1]);
         return -1;
     }
+    req_buf = malloc(vemb_v16_migration_control_batch_req_encoded_len(req));
+    if (!req_buf ||
+        vemb_v16_migration_control_batch_req_encode(
+            req_buf,
+            vemb_v16_migration_control_batch_req_encoded_len(req),
+            req,
+            &req_len) != 0) {
+        free(req_buf);
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(sv[0],
                                  VEMB_V16_NET_MIGRATION_MARK_MIGRATING_BATCH,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
+        free(req_buf);
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
     }
+    free(req_buf);
 
     vemb_v16_net_hdr_t hdr;
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
-        (hdr.type != VEMB_V16_NET_MIGRATION_CONTROL_BATCH_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+        hdr.type != VEMB_V16_NET_MIGRATION_CONTROL_BATCH_RESPONSE) {
         rc = -1;
     }
+    if (rc == 0) {
+        resp_buf = malloc(hdr.payload_len);
+        if (!resp_buf)
+            rc = -1;
+    }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_migration_control_batch_resp_decode(resp,
+                                                          resp_buf,
+                                                          hdr.payload_len);
+    free(resp_buf);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -360,6 +511,9 @@ static int tcp_migration_range_control(
     int sv[2];
     control_thread_arg_t handler_arg;
     pthread_t handler;
+    uint8_t req_buf[32];
+    uint8_t resp_buf[128];
+    size_t req_len = 0;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
     if (start_tcp_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
@@ -367,13 +521,21 @@ static int tcp_migration_range_control(
         close(sv[1]);
         return -1;
     }
+    if (vemb_v16_migration_range_control_req_encode(req_buf,
+                                                    sizeof(req_buf),
+                                                    req,
+                                                    &req_len) != 0) {
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
     if (vemb_v16_net_write_frame(sv[0],
                                  type,
                                  0,
                                  0,
                                  0,
-                                 req,
-                                 sizeof(*req)) != 0) {
+                                 req_buf,
+                                 (uint32_t)req_len) != 0) {
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
@@ -383,11 +545,15 @@ static int tcp_migration_range_control(
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
         (hdr.type != VEMB_V16_NET_MIGRATION_RANGE_CONTROL_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+         hdr.payload_len > sizeof(resp_buf))) {
         rc = -1;
     }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_migration_range_control_resp_decode(resp,
+                                                          resp_buf,
+                                                          hdr.payload_len);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -452,9 +618,18 @@ static int tcp_epoch_control(vemb_v16_proxy_t *proxy,
     pthread_t handler;
     const void *payload = NULL;
     uint32_t payload_len = 0;
+    uint8_t req_buf[32];
+    uint8_t resp_buf[32];
+    size_t req_len = 0;
     if (type == VEMB_V16_NET_EPOCH_SET) {
-        payload = req;
-        payload_len = sizeof(*req);
+        if (vemb_v16_epoch_control_req_encode(req_buf,
+                                              sizeof(req_buf),
+                                              req,
+                                              &req_len) != 0) {
+            return -1;
+        }
+        payload = req_buf;
+        payload_len = (uint32_t)req_len;
     }
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
@@ -479,11 +654,15 @@ static int tcp_epoch_control(vemb_v16_proxy_t *proxy,
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
     if (rc == 0 &&
         (hdr.type != VEMB_V16_NET_EPOCH_CONTROL_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+         hdr.payload_len != vemb_v16_epoch_control_resp_encoded_len())) {
         rc = -1;
     }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_epoch_control_resp_decode(resp,
+                                                resp_buf,
+                                                hdr.payload_len);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -562,6 +741,33 @@ static int uds_topology_get(vemb_v16_proxy_t *proxy,
     return rc;
 }
 
+static int uds_peer_view_topology_set(
+        vemb_v16_proxy_t *proxy,
+        const vemb_v16_peer_view_topology_control_req_t *req,
+        vemb_v16_peer_view_topology_control_resp_t *resp) {
+    int sv[2];
+    uint8_t op = VEMB_V16_CTRL_PEER_VIEW_MAP_TOPOLOGY_SET;
+    control_thread_arg_t handler_arg;
+    pthread_t handler;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return -1;
+    if (start_aeron_control_thread(&handler_arg, &handler, proxy, sv[1]) != 0) {
+        close(sv[0]);
+        close(sv[1]);
+        return -1;
+    }
+    if (vemb_v16_net_write_full(sv[0], &op, sizeof(op)) != 0 ||
+        vemb_v16_net_write_full(sv[0], req, sizeof(*req)) != 0) {
+        close(sv[0]);
+        pthread_join(handler, NULL);
+        return -1;
+    }
+    int rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+    close(sv[0]);
+    pthread_join(handler, NULL);
+    return rc;
+}
+
 static int tcp_topology_control(vemb_v16_proxy_t *proxy,
                                 uint8_t type,
                                 const vemb_v16_topology_control_req_t *req,
@@ -571,9 +777,22 @@ static int tcp_topology_control(vemb_v16_proxy_t *proxy,
     pthread_t handler;
     const void *payload = NULL;
     uint32_t payload_len = 0;
+    uint8_t *req_buf = NULL;
+    uint8_t *resp_buf = NULL;
+    size_t req_len = 0;
     if (type == VEMB_V16_NET_TOPOLOGY_SET) {
-        payload = req;
-        payload_len = sizeof(*req);
+        req_buf = malloc(vemb_v16_topology_control_req_encoded_len(req));
+        if (!req_buf ||
+            vemb_v16_topology_control_req_encode(
+                req_buf,
+                vemb_v16_topology_control_req_encoded_len(req),
+                req,
+                &req_len) != 0) {
+            free(req_buf);
+            return -1;
+        }
+        payload = req_buf;
+        payload_len = (uint32_t)req_len;
     }
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
         return -1;
@@ -589,20 +808,30 @@ static int tcp_topology_control(vemb_v16_proxy_t *proxy,
                                  0,
                                  payload,
                                  payload_len) != 0) {
+        free(req_buf);
         close(sv[0]);
         pthread_join(handler, NULL);
         return -1;
     }
+    free(req_buf);
 
     vemb_v16_net_hdr_t hdr;
     int rc = vemb_v16_net_read_header(sv[0], &hdr);
-    if (rc == 0 &&
-        (hdr.type != VEMB_V16_NET_TOPOLOGY_RESPONSE ||
-         hdr.payload_len != sizeof(*resp))) {
+    if (rc == 0 && hdr.type != VEMB_V16_NET_TOPOLOGY_RESPONSE) {
         rc = -1;
     }
+    if (rc == 0) {
+        resp_buf = malloc(hdr.payload_len);
+        if (!resp_buf)
+            rc = -1;
+    }
     if (rc == 0)
-        rc = vemb_v16_net_read_full(sv[0], resp, sizeof(*resp));
+        rc = vemb_v16_net_read_full(sv[0], resp_buf, hdr.payload_len);
+    if (rc == 0)
+        rc = vemb_v16_topology_control_resp_decode(resp,
+                                                   resp_buf,
+                                                   hdr.payload_len);
+    free(resp_buf);
     close(sv[0]);
     pthread_join(handler, NULL);
     return rc;
@@ -624,7 +853,7 @@ static void find_key_for_ring_owner(const vemb_v16_topology_ring_t *ring,
     for (uint32_t i = 0; i < 100000; i++) {
         snprintf(key, key_size, "%s:%u", prefix, i);
         uint32_t key_len = (uint32_t)strlen(key);
-        uint64_t hash = vemb_v16_murmur3(key, key_len);
+        uint64_t hash = vemb_v16_xxh3_64_str(key, key_len);
         if (vemb_v16_topology_ring_owner(ring, hash) == owner) {
             *key_hash = hash;
             return;
@@ -653,7 +882,7 @@ static void assert_topology_dual_write_key(
     for (uint32_t i = 0; i < 100000; i++) {
         char key[64];
         snprintf(key, sizeof(key), "p5-topology-key:%u", i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         uint32_t active_owner =
             vemb_v16_topology_ring_owner(&active_ring, key_hash);
         uint32_t standby_owner =
@@ -711,15 +940,19 @@ static void run_write_job(vemb_v16_storage_ctx_t *storage,
     job.base.req_id = 7001;
     job.base.channel_id = 1001;
     job.base.key_hash = key_hash;
-    job.base.key_len = key_len;
     job.base.topology_epoch = topology_epoch;
-    job.base.dim = op == VEMB_V16_OP_VREM ? 0 : dim;
-    job.base.vector_bytes = op == VEMB_V16_OP_VREM ? 0 : dim * sizeof(float);
-    memcpy(job.base.key, key, key_len);
-    if (job.base.vector_bytes > 0)
-        memcpy(job.vector, vector, job.base.vector_bytes);
+    job.key_len = key_len;
+    job.dim = op == VEMB_V16_OP_VREM ? 0 : dim;
+    job.vector_bytes = op == VEMB_V16_OP_VREM ? 0 : dim * sizeof(float);
+    memcpy(job.key, key, key_len);
+    if (job.vector_bytes > 0)
+        memcpy(job.vector, vector, job.vector_bytes);
 
-    vemb_v16_supernode_handle_vadd_job(&ctx, &job);
+    if (op == VEMB_V16_OP_VREM)
+        vemb_v16_supernode_handle_vrem_job(&ctx,
+                                           (const vemb_v16_vemb_job_t *)&job);
+    else
+        vemb_v16_supernode_handle_vadd_job(&ctx, &job);
     assert(vemb_v16_aeron_poll(&completion_ring, completion) == 1);
 }
 
@@ -807,26 +1040,26 @@ static void test_proxy_migration_control_primitives(void) {
     vemb_v16_proxy_t *proxy = NULL;
     const char *key = "control-migration-key";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     const char *transport_key = "transport-control-key";
     uint32_t transport_key_len = (uint32_t)strlen(transport_key);
     uint64_t transport_key_hash =
-        vemb_v16_murmur3(transport_key, transport_key_len);
+        vemb_v16_xxh3_64_str(transport_key, transport_key_len);
     const char *batch_key1 = "batch-migration-key-1";
     const char *batch_key2 = "batch-migration-key-2";
     const char *batch_missing_key = "batch-migration-missing";
     uint32_t batch_key1_len = (uint32_t)strlen(batch_key1);
     uint32_t batch_key2_len = (uint32_t)strlen(batch_key2);
-    uint64_t batch_key1_hash = vemb_v16_murmur3(batch_key1, batch_key1_len);
-    uint64_t batch_key2_hash = vemb_v16_murmur3(batch_key2, batch_key2_len);
+    uint64_t batch_key1_hash = vemb_v16_xxh3_64_str(batch_key1, batch_key1_len);
+    uint64_t batch_key2_hash = vemb_v16_xxh3_64_str(batch_key2, batch_key2_len);
     uint64_t batch_missing_hash =
-        vemb_v16_murmur3(batch_missing_key, strlen(batch_missing_key));
+        vemb_v16_xxh3_64_str(batch_missing_key, strlen(batch_missing_key));
     const char *epoch_key = "epoch-write-key";
     uint32_t epoch_key_len = (uint32_t)strlen(epoch_key);
-    uint64_t epoch_key_hash = vemb_v16_murmur3(epoch_key, epoch_key_len);
+    uint64_t epoch_key_hash = vemb_v16_xxh3_64_str(epoch_key, epoch_key_len);
     const char *pending_key = "pending-delta-cutover-key";
     uint32_t pending_key_len = (uint32_t)strlen(pending_key);
-    uint64_t pending_key_hash = vemb_v16_murmur3(pending_key,
+    uint64_t pending_key_hash = vemb_v16_xxh3_64_str(pending_key,
                                                  pending_key_len);
     float vector[dim];
     float vector2[dim];
@@ -863,7 +1096,7 @@ static void test_proxy_migration_control_primitives(void) {
              (long)getpid());
 
     unlink(uds_path);
-    cleanup_region_and_allocator(shm1, 901);
+    cleanup_region_and_layout(shm1, 901);
     shm_unlink(remote_meta_default);
     shm_unlink(req0_1);
     shm_unlink(req1_0);
@@ -1423,14 +1656,14 @@ static void test_proxy_migration_control_primitives(void) {
     shm_unlink(req1_0);
     shm_unlink(resp0_1);
     shm_unlink(resp1_0);
-    cleanup_region_and_allocator(shm1, 901);
+    cleanup_region_and_layout(shm1, 901);
 }
 
 static void test_storage_topology_auto_marks_migrating_keys(void) {
     enum { dim = 2, max_vectors = 16 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 911,
@@ -1440,7 +1673,7 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_storage_ctx_t storage;
     vemb_v16_topology_control_req_t topology_req = {0};
@@ -1544,13 +1777,147 @@ static void test_storage_topology_auto_marks_migrating_keys(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
+static void test_proxy_peer_view_topology_set_applies_mapping_first(void) {
+    enum { dim = 2, max_vectors = 4, slots = 2 };
+    char manifest_path[128];
+    char uds_path[108];
+    char shm1[64];
+    char combo_region[64];
+    char remote_meta_default[64];
+    vemb_v16_storage_ctx_t *storage = NULL;
+    vemb_v16_proxy_t *proxy = NULL;
+    vemb_v16_warm_regions_manifest_t manifest;
+    vemb_v16_peer_view_topology_control_req_t req;
+    vemb_v16_peer_view_topology_control_resp_t resp;
+    vemb_v16_topology_control_resp_t topology_resp;
+    const uint32_t active_owners[] = {0, 1};
+    const uint32_t standby_owners[] = {0, 1, 2};
+
+    snprintf(manifest_path, sizeof(manifest_path),
+             "/tmp/vemb_v16_combo_%ld.yaml",
+             (long)getpid());
+    snprintf(uds_path, sizeof(uds_path),
+             "/tmp/vemb_v16_combo_%ld.sock",
+             (long)getpid());
+    snprintf(shm1, sizeof(shm1), "/v16combo_r1_%ld", (long)getpid());
+    snprintf(combo_region, sizeof(combo_region),
+             "/tmp/v16combo_r2_%ld.ub",
+             (long)getpid());
+    snprintf(remote_meta_default, sizeof(remote_meta_default),
+             "/v16combo_meta_%ld", (long)getpid());
+    unlink(manifest_path);
+    unlink(uds_path);
+    cleanup_region_and_layout(shm1, 801);
+    unlink(combo_region);
+    shm_unlink(remote_meta_default);
+    create_test_ub_region_file(combo_region, 802, slots, dim * sizeof(float));
+
+    FILE *fp = fopen(manifest_path, "w");
+    assert(fp != NULL);
+    fprintf(fp,
+            "local_ub_node_id: 0\n"
+            "remote_meta_provider: shm\n"
+            "remote_meta_path: %s\n"
+            "remote_meta_entries: %u\n"
+            "remote_meta_buckets: %u\n"
+            "warm_regions:\n"
+            "  - region_id: 801\n"
+            "    provider: shm\n"
+            "    path: %s\n"
+            "    mmap_offset: 0\n"
+            "    bytes: %u\n"
+            "    value_size: %u\n"
+            "    home_ub_node_id: 0\n"
+            "    is_local: true\n"
+            "    weight: 1\n",
+            remote_meta_default,
+            max_vectors,
+            max_vectors * 2,
+            shm1,
+            (unsigned)(sizeof(float) * dim * slots),
+            (unsigned)(sizeof(float) * dim));
+    fclose(fp);
+
+    assert(vemb_v16_parse_warm_regions_manifest(manifest_path,
+                                                dim * sizeof(float),
+                                                &manifest) == 0);
+    assert(vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                     dim,
+                                                     dim * sizeof(float),
+                                                     max_vectors,
+                                                     &manifest) == 0);
+    assert(vemb_v16_proxy_create(&proxy,
+                                 uds_path,
+                                 dim,
+                                 max_vectors,
+                                 storage,
+                                 &manifest) == 0);
+
+    memset(&req, 0, sizeof(req));
+    req.peer_view_map_req.flags = VEMB_V16_PEER_VIEW_MAP_F_ATTACH_NOW;
+    req.peer_view_map_req.expected_local_owner_id = 0;
+    req.peer_view_map_req.expected_local_owner_valid = 1;
+    req.peer_view_map_req.region_count = 1;
+    req.peer_view_map_req.regions[0].region_id = 802;
+    req.peer_view_map_req.regions[0].backend_type = VEMB_V16_REGION_UB;
+    req.peer_view_map_req.regions[0].home_ub_node_id = 2;
+    req.peer_view_map_req.regions[0].weight = 1;
+    req.peer_view_map_req.regions[0].value_size = dim * sizeof(float);
+    req.peer_view_map_req.regions[0].region_bytes =
+        sizeof(float) * dim * slots;
+    snprintf(req.peer_view_map_req.regions[0].path,
+             sizeof(req.peer_view_map_req.regions[0].path),
+             "%s",
+             combo_region);
+
+    fill_topology_req(&req.topology_req,
+                      1,
+                      1,
+                      0,
+                      active_owners,
+                      2,
+                      standby_owners,
+                      3);
+    req.topology_req.endpoint_count = 1;
+    req.topology_req.endpoints[0].owner_id = 2;
+    req.topology_req.endpoints[0].transport_type = VEMB_V16_TRANSPORT_TCP;
+    snprintf(req.topology_req.endpoints[0].host,
+             sizeof(req.topology_req.endpoints[0].host),
+             "%s",
+             "127.0.0.1");
+    req.topology_req.endpoints[0].tcp_port = 6399;
+
+    memset(&resp, 0, sizeof(resp));
+    assert(uds_peer_view_topology_set(proxy, &req, &resp) == 0);
+    assert(resp.status == VEMB_V16_STATUS_OK);
+    assert(resp.peer_view_map_status == VEMB_V16_STATUS_OK);
+    assert(resp.topology_attempted == 1);
+    assert(resp.topology_status == VEMB_V16_STATUS_OK);
+    assert(resp.peer_view_map_resp.applied_region_count == 1);
+
+    memset(&topology_resp, 0, sizeof(topology_resp));
+    assert(vemb_v16_proxy_topology_get(proxy, &topology_resp) == 0);
+    assert(topology_resp.status == VEMB_V16_STATUS_OK);
+    assert(topology_resp.active_owner_count == 2);
+    assert(topology_resp.standby_owner_count == 3);
+    assert_owner_list(topology_resp.active_owners, active_owners, 2);
+    assert_owner_list(topology_resp.standby_owners, standby_owners, 3);
+    assert(vemb_v16_tlc_find_region(storage->tlc, 802) != NULL);
+
+    vemb_v16_proxy_destroy(proxy);
+    unlink(manifest_path);
+    cleanup_region_and_layout(shm1, 801);
+    unlink(combo_region);
+    shm_unlink(remote_meta_default);
+}
+
 static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
     enum { dim = 2, max_vectors = 16 };
     float source_region[dim * max_vectors];
     float target_region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -1563,7 +1930,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -1574,7 +1941,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 923,
@@ -1584,7 +1951,7 @@ static void test_storage_topology_auto_pushes_baseline_snapshot(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -1754,8 +2121,8 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
     float source_region[dim * max_vectors];
     float target_region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -1768,7 +2135,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -1779,7 +2146,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 933,
@@ -1789,7 +2156,7 @@ static void test_storage_baseline_retry_drains_after_target_ready(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -1992,8 +2359,8 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
     float target_region[dim * max_vectors];
     float initial[dim];
     float updated[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2006,7 +2373,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -2017,7 +2384,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 943,
@@ -2027,7 +2394,7 @@ static void test_storage_auto_scaleout_state_machine_cutover(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -2238,8 +2605,8 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
     float target_region[dim * max_vectors];
     float initial[dim];
     float updated[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t target_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t target_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *target = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2252,7 +2619,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t target_regions[] = {
         {
@@ -2263,7 +2630,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 947,
@@ -2273,7 +2640,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
             .mapped_addr = target_region,
             .region_bytes = sizeof(target_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &target_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_target[64];
@@ -2578,8 +2945,8 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     char large_range_keys[large_range_key_count][64];
     uint32_t large_range_key_lens[large_range_key_count];
     uint64_t large_range_key_hashes[large_range_key_count];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2593,7 +2960,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_regions[] = {
         {
@@ -2604,7 +2971,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 953,
@@ -2614,7 +2981,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
             .mapped_addr = dest_region,
             .region_bytes = sizeof(dest_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &dest_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_dest[64];
@@ -2626,55 +2993,55 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
     vemb_v16_ub_rpc_peer_t dest_peer;
     const char *key = "supernode:migration-delta";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     const char *baseline_key = "supernode:migration-baseline-only";
     uint32_t baseline_key_len = (uint32_t)strlen(baseline_key);
     uint64_t baseline_key_hash =
-        vemb_v16_murmur3(baseline_key, baseline_key_len);
+        vemb_v16_xxh3_64_str(baseline_key, baseline_key_len);
     const char *lease_fail_key = "supernode:migration-lease-fail";
     uint32_t lease_fail_key_len = (uint32_t)strlen(lease_fail_key);
     uint64_t lease_fail_key_hash =
-        vemb_v16_murmur3(lease_fail_key, lease_fail_key_len);
+        vemb_v16_xxh3_64_str(lease_fail_key, lease_fail_key_len);
     const char *range_abort_key1 = "supernode:migration-range-abort-1";
     const char *range_abort_key2 = "supernode:migration-range-abort-2";
     uint32_t range_abort_key1_len = (uint32_t)strlen(range_abort_key1);
     uint32_t range_abort_key2_len = (uint32_t)strlen(range_abort_key2);
     uint64_t range_abort_key1_hash =
-        vemb_v16_murmur3(range_abort_key1, range_abort_key1_len);
+        vemb_v16_xxh3_64_str(range_abort_key1, range_abort_key1_len);
     uint64_t range_abort_key2_hash =
-        vemb_v16_murmur3(range_abort_key2, range_abort_key2_len);
+        vemb_v16_xxh3_64_str(range_abort_key2, range_abort_key2_len);
     const char *range_key1 = "supernode:migration-range-1";
     const char *range_key2 = "supernode:migration-range-2";
     uint32_t range_key1_len = (uint32_t)strlen(range_key1);
     uint32_t range_key2_len = (uint32_t)strlen(range_key2);
-    uint64_t range_key1_hash = vemb_v16_murmur3(range_key1,
+    uint64_t range_key1_hash = vemb_v16_xxh3_64_str(range_key1,
                                                 range_key1_len);
-    uint64_t range_key2_hash = vemb_v16_murmur3(range_key2,
+    uint64_t range_key2_hash = vemb_v16_xxh3_64_str(range_key2,
                                                 range_key2_len);
     const char *range_tcp_key1 = "supernode:migration-range-tcp-1";
     const char *range_tcp_key2 = "supernode:migration-range-tcp-2";
     uint32_t range_tcp_key1_len = (uint32_t)strlen(range_tcp_key1);
     uint32_t range_tcp_key2_len = (uint32_t)strlen(range_tcp_key2);
     uint64_t range_tcp_key1_hash =
-        vemb_v16_murmur3(range_tcp_key1, range_tcp_key1_len);
+        vemb_v16_xxh3_64_str(range_tcp_key1, range_tcp_key1_len);
     uint64_t range_tcp_key2_hash =
-        vemb_v16_murmur3(range_tcp_key2, range_tcp_key2_len);
+        vemb_v16_xxh3_64_str(range_tcp_key2, range_tcp_key2_len);
     const char *live_range_key1 = "supernode:migration-live-range-1";
     const char *live_range_key2 = "supernode:migration-live-range-2";
     uint32_t live_range_key1_len = (uint32_t)strlen(live_range_key1);
     uint32_t live_range_key2_len = (uint32_t)strlen(live_range_key2);
     uint64_t live_range_key1_hash =
-        vemb_v16_murmur3(live_range_key1, live_range_key1_len);
+        vemb_v16_xxh3_64_str(live_range_key1, live_range_key1_len);
     uint64_t live_range_key2_hash =
-        vemb_v16_murmur3(live_range_key2, live_range_key2_len);
+        vemb_v16_xxh3_64_str(live_range_key2, live_range_key2_len);
     const char *deleted_key = "supernode:migration-delete";
     uint32_t deleted_key_len = (uint32_t)strlen(deleted_key);
     uint64_t deleted_key_hash =
-        vemb_v16_murmur3(deleted_key, deleted_key_len);
+        vemb_v16_xxh3_64_str(deleted_key, deleted_key_len);
     const char *vrem_key = "supernode:migration-vrem";
     uint32_t vrem_key_len = (uint32_t)strlen(vrem_key);
     uint64_t vrem_key_hash =
-        vemb_v16_murmur3(vrem_key, vrem_key_len);
+        vemb_v16_xxh3_64_str(vrem_key, vrem_key_len);
     vemb_v16_storage_ctx_t source_storage;
     vemb_v16_storage_ctx_t dest_storage;
     vemb_v16_vector_handle_t handle = {0};
@@ -3847,7 +4214,7 @@ static void test_supernode_vadd_pushes_migration_delta(void) {
         large_range_key_lens[i] =
             (uint32_t)strlen(large_range_keys[i]);
         large_range_key_hashes[i] =
-            vemb_v16_murmur3(large_range_keys[i],
+            vemb_v16_xxh3_64_str(large_range_keys[i],
                              large_range_key_lens[i]);
         fill_vector(large_range_value, dim, 8400 + i);
         warm_slot = UINT32_MAX;
@@ -4459,8 +4826,8 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
     float dest_region[dim * max_vectors];
     float initial[dim];
     float updated[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -4473,7 +4840,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_regions[] = {
         {
@@ -4484,7 +4851,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 973,
@@ -4494,7 +4861,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
             .mapped_addr = dest_region,
             .region_bytes = sizeof(dest_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &dest_allocator,
+            .slot_meta = NULL,
         },
     };
     char req_source_dest[64];
@@ -4505,7 +4872,7 @@ static void test_migration_retry_worker_drains_when_target_becomes_ready(void) {
     vemb_v16_ub_rpc_peer_t dest_peer;
     const char *key = "supernode:migration-retry";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_storage_ctx_t source_storage;
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
@@ -4661,6 +5028,7 @@ int main(void) {
     monotonicInit();
 
     test_proxy_migration_control_primitives();
+    test_proxy_peer_view_topology_set_applies_mapping_first();
     test_storage_topology_auto_marks_migrating_keys();
     test_storage_topology_auto_pushes_baseline_snapshot();
     test_storage_baseline_retry_drains_after_target_ready();

@@ -4,7 +4,7 @@
  * Select strategy via -DHASH_STRATEGY=N:
  *   1 = V1_LINEAR     Murmur3 full-64bit, linear stride +1
  *   2 = V2_ORIGINAL   Murmur3 on key>>32 (reproduces small-key bug), fib stride
- *   3 = V2_FIXED       Murmur3 on key&0xFFFFFFFF (bugfix), fib stride
+ *   3 = V2_FIXED      Murmur3 on key&0xFFFFFFFF (bugfix), fib stride
  *   4 = V2_FULL64     Murmur3 full-64bit primary, fib stride
  *   5 = V3_ODDEVEN    Odd-bit positions for primary, even-bit for stride
  */

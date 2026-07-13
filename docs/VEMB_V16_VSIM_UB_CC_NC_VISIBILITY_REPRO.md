@@ -14,10 +14,14 @@ vector。
 
 | 本地 Export 设备 | 对端 Import 设备 |
 |---|---|
-| 111 `/dev/obmm_shmdev1`，NUMA Node 0 | 112 `/dev/obmm_shmdev3` |
-| 111 `/dev/obmm_shmdev2`，NUMA Node 1 | 112 `/dev/obmm_shmdev4` |
-| 112 `/dev/obmm_shmdev1`，NUMA Node 0 | 111 `/dev/obmm_shmdev3` |
-| 112 `/dev/obmm_shmdev2`，NUMA Node 1 | 111 `/dev/obmm_shmdev4` |
+| 111 `/dev/obmm_shmdev1` | 112 `/dev/obmm_shmdev5` |
+| 111 `/dev/obmm_shmdev2` | 112 `/dev/obmm_shmdev6` |
+| 111 `/dev/obmm_shmdev3` | 112 `/dev/obmm_shmdev7` |
+| 111 `/dev/obmm_shmdev4` | 112 `/dev/obmm_shmdev8` |
+| 112 `/dev/obmm_shmdev1` | 111 `/dev/obmm_shmdev5` |
+| 112 `/dev/obmm_shmdev2` | 111 `/dev/obmm_shmdev6` |
+| 112 `/dev/obmm_shmdev3` | 111 `/dev/obmm_shmdev7` |
+| 112 `/dev/obmm_shmdev4` | 111 `/dev/obmm_shmdev8` |
 
 当前设备配置模式为：
 
@@ -26,7 +30,7 @@ vector。
 - `USE_CC_MODE=no`。
 - 应用不调用 `obmm_set_ownership`，ownership 由 `/dev/obmm_shmdev*` 驱动管理。
 
-设备映射原图见仓库根目录的 `obmm_dev_mapping.jpeg`。
+`obmm_dev_mapping.jpeg` 与当前双机实测不符，不能作为当前调试依据。
 
 ## 3. 最小复现 UT
 
@@ -110,7 +114,7 @@ writer 显示 `WRITER_READY` 后，在 112 启动 reader：
 cd /root/szz/codespace/hpc-redis/benchmark
 
 ./ub_cc_nc_visibility_ut reader \
-    --path /dev/obmm_shmdev3 \
+    --path /dev/obmm_shmdev5 \
     --offset 7516192768 \
     --seed 0x1111000000000000 \
     --watch-seconds 70
@@ -136,51 +140,70 @@ cd /root/szz/codespace/hpc-redis/benchmark
 cd /root/szz/codespace/hpc-redis/benchmark
 
 ./ub_cc_nc_visibility_ut reader \
-    --path /dev/obmm_shmdev3 \
+    --path /dev/obmm_shmdev5 \
     --offset 7516192768 \
     --seed 0x1122000000000000 \
     --watch-seconds 70
 ```
 
-另一组 UB region 可以使用相同方式验证：
+其余 3 组 UB region 也应按同样方式验证：
 
 ```text
-本地 /dev/obmm_shmdev2 -> 对端 /dev/obmm_shmdev4
+本地 /dev/obmm_shmdev2 -> 对端 /dev/obmm_shmdev6
+本地 /dev/obmm_shmdev3 -> 对端 /dev/obmm_shmdev7
+本地 /dev/obmm_shmdev4 -> 对端 /dev/obmm_shmdev8
 ```
 
-## 6. 已观察到的现象
+## 6. 2026-07-09 远端实测结果
 
-111 writer 输出：
+在以下真实机器上完成双向验证：
+
+- `node0=192.168.90.111`
+- `node1=192.168.90.112`
+
+构建：
+
+```bash
+cd /root/szz/codespace/hpc-redis
+make -C benchmark ub_cc_nc_visibility_ut
+```
+
+共验证 8 组方向：
+
+- `111:1 -> 112:5`
+- `111:2 -> 112:6`
+- `111:3 -> 112:7`
+- `111:4 -> 112:8`
+- `112:1 -> 111:5`
+- `112:2 -> 111:6`
+- `112:3 -> 111:7`
+- `112:4 -> 111:8`
+
+结果全部通过，reader 在 `attempt=0` 即读到 `VISIBLE`。
+
+示例输出：
 
 ```text
-WRITER_READY path=/dev/obmm_shmdev1 flags=O_RDWR(CC) offset=7516192768 hold_seconds=60
-written: 1111000000000000 1111000000000001 1111000000000002 1111000000000003 1111000000000004 1111000000000005 1111000000000006 1111000000000007
-Run the reader while this process is sleeping.
-WRITER_UNMAP
+WRITER_READY path=/dev/obmm_shmdev1 flags=O_RDWR(CC) offset=7516192768 hold_seconds=4
+written: 1111000000000000 ... 1111000000000007
+
+READER_READY path=/dev/obmm_shmdev5 flags=O_RDWR|O_SYNC(NC) offset=7516192768 watch_seconds=8
+expected: 1111000000000000 ... 1111000000000007
+attempt=0 result=VISIBLE
 ```
 
-112 reader 在 writer mmap 存活期间持续读取到旧值：
+## 7. 当前结论
 
-```text
-attempt=0 result=STALE
-actual:   0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+当前这批真实双机上的有效映射关系应固定为：
 
-...
+- `1 -> 5`
+- `2 -> 6`
+- `3 -> 7`
+- `4 -> 8`
 
-attempt=25 result=STALE
-actual:   0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000
-```
+并且在这次 UT 中，没有复现“必须等 `munmap` 后远端才可见”的旧现象。
 
-writer 执行 `WRITER_UNMAP` 后，reader 开始读取到完整的新值：
-
-```text
-attempt=26 result=VISIBLE
-actual:   1111000000000000 1111000000000001 1111000000000002 1111000000000003 1111000000000004 1111000000000005 1111000000000006 1111000000000007
-```
-
-可见后的 64B 数据完整，没有观察到 partial write 或 torn write。
-
-## 7. 已确认的事实
+## 8. 已确认的事实
 
 1. `bench_ub_dim.sh` 已验证四组 Export/Import 映射关系，跨节点读取全部
    `verify: OK`。
@@ -188,74 +211,27 @@ actual:   1111000000000000 1111000000000001 1111000000000002 1111000000000003 11
    `munmap`，其访问模型与 VSIM 不同。
 3. 最小 UT 中，writer 使用本地 CC mapping，reader 使用远端 NC mapping。
 4. writer 写入的是一条完整、64B 对齐的 cacheline。
-5. writer CC mmap 存活期间，远端 NC reader 持续读取旧值。
-6. writer `munmap` 后，远端 NC reader 可以读取到完整的新值。
-7. 该现象不依赖 VSIM、remote meta、atomic RMW 或 ownership API。
+5. 当前真实双机上，四组映射都能在 writer 持有 mmap 期间直接被远端 reader 读到。
+6. 这次结果不支持“当前机器必须等 `munmap` 后才可见”的旧结论。
+7. 该 UT 仍然不依赖 VSIM、remote meta、atomic RMW 或 ownership API。
 
-## 8. 对 VSIM 的影响
+## 9. 对当前扩容调试的影响
 
-VSIM 服务会长期持有本地 CC mapping：
+这次 UT 的意义主要是两点：
 
-```text
-VADD:
-    本地 CC mapping 写入 payload 和 remote meta
+- 可以把当前双机环境的 UB 路径基线明确固定为
+  `1/5, 2/6, 3/7, 4/8`
+- 当前扩容问题不能再归因于“peer-view path 选错成 3/4 这一组”
 
-VSIM:
-    对端通过远端 NC mapping 实时读取 remote meta 和 payload
-```
+## 10. 若后续仍出现可见性异常
 
-根据最小 UT 的现象，本地 CC mapping 写入的新 remote-meta cacheline 在 mapping
-存活期间没有及时对远端 NC reader 可见。因此，对端执行 remote-meta lookup
-时仍读取旧值，并返回 `NOT_FOUND`。
+若未来再次观测到 VSIM 或 remote-meta 可见性异常，应优先记录：
 
-C11 `memory_order_release`、`memory_order_acquire`、atomic RMW 和
-`atomic_thread_fence` 只能约束 CPU 内存访问顺序，不能替代 UB/设备要求的
-cache writeback 或 publish 操作。
+1. 具体使用的是哪一对 export/import 设备。
+2. 是否仍然满足 `1/5, 2/6, 3/7, 4/8`。
+3. UT 是否还能复现。
+4. 是否只有业务路径异常，而最小 UT 正常。
 
-## 9. 当前结论
+## 11. 备注
 
-当前可以确认 VSIM 失败的直接原因：
-
-> 本地 CC mapping 中的普通 CPU 写入，在 mapping 持续存活期间没有及时对远端
-> NC mapping 可见；执行 `munmap` 后，远端才能读取到新数据。
-
-当前尚不能仅根据应用侧测试确定驱动内部的根因，也不能确定 `munmap` 是否是
-规范要求的唯一写回触发方式。
-
-## 10. 需要驱动负责人确认的问题
-
-1. 当前 Export CC、Import NC 配置是否支持本地 writer 和远端 reader 的运行期
-   cache coherence？
-2. 本地 CC mapping 执行普通 CPU store 后，应用应如何保证远端 NC mapping
-   实时读取到最新数据？
-3. 是否需要调用特定 ioctl、驱动接口或 cache flush/publish 操作？
-4. 为什么当前测试中，数据在 writer `munmap` 后才对远端可见？
-5. `MAP_SHARED`、64B 对齐并写满完整 cacheline，是否足以触发实时远端可见？
-6. 本地 CC 与远端 NC 混合访问时，驱动提供的可见性和一致性语义是什么？
-7. CPU atomic RMW 是否支持跨节点原子性？其结果何时对远端 NC reader 可见？
-8. Export/Import region 是否需要额外配置 coherence、snoop 或 writeback 属性？
-9. 是否存在可查询的接口，用于确认 dirty cacheline 已经发布到 UB home memory？
-10. 对长期 mmap 的服务进程，驱动推荐的高性能 publish/writeback 方式是什么？
-
-## 11. 驱动侧问题摘要
-
-可向驱动负责人提供以下最小摘要：
-
-```text
-访问模式：
-writer: local Export, open(O_RDWR), MAP_SHARED, aligned 64B memcpy,
-        mapping remains alive
-reader: remote Import, open(O_RDWR|O_SYNC), MAP_SHARED,
-        repeated aligned 64B memcpy
-
-未使用：
-ownership API、VSIM、remote meta、atomic RMW、msync、显式 cache flush
-
-现象：
-writer 写入后，reader 在 writer mmap 存活期间持续读取旧值；
-writer munmap 后，reader 立即读取到完整的新 64B 数据。
-
-诉求：
-确认本地 CC writer -> 远端 NC reader 的运行期可见性语义，
-以及应用需要调用的 publish/cache-writeback 机制。
-```
+本文已被更新为当前真实双机结果，不再保留旧的 `3/4` 映射结论。

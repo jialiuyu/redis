@@ -1,6 +1,11 @@
 #ifndef __VEMB_V16_HASH_H
 #define __VEMB_V16_HASH_H
 
+#ifndef XXH_INLINE_ALL
+#define XXH_INLINE_ALL
+#endif
+#include "../deps/xxhash/xxhash.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -33,6 +38,15 @@ static inline uint64_t vemb_v16_avalanche64(uint64_t key) {
     key *= UINT64_C(0xc4ceb9fe1a85ec53);
     key ^= key >> 33;
     return key;
+}
+
+static inline uint64_t vemb_v16_xxh3_64(const void *data, size_t len) {
+    return (uint64_t)XXH3_64bits(data, len);
+}
+
+
+static inline uint64_t vemb_v16_xxh3_64_str(const char *key, size_t len) {
+    return vemb_v16_xxh3_64(key, len);
 }
 
 static inline uint32_t vemb_v16_hash_mask_u64(uint64_t key, uint32_t mask) {
@@ -91,12 +105,13 @@ static inline uint32_t vemb_v16_murmur3_32(const char *key, size_t len) {
     return h;
 }
 
-static inline uint32_t vemb_v16_murmur3(const char *key, size_t len) {
+static inline uint64_t vemb_v16_murmur3(const char *key, size_t len) {
     return vemb_v16_murmur3_32(key, len);
 }
 
 static inline uint32_t murmur3_hash(const char *key, size_t len) {
     return vemb_v16_murmur3_32(key, len);
 }
+
 
 #endif

@@ -1,5 +1,6 @@
 #include "vemb_v16_topology.h"
 
+#include "macro.h"
 #include "vemb_v16_hash.h"
 
 #include <stdio.h>
@@ -29,8 +30,6 @@ static int ring_node_cmp(const void *a, const void *b) {
 int vemb_v16_topology_owner_exists(
     const vemb_v16_topology_ring_t *ring,
     uint32_t owner_id) {
-    if (!ring)
-        return 0;
     for (uint32_t i = 0; i < ring->owner_count; i++) {
         if (ring->owners[i] == owner_id)
             return 1;
@@ -71,13 +70,13 @@ int vemb_v16_topology_ring_build(vemb_v16_topology_ring_t *ring,
             char vnode_key[64];
             snprintf(vnode_key,
                      sizeof(vnode_key),
-                     "supernode_%u_vnode_%u",
+                    "supernode_%u_vnode_%u",
                      owner_id,
                      vnode);
             ring->nodes[ring->node_count++] =
                 (vemb_v16_topology_ring_node_t){
-                    .hash_value = vemb_v16_murmur3(vnode_key,
-                                                   strlen(vnode_key)),
+                    .hash_value = vemb_v16_xxh3_64_str(vnode_key,
+                                                       strlen(vnode_key)),
                     .owner_id = owner_id,
                     .vnode_id = vnode,
                 };
@@ -96,7 +95,7 @@ uint32_t vemb_v16_topology_ring_owner(
     if (!ring || ring->node_count == 0)
         return UINT32_MAX;
 
-    uint32_t hash = (uint32_t)key_hash;
+    uint64_t hash = key_hash;
     uint32_t left = 0;
     uint32_t right = ring->node_count;
     while (left < right) {

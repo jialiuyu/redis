@@ -23,18 +23,140 @@ static void make_key(char *buf, size_t len, uint32_t id) {
 }
 #endif
 
-static void init_test_allocator(vemb_v16_shared_region_allocator_t *allocator,
+static void init_test_allocator(vemb_v16_warm_region_header_t *allocator,
                                 uint32_t region_id,
                                 uint32_t capacity_slots) {
     memset(allocator, 0, sizeof(*allocator));
-    atomic_init(&allocator->magic, VEMB_V16_SHARED_ALLOCATOR_MAGIC);
-    allocator->version = VEMB_V16_SHARED_ALLOCATOR_VERSION;
+    atomic_init(&allocator->magic, VEMB_V16_WARM_REGION_LAYOUT_MAGIC);
+    allocator->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
     allocator->region_id = region_id;
     allocator->capacity_slots = capacity_slots;
-    atomic_init(&allocator->next_slot, 0);
-    atomic_init(&allocator->full, 0);
-    atomic_init(&allocator->used_slots, 0);
 }
+
+static vemb_v16_warm_region_header_t *init_test_allocator_with_slot_meta(
+        void *backing,
+        uint32_t region_id,
+        uint32_t capacity_slots) {
+    vemb_v16_warm_region_header_t *allocator = backing;
+    memset(backing, 0, vemb_v16_warm_region_layout_bytes(capacity_slots));
+    atomic_init(&allocator->magic, VEMB_V16_WARM_REGION_LAYOUT_MAGIC);
+    allocator->version = VEMB_V16_WARM_REGION_LAYOUT_VERSION;
+    allocator->region_id = region_id;
+    allocator->capacity_slots = capacity_slots;
+    vemb_v16_warm_slot_meta_t *slots =
+        vemb_v16_warm_region_slot_meta(allocator);
+    for (uint32_t i = 0; i < capacity_slots; i++) {
+        slots[i].region_id = region_id;
+        slots[i].local_slot = i;
+        atomic_init(&slots[i].state, VEMB_V16_WARM_SLOT_FREE);
+        atomic_init(&slots[i].owner_generation, 0);
+        atomic_init(&slots[i].write_seq, 0);
+        atomic_init(&slots[i].last_access_ns, 0);
+        atomic_init(&slots[i].clock_bit, 0);
+        atomic_init(&slots[i].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+    }
+    return allocator;
+}
+
+typedef struct tlc_ut_slot_meta_entry {
+    void *mapped_addr;
+    uint32_t region_id;
+    uint32_t capacity_slots;
+    vemb_v16_warm_slot_meta_t *slot_meta;
+} tlc_ut_slot_meta_entry_t;
+
+#define TLC_UT_SLOT_META_REGISTRY_MAX 128u
+
+static tlc_ut_slot_meta_entry_t
+    tlc_ut_slot_meta_registry[TLC_UT_SLOT_META_REGISTRY_MAX];
+
+static vemb_v16_warm_slot_meta_t *tlc_ut_slot_meta_acquire(
+        void *mapped_addr,
+        uint32_t region_id,
+        uint32_t capacity_slots) {
+    for (uint32_t i = 0; i < TLC_UT_SLOT_META_REGISTRY_MAX; i++) {
+        tlc_ut_slot_meta_entry_t *entry = &tlc_ut_slot_meta_registry[i];
+        if (entry->mapped_addr == mapped_addr &&
+            entry->region_id == region_id &&
+            entry->capacity_slots == capacity_slots) {
+            return entry->slot_meta;
+        }
+    }
+
+    for (uint32_t i = 0; i < TLC_UT_SLOT_META_REGISTRY_MAX; i++) {
+        tlc_ut_slot_meta_entry_t *entry = &tlc_ut_slot_meta_registry[i];
+        if (entry->mapped_addr)
+            continue;
+
+        vemb_v16_warm_slot_meta_t *slots =
+            calloc(capacity_slots, sizeof(*slots));
+        assert(slots);
+        for (uint32_t slot = 0; slot < capacity_slots; slot++) {
+            slots[slot].region_id = region_id;
+            slots[slot].local_slot = slot;
+            atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
+            atomic_init(&slots[slot].owner_generation, 0);
+            atomic_init(&slots[slot].write_seq, 0);
+            atomic_init(&slots[slot].last_access_ns, 0);
+            atomic_init(&slots[slot].clock_bit, 0);
+            atomic_init(&slots[slot].cold_state, VEMB_V16_WARM_SLOT_COLD_NONE);
+        }
+        *entry = (tlc_ut_slot_meta_entry_t){
+            .mapped_addr = mapped_addr,
+            .region_id = region_id,
+            .capacity_slots = capacity_slots,
+            .slot_meta = slots,
+        };
+        return slots;
+    }
+
+    assert(!"tlc_ut slot_meta registry exhausted");
+    return NULL;
+}
+
+static void tlc_ut_ensure_slot_meta(vemb_v16_tlc_warm_region_t *warm_region) {
+    if (warm_region->slot_meta)
+        return;
+    assert(warm_region->mapped_addr);
+    assert(warm_region->value_size > 0);
+    assert(warm_region->region_bytes >= warm_region->value_size);
+    uint32_t capacity_slots =
+        (uint32_t)(warm_region->region_bytes / warm_region->value_size);
+    warm_region->slot_meta = tlc_ut_slot_meta_acquire(warm_region->mapped_addr,
+                                                      warm_region->region_id,
+                                                      capacity_slots);
+}
+
+static void tlc_ut_ensure_regions_slot_meta(
+        vemb_v16_tlc_warm_region_t *warm_regions,
+        uint32_t warm_region_count) {
+    for (uint32_t i = 0; i < warm_region_count; i++)
+        tlc_ut_ensure_slot_meta(&warm_regions[i]);
+}
+
+static int tlc_ut_create(vemb_v16_tlc_t **out,
+                         uint32_t vector_dim,
+                         uint32_t max_vectors,
+                         vemb_v16_tlc_warm_region_t *warm_regions,
+                         uint32_t warm_region_count,
+                         uint32_t local_region_weight) {
+    tlc_ut_ensure_regions_slot_meta(warm_regions, warm_region_count);
+    return vemb_v16_tlc_create(out,
+                               vector_dim,
+                               max_vectors,
+                               warm_regions,
+                               warm_region_count,
+                               local_region_weight);
+}
+
+static int tlc_ut_attach_warm_region(vemb_v16_tlc_t *tlc,
+                                     vemb_v16_tlc_warm_region_t *warm_region) {
+    tlc_ut_ensure_slot_meta(warm_region);
+    return vemb_v16_tlc_attach_warm_region(tlc, warm_region);
+}
+
+#define vemb_v16_tlc_create tlc_ut_create
+#define vemb_v16_tlc_attach_warm_region tlc_ut_attach_warm_region
 
 static void set_rpc_ring(vemb_v16_ub_rpc_ring_config_t *ring,
                          const char *path) {
@@ -76,11 +198,29 @@ static void make_rpc_peers(vemb_v16_ub_rpc_peer_t *peer_a_to_b,
     set_rpc_ring(&peer_b_to_a->outbound_response, resp_b_a);
 }
 
+static void assert_region_stats(vemb_v16_tlc_t *tlc,
+                                uint32_t region_id,
+                                uint32_t expected_used_slots,
+                                uint32_t expected_full) {
+    tlc_core_region_stats_t stats[TLC_CORE_MAX_WARM_REGIONS];
+    uint32_t count = tlc_core_get_region_stats(tlc->core,
+                                               stats,
+                                               TLC_CORE_MAX_WARM_REGIONS);
+    for (uint32_t i = 0; i < count; i++) {
+        if (stats[i].region_id != region_id)
+            continue;
+        assert(stats[i].used_slots == expected_used_slots);
+        assert(stats[i].full == expected_full);
+        return;
+    }
+    assert(!"region stats not found");
+}
+
 static void test_put_get_handle(void) {
     enum { dim = 4, max_vectors = 8 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 7,
@@ -88,12 +228,12 @@ static void test_put_get_handle(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = 0;
     const char *key = "item:1";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 7, max_vectors);
@@ -125,7 +265,7 @@ static void test_overwrite_and_capacity(void) {
     enum { dim = 2, max_vectors = 1 };
     float region[dim * max_vectors];
     float first[dim], second[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 0,
@@ -133,14 +273,14 @@ static void test_overwrite_and_capacity(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = 0;
     const char *key = "only";
     const char *evicting = "extra";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
-    uint64_t evicting_hash = vemb_v16_murmur3(evicting, strlen(evicting));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+    uint64_t evicting_hash = vemb_v16_xxh3_64_str(evicting, strlen(evicting));
 
     init_test_allocator(&allocator, 0, max_vectors);
     assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &warm, 1, 4) == 0);
@@ -172,7 +312,7 @@ static void test_eviction_rejects_stale_handle(void) {
     enum { dim = 2, max_vectors = 1 };
     float region[dim * max_vectors];
     float first[dim], second[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 6,
@@ -180,7 +320,7 @@ static void test_eviction_rejects_stale_handle(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t stale = {0};
     vemb_v16_vector_handle_t fresh = {0};
@@ -189,8 +329,8 @@ static void test_eviction_rejects_stale_handle(void) {
     uint32_t len = 0;
     const char *key1 = "stale:one";
     const char *key2 = "stale:two";
-    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key1_hash = vemb_v16_xxh3_64_str(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 6, max_vectors);
@@ -222,7 +362,7 @@ static void test_cold_read_through_promotes_warm_handle(void) {
     enum { dim = 3, max_vectors = 4 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 42,
@@ -230,12 +370,12 @@ static void test_cold_read_through_promotes_warm_handle(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = 99;
     const char *key = "cold-key";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 42, max_vectors);
@@ -259,7 +399,7 @@ static void test_disabled_cold_append_is_noop(void) {
     enum { dim = 2, max_vectors = 4 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     tlc_core_t *core = NULL;
     tlc_core_warm_region_config_t warm = {
         .region_id = 42,
@@ -269,7 +409,7 @@ static void test_disabled_cold_append_is_noop(void) {
         .value_size = sizeof(vector),
         .region_bytes = sizeof(region),
         .mapped_addr = (uint8_t *)region,
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     tlc_core_config_t config = {
         .value_size = sizeof(vector),
@@ -282,11 +422,14 @@ static void test_disabled_cold_append_is_noop(void) {
         .local_region_weight = 1,
     };
     const char *key = "cold-disabled";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
     tlc_warm_location_t location = {0};
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 42, max_vectors);
+    warm.slot_meta = tlc_ut_slot_meta_acquire(warm.mapped_addr,
+                                              warm.region_id,
+                                              max_vectors);
     assert(tlc_core_create(&core, &config) == 0);
     fill_vector(vector, dim, 42);
     assert(tlc_core_cold_append(core,
@@ -309,7 +452,7 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
     float region[dim * max_vectors];
     float vector[dim];
     float expected[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     tlc_core_t *core = NULL;
     tlc_core_warm_region_config_t warm = {
         .region_id = 77,
@@ -319,7 +462,7 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
         .value_size = sizeof(vector),
         .region_bytes = sizeof(region),
         .mapped_addr = (uint8_t *)region,
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     tlc_core_config_t config = {
         .value_size = sizeof(vector),
@@ -332,11 +475,14 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
         .local_region_weight = 1,
     };
     const char *key = "hot-update";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
     tlc_warm_location_t location = {0};
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 77, max_vectors);
+    warm.slot_meta = tlc_ut_slot_meta_acquire(warm.mapped_addr,
+                                              warm.region_id,
+                                              max_vectors);
     assert(tlc_core_create(&core, &config) == 0);
     for (uint32_t i = 0; i < 16; i++) {
         fill_vector(vector, dim, 1000 + i);
@@ -364,10 +510,16 @@ static void test_cold_same_key_updates_do_not_exhaust_log(void) {
 }
 
 static void test_hot_is_cache_only(void) {
-    enum { dim = 2, max_vectors = 16 };
+    /*
+     * TLC warm placement is set-associative and hash-routed, so a region can
+     * evict within one set before the whole payload view is numerically full.
+     * Keep this test within a stable no-eviction budget and verify the hot
+     * layer is only a cache over real warm handles.
+     */
+    enum { dim = 2, max_vectors = 8 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 5,
@@ -375,7 +527,7 @@ static void test_hot_is_cache_only(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = 0;
@@ -387,14 +539,14 @@ static void test_hot_is_cache_only(void) {
     for (uint32_t i = 0; i < max_vectors; i++) {
         snprintf(key, sizeof(key), "hot-cache:%u", i);
         fill_vector(vector, dim, i + 1);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                                 vector, sizeof(vector),
                                 &handle, &warm_slot) == 0);
     }
     for (uint32_t i = 0; i < max_vectors; i++) {
         snprintf(key, sizeof(key), "hot-cache:%u", i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         memset(&handle, 0, sizeof(handle));
         warm_slot = UINT32_MAX;
         assert(vemb_v16_tlc_get_handle(tlc, key, (uint32_t)strlen(key),
@@ -411,7 +563,7 @@ static void test_prefill_distribution_stays_warm(void) {
     enum { dim = 1, max_vectors = 131072, prefill = 65536 };
     float *region = calloc((size_t)dim * max_vectors, sizeof(*region));
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 19,
@@ -419,7 +571,7 @@ static void test_prefill_distribution_stays_warm(void) {
         .mapped_addr = region,
         .region_bytes = (uint64_t)sizeof(*region) * dim * max_vectors,
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
@@ -432,7 +584,7 @@ static void test_prefill_distribution_stays_warm(void) {
     for (uint32_t i = 0; i < prefill; i++) {
         make_key(key, sizeof(key), i);
         fill_vector(vector, dim, i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         memset(&handle, 0, sizeof(handle));
         warm_slot = UINT32_MAX;
         assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
@@ -445,7 +597,7 @@ static void test_prefill_distribution_stays_warm(void) {
 
     for (uint32_t i = 0; i < prefill; i++) {
         make_key(key, sizeof(key), i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         memset(&handle, 0, sizeof(handle));
         warm_slot = UINT32_MAX;
         assert(vemb_v16_tlc_get_handle(tlc, key, (uint32_t)strlen(key),
@@ -478,7 +630,7 @@ static void *concurrent_worker(void *arg) {
         uint32_t id = (uint32_t)(a->tid * a->iterations + i);
         snprintf(key, sizeof(key), "k:%u", id);
         fill_vector(vector, a->dim, id);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         assert(vemb_v16_tlc_put(a->tlc, key, (uint32_t)strlen(key), key_hash,
                                 vector, sizeof(vector),
                                 &handle, &warm_slot) == 0);
@@ -499,7 +651,7 @@ static void *concurrent_worker(void *arg) {
 static void test_concurrent_distinct_keys(void) {
     enum { dim = 4, max_vectors = 128, threads = 4, iterations = 24 };
     float region[dim * max_vectors];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     pthread_t tids[threads];
     concurrent_arg_t args[threads];
@@ -509,7 +661,7 @@ static void test_concurrent_distinct_keys(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
 
     memset(region, 0, sizeof(region));
@@ -536,7 +688,7 @@ static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
     float region1[dim * max_vectors];
     float region2[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t alloc1, alloc2;
+    vemb_v16_warm_region_header_t alloc1, alloc2;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t regions[] = {
         {
@@ -547,7 +699,7 @@ static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
             .mapped_addr = region1,
             .region_bytes = sizeof(region1),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc1,
+            .slot_meta = NULL,
         },
         {
             .region_id = 2,
@@ -557,7 +709,7 @@ static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
             .mapped_addr = region2,
             .region_bytes = sizeof(region2),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc2,
+            .slot_meta = NULL,
         },
     };
     uint32_t found = 0;
@@ -574,7 +726,7 @@ static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
         vemb_v16_vector_handle_t handle = {0};
         uint32_t warm_slot = UINT32_MAX;
         snprintf(key, sizeof(key), "region-probe:%u", i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                                 vector, sizeof(vector),
                                 &handle, &warm_slot) == 0);
@@ -593,7 +745,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     float remote_region[dim * 4];
     float first[dim], second[dim], overwrite[dim];
     char local_keys[2][32];
-    vemb_v16_shared_region_allocator_t local_alloc, remote_alloc;
+    vemb_v16_warm_region_header_t local_alloc, remote_alloc;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t regions[] = {
         {
@@ -604,7 +756,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
             .mapped_addr = local_region,
             .region_bytes = sizeof(local_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &local_alloc,
+            .slot_meta = NULL,
         },
         {
             .region_id = 2,
@@ -614,7 +766,7 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
             .mapped_addr = remote_region,
             .region_bytes = sizeof(remote_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &remote_alloc,
+            .slot_meta = NULL,
         },
     };
     vemb_v16_vector_handle_t h1 = {0}, h2 = {0}, h3 = {0};
@@ -630,8 +782,8 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     fill_vector(first, dim, 10);
     fill_vector(second, dim, 20);
     fill_vector(overwrite, dim, 30);
-    uint64_t h1_hash = vemb_v16_murmur3(local_keys[0], strlen(local_keys[0]));
-    uint64_t h2_hash = vemb_v16_murmur3(local_keys[1], strlen(local_keys[1]));
+    uint64_t h1_hash = vemb_v16_xxh3_64_str(local_keys[0], strlen(local_keys[0]));
+    uint64_t h2_hash = vemb_v16_xxh3_64_str(local_keys[1], strlen(local_keys[1]));
 
     assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
                             h1_hash, first, sizeof(first),
@@ -666,7 +818,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     float region1[dim];
     float region2[dim];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t alloc1, alloc2;
+    vemb_v16_warm_region_header_t alloc1, alloc2;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t regions[] = {
         {
@@ -677,7 +829,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
             .mapped_addr = region1,
             .region_bytes = sizeof(region1),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc1,
+            .slot_meta = NULL,
         },
         {
             .region_id = 20,
@@ -687,7 +839,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
             .mapped_addr = region2,
             .region_bytes = sizeof(region2),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc2,
+            .slot_meta = NULL,
         },
     };
     vemb_v16_vector_handle_t handle = {0};
@@ -701,7 +853,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     fill_vector(vector, dim, 700);
     for (uint32_t i = 0; i < max_vectors; i++) {
         snprintf(key, sizeof(key), "full:%u", i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                                 vector, sizeof(vector),
                                 &handle, &warm_slot) == 0);
@@ -710,7 +862,7 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
 
     memset(&handle, 0xff, sizeof(handle));
     snprintf(key, sizeof(key), "full:%u", max_vectors);
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
     assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                             vector, sizeof(vector),
                             &handle, &warm_slot) == 0);
@@ -725,11 +877,11 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_shared_allocator_two_tlcs_unique_slots(void) {
+static void test_shared_slot_meta_two_tlcs_unique_slots(void) {
     enum { dim = 2, max_vectors = 4 };
     float region[dim * max_vectors];
     float v1[dim], v2[dim], overwrite[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc1 = NULL, *tlc2 = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 77,
@@ -739,14 +891,14 @@ static void test_shared_allocator_two_tlcs_unique_slots(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t h1 = {0}, h2 = {0}, h3 = {0};
     uint32_t warm_slot = UINT32_MAX;
     const char *key1 = "shared:one";
     const char *key2 = "shared:two";
-    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key1_hash = vemb_v16_xxh3_64_str(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 77, max_vectors);
@@ -766,7 +918,7 @@ static void test_shared_allocator_two_tlcs_unique_slots(void) {
     assert(h2.region_id == 77);
     assert(h2.offset == sizeof(v2));
     assert(warm_slot == 1);
-    assert(vemb_v16_shared_allocator_used_slots(&allocator) == 2);
+    assert_region_stats(tlc1, 77, 2, 0);
 
     assert(vemb_v16_tlc_put(tlc1, key1, (uint32_t)strlen(key1), key1_hash,
                             overwrite, sizeof(overwrite), &h3,
@@ -774,7 +926,7 @@ static void test_shared_allocator_two_tlcs_unique_slots(void) {
     assert(h3.region_id == h1.region_id);
     assert(h3.offset == h1.offset);
     assert(warm_slot == 0);
-    assert(vemb_v16_shared_allocator_used_slots(&allocator) == 2);
+    assert_region_stats(tlc1, 77, 2, 0);
     assert(memcmp(region, overwrite, sizeof(overwrite)) == 0);
     assert(memcmp(region + dim, v2, sizeof(v2)) == 0);
 
@@ -786,7 +938,7 @@ static void test_vsim_key2_lookup_local_source(void) {
     enum { dim = 2, max_vectors = 4 };
     float region[dim * max_vectors];
     float v1[dim], v2[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 88,
@@ -796,7 +948,7 @@ static void test_vsim_key2_lookup_local_source(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t key2_handle = {0};
@@ -806,9 +958,9 @@ static void test_vsim_key2_lookup_local_source(void) {
     const char *key1 = "vsim:one";
     const char *key2 = "vsim:two";
     const char *missing = "vsim:missing";
-    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
-    uint64_t missing_hash = vemb_v16_murmur3(missing, strlen(missing));
+    uint64_t key1_hash = vemb_v16_xxh3_64_str(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
+    uint64_t missing_hash = vemb_v16_xxh3_64_str(missing, strlen(missing));
 
     memset(region, 0, sizeof(region));
     init_test_allocator(&allocator, 88, max_vectors);
@@ -860,7 +1012,7 @@ static void test_vsim_key2_lookup_remote_source(void) {
     enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *owner = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_tlc_warm_region_t warm = {
@@ -871,7 +1023,7 @@ static void test_vsim_key2_lookup_remote_source(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t owner_meta;
     vemb_v16_remote_meta_view_t reader_meta;
@@ -881,7 +1033,7 @@ static void test_vsim_key2_lookup_remote_source(void) {
     void *reader_meta_base = NULL;
     uint32_t wanted_owner = 1;
     const char *key2 = "vsim:remote-key2";
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
@@ -960,7 +1112,7 @@ static void test_remote_meta_async_publish_flush(void) {
     enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 299,
@@ -970,14 +1122,14 @@ static void test_remote_meta_async_publish_flush(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t meta;
     size_t meta_bytes =
         vemb_v16_remote_meta_layout_bytes(remote_entries, remote_buckets);
     void *meta_base = NULL;
     const char *key = "remote-meta:async";
-    uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_remote_meta_handle_t remote_handle = {0};
     uint32_t warm_slot = UINT32_MAX;
@@ -1035,7 +1187,7 @@ static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
     enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *owner = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_tlc_warm_region_t warm = {
@@ -1046,7 +1198,7 @@ static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t owner_meta;
     vemb_v16_remote_meta_view_t reader_meta;
@@ -1056,7 +1208,7 @@ static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
     void *reader_meta_base = NULL;
     uint32_t wanted_owner = 1;
     const char *key2 = "vsim:rpc-key2";
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
@@ -1146,7 +1298,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
     enum { dim = 2, max_vectors = 8, remote_entries = 8, remote_buckets = 16 };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *owner = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_ub_rpc_t *owner_rpc = NULL;
@@ -1159,7 +1311,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t owner_meta;
     vemb_v16_remote_meta_view_t reader_meta;
@@ -1169,7 +1321,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
     void *reader_meta_base = NULL;
     uint32_t wanted_owner = 1;
     const char *key2 = "vsim:ub-ring-rpc-key2";
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
@@ -1343,7 +1495,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_concurrent(void) {
     };
     float region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *owner = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_ub_rpc_t *owner_rpc = NULL;
@@ -1356,7 +1508,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_concurrent(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t owner_meta;
     vemb_v16_remote_meta_view_t reader_meta;
@@ -1444,7 +1596,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_concurrent(void) {
         vemb_v16_vector_handle_t handle = {0};
         uint32_t warm_slot = UINT32_MAX;
         snprintf(keys[i], sizeof(keys[i]), "vsim:ub-ring-rpc-conc:%u", i);
-        hashes[i] = vemb_v16_murmur3(keys[i], strlen(keys[i]));
+        hashes[i] = vemb_v16_xxh3_64_str(keys[i], strlen(keys[i]));
         fill_vector(vector, dim, 2000 + i);
         assert(vemb_v16_tlc_put(owner,
                                 keys[i],
@@ -1498,7 +1650,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
     enum { dim = 2, max_vectors = 8 };
     float region[dim * max_vectors];
     float first[dim], second[dim], other[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *owner = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_ub_rpc_t *owner_rpc = NULL;
@@ -1511,7 +1663,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t owner_meta;
     vemb_v16_remote_meta_view_t reader_meta;
@@ -1523,9 +1675,9 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
     const char *stale_key = "vsim:ub-ring-rpc-stale";
     const char *evict_a = "vsim:ub-ring-rpc-evict-a";
     const char *evict_b = "vsim:ub-ring-rpc-evict-b";
-    uint64_t stale_hash = vemb_v16_murmur3(stale_key, strlen(stale_key));
-    uint64_t evict_a_hash = vemb_v16_murmur3(evict_a, strlen(evict_a));
-    uint64_t evict_b_hash = vemb_v16_murmur3(evict_b, strlen(evict_b));
+    uint64_t stale_hash = vemb_v16_xxh3_64_str(stale_key, strlen(stale_key));
+    uint64_t evict_a_hash = vemb_v16_xxh3_64_str(evict_a, strlen(evict_a));
+    uint64_t evict_b_hash = vemb_v16_xxh3_64_str(evict_b, strlen(evict_b));
     vemb_v16_vector_handle_t stale_old = {0};
     vemb_v16_vector_handle_t stale_new = {0};
     vemb_v16_vector_handle_t evict_a_handle = {0};
@@ -1714,7 +1866,7 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
     enum { dim = 2, max_vectors = 1, remote_entries = 4, remote_buckets = 8 };
     float region[dim * max_vectors];
     float first[dim], second[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *owner = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_tlc_warm_region_t warm = {
@@ -1725,7 +1877,7 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_remote_meta_view_t owner_meta;
     vemb_v16_remote_meta_view_t reader_meta;
@@ -1736,8 +1888,8 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
     uint32_t wanted_owner = 1;
     const char *key1 = "vsim:remote-stale-old";
     const char *key2 = "vsim:remote-stale-new";
-    uint64_t key1_hash = vemb_v16_murmur3(key1, strlen(key1));
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key1_hash = vemb_v16_xxh3_64_str(key1, strlen(key1));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
@@ -1823,7 +1975,7 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     float region1[dim * max_vectors];
     float region2[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t alloc1, alloc2;
+    vemb_v16_warm_region_header_t alloc1, alloc2;
     vemb_v16_tlc_t *owner2 = NULL;
     vemb_v16_tlc_t *reader = NULL;
     vemb_v16_tlc_warm_region_t owner2_region = {
@@ -1834,7 +1986,7 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
         .mapped_addr = region2,
         .region_bytes = sizeof(region2),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &alloc2,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t reader_regions[] = {
         {
@@ -1845,7 +1997,7 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
             .mapped_addr = region1,
             .region_bytes = sizeof(region1),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc1,
+            .slot_meta = NULL,
         },
         {
             .region_id = 992,
@@ -1855,7 +2007,7 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
             .mapped_addr = region2,
             .region_bytes = sizeof(region2),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc2,
+            .slot_meta = NULL,
         },
     };
     vemb_v16_remote_meta_view_t owner1_meta, owner2_meta;
@@ -1865,7 +2017,7 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     void *owner2_base = NULL;
     uint32_t wanted_owner = 2;
     const char *key2 = "vsim:owner2-key2";
-    uint64_t key2_hash = vemb_v16_murmur3(key2, strlen(key2));
+    uint64_t key2_hash = vemb_v16_xxh3_64_str(key2, strlen(key2));
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
@@ -1950,10 +2102,10 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     free(owner1_base);
 }
 
-static void test_shared_allocator_local_set_before_remote(void) {
+static void test_shared_slot_meta_local_set_before_remote(void) {
     enum { dim = 2, max_vectors = 6 };
     float local0[dim], local1[dim], remote[dim * 4];
-    vemb_v16_shared_region_allocator_t alloc0, alloc1, alloc_remote;
+    vemb_v16_warm_region_header_t alloc0, alloc1, alloc_remote;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t regions[] = {
         {
@@ -1964,7 +2116,7 @@ static void test_shared_allocator_local_set_before_remote(void) {
             .mapped_addr = local0,
             .region_bytes = sizeof(local0),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc0,
+            .slot_meta = NULL,
         },
         {
             .region_id = 101,
@@ -1974,7 +2126,7 @@ static void test_shared_allocator_local_set_before_remote(void) {
             .mapped_addr = local1,
             .region_bytes = sizeof(local1),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc1,
+            .slot_meta = NULL,
         },
         {
             .region_id = 200,
@@ -1984,7 +2136,7 @@ static void test_shared_allocator_local_set_before_remote(void) {
             .mapped_addr = remote,
             .region_bytes = sizeof(remote),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &alloc_remote,
+            .slot_meta = NULL,
         },
     };
     float vector[dim];
@@ -2005,7 +2157,7 @@ static void test_shared_allocator_local_set_before_remote(void) {
         vemb_v16_vector_handle_t handle = {0};
         uint32_t warm_slot = UINT32_MAX;
         snprintf(key, sizeof(key), "local-first:%u", i);
-        uint64_t key_hash = vemb_v16_murmur3(key, strlen(key));
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
         assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
                                 vector, sizeof(vector), &handle,
                                 &warm_slot) == 0);
@@ -2016,9 +2168,86 @@ static void test_shared_allocator_local_set_before_remote(void) {
     }
     assert(local_writes == 3);
     assert(remote_writes == 0);
-    assert(vemb_v16_shared_allocator_full(&alloc0) == 1);
-    assert(vemb_v16_shared_allocator_full(&alloc1) == 1);
-    assert(vemb_v16_shared_allocator_used_slots(&alloc_remote) == 0);
+    assert_region_stats(tlc, 100, 1, 1);
+    assert_region_stats(tlc, 101, 1, 1);
+    assert_region_stats(tlc, 200, 0, 0);
+
+    vemb_v16_tlc_destroy(tlc);
+}
+
+static void test_runtime_attach_remote_region_after_create(void) {
+    enum { dim = 2, max_vectors = 8 };
+    float local_region[dim];
+    float remote_region[dim * 4];
+    float vector[dim];
+    uint8_t local_alloc_backing[sizeof(vemb_v16_warm_region_header_t) +
+                                sizeof(vemb_v16_warm_slot_meta_t)];
+    vemb_v16_warm_region_header_t *local_alloc = NULL;
+    vemb_v16_warm_region_header_t remote_alloc;
+    vemb_v16_tlc_t *tlc = NULL;
+    vemb_v16_tlc_warm_region_t local = {
+        .region_id = 300,
+        .backend_type = VEMB_V16_REGION_LOCAL_SHM,
+        .is_local = 1,
+        .weight = 1,
+        .mapped_addr = local_region,
+        .region_bytes = sizeof(local_region),
+        .value_size = dim * sizeof(float),
+        .slot_meta = NULL,
+    };
+    vemb_v16_tlc_warm_region_t remote = {
+        .region_id = 301,
+        .backend_type = VEMB_V16_REGION_UB,
+        .is_local = 0,
+        .weight = 1,
+        .mapped_addr = remote_region,
+        .region_bytes = sizeof(remote_region),
+        .value_size = dim * sizeof(float),
+        .slot_meta = NULL,
+    };
+
+    memset(local_region, 0, sizeof(local_region));
+    memset(remote_region, 0, sizeof(remote_region));
+    local_alloc = init_test_allocator_with_slot_meta(local_alloc_backing, 300, 1);
+    local.slot_meta = vemb_v16_warm_region_slot_meta(local_alloc);
+    init_test_allocator(&remote_alloc, 301, 4);
+    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors, &local, 1, 4) == 0);
+    fill_vector(vector, dim, 9000);
+
+    {
+        const char *key = "runtime-local";
+        vemb_v16_vector_handle_t handle = {0};
+        uint32_t warm_slot = UINT32_MAX;
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                                vector, sizeof(vector), &handle,
+                                &warm_slot) == 0);
+        assert(handle.region_id == 300);
+        assert_region_stats(tlc, 300, 1, 1);
+        atomic_store_explicit(
+            &vemb_v16_warm_region_slot_meta(local_alloc)[0].cold_state,
+            VEMB_V16_WARM_SLOT_COLD_NONE,
+            memory_order_release);
+    }
+
+    assert(vemb_v16_tlc_attach_warm_region(tlc, &remote) == 0);
+
+    {
+        const char *key = "runtime-remote";
+        tlc_warm_location_t location = {0};
+        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
+        assert(tlc_core_put_location_epoch(tlc->core,
+                                           key,
+                                           (uint32_t)strlen(key),
+                                           key_hash,
+                                           vector,
+                                           sizeof(vector),
+                                           0,
+                                           0,
+                                           &location) == 0);
+        assert(location.region_id == 301);
+        assert_region_stats(tlc, 301, 1, 0);
+    }
 
     vemb_v16_tlc_destroy(tlc);
 }
@@ -2029,8 +2258,8 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
     float dest_region[dim * max_vectors];
     float v1[dim], v2[dim];
     float snapshot_value1[dim], snapshot_value2[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_tlc_warm_region_t source_warm = {
@@ -2041,7 +2270,7 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_warm = {
         .region_id = 703,
@@ -2051,11 +2280,11 @@ static void test_migration_snapshot_apply_rejects_stale(void) {
         .mapped_addr = dest_region,
         .region_bytes = sizeof(dest_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &dest_allocator,
+        .slot_meta = NULL,
     };
     const char *key = "migration:key";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
     tlc_core_key_migration_info_t info = {0};
@@ -2207,7 +2436,7 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
     enum { dim = 2, max_vectors = 4 };
     float region[dim * max_vectors];
     float v1[dim], v2[dim], v3[dim];
-    vemb_v16_shared_region_allocator_t allocator;
+    vemb_v16_warm_region_header_t allocator;
     vemb_v16_tlc_t *tlc = NULL;
     vemb_v16_tlc_warm_region_t warm = {
         .region_id = 709,
@@ -2217,11 +2446,11 @@ static void test_put_with_epoch_rejects_stale_epoch(void) {
         .mapped_addr = region,
         .region_bytes = sizeof(region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &allocator,
+        .slot_meta = NULL,
     };
     const char *key = "migration:epoch-write";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
     tlc_core_key_migration_info_t info = {0};
@@ -2310,7 +2539,7 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
     enum { dim = 2, max_vectors = 4 };
     float source_region[dim * max_vectors];
     float v1[dim], v2[dim], v3[dim], snapshot_value[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_warm_region_t source_warm = {
         .region_id = 711,
@@ -2320,11 +2549,11 @@ static void test_migration_source_cutover_rejects_old_owner_access(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     const char *key = "migration:cutover:key";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
     tlc_core_key_migration_info_t info = {0};
@@ -2433,8 +2662,8 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
     float source_region[dim * max_vectors];
     float dest_region[dim * max_vectors];
     float v1[dim], v2[dim], stale[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_tlc_warm_region_t regions[] = {
         {
@@ -2445,7 +2674,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 903,
@@ -2455,12 +2684,12 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
             .mapped_addr = dest_region,
             .region_bytes = sizeof(dest_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &dest_allocator,
+            .slot_meta = NULL,
         },
     };
     const char *key = "migration:delta:key";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_ub_migration_rpc_req_t req = {0};
     vemb_v16_ub_migration_rpc_req_t lease_req = {0};
     vemb_v16_ub_migration_rpc_resp_t resp = {0};
@@ -2678,7 +2907,7 @@ static void test_migration_delta_rpc_apply_idempotent_and_tombstone(void) {
     };
     const char *missing_key = "migration:delta:missing";
     uint32_t missing_key_len = (uint32_t)strlen(missing_key);
-    uint64_t missing_key_hash = vemb_v16_murmur3(missing_key,
+    uint64_t missing_key_hash = vemb_v16_xxh3_64_str(missing_key,
                                                  missing_key_len);
     req.key_hash = missing_key_hash;
     req.key_len = missing_key_len;
@@ -2796,8 +3025,8 @@ static void test_migration_delta_ub_ring_rpc_put(void) {
     float source_region[dim * max_vectors];
     float dest_region[dim * max_vectors];
     float vector[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -2810,7 +3039,7 @@ static void test_migration_delta_ub_ring_rpc_put(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_regions[] = {
         {
@@ -2821,7 +3050,7 @@ static void test_migration_delta_ub_ring_rpc_put(void) {
             .mapped_addr = source_region,
             .region_bytes = sizeof(source_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &source_allocator,
+            .slot_meta = NULL,
         },
         {
             .region_id = 923,
@@ -2831,7 +3060,7 @@ static void test_migration_delta_ub_ring_rpc_put(void) {
             .mapped_addr = dest_region,
             .region_bytes = sizeof(dest_region),
             .value_size = dim * sizeof(float),
-            .shared_allocator = &dest_allocator,
+            .slot_meta = NULL,
         },
     };
     vemb_v16_ub_rpc_peer_t source_peer;
@@ -2842,7 +3071,7 @@ static void test_migration_delta_ub_ring_rpc_put(void) {
     char resp_dest_source[64];
     const char *key = "migration:delta:ring:key";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_vector_handle_t source_handle = {0};
     vemb_v16_vector_handle_t dest_handle = {0};
     uint32_t warm_slot = UINT32_MAX;
@@ -3002,8 +3231,8 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
     float dest_region[dim * max_vectors];
     float vector[dim];
     float snapshot_value[dim];
-    vemb_v16_shared_region_allocator_t source_allocator;
-    vemb_v16_shared_region_allocator_t dest_allocator;
+    vemb_v16_warm_region_header_t source_allocator;
+    vemb_v16_warm_region_header_t dest_allocator;
     vemb_v16_tlc_t *source = NULL;
     vemb_v16_tlc_t *dest = NULL;
     vemb_v16_ub_rpc_t *source_rpc = NULL;
@@ -3016,7 +3245,7 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
         .mapped_addr = source_region,
         .region_bytes = sizeof(source_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &source_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_tlc_warm_region_t dest_warm = {
         .region_id = 803,
@@ -3026,7 +3255,7 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
         .mapped_addr = dest_region,
         .region_bytes = sizeof(dest_region),
         .value_size = dim * sizeof(float),
-        .shared_allocator = &dest_allocator,
+        .slot_meta = NULL,
     };
     vemb_v16_ub_rpc_peer_t source_peer;
     vemb_v16_ub_rpc_peer_t dest_peer;
@@ -3036,7 +3265,7 @@ static void test_migration_snapshot_ub_ring_rpc_descriptor(void) {
     char resp_dest_source[64];
     const char *key = "migration:ring:key";
     uint32_t key_len = (uint32_t)strlen(key);
-    uint64_t key_hash = vemb_v16_murmur3(key, key_len);
+    uint64_t key_hash = vemb_v16_xxh3_64_str(key, key_len);
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = UINT32_MAX;
     tlc_core_key_migration_info_t info = {0};
@@ -3188,7 +3417,7 @@ int main(void) {
     test_concurrent_distinct_keys();
     test_multi_region_local_full_fallback_and_overwrite();
     test_multi_region_all_full_evicts_committed_warm();
-    test_shared_allocator_two_tlcs_unique_slots();
+    test_shared_slot_meta_two_tlcs_unique_slots();
     test_vsim_key2_lookup_local_source();
     test_vsim_key2_lookup_remote_source();
     test_remote_meta_async_publish_flush();
@@ -3198,7 +3427,8 @@ int main(void) {
     test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict();
     test_vsim_key2_lookup_remote_meta_stale();
     test_vsim_key2_lookup_remote_owner_routing();
-    test_shared_allocator_local_set_before_remote();
+    test_shared_slot_meta_local_set_before_remote();
+    test_runtime_attach_remote_region_after_create();
     test_migration_snapshot_apply_rejects_stale();
     test_put_with_epoch_rejects_stale_epoch();
     test_migration_source_cutover_rejects_old_owner_access();
