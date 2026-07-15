@@ -253,6 +253,18 @@ typedef struct vemb_v16_storage_ctx {
     vemb_v16_topology_endpoint_t
         scaleout_auto_endpoints[VEMB_V16_TOPOLOGY_CONTROL_MAX_ENDPOINTS];
     vemb_v16_topology_endpoint_t scaleout_auto_coordinator_endpoint;
+    /* Coordinator state — only active on the node whose local_owner_id ==
+     * scaleout_auto_coordinator_endpoint.owner_id. All fields guarded by
+     * topology_lock (same lock that protects scaleout_auto_* writes). */
+    uint32_t coordinator_enabled;
+    uint32_t coordinator_expected_source_count;
+    uint32_t
+        coordinator_expected_sources[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    uint8_t  coordinator_done[VEMB_V16_TOPOLOGY_CONTROL_MAX_OWNERS];
+    uint32_t coordinator_done_count;
+    uint32_t coordinator_finalized;
+    uint64_t coordinator_mig_epoch;
+    uint64_t coordinator_cutover_epoch;
     uint32_t migration_outbox_count;
     vemb_v16_migration_outbox_t
         *migration_outboxes[VEMB_V16_STORAGE_MAX_MIGRATION_OUTBOXES];
@@ -458,6 +470,30 @@ int vemb_v16_storage_scaleout_auto_mark_notified(
     uint64_t migration_epoch,
     uint32_t source_owner,
     uint64_t notify_seq);
+/* Coordinator record-keeping for embedded coordinator mode (the node whose
+ * local_owner_id == coordinator_endpoint.owner_id). Called from
+ * vemb_v16_tcp_handle_fd when a SCALEOUT_LOCAL_DONE frame arrives.
+ *
+ * On the first-time record for a given source_owner, returns 1 and
+ * increments done_count. On duplicates returns 0. Sets *out_finalized=1
+ * exactly once (when done_count reaches expected_source_count) — the
+ * caller uses this to trigger publish_full_active. Idempotent on dup
+ * frames: a duplicate arriving after finalization returns 0 with
+ * *out_finalized=0. */
+int vemb_v16_storage_scaleout_coordinator_record_done(
+    vemb_v16_storage_ctx_t *storage,
+    const vemb_v16_scaleout_local_done_req_t *req,
+    int *out_finalized);
+/* Snapshot the publish_full_active targets and build the TOPOLOGY_SET
+ * request that coordinator_publish_to_all_endpoints should send to every
+ * owner. Copies endpoints[] by value under topology_lock so the caller
+ * can perform outbound TCP sends without holding the lock. */
+int vemb_v16_storage_scaleout_coordinator_get_publish_targets(
+    vemb_v16_storage_ctx_t *storage,
+    vemb_v16_topology_endpoint_t *out_endpoints,
+    uint32_t max_endpoints,
+    uint32_t *out_count,
+    vemb_v16_topology_control_req_t *out_req);
 int vemb_v16_storage_migration_write_blocked(
     vemb_v16_storage_ctx_t *storage,
     const char *key,

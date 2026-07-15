@@ -796,42 +796,6 @@ int VADD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         }
     }
 
-    /* UB engine dispatch — after parameter parsing and key open/create,
-     * before CAS branch. UB path does not support CAS threaded insert. */
-    vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vadd) {
-        if (attrib) {
-            RedisModule_Free(vec);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support SETATTR");
-        }
-        if (cas) {
-            RedisModule_Free(vec);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support CAS");
-        }
-        if (reduce_dim) {
-            RedisModule_Free(vec);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support REDUCE");
-        }
-        if (quant_type != HNSW_QUANT_Q8) {
-            RedisModule_Free(vec);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine only supports default FP32/VALUES path");
-        }
-        vector_data_t vd = { .data = vec, .dim = dim, .is_fp32 = 1 };
-        int ret = ve->vadd(ctx, argv[1], &vd, val, attrib);
-        RedisModule_Free(vec);
-        if (ret == C_OK) {
-            RedisModule_ReplyWithBool(ctx, 1);
-            RedisModule_ReplicateVerbatim(ctx);
-        } else {
-            RedisModule_ReplyWithError(ctx, "ERR UB engine vadd failed");
-        }
-        return REDISMODULE_OK;
-    }
-
     /* For existing keys don't do CAS updates. For how things work now, the
      * CAS state would be invalidated by the deletion before adding back. */
     if (cas && RedisModule_DictGet(vset->dict,val,NULL) != NULL)
@@ -1203,38 +1167,6 @@ int VSIM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         }
     }
 
-    /* UB engine dispatch — after all option parsing, before threaded
-     * execution. UB path handles search internally. */
-    vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vsim) {
-        if (withattribs) {
-            RedisModule_Free(vec);
-            if (filter_expr) exprFree(filter_expr);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support WITHATTRIBS");
-        }
-        if (ground_truth) {
-            RedisModule_Free(vec);
-            if (filter_expr) exprFree(filter_expr);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support TRUTH");
-        }
-        if (filter_expr || filter_ef > 0) {
-            RedisModule_Free(vec);
-            if (filter_expr) exprFree(filter_expr);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support FILTER");
-        }
-        if (ef > 0) {
-            RedisModule_Free(vec);
-            return RedisModule_ReplyWithError(ctx,
-                "ERR UB engine does not support EF");
-        }
-        int ret = proxy_submit_vsim(ctx, argv[1], vec, dim, (size_t)count, withscores);
-        if (filter_expr) exprFree(filter_expr);
-        return ret;
-    }
-
     int threaded_request = 1; // Run on a thread, by default.
     if (filter_ef == 0) filter_ef = count * 100; // Max filter visited nodes.
 
@@ -1300,13 +1232,6 @@ int VDIM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (RedisModule_ModuleTypeGetType(key) != VectorSetType)
         return RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
 
-    /* UB engine dispatch — after key open and type check */
-    vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vdim) {
-        int dim = ve->vdim(ctx, key);
-        return RedisModule_ReplyWithLongLong(ctx, dim);
-    }
-
     struct vsetObject *vset = RedisModule_ModuleTypeGetValue(key);
     return RedisModule_ReplyWithLongLong(ctx, vset->hnsw->vector_dim);
 }
@@ -1325,13 +1250,6 @@ int VCARD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_ModuleTypeGetType(key) != VectorSetType)
         return RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
-
-    /* UB engine dispatch — after key open and type check */
-    vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vcard) {
-        int count = ve->vcard(ctx, key);
-        return RedisModule_ReplyWithLongLong(ctx, count);
-    }
 
     struct vsetObject *vset = RedisModule_ModuleTypeGetValue(key);
     return RedisModule_ReplyWithLongLong(ctx, vset->hnsw->node_count);
@@ -1364,21 +1282,6 @@ int VREM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
     /* Get vector set from key */
     struct vsetObject *vset = RedisModule_ModuleTypeGetValue(keyptr);
-
-    /* UB engine dispatch — after key open and type check,
-     * before element dictionary lookup. UB vrem performs soft delete
-     * (zero-vector overwrite), no Redis dict operations needed. */
-    vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled && ve && ve->type == VECTOR_ENGINE_UB && ve->vrem) {
-        int ret = ve->vrem(ctx, key, element);
-        if (ret == C_OK) {
-            RedisModule_ReplyWithBool(ctx, 1);
-            RedisModule_ReplicateVerbatim(ctx);
-        } else {
-            RedisModule_ReplyWithError(ctx, "ERR UB engine vrem failed");
-        }
-        return REDISMODULE_OK;
-    }
 
     /* Find the node for this element */
     hnswNode *node = RedisModule_DictGet(vset->dict, element, NULL);
@@ -1435,15 +1338,6 @@ int VEMB_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     /* Get key and element. */
     RedisModuleString *key = argv[1];
     RedisModuleString *element = argv[2];
-
-    /* Check if UB engine is active — no fallback, fail explicitly */
-    vector_engine_t *ve = vector_engine_get();
-    if (vector_engine_enabled &&
-        ve &&
-        ve->type == VECTOR_ENGINE_UB &&
-        ve->vemb) {
-        return proxy_submit_vemb(ctx, key, element, raw_output);
-    }
 
     /* Traditional Redis implementation */
     /* Open key. */
@@ -2400,8 +2294,12 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (vector_engine_init_from_config(NULL) == C_OK) {
         current_engine_type = vector_engine_get_current_type();
         vector_engine_enabled = 1;
-        RedisModule_Log(ctx, "notice", "Vector engine initialized: %s",
-                       current_engine_type == VECTOR_ENGINE_UB ? "UB Engine" : "Redis Engine");
+        const char *engine_name;
+        switch (current_engine_type) {
+            case VECTOR_ENGINE_UB:       engine_name = "UB Engine"; break;
+            default:                     engine_name = "Redis Engine"; break;
+        }
+        RedisModule_Log(ctx, "notice", "Vector engine initialized: %s", engine_name);
 
         /* Initialize batch processor for high-throughput operations */
         if (batch_processor_init() == C_OK) {
@@ -2798,8 +2696,12 @@ int VENGINE_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
         vector_engine_type_t active_type = vector_engine_get_current_type();
         RedisModule_ReplyWithArray(ctx, 2);
         RedisModule_ReplyWithSimpleString(ctx, "engine");
-        RedisModule_ReplyWithSimpleString(ctx,
-            active_type == VECTOR_ENGINE_UB ? "UB" : "REDIS");
+        const char *engine_name;
+        switch (active_type) {
+            case VECTOR_ENGINE_UB:       engine_name = "UB"; break;
+            default:                     engine_name = "REDIS"; break;
+        }
+        RedisModule_ReplyWithSimpleString(ctx, engine_name);
         return REDISMODULE_OK;
 
     } else if (!strcasecmp(subcmd, "STATS")) {

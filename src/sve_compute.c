@@ -154,20 +154,6 @@ int sve_compute_similarity(sve_context_t *ctx,
     return C_OK;
 }
 
-/* Streaming load (non-temporal) */
-int sve_streaming_load_f32(sve_context_t *ctx,
-                          const float *src,
-                          float *dst,
-                          size_t num_elements) {
-    if (!ctx || !src || !dst) {
-        return C_ERR;
-    }
-
-    /* Fallback to regular memcpy */
-    memcpy(dst, src, num_elements * sizeof(float));
-    return C_OK;
-}
-
 /* Streaming store (non-temporal) */
 int sve_streaming_store_f32(sve_context_t *ctx,
                            const float *src,

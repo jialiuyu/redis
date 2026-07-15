@@ -375,6 +375,60 @@ static void log_limited(atomic_uint_fast32_t *counter,
               strerror(err));
 }
 
+/* Diagnostic: explain *why* rpc_ring_ready returned false.
+ * Used to disambiguate "consumer never initialized" (magic=0) from
+ * "consumer wrote but producer can't see it" (cache coherency / wrong path)
+ * from "slot_size mismatch" (config bug). Gated by the same per-rpc
+ * timeout_logs counter so the limit still applies. */
+static void log_ring_not_ready_diag(vemb_v16_ub_rpc_t *rpc,
+                                    const vemb_v16_ub_rpc_ring_t *ring,
+                                    uint32_t owner_id,
+                                    uint64_t request_id,
+                                    uint64_t key_hash) {
+    uint32_t n = atomic_fetch_add_explicit(&rpc->timeout_logs, 1,
+                                          memory_order_relaxed);
+    if (n >= VEMB_V16_UB_RPC_LOG_LIMIT)
+        return;
+    const char *reason = "null_ring_struct";
+    uint32_t h_magic = 0, h_version = 0;
+    uint32_t h_slot_size = 0, h_slot_count = 0;
+    uint32_t h_slot_mask = 0, h_slot_stride = 0;
+    if (ring) {
+        if (!ring->ring) {
+            reason = "null_mapped_ptr";
+        } else {
+            h_magic = ring->ring->magic;
+            h_version = ring->ring->version;
+            h_slot_size = ring->ring->slot_size;
+            h_slot_count = ring->ring->slot_count;
+            h_slot_mask = ring->ring->slot_mask;
+            h_slot_stride = ring->ring->slot_stride;
+            if (h_magic != VEMB_V16_UB_RPC_MAGIC) reason = "magic";
+            else if (h_version != VEMB_V16_UB_RPC_VERSION) reason = "version";
+            else if (h_slot_size != ring->slot_size) reason = "slot_size";
+            else if (h_slot_count != VEMB_V16_UB_RPC_RING_SIZE) reason = "slot_count";
+            else if (h_slot_mask != VEMB_V16_UB_RPC_RING_MASK) reason = "slot_mask";
+            else if (h_slot_stride != ring->slot_stride) reason = "slot_stride";
+            else reason = "race";
+        }
+    }
+    serverLog(LL_NOTICE,
+              "vemb_v16 ub rpc ring not ready diag: owner=%u request_id=%llu key_hash=%llu path=%s mmap_offset=%lld reason=%s "
+              "header(magic=0x%x version=%u slot_size=%u slot_count=%u slot_mask=%u slot_stride=%u) "
+              "expected(slot_size=%u slot_count=%u slot_mask=%u slot_stride=%u)",
+              owner_id,
+              (unsigned long long)request_id,
+              (unsigned long long)key_hash,
+              (ring && ring->config.path[0]) ? ring->config.path : "(none)",
+              (long long)(ring ? (long)ring->config.mmap_offset : -1),
+              reason,
+              h_magic, h_version, h_slot_size, h_slot_count, h_slot_mask, h_slot_stride,
+              ring ? ring->slot_size : 0,
+              VEMB_V16_UB_RPC_RING_SIZE,
+              VEMB_V16_UB_RPC_RING_MASK,
+              ring ? ring->slot_stride : 0);
+}
+
 static int ring_config_valid(const vemb_v16_ub_rpc_ring_config_t *config) {
     return config &&
            (config->backend_type == VEMB_V16_REGION_LOCAL_SHM ||
@@ -604,14 +658,11 @@ static int publish_with_deadline(vemb_v16_ub_rpc_t *rpc,
             if (vemb_v16_monotonic_ns() >= deadline_ns) {
                 if (status)
                     *status = VEMB_V16_UB_LOOKUP_RPC_TIMEOUT;
-                log_limited(&rpc->timeout_logs,
-                            LL_NOTICE,
-                            "vemb_v16 ub rpc ring not ready: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
-                            owner_id,
-                            request_id,
-                            key_hash,
-                            ring ? ring->config.path : NULL,
-                            ETIMEDOUT);
+                /* Diagnostic: capture which field mismatched so we can
+                 * tell apart "consumer never inited" (magic=0) from
+                 * "consumer inited but producer can't see it" (cross-map
+                 * cache / wrong path) from "slot_size config bug". */
+                log_ring_not_ready_diag(rpc, ring, owner_id, request_id, key_hash);
                 return -1;
             }
             tiny_pause();

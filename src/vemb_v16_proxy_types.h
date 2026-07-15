@@ -3,6 +3,7 @@
 
 #include "vemb_v16_proxy_internal.h"
 #include "vemb_v16_aeron_ring.h"
+#include "vemb_v16_client_ring.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_supernode.h"
 
@@ -10,6 +11,9 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* Forward decl: defined in vemb_v16_proxy.c (non-blocking handshake state machine). */
+struct vemb_v16_handshake_ctx;
 
 typedef struct vemb_v16_proxy_io_worker {
     uint32_t worker_id;
@@ -107,6 +111,9 @@ struct vemb_v16_proxy {
     uint64_t read_pool_slot_total;
     pthread_mutex_t stats_lock;
     vemb_v16_stats_t closed_stats;
+    int inject_pipe_rd;   /* read by proxy thread to receive injected fds */
+    int inject_pipe_wr;   /* written by Redis main thread to inject fds  */
+    struct vemb_v16_handshake_ctx *pending_handshakes;  /* non-blocking handshake state list (proxy main only) */
 };
 
 #endif

@@ -3,8 +3,8 @@
 # Uses real data, real network, real 1M+ entries
 set -e
 
-REDIS_CLI="./src/redis-cli"
-REDIS_BENCH="./src/redis-benchmark"
+REDIS_CLI="./output/src/redis-cli"
+REDIS_BENCH="./output/src/redis-benchmark"
 N=${1:-500000}
 C=${2:-50}
 T=${3:-8}

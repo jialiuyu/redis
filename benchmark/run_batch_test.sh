@@ -9,7 +9,7 @@ BENCHMARK_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$BENCHMARK_DIR/.." && pwd)"
 
 REDIS_SERVER="$REPO_ROOT/src/redis-server"
-REDIS_CLI="$REPO_ROOT/src/redis-cli"
+REDIS_CLI="$REPO_ROOT/output/src/redis-cli"
 TEST_PROGRAM="$BENCHMARK_DIR/batch_embedding_test"
 TEST_CONFIG="/tmp/redis_ub_test.conf"
 TEST_PORT=6381
@@ -21,7 +21,6 @@ cat > "$TEST_CONFIG" << EOF
 port $TEST_PORT
 save ""
 appendonly no
-vector-engine ub
 daemonize no
 loglevel notice
 EOF

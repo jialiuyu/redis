@@ -117,7 +117,6 @@ vim /etc/redis/redis-ub-sve.conf
 ```bash
 # 一体化模式（Proxy + SuperNode 同机部署）
 ./src/redis-server /etc/redis/redis-ub-sve.conf \
-    --vector-engine ub \
     --proxy-aggregator-enabled yes \
     --supernode-id 0 \
     --supernode-num-workers 16

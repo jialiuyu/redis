@@ -3,8 +3,8 @@
 #include "vemb_v16_client_topology.h"
 
 #include "vemb_v16_net.h"
-#include "zmalloc.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -160,16 +160,16 @@ int vemb_v16_client_topology_fetch_tcp_fd(
         hdr.flags != 0) {
         return -1;
     }
-    payload = zmalloc(hdr.payload_len);
+    payload = malloc(hdr.payload_len);
     if (!payload ||
         vemb_v16_net_read_full(fd, payload, hdr.payload_len) != 0 ||
         vemb_v16_topology_control_resp_decode(&resp,
                                               payload,
                                               hdr.payload_len) != 0) {
-        zfree(payload);
+        free(payload);
         return -1;
     }
-    zfree(payload);
+    free(payload);
     if (raw_resp)
         *raw_resp = resp;
     return vemb_v16_client_topology_from_response(&resp, topology);

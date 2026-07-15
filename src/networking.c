@@ -22,6 +22,7 @@
 #include "cluster_asm.h"
 #include "memory_prefetch.h"
 #include "connection.h"
+#include "vemb_v16_server_integration.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <math.h>
@@ -1569,7 +1570,6 @@ void clientAcceptHandler(connection *conn) {
 }
 
 void acceptCommonHandler(connection *conn, int flags, char *ip) {
-    client *c;
     UNUSED(ip);
 
     if (connGetState(conn) != CONN_STATE_ACCEPTING) {
@@ -1583,6 +1583,34 @@ void acceptCommonHandler(connection *conn, int flags, char *ip) {
         connClose(conn);
         return;
     }
+
+    /* VEMB V16 protocol sniffing.
+     * Returns: 0 = RESP (continue to client creation),
+     *          1 = VEMB steal (fd injected to proxy, conn freed by caller),
+     *          2 = async pending (data not arrived; peek handler will finalize). */
+    int vemb_r = vemb_v16_sniff_and_handoff(conn);
+    if (vemb_r == 1) {
+        /* fd has been stolen (conn->fd == -1).  Free the connection struct
+         * without closing the fd — the proxy now owns it. */
+        conn->state = CONN_STATE_CLOSED;
+        zfree(conn);
+        return;
+    }
+    if (vemb_r == 2) {
+        /* Async sniff pending: a peek handler has been registered on this conn.
+         * Do NOT create a Redis client now — the handler will either inject the
+         * fd to the VEMB proxy or call acceptCommonFinalize() for RESP. */
+        return;
+    }
+
+    acceptCommonFinalize(conn, flags);
+}
+
+/* Second half of acceptCommonHandler: maxclients admission + createClient +
+ * connAccept.  Split out so that the async VEMB peek handler can re-enter the
+ * normal RESP path once it determines the connection is not VEMB. */
+void acceptCommonFinalize(connection *conn, int flags) {
+    client *c;
 
     /* Limit the number of connections we take at the same time.
      *

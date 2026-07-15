@@ -33,7 +33,6 @@
 #include "ub_client.h"
 #include "ub_metadata.h"
 #include "proxy_aggregator.h"
-#include "sve_compute.h"
 #include "sve_config.h"
 #include "supernode_worker.h"
 #include "zmalloc.h"

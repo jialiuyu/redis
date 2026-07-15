@@ -15,6 +15,7 @@ int vemb_v16_net_read_full(int fd, void *buf, size_t n);
 int vemb_v16_net_write_full(int fd, const void *buf, size_t n);
 int vemb_v16_net_readv_full(int fd, const struct iovec *iov, int iovcnt);
 int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt);
+ssize_t vemb_v16_net_writev_nonblocking(int fd, const struct iovec *iov, int iovcnt);
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr);
 int vemb_v16_net_write_frame(int fd,
                              uint16_t type,

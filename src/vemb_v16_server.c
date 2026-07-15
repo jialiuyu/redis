@@ -49,18 +49,18 @@ static void on_signal(int sig) {
 int main(int argc, char **argv) {
     int ret = 1;
     vemb_v16_storage_ctx_t *storage = NULL;
-    const char *uds_path = VEMB_V16_UDS_PATH;
     const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     const char *warm_regions_manifest = NULL;
     uint32_t dim = VEMB_V16_DEFAULT_DIM;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
     uint32_t warm_region_id = 0;
-    uint32_t warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    uint32_t warm_backend_type = VEMB_V16_REGION_UB;
     uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
-    const char *transport = "aeron";
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
+    const char *transport = "tcp";
+    const char *uds_path = "/tmp/vemb_v16.sock";
     uint32_t proxy_io_threads = default_proxy_io_threads();
     uint32_t supernode_workers = default_supernode_workers();
     int reset_warm_regions = 0;

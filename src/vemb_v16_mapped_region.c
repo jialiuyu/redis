@@ -101,7 +101,7 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
                                 const char *path,
                                 uint64_t mmap_offset,
                                 size_t requested_size) {
-    RETURN_IF(!path[0] || requested_size == 0, -1);
+    RETURN_IF(!region || !path || !path[0] || requested_size == 0, -1);
     RETURN_IF(strlen(path) >= sizeof(region->path), -1);
     memset(region, 0, sizeof(*region));
     region->fd = -1;
@@ -121,6 +121,8 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
         if (open_or_attach_local_shm(region, path, required_size, &created) != 0)
             return -1;
     } else {
+        /* OBMM import devices (remote memory) reject cacheable mmap with EPERM.
+         * The kernel requires O_SYNC on open() to select noncacheable mapping. */
         region->fd = open(path, O_RDWR);
         if (region->fd < 0 && (errno == EACCES || errno == EPERM)) {
             int open_errno = errno;
@@ -245,7 +247,6 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
         return -1;
     }
     region->mapped_addr = (uint8_t *)region->mapping_addr + offset_delta;
-    region->created = created;
     serverLog(LL_NOTICE,
               "vemb_v16 mapped region mmap ok: backend=%u path=%s fd=%d request_size=%zu offset=%llu aligned_offset=%llu mapping_bytes=%zu mapping_addr=%p mapped_addr=%p created=%d",
               region->backend_type,
@@ -264,6 +265,7 @@ int vemb_v16_mapped_region_open(vemb_v16_mapped_region_t *region,
 }
 
 void vemb_v16_mapped_region_close(vemb_v16_mapped_region_t *region) {
+    RETURN_IF(!region);
     if (region->mapping_addr)
         munmap(region->mapping_addr, region->mapping_bytes);
     if (region->fd >= 0)

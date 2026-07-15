@@ -502,7 +502,7 @@ void *sve_worker_thread(void *arg) {
 #ifdef __linux__
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(ctx->worker_id, &cpuset);
+    CPU_SET((ctx->worker_id + 32) % 96, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 #endif
 

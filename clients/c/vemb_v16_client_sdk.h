@@ -1,0 +1,370 @@
+#ifndef __VEMB_V16_CLIENT_SDK_H
+#define __VEMB_V16_CLIENT_SDK_H
+
+#include <stdint.h>
+#include <unistd.h>
+#include <stddef.h>
+
+/* Include shared wire-protocol definitions.
+ * NOTE: the ../../src/ prefix is intentional — it lets hpc-redis's own
+ * src/Makefile build find these headers without extra -I flags.  When the
+ * SDK is installed to build/include/ (flat), the Makefile rewrites these
+ * lines via sed so external consumers get a path-free #include. */
+#include "../../src/vemb_v16_protocol.h"
+#include "../../src/vemb_v16_client_topology.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* opaque handle */
+typedef struct vemb_v16_client vemb_v16_client_t;
+
+/* =====================================================================
+ *  Synchronous Blocking API (high-level, existing)
+ * ===================================================================== */
+
+/*
+ * Multi-endpoint client — connect to N backends and route every operation
+ * by key.  'endpoints' is an NULL-terminated array of "host:port" strings.
+ * Routing uses a murmur3-based consistent-hash ring (10 vnodes per backend),
+ * interoperable with benchmark/vemb_v16_bench.c so a set filled by one tool
+ * is visible to the others.
+ *
+ * All keyed operations (vadd / vemb_vector / vsim / *_pipeline / *_repeat)
+ * select the backend internally; callers do not pick a backend.  In
+ * multi-endpoint mode the pipeline helpers route all entries in one call to
+ * the backend picked by set_names[0] — group by backend if keys span nodes.
+ *
+ * offset-based helpers (vemb_handle + read_vector) follow the last routed
+ * backend, which is correct because vemb_vector routes vemb_handle before
+ * calling read_vector synchronously.
+ */
+
+/*
+ * THREAD SAFETY: a vemb_v16_client_t handle is NOT thread-safe.
+ * One handle must only be used by one thread. Multi-threaded
+ * applications must create one client per thread.
+ *
+ * TOPOLOGY / REDIRECTS: all single-key and pipeline operations
+ * transparently retry ASK / MOVED / STALE_TOPOLOGY redirects
+ * internally. Callers see only OK / NOT_FOUND / ERR. For
+ * observability of redirect activity, use
+ * vemb_v16_client_get_redirect_stats().
+ */
+vemb_v16_client_t *vemb_v16_client_create_multi(const char *endpoints[],
+                                                 int endpoint_count,
+                                                 uint32_t dim,
+                                                 uint32_t timeout_ms);
+
+/*
+ * Route-only helper: given the same endpoint list used by
+ * vemb_v16_client_create_multi, return the backend index selected for key
+ * by the murmur3 consistent-hash ring.  This does not open any connection.
+ * Returns 0 on success, -1 on error.
+ */
+int vemb_v16_route_key(const char *endpoints[], int endpoint_count,
+                       const char *key, int *out_backend_idx);
+
+vemb_v16_client_t *vemb_v16_client_create(const char *host,
+                                          uint16_t port,
+                                          uint32_t dim,
+                                          uint32_t timeout_ms);
+void vemb_v16_client_destroy(vemb_v16_client_t *client);
+
+int vemb_v16_client_vadd(vemb_v16_client_t *client,
+                         const char *set_name,
+                         const char *elem_name,
+                         const float *vector,
+                         uint32_t dim);
+
+int vemb_v16_client_vemb_handle(vemb_v16_client_t *client,
+                                const char *set_name,
+                                const char *elem_name,
+                                uint64_t *out_offset,
+                                uint32_t *out_bytes,
+                                uint32_t *out_dim,
+                                uint32_t *out_region_id);
+
+int vemb_v16_client_vemb_vector(vemb_v16_client_t *client,
+                                const char *set_name,
+                                const char *elem_name,
+                                float *out_vector,
+                                uint32_t out_cap,
+                                uint32_t *out_dim);
+
+/*
+ * VSIM_INLINE — compute cosine similarity between the stored vector
+ * for (set_name, elem_name) and the provided query_vector.
+ * On success, *out_score receives the similarity score.
+ * Returns 0 on success, 1 if key not found, -1 on error.
+ */
+int vemb_v16_client_vsim(vemb_v16_client_t *client,
+                         const char *set_name,
+                         const char *elem_name,
+                         const float *query_vector,
+                         uint32_t dim,
+                         float *out_score);
+
+/*
+ * VREM — remove a vector by (set_name, elem_name).
+ * Idempotent: returns 0 whether the key existed or not. Returns -1 on error.
+ */
+int vemb_v16_client_vrem(vemb_v16_client_t *client,
+                         const char *set_name,
+                         const char *elem_name);
+
+int vemb_v16_client_read_vector(vemb_v16_client_t *client,
+                                uint64_t offset,
+                                uint32_t bytes,
+                                float *out_vector,
+                                uint32_t out_cap);
+
+/*
+ * Pipeline — batch send / batch recv, blocking.
+ * Returns 0 on success, -1 on error (caller cannot tell which one failed).
+ */
+int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
+                                  const char **set_names,
+                                  const char **elem_names,
+                                  const float **vectors,
+                                  uint32_t count,
+                                  uint32_t max_inflight);
+
+/* Per-response status for vemb pipeline */
+typedef struct vemb_v16_pipeline_resp {
+    int      status;      /* 0=OK, 1=NOT_FOUND, -1=error */
+    uint64_t offset;
+    uint32_t bytes;
+    uint32_t dim;
+    uint32_t region_id;
+} vemb_v16_pipeline_resp_t;
+
+/* Response classification — used by sync retry engine and async callers. */
+typedef enum {
+    VEMB_V16_RESP_CLASS_OK,         /* op succeeded */
+    VEMB_V16_RESP_CLASS_NOT_FOUND,  /* key absent */
+    VEMB_V16_RESP_CLASS_ASK,        /* one-shot redirect to resp.redirect_owner */
+    VEMB_V16_RESP_CLASS_REFRESH,    /* MOVED or STALE_TOPOLOGY: refresh topology, retry */
+    VEMB_V16_RESP_CLASS_FATAL,      /* ERR or unknown: give up */
+} vemb_v16_resp_class_t;
+
+vemb_v16_resp_class_t vemb_v16_classify_resp_status(uint8_t status);
+
+int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
+                                  const char **set_names,
+                                  const char **elem_names,
+                                  uint32_t count,
+                                  vemb_v16_pipeline_resp_t *out_resps,
+                                  uint32_t max_inflight);
+
+/* VSIM_INLINE pipeline — cosine similarity for many (set,elem) pairs.
+ * query_vector must be valid for the duration of the call (read-only).
+ * out_scores is filled with similarity scores for OK responses.
+ * Returns 0 on success, -1 on network/protocol error. */
+int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
+                                  const char **set_names,
+                                  const char **elem_names,
+                                  const float *query_vector,
+                                  uint32_t count,
+                                  float *out_scores,
+                                  uint32_t max_inflight);
+
+/*
+ * PING — data-plane heartbeat.
+ * Returns 0 if server responds OK, -1 on error or timeout.
+ */
+int vemb_v16_client_ping(vemb_v16_client_t *client);
+
+/*
+ * STATS — fetch proxy runtime statistics.
+ * Returns 0 on success, -1 on error.
+ */
+int vemb_v16_client_stats(vemb_v16_client_t *client,
+                          vemb_v16_stats_t *out_stats);
+
+/* -------------------------------------------------------------------
+ * Topology / redirect observability (advanced)
+ * ------------------------------------------------------------------- */
+
+/* Explicit pre-warm of topology. Call right after create_multi to avoid
+ * a first-op RTT spike in multi-endpoint mode. In single-endpoint mode
+ * this is a no-op (topology is not used). Returns 0 on success, -1 on
+ * failure (caller can proceed; the engine will retry lazily). */
+int vemb_v16_client_topology_refresh(vemb_v16_client_t *client);
+
+/* Configure max retry attempts per op for transparent redirect handling.
+ * Default 256. Set to 0 to disable retry (first redirect surfaces as ERR —
+ * debug only). Takes effect on the next op call. */
+void vemb_v16_client_set_retry_budget(vemb_v16_client_t *client,
+                                       uint32_t max_attempts);
+
+/* Observability: cumulative redirect counters since client creation.
+ * All fields are 0-initialized; this reports lifetime totals. */
+typedef struct {
+    uint64_t ask_redirects;
+    uint64_t moved_redirects;
+    uint64_t stale_topology_responses;
+    uint64_t topology_refresh_calls;
+} vemb_v16_redirect_stats_t;
+void vemb_v16_client_get_redirect_stats(const vemb_v16_client_t *client,
+                                         vemb_v16_redirect_stats_t *out);
+
+/* =====================================================================
+ *  Convenience helpers (caller-allocates or standalone)
+ * ===================================================================== */
+
+/* Parse a comma-separated vector string: "0.1,0.2,0.3"
+ * Returns malloc'd float array on success, NULL on error.
+ */
+float *vemb_v16_parse_vector_csv(const char *str, uint32_t expected_dim);
+
+/* Parse vector from argv array starting at start_idx.
+ * Supports comma-separated single token or individual float tokens.
+ * Returns malloc'd float array on success, NULL on error.
+ * out_consumed receives the number of argv tokens consumed.
+ */
+float *vemb_v16_parse_vector_argv(char **argv, int argc, int start_idx,
+                                   uint32_t expected_dim, int *out_consumed);
+
+/* Repeat VSIM on the same (set_name, elem_name) pair 'repeat' times.
+ * Returns 0 on success, -1 on error.
+ * out_score receives the last response's score.
+ * out_found receives 1 if last response was OK, 0 if NOT_FOUND.
+ */
+int vemb_v16_client_vsim_repeat(vemb_v16_client_t *c,
+                                 const char *set_name, const char *elem_name,
+                                 const float *query_vector, uint32_t repeat,
+                                 float *out_score, int *out_found,
+                                 uint32_t max_inflight);
+
+/* Repeat VEMB_HANDLE on the same (set_name, elem_name) pair 'repeat' times.
+ * Returns 0 on success, -1 on error.
+ */
+int vemb_v16_client_vemb_repeat(vemb_v16_client_t *c,
+                                 const char *set_name, const char *elem_name,
+                                 uint32_t repeat, uint32_t max_inflight);
+
+/* Repeat VADD_INLINE on the same (set_name, elem_name) pair 'repeat' times
+ * with the same vector.
+ * Returns 0 on success, -1 on error.
+ */
+int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
+                                 const char *set_name, const char *elem_name,
+                                 const float *vector, uint32_t repeat,
+                                 uint32_t max_inflight);
+
+/* Internal accessors for thin wrappers (e.g. redis-cli pipeline) */
+int vemb_v16_client_fd(const vemb_v16_client_t *client);
+uint64_t vemb_v16_client_channel_id(const vemb_v16_client_t *client);
+
+/* =====================================================================
+ *  Async / Buffer-based API (low-level, for event-loop callers)
+ * =====================================================================
+ *
+ * These functions serialize / deserialize VEMB V16 frames into
+ * caller-provided buffers.  The caller is responsible for transport
+ * (e.g. libevent evbuffer_add, sendmsg, etc.).
+ */
+
+/*
+ * Build combined key: set_name + '\0' + elem_name
+ * Used by the RESP path; native-protocol callers may skip this.
+ * Returns 0 on success, -1 on error.
+ */
+int vemb_v16_build_combined_key(char *out, size_t out_cap,
+                                const char *set_name, const char *elem_name,
+                                uint32_t *out_len);
+
+/*
+ * Serialize a complete HELLO frame into a user-provided buffer.
+ * Returns bytes written (>0), or -1 if buf_cap too small.
+ */
+ssize_t vemb_v16_serialize_hello(void *buf, size_t buf_cap,
+                                 uint32_t vector_dim, uint32_t flags);
+
+/*
+ * Serialize a complete VADD_INLINE frame into a user-provided buffer.
+ * 'key' is the raw key as sent on the wire (already combined if needed).
+ * Returns bytes written (>0), or -1 if buf_cap too small.
+ */
+ssize_t vemb_v16_serialize_vadd(void *buf, size_t buf_cap,
+                                uint64_t channel_id, uint32_t req_id,
+                                const char *key, uint32_t key_len,
+                                const float *vector, uint32_t dim);
+
+/*
+ * Serialize a complete VEMB_HANDLE frame into a user-provided buffer.
+ * Returns bytes written (>0), or -1 if buf_cap too small.
+ */
+ssize_t vemb_v16_serialize_vemb(void *buf, size_t buf_cap,
+                                uint64_t channel_id, uint32_t req_id,
+                                const char *key, uint32_t key_len,
+                                uint32_t dim);
+
+/*
+ * Serialize a complete VSIM_INLINE frame into a user-provided buffer.
+ * 'key' is the raw key as sent on the wire (already combined if needed).
+ * Returns bytes written (>0), or -1 if buf_cap too small.
+ */
+ssize_t vemb_v16_serialize_vsim_inline(void *buf, size_t buf_cap,
+                                       uint64_t channel_id, uint32_t req_id,
+                                       const char *key, uint32_t key_len,
+                                       const float *query_vector, uint32_t dim);
+
+/*
+ * Serialize a complete VEMB_INLINE frame.
+ * This produces the same frame as vemb_v16_serialize_vemb() but requests the
+ * server to return the vector inline, which is the default read path for TCP
+ * clients that do not mmap the warm region.
+ */
+ssize_t vemb_v16_serialize_vemb_inline(void *buf, size_t buf_cap,
+                                       uint64_t channel_id, uint32_t req_id,
+                                       const char *key, uint32_t key_len,
+                                       uint32_t dim);
+
+/*
+ * Serialize a complete VREM frame (key-only, no vector payload).
+ * 'key' is the raw key as sent on the wire (already combined if needed).
+ * Returns bytes written (>0), or -1 if buf_cap too small.
+ */
+ssize_t vemb_v16_serialize_vrem(void *buf, size_t buf_cap,
+                                uint64_t channel_id, uint32_t req_id,
+                                const char *key, uint32_t key_len);
+
+/*
+ * Parse a WELCOME frame from a caller-provided byte buffer.
+ * Returns bytes consumed (>0) on success, 0 if the frame is incomplete,
+ * and -1 on a protocol error.
+ */
+ssize_t vemb_v16_parse_welcome(const void *buf, size_t buf_len,
+                               vemb_v16_channel_desc_t *out_desc);
+
+/*
+ * Parse a RESPONSE frame from a caller-provided byte buffer.
+ * Returns bytes consumed (>0) on success, 0 if the frame is incomplete,
+ * and -1 on a protocol error.
+ * On success *out_inline_bytes receives the number of inline-vector payload
+ * bytes contained in the returned frame (the caller drains them together with
+ * the rest of the frame by removing `consumed` bytes from the buffer).
+ */
+ssize_t vemb_v16_parse_response(const void *buf, size_t buf_len,
+                                vemb_v16_resp_t *out_resp,
+                                size_t *out_inline_bytes);
+
+/*
+ * Warm-region mmap helpers.
+ * Standalone — no client handle required.
+ */
+int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
+                              void **out_mapping_addr,
+                              size_t *out_mapping_bytes,
+                              void **out_mapped_addr,
+                              uint64_t *out_region_bytes);
+void vemb_v16_close_warm_region(void *mapping_addr, size_t mapping_bytes);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

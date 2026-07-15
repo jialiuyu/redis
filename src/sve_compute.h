@@ -109,11 +109,6 @@ int sve_compute_similarity(sve_context_t *ctx,
                           float *similarities);
 
 /* Non-temporal Memory Access (Streaming) */
-int sve_streaming_load_f32(sve_context_t *ctx,
-                          const float *src,
-                          float *dst,
-                          size_t num_elements);
-
 int sve_streaming_store_f32(sve_context_t *ctx,
                            const float *src,
                            float *dst,

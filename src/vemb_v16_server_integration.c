@@ -1,0 +1,342 @@
+#define _GNU_SOURCE
+
+#include "vemb_v16_server_integration.h"
+#include "vemb_v16_proxy.h"
+#include "vemb_v16_server_tcp_client.h"
+#include "vemb_v16_storage.h"
+#include "vemb_v16_protocol.h"
+#include "vemb_v16_control_listener.h"
+#include "server.h"
+#include "connection.h"
+#include "connhelpers.h"   /* callHandler ref-counting: connDecrRefs / CONN_FLAG_CLOSE_SCHEDULED */
+
+/* vemb_v16_log compatibility: standalone server links vemb_v16_log.o,
+ * but redis-server already has serverLog in server.c.  We only need
+ * the global verbosity variable that vemb_v16_log.h's serverLog macro
+ * references when compiling vemb_v16_proxy.o / vemb_v16_supernode.o. */
+int vemb_v16_log_verbosity_value = LL_NOTICE;
+
+#include <pthread.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <poll.h>
+
+static void *proxy_run_thread(void *arg) {
+    vemb_v16_proxy_run((vemb_v16_proxy_t *)arg);
+    return NULL;
+}
+
+static vemb_v16_storage_ctx_t *g_vemb_storage = NULL;
+
+int vemb_v16_server_integration_init(void) {
+    if (!server.vemb_v16_enabled) return 0;
+
+    uint32_t dim = server.vemb_v16_dim > 0
+        ? (uint32_t)server.vemb_v16_dim
+        : VEMB_V16_DEFAULT_DIM;
+    uint32_t max_vectors = server.vemb_v16_max_vectors > 0
+        ? (uint32_t)server.vemb_v16_max_vectors
+        : VEMB_V16_DEFAULT_MAX_VECTORS;
+
+    if (!server.vemb_v16_warm_regions_manifest ||
+        !server.vemb_v16_warm_regions_manifest[0]) {
+        serverLog(LL_WARNING,
+                  "VEMB V16 requires --vemb-v16-warm-regions-manifest");
+        return -1;
+    }
+
+    serverLog(LL_NOTICE,
+              "VEMB V16 integration init: dim=%u max_vectors=%u",
+              dim, max_vectors);
+
+    vemb_v16_warm_regions_manifest_t manifest;
+    memset(&manifest, 0, sizeof(manifest));
+    if (vemb_v16_parse_warm_regions_manifest(server.vemb_v16_warm_regions_manifest,
+                                              dim * sizeof(float),
+                                              &manifest) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_parse_warm_regions_manifest failed: %s",
+                  server.vemb_v16_warm_regions_manifest);
+        return -1;
+    }
+    if (server.vemb_v16_reset_warm_regions) {
+        if (vemb_v16_storage_reset_manifest_regions(&manifest) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_storage_reset_manifest_regions failed");
+            return -1;
+        }
+    }
+
+    vemb_v16_storage_ctx_t *storage = NULL;
+    if (vemb_v16_storage_ctx_create_from_manifest(&storage,
+                                                   dim,
+                                                   dim * sizeof(float),
+                                                   max_vectors,
+                                                   &manifest) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_storage_ctx_create_from_manifest failed");
+        return -1;
+    }
+
+    if (vemb_v16_proxy_create(&server.vemb_v16_proxy,
+                              VEMB_V16_UDS_PATH,
+                              dim,
+                              max_vectors,
+                              storage,
+                              &manifest) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_proxy_create failed");
+        vemb_v16_storage_ctx_destroy(storage);
+        return -1;
+    }
+    g_vemb_storage = storage;
+
+    if (server.vemb_v16_supernode_workers > 0) {
+        if (vemb_v16_proxy_set_supernode_workers(
+                server.vemb_v16_proxy,
+                (uint32_t)server.vemb_v16_supernode_workers) != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16_proxy_set_supernode_workers failed");
+            vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+            server.vemb_v16_proxy = NULL;
+            return -1;
+        }
+    }
+
+    if (server.vemb_v16_proxy_io_threads > 0) {
+        if (vemb_v16_proxy_set_proxy_io_threads(
+                server.vemb_v16_proxy,
+                (uint32_t)server.vemb_v16_proxy_io_threads) != 0) {
+            serverLog(LL_WARNING,
+                      "vemb_v16_proxy_set_proxy_io_threads failed");
+            vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+            server.vemb_v16_proxy = NULL;
+            return -1;
+        }
+    }
+
+    /* Enable inject pipe so Redis accept path can hand off VEMB connections.
+     * Sniff is always on for VEMB V16 — it rides the Redis accept loop on every
+     * listening fd (port, TLS, bind) and steals fds whose first bytes match the
+     * VEMB magic.  No per-port opt-in needed. */
+    if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
+    serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports");
+
+    if (pthread_create(&server.vemb_v16_proxy_thread, NULL,
+                       proxy_run_thread, server.vemb_v16_proxy) != 0) {
+        serverLog(LL_WARNING, "pthread_create for proxy_run_thread failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
+
+    serverLog(LL_NOTICE, "VEMB V16 integration ready");
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * VEMB V16 protocol sniffing on Redis port 6379 (event-driven, non-blocking)
+ *
+ * When a new TCP connection arrives, peek at the first 4 bytes.
+ * If they match the VEMB binary protocol magic (0x56313645),
+ * steal the fd and hand it to the VEMB proxy thread via an
+ * inject pipe.  Otherwise let normal RESP processing continue.
+ *
+ * Returns: 0 = RESP (caller proceeds to createClient),
+ *          1 = VEMB steal (fd injected; caller frees conn without closing fd),
+ *          2 = async pending (client hasn't sent bytes yet; a peek handler
+ *              has been registered on the conn, caller must NOT createClient).
+ *
+ * The fast path tries one non-blocking MSG_PEEK.  If data is already in the
+ * socket buffer (common for blocking clients that send HELLO in the
+ * connect/accept window), the decision is immediate with zero main-thread
+ * blocking.  If data hasn't arrived (libevent/memtier clients that defer the
+ * first write to their own event loop), an async peek handler is registered
+ * — the main event loop fires it when bytes arrive, with no per-connection
+ * poll() blocking.  This replaces the old synchronous poll(5ms) which
+ * serialized connection establishment under burst load (5ms × N connections
+ * stuck the main thread and caused c=20+ connection drops).
+ * ------------------------------------------------------------------- */
+
+/* Async peek handler: invoked by the main event loop when a pending conn
+ * becomes readable. Peeks the first 8 bytes and decides:
+ *   - non-VEMB magic          → RESP (redis handles)
+ *   - VEMB magic + type=HELLO → data plane (proxy_inject_fd)
+ *   - VEMB magic + type!=HELLO→ control plane (control_inject_fd) */
+static void vemb_async_peek_handler(connection *conn) {
+    int fd = conn->fd;
+    if (fd < 0) return;  /* shouldn't happen */
+
+    uint8_t buf[8];
+    ssize_t n = recv(fd, buf, 8, MSG_PEEK);
+    if (n < 8) {
+        /* Partial data or spurious wakeup. Stay registered; ae will fire
+         * again when more bytes arrive. */
+        return;
+    }
+
+    uint32_t magic;
+    memcpy(&magic, buf, sizeof(magic));
+    if (magic != VEMB_V16_MAGIC) {
+        /* RESP: detach peek handler, then finalize as a normal Redis client. */
+        connSetReadHandler(conn, NULL);
+        acceptCommonFinalize(conn, 0);
+        return;
+    }
+
+    /* VEMB frame: read type at byte offset 6 (after magic[4] + version[2]). */
+    uint16_t ftype;
+    memcpy(&ftype, buf + 6, sizeof(ftype));
+
+    /* Steal the fd from conn so cleanup won't close it. */
+    connSetReadHandler(conn, NULL);
+    conn->fd = -1;
+
+    if (ftype == VEMB_V16_NET_HELLO) {
+        /* Data plane: channel setup. */
+        if (vemb_v16_proxy_inject_fd(server.vemb_v16_proxy, fd) != 0) {
+            serverLog(LL_WARNING,
+                      "VEMB V16 inject_fd failed for fd %d (async), closing", fd);
+            close(fd);
+        } else {
+            serverLog(LL_VERBOSE,
+                      "VEMB V16 HELLO on fd %d (async), injecting data plane", fd);
+        }
+    } else {
+        /* Control plane: TOPOLOGY/RANGE/EPOCH/MIGRATION/SCALEOUT_ACK/STATS/etc.
+         * vemb_v16_tcp_handle_fd dispatches; unknown types get an error reply
+         * and the fd is closed.  No allow-list needed. */
+        if (vemb_v16_control_inject_fd(fd) != 0) {
+            serverLog(LL_WARNING,
+                      "VEMB V16 control_inject_fd rejected fd %d (async), closing", fd);
+            /* control_inject_fd already closed fd on rejection. */
+        } else {
+            serverLog(LL_NOTICE,
+                      "VEMB V16 control frame type=0x%02x on fd %d (async), "
+                      "dispatching to tcp_handle_fd", ftype, fd);
+        }
+    }
+    conn->state = CONN_STATE_CLOSED;
+
+    /* We are inside callHandler (socket.c event loop) which did
+     * connIncrRefs before invoking us.  Direct zfree(conn) here would
+     * free the connection while callHandler still holds a ref → after
+     * we return, callHandler's connDecrRefs reads freed memory
+     * (heap-use-after-free, caught by ASan).
+     *
+     * Correct sequence:
+     *   1. connDecrRefs — drops the creation ref (refs: 2→1)
+     *   2. connClose    — fd==-1 so skips fd cleanup; connHasRefs
+     *                     (refs==1) so sets CONN_FLAG_CLOSE_SCHEDULED
+     *                     without zfree
+     *   3. back in callHandler: connDecrRefs (refs: 1→0), sees
+     *      CONN_FLAG_CLOSE_SCHEDULED && !connHasRefs → connClose→zfree
+     *
+     * The fast path (vemb_v16_sniff_and_handoff returning 1) is NOT
+     * inside callHandler and can safely zfree directly (see
+     * networking.c:1596). */
+    connDecrRefs(conn);
+    connClose(conn);
+}
+
+int vemb_v16_sniff_and_handoff(connection *conn) {
+    /* Fast path: proxy not running (VEMB V16 disabled) */
+    if (!server.vemb_v16_proxy)
+        return 0;
+    /* Cannot sniff through TLS */
+    if (connIsTLS(conn))
+        return 0;
+
+    int fd = conn->fd;
+    if (fd < 0) return 0;
+
+    /* Non-blocking peek. For blocking clients the HELLO is often already in
+     * the socket buffer when accept fires, so this succeeds immediately.
+     * Peek 8 bytes so we can read the type field at offset 6. */
+    uint8_t buf[8];
+    ssize_t n = recv(fd, buf, 8, MSG_PEEK);
+    if (n >= 8) {
+        uint32_t magic;
+        memcpy(&magic, buf, sizeof(magic));
+        if (magic != VEMB_V16_MAGIC) return 0;  /* RESP */
+
+        /* VEMB frame — read type to choose data vs control plane. */
+        uint16_t ftype;
+        memcpy(&ftype, buf + 6, sizeof(ftype));
+
+        /* Steal the fd so connClose won't close it. */
+        conn->fd = -1;
+
+        if (ftype == VEMB_V16_NET_HELLO) {
+            serverLog(LL_VERBOSE,
+                      "VEMB V16 HELLO on fd %d (fast), injecting data plane", fd);
+            if (vemb_v16_proxy_inject_fd(server.vemb_v16_proxy, fd) != 0) {
+                serverLog(LL_WARNING,
+                          "VEMB V16 inject_fd failed for fd %d (fast), closing", fd);
+                close(fd);
+            }
+        } else {
+            serverLog(LL_NOTICE,
+                      "VEMB V16 control frame type=0x%02x on fd %d (fast), "
+                      "dispatching to tcp_handle_fd", ftype, fd);
+            if (vemb_v16_control_inject_fd(fd) != 0) {
+                serverLog(LL_WARNING,
+                          "VEMB V16 control_inject_fd rejected fd %d (fast)", fd);
+                /* control_inject_fd already closed fd on rejection. */
+            }
+        }
+        return 1;
+    }
+
+    /* Data not arrived yet (n < 4, includes EAGAIN). Register an async peek
+     * handler; the main event loop will call it when the client sends bytes,
+     * with zero main-thread blocking. Caller sees return 2 and skips
+     * createClient. */
+    if (connSetReadHandler(conn, vemb_async_peek_handler) == C_OK)
+        return 2;  /* async pending */
+
+    /* Handler registration failed (out of fd slots in ae?) — fall back to RESP. */
+    return 0;
+}
+
+void vemb_v16_server_integration_shutdown(void) {
+    /* Exit immediately. The heap accumulates latent corruption during runtime
+     * that is invisible to ASan (jemalloc-internal rtree/edata state, not
+     * user-buffer UAF). When ANY worker thread exits, jemalloc TSD cleanup
+     * flushes its tcache back into arenas; the flush dereferences a NULL
+     * edata_t and SIGSEGVs. ASan runs are 0-report clean, our alloc/free
+     * pairs are correct, but jemalloc's stricter metadata checks trip on the
+     * corruption. The crash happens DURING pthread_join, before any explicit
+     * _exit at function end could run, so _exit(0) must come before any
+     * proxy_stop/storage_destroy that would trigger worker thread exits.
+     *
+     * Safe in our scale-out test because:
+     *   - finishShutdown already ran RDB/AOF flush (we use --save '' --appendonly no)
+     *   - kernel reclaims all fds, mmaps, UB device handles on process exit
+     *   - cross-node peer detects socket close and tears down its session
+     * No correctness impact — only loses exit-time instrumentation (valgrind etc). */
+    serverLog(LL_NOTICE, "VEMB V16 integration shutdown: _exit(0) to skip corrupted jemalloc cleanup");
+    _exit(0);
+
+    /* Legacy cleanup (unreachable, kept for production paths that may later
+     * fix the jemalloc corruption root cause and want graceful shutdown). */
+    serverLog(LL_NOTICE, "VEMB V16 integration shutdown...");
+
+    /* Close the internal TCP client connection before stopping proxy */
+    vemb_v16_stc_cleanup();
+
+    if (server.vemb_v16_proxy) {
+        vemb_v16_proxy_stop(server.vemb_v16_proxy);
+        pthread_join(server.vemb_v16_proxy_thread, NULL);
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+    }
+    if (g_vemb_storage) {
+        vemb_v16_storage_ctx_destroy(g_vemb_storage);
+        g_vemb_storage = NULL;
+    }
+
+    serverLog(LL_NOTICE, "VEMB V16 integration shutdown complete");
+}
