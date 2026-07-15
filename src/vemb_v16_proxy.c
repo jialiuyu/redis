@@ -119,6 +119,59 @@ uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy) {
     return proxy->tcp_port;
 }
 
+size_t vemb_v16_tcp_input_pending_bytes(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_len - ch->tcp_input_pos;
+}
+
+size_t vemb_v16_tcp_input_tailroom(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_cap - ch->tcp_input_len;
+}
+
+uint8_t *vemb_v16_tcp_input_buffer(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_buf;
+}
+
+uint8_t *vemb_v16_tcp_input_pending_ptr(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_buf + ch->tcp_input_pos;
+}
+
+uint8_t *vemb_v16_tcp_input_tail_ptr(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_buf + ch->tcp_input_len;
+}
+
+void vemb_v16_tcp_input_set_buffer(vemb_v16_channel_t *ch,
+                                   uint8_t *buf,
+                                   size_t cap) {
+    ch->tcp_input_buf = buf;
+    ch->tcp_input_cap = cap;
+}
+
+void vemb_v16_tcp_input_append_done(vemb_v16_channel_t *ch, size_t len) {
+    ch->tcp_input_len += len;
+}
+
+void vemb_v16_tcp_input_consume(vemb_v16_channel_t *ch, size_t len) {
+    ch->tcp_input_pos += len;
+    if (ch->tcp_input_pos == ch->tcp_input_len)
+        vemb_v16_tcp_input_reset(ch);
+}
+
+void vemb_v16_tcp_input_compact(vemb_v16_channel_t *ch) {
+    size_t pending = vemb_v16_tcp_input_pending_bytes(ch);
+    if (ch->tcp_input_pos != 0 && pending != 0) {
+        memmove(ch->tcp_input_buf,
+                ch->tcp_input_buf + ch->tcp_input_pos,
+                pending);
+    }
+    ch->tcp_input_pos = 0;
+    ch->tcp_input_len = pending;
+}
+
+void vemb_v16_tcp_input_reset(vemb_v16_channel_t *ch) {
+    ch->tcp_input_len = 0;
+    ch->tcp_input_pos = 0;
+}
+
 #ifdef __linux__
 int vemb_v16_tcp_backlog_pending(vemb_v16_channel_t *ch) {
     return ch->tcp_response_backlog_len > ch->tcp_response_backlog_sent;
@@ -174,8 +227,13 @@ void vemb_v16_tcp_backlog_reset(vemb_v16_channel_t *ch) {
 static void vemb_v16_channel_free_slots(vemb_v16_channel_t *ch) {
     assert(ch != NULL);
     free(ch->completion_slots);
+    zfree(ch->tcp_input_buf);
     zfree(ch->tcp_response_backlog);
     ch->completion_slots = NULL;
+    ch->tcp_input_buf = NULL;
+    ch->tcp_input_cap = 0;
+    ch->tcp_input_len = 0;
+    ch->tcp_input_pos = 0;
     ch->tcp_response_backlog = NULL;
     ch->tcp_response_backlog_cap = 0;
     ch->tcp_response_backlog_len = 0;
@@ -584,6 +642,10 @@ static void reset_closed_channel(vemb_v16_channel_t *ch) {
     ch->transport_type = 0;
     ch->net_fd = -1;
     ch->tcp_backpressure_enabled = 0;
+    ch->tcp_input_buf = NULL;
+    ch->tcp_input_cap = 0;
+    ch->tcp_input_len = 0;
+    ch->tcp_input_pos = 0;
     ch->tcp_response_backlog = NULL;
     ch->tcp_response_backlog_cap = 0;
     ch->tcp_response_backlog_len = 0;
@@ -1511,6 +1573,18 @@ static void *proxy_io_poll_thread_main(void *arg) {
 
             if (atomic_load_explicit(&ch->active, memory_order_acquire) &&
                 ch->net_fd >= 0) {
+                if (vemb_v16_tcp_has_buffered_requests(ch)) {
+                    int rc = vemb_v16_tcp_read_ready_requests(ch,
+                                                             worker->worker_id);
+                    if (rc < 0) {
+                        proxy_io_channel_deactivate(ch);
+                        did_work = 1;
+                        proxy_io_channel_release(ch);
+                        continue;
+                    }
+                    if (rc > 0)
+                        did_work = 1;
+                }
                 pfds[nfds] = (struct pollfd){
                     .fd = ch->net_fd,
                     .events = POLLIN,
@@ -1751,6 +1825,18 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 if (flush == 1)
                     did_work = 1;
             }
+            if (vemb_v16_tcp_has_buffered_requests(ch)) {
+                int rc = vemb_v16_tcp_read_ready_requests(ch,
+                                                         worker->worker_id);
+                if (rc < 0) {
+                    proxy_io_channel_deactivate(ch);
+                    did_work = 1;
+                    proxy_io_channel_release(ch);
+                    continue;
+                }
+                if (rc > 0)
+                    did_work = 1;
+            }
             int n = drain_completions(ch);
             if (n < 0) {
                 proxy_io_channel_deactivate(ch);
@@ -1804,6 +1890,8 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                                                          worker->worker_id);
                 if (rc < 0) {
                     proxy_io_channel_deactivate(ch);
+                } else if (rc > 0) {
+                    did_work = 1;
                 }
             }
             if ((revents & EPOLLOUT) && atomic_load_explicit(&ch->active, memory_order_acquire)) {

@@ -35,6 +35,19 @@ const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy);
 const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy);
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy);
 
+size_t vemb_v16_tcp_input_pending_bytes(vemb_v16_channel_t *ch);
+size_t vemb_v16_tcp_input_tailroom(vemb_v16_channel_t *ch);
+uint8_t *vemb_v16_tcp_input_buffer(vemb_v16_channel_t *ch);
+uint8_t *vemb_v16_tcp_input_pending_ptr(vemb_v16_channel_t *ch);
+uint8_t *vemb_v16_tcp_input_tail_ptr(vemb_v16_channel_t *ch);
+void vemb_v16_tcp_input_set_buffer(vemb_v16_channel_t *ch,
+                                   uint8_t *buf,
+                                   size_t cap);
+void vemb_v16_tcp_input_append_done(vemb_v16_channel_t *ch, size_t len);
+void vemb_v16_tcp_input_consume(vemb_v16_channel_t *ch, size_t len);
+void vemb_v16_tcp_input_compact(vemb_v16_channel_t *ch);
+void vemb_v16_tcp_input_reset(vemb_v16_channel_t *ch);
+
 #ifdef __linux__
 int vemb_v16_tcp_backlog_pending(vemb_v16_channel_t *ch);
 size_t vemb_v16_tcp_backlog_pending_bytes(vemb_v16_channel_t *ch);

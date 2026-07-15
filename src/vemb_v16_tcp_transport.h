@@ -14,6 +14,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                         const uint16_t *completion_indices,
                                         uint32_t ready_count,
                                         uint32_t *published);
+int vemb_v16_tcp_has_buffered_requests(vemb_v16_channel_t *ch);
 int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id);
 void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd);
