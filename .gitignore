@@ -1,6 +1,9 @@
 # Build output directory
 output/
 
+# Generated perf artifacts
+perf/
+
 # Build metadata
 .make-*
 .nfs*
