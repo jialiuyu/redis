@@ -8,7 +8,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -20,6 +19,9 @@
 /// TCP transport implementation.
 
 #define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
+#define VEMB_V16_TCP_INPUT_INITIAL_CAP (64u * 1024u)
+#define VEMB_V16_TCP_INPUT_READ_CHUNK (64u * 1024u)
+#define VEMB_V16_TCP_INPUT_BUFFER_LIMIT (4u * 1024u * 1024u)
 
 static int diag_should_log_req(uint32_t req_id) {
     return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
@@ -629,32 +631,96 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
 #endif
 }
 
-static int tcp_poll_input(int fd) {
-    if (fd < 0) return -1;
-    struct pollfd pfd = {
-        .fd = fd,
-        .events = POLLIN,
-    };
-    int pr = poll(&pfd, 1, 0);
-    if (pr < 0) return errno == EINTR ? 0 : -1;
-    if (pr == 0) return 0;
-    if (pfd.revents & (POLLERR | POLLNVAL))
+static int ensure_tcp_input_tailroom(vemb_v16_channel_t *ch,
+                                     size_t min_tailroom) {
+    if (vemb_v16_tcp_input_tailroom(ch) >= min_tailroom)
+        return 0;
+
+    vemb_v16_tcp_input_compact(ch);
+    if (vemb_v16_tcp_input_tailroom(ch) >= min_tailroom)
+        return 0;
+
+    size_t pending = vemb_v16_tcp_input_pending_bytes(ch);
+    if (min_tailroom > VEMB_V16_TCP_INPUT_BUFFER_LIMIT ||
+        pending > VEMB_V16_TCP_INPUT_BUFFER_LIMIT - min_tailroom) {
         return -1;
-    if (pfd.revents & POLLIN)
-        return 1;
-    if (pfd.revents & POLLHUP)
+    }
+
+    size_t needed = pending + min_tailroom;
+    size_t next_cap = vemb_v16_tcp_input_tailroom(ch) ?
+        pending + vemb_v16_tcp_input_tailroom(ch) :
+        VEMB_V16_TCP_INPUT_INITIAL_CAP;
+    while (next_cap < needed) {
+        next_cap <<= 1;
+        if (next_cap > VEMB_V16_TCP_INPUT_BUFFER_LIMIT) {
+            next_cap = VEMB_V16_TCP_INPUT_BUFFER_LIMIT;
+            break;
+        }
+    }
+    if (next_cap < needed)
         return -1;
+
+    uint8_t *next = zrealloc(vemb_v16_tcp_input_buffer(ch), next_cap);
+    if (!next)
+        return -1;
+    vemb_v16_tcp_input_set_buffer(ch, next, next_cap);
     return 0;
 }
 
-/// TCP transport: read one request frame and hand it to the scheduler.
-static int channel_read_tcp_request(vemb_v16_channel_t *ch,
-                                    uint32_t proxy_io_worker_id) {
+static int fill_tcp_input_buffer(vemb_v16_channel_t *ch) {
+    if (vemb_v16_channel_net_fd(ch) < 0)
+        return -1;
+    if (ensure_tcp_input_tailroom(ch, VEMB_V16_TCP_INPUT_READ_CHUNK) != 0)
+        return -1;
+
+    for (;;) {
+        size_t tailroom = vemb_v16_tcp_input_tailroom(ch);
+        size_t read_len = tailroom > VEMB_V16_TCP_INPUT_READ_CHUNK ?
+            VEMB_V16_TCP_INPUT_READ_CHUNK : tailroom;
+        ssize_t n = recv(vemb_v16_channel_net_fd(ch),
+                         vemb_v16_tcp_input_tail_ptr(ch),
+                         read_len,
+                         MSG_DONTWAIT);
+        if (n > 0) {
+            vemb_v16_tcp_input_append_done(ch, (size_t)n);
+            return 1;
+        }
+        if (n == 0)
+            return -1;
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+        return -1;
+    }
+}
+
+int vemb_v16_tcp_has_buffered_requests(vemb_v16_channel_t *ch) {
+    size_t pending = vemb_v16_tcp_input_pending_bytes(ch);
+    if (pending < sizeof(vemb_v16_net_hdr_t))
+        return 0;
+
     vemb_v16_net_hdr_t hdr;
-    int req_len = 0;
-    vemb_v16_req_t req;
-    uint8_t payload[sizeof(vemb_v16_req_t)];
-    if (vemb_v16_net_read_header(vemb_v16_channel_net_fd(ch), &hdr) != 0)
+    memcpy(&hdr, vemb_v16_tcp_input_pending_ptr(ch), sizeof(hdr));
+    if (hdr.magic != VEMB_V16_MAGIC ||
+        hdr.version != VEMB_V16_VERSION ||
+        hdr.payload_len > sizeof(vemb_v16_req_t)) {
+        return 1;
+    }
+    return pending >= sizeof(hdr) + (size_t)hdr.payload_len;
+}
+
+/// TCP transport: decode one buffered request frame and hand it to the scheduler.
+static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
+                                               uint32_t proxy_io_worker_id) {
+    size_t pending = vemb_v16_tcp_input_pending_bytes(ch);
+    if (pending < sizeof(vemb_v16_net_hdr_t))
+        return 0;
+
+    const uint8_t *frame = vemb_v16_tcp_input_pending_ptr(ch);
+    vemb_v16_net_hdr_t hdr;
+    memcpy(&hdr, frame, sizeof(hdr));
+    if (hdr.magic != VEMB_V16_MAGIC || hdr.version != VEMB_V16_VERSION)
         return -1;
     if (hdr.type == VEMB_V16_NET_CLOSE)
         return -1;
@@ -666,11 +732,16 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
         return -1;
     }
 
+    size_t frame_len = sizeof(hdr) + (size_t)hdr.payload_len;
+    if (pending < frame_len)
+        return 0;
+
+    int req_len = 0;
+    vemb_v16_req_t req;
     memset(&req, 0, sizeof(req));
-    if (vemb_v16_net_read_full(vemb_v16_channel_net_fd(ch),
-                               payload,
-                               hdr.payload_len) != 0 ||
-        vemb_v16_req_decode(&req, payload, hdr.payload_len) != 0) {
+    if (vemb_v16_req_decode(&req,
+                            frame + sizeof(hdr),
+                            hdr.payload_len) != 0) {
         return -1;
     }
     if (req.channel_id == 0)
@@ -692,6 +763,7 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
                   (unsigned long long)req.key_hash,
                   req.vector_bytes);
     }
+    vemb_v16_tcp_input_consume(ch, frame_len);
     vemb_v16_proxy_handle_request(ch, &req, req_len, proxy_io_worker_id);
     if (vemb_v16_channel_net_fd(ch) < 0)
         return -1;
@@ -702,18 +774,28 @@ static int channel_read_tcp_request(vemb_v16_channel_t *ch,
 int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
                                     uint32_t proxy_io_worker_id) {
     uint32_t count = 0;
-    int ready = 0;
     while (count < VEMB_V16_PROXY_BATCH) {
-        if (channel_read_tcp_request(ch, proxy_io_worker_id) < 0)
+        int rc = channel_read_tcp_request_from_input(ch, proxy_io_worker_id);
+        if (rc < 0)
             return -1;
+        if (rc == 0)
+            break;
         count++;
-        if (count >= VEMB_V16_PROXY_BATCH)
-            break;
-        ready = tcp_poll_input(vemb_v16_channel_net_fd(ch));
-        if (ready < 0)
+    }
+    if (count >= VEMB_V16_PROXY_BATCH)
+        return (int)count;
+
+    int fill_rc = fill_tcp_input_buffer(ch);
+    if (fill_rc < 0)
+        return -1;
+
+    while (count < VEMB_V16_PROXY_BATCH) {
+        int rc = channel_read_tcp_request_from_input(ch, proxy_io_worker_id);
+        if (rc < 0)
             return -1;
-        if (ready == 0)
+        if (rc == 0)
             break;
+        count++;
     }
 
     return (int)count;
@@ -1140,6 +1222,11 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
                                             (uint32_t)welcome_len);
     }
     zfree(welcome);
-    if (write_rc != 0)
+    if (write_rc != 0) {
         vemb_v16_proxy_close_channel_by_id(proxy, desc.channel_id);
+        return;
+    }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }

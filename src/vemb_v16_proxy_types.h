@@ -55,6 +55,10 @@ struct vemb_v16_channel {
     atomic_uint_fast32_t supernode_state;
     atomic_int completion_notify_armed;
     int tcp_backpressure_enabled;
+    uint8_t *tcp_input_buf;
+    size_t tcp_input_cap;
+    size_t tcp_input_len;
+    size_t tcp_input_pos;
     uint8_t *tcp_response_backlog;
     size_t tcp_response_backlog_cap;
     size_t tcp_response_backlog_len;
