@@ -112,6 +112,17 @@ int vemb_v16_server_integration_init(void) {
         }
     }
 
+    /* Enable Aeron/UDS listener so direct VEMB V16 clients can connect to
+     * /tmp/vemb_v16.sock.  This coexists with inject — the proxy main loop
+     * drains both the UDS accept queue and the inject pipe each iteration. */
+    if (vemb_v16_proxy_enable_uds(server.vemb_v16_proxy) != 0) {
+        serverLog(LL_WARNING, "vemb_v16_proxy_enable_uds failed");
+        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+        server.vemb_v16_proxy = NULL;
+        return -1;
+    }
+    serverLog(LL_NOTICE, "VEMB V16 UDS listener enabled: %s", VEMB_V16_UDS_PATH);
+
     /* Enable inject pipe so Redis accept path can hand off VEMB connections.
      * Sniff is always on for VEMB V16 — it rides the Redis accept loop on every
      * listening fd (port, TLS, bind) and steals fds whose first bytes match the

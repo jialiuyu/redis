@@ -16,6 +16,8 @@ int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,
                               uint16_t port);
+int vemb_v16_proxy_enable_inject(vemb_v16_proxy_t *proxy);
+int vemb_v16_proxy_inject_fd(vemb_v16_proxy_t *proxy, int fd);
 int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
                                         uint32_t threads);
 int vemb_v16_proxy_set_supernode_workers(vemb_v16_proxy_t *proxy,

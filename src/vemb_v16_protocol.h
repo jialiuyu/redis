@@ -19,7 +19,7 @@
 #define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
 #ifndef VEMB_V16_MAX_CHANNELS
-#define VEMB_V16_MAX_CHANNELS 64
+#define VEMB_V16_MAX_CHANNELS 1024
 #endif
 
 #define VEMB_V16_MAX_KEY_LEN 128
@@ -1958,7 +1958,12 @@ static inline int vemb_v16_resp_decode(vemb_v16_resp_t *resp,
     resp->op = (uint8_t)(op_flags & VEMB_V16_TCP_RESP_OP_MASK);
     resp->flags = (uint16_t)((op_flags & VEMB_V16_TCP_RESP_FLAG_MASK) >> 6);
     resp->req_id = vemb_v16_proto_get_u32(&p);
-    RETURN_IF(len != vemb_v16_resp_encoded_len(resp), -1);
+    /* VEMB_INLINE responses append the inline vector payload after the 6B+28B
+     * metadata on the wire. The wire `len` here is the full frame payload
+     * (metadata + inline bytes); vemb_v16_resp_encoded_len() returns only the
+     * metadata portion, so enforce a lower bound — strict equality would reject
+     * every VEMB_INLINE response. */
+    RETURN_IF(len < vemb_v16_resp_encoded_len(resp), -1);
     if (resp->status == VEMB_V16_STATUS_OK) {
         switch (resp->op) {
         case VEMB_V16_OP_VEMB_HANDLE:

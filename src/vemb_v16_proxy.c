@@ -30,6 +30,7 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define VEMB_V16_JOB_SHARD_RING_SIZE 256u
 #define VEMB_V16_JOB_RETURN_RING_SIZE 256u
@@ -858,6 +859,11 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
            atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
         atomic_fetch_add_explicit(ring_full_counter, 1, memory_order_relaxed);
+        /* While waiting for a supernode worker to drain this shard queue,
+         * drain our return queue so the supernode worker can publish
+         * completions and make forward progress. Without this, pio and snw
+         * can spin forever with both rings full. */
+        (void)drain_job_return_queues(proxy, proxy_io_worker_id);
         cpu_relax();
     }
 #ifdef __linux__
@@ -1447,7 +1453,7 @@ static void proxy_io_set_affinity(uint32_t worker_id) {
 #ifdef __linux__
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET((int)((worker_id * 2 + 1) % 64), &cpuset);
+    CPU_SET((int)((worker_id * 2 + 1) % 96), &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #else
     (void)worker_id;
@@ -2198,7 +2204,7 @@ static void *supernode_pool_thread_main(void *arg) {
 #ifdef __linux__
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET((int)((worker->worker_id * 2 + 2) % 64), &cpuset);
+    CPU_SET((int)((worker->worker_id * 2 + 2) % 96), &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #endif
 
@@ -2479,6 +2485,8 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     proxy->response_ring_slot_size = sizeof(vemb_v16_resp_t);
     proxy->max_vectors = max_vectors;
     proxy->listen_fd = -1;
+    proxy->inject_pipe_rd = -1;
+    proxy->inject_pipe_wr = -1;
     proxy->tcp_port = VEMB_V16_TCP_PORT;
     strncpy(proxy->tcp_host, VEMB_V16_TCP_HOST, sizeof(proxy->tcp_host) - 1);
     atomic_init(&proxy->running, 0);
@@ -2531,6 +2539,34 @@ int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     proxy->uds_enabled = 1;
     return 0;
+}
+
+/* Enable the inject pipe so the Redis main thread can hand off VEMB fds that
+ * it sniffed off its own listening ports.  Same-process cross-thread fd-pass:
+ * the integer fd is valid in both threads (redis stole it from the conn by
+ * setting conn->fd=-1, so the kernel descriptor stays open until the proxy's
+ * side closes it). */
+int vemb_v16_proxy_enable_inject(vemb_v16_proxy_t *proxy) {
+    assert(proxy != NULL);
+    if (proxy->inject_pipe_rd >= 0) return 0; /* already enabled */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
+    fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(pipefd[1], F_SETFL, fcntl(pipefd[1], F_GETFL, 0) | O_NONBLOCK);
+    proxy->inject_pipe_rd = pipefd[0];
+    proxy->inject_pipe_wr = pipefd[1];
+    return 0;
+}
+
+int vemb_v16_proxy_inject_fd(vemb_v16_proxy_t *proxy, int fd) {
+    if (!proxy || proxy->inject_pipe_wr < 0 || fd < 0) return -1;
+    /* Make fd blocking for proxy's blocking reads */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    vemb_v16_net_set_tcp_nodelay(fd);
+    vemb_v16_net_set_timeouts(fd, 10000);
+    ssize_t w = write(proxy->inject_pipe_wr, &fd, sizeof(fd));
+    return (w == sizeof(fd)) ? 0 : -1;
 }
 
 static int proxy_set_worker_count(vemb_v16_proxy_t *proxy,
@@ -2662,6 +2698,18 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
             did_work = 1;
             listener.handle_fd(proxy, cfd);
         }
+        /* Drain fds injected from Redis main thread (protocol sniffing).  These
+         * are always data-plane HELLO frames — control frames never go through
+         * the pipe (server_integration.c dispatches them directly). */
+        if (proxy->inject_pipe_rd >= 0) {
+            for (;;) {
+                int injected_fd;
+                ssize_t r = read(proxy->inject_pipe_rd, &injected_fd, sizeof(injected_fd));
+                if (r != sizeof(injected_fd)) break;
+                did_work = 1;
+                vemb_v16_tcp_handle_fd(proxy, injected_fd);
+            }
+        }
         if (!did_work) {
             struct timespec ts = {0, 1000000};
             nanosleep(&ts, NULL);
@@ -2681,6 +2729,14 @@ cleanup:
     if (proxy->listen_fd >= 0) {
         close(proxy->listen_fd);
         proxy->listen_fd = -1;
+    }
+    if (proxy->inject_pipe_rd >= 0) {
+        close(proxy->inject_pipe_rd);
+        proxy->inject_pipe_rd = -1;
+    }
+    if (proxy->inject_pipe_wr >= 0) {
+        close(proxy->inject_pipe_wr);
+        proxy->inject_pipe_wr = -1;
     }
     if (proxy->uds_enabled && proxy->uds_path[0])
         unlink(proxy->uds_path);

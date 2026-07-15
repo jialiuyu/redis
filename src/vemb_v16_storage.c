@@ -992,7 +992,7 @@ static int parse_ub_rpc_ring_field(vemb_v16_ub_rpc_ring_config_t *ring,
     snprintf(expected, sizeof(expected), "%s_path", prefix);
     if (!strcmp(key, expected)) {
         RETURN_IF(strlen(value) >= sizeof(ring->path), -1);
-        strcpy(ring->path, value);
+        redis_strlcpy(ring->path, value, sizeof(ring->path));
         return 0;
     }
     snprintf(expected, sizeof(expected), "%s_mmap_offset", prefix);
@@ -1029,7 +1029,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "remote_meta_path")) {
             RETURN_IF(strlen(value) >= sizeof(manifest->remote_meta_path), -1);
-            strcpy(manifest->remote_meta_path, value);
+            redis_strlcpy(manifest->remote_meta_path, value, sizeof(manifest->remote_meta_path));
             return 0;
         }
         if (!strcmp(key, "remote_meta_mmap_offset"))
@@ -1043,7 +1043,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "job_plane_path")) {
             RETURN_IF(strlen(value) >= sizeof(manifest->job_plane_path), -1);
-            strcpy(manifest->job_plane_path, value);
+            redis_strlcpy(manifest->job_plane_path, value, sizeof(manifest->job_plane_path));
             return 0;
         }
         if (!strcmp(key, "job_plane_mmap_offset"))
@@ -1071,7 +1071,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
             return parse_backend_value(value, &current->backend_type);
         if (!strcmp(key, "path")) {
             RETURN_IF(strlen(value) >= sizeof(current->path), -1);
-            strcpy(current->path, value);
+            redis_strlcpy(current->path, value, sizeof(current->path));
             return 0;
         }
         if (!strcmp(key, "mmap_offset"))
@@ -1108,7 +1108,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "path")) {
             RETURN_IF(strlen(value) >= sizeof(current_meta->path), -1);
-            strcpy(current_meta->path, value);
+            redis_strlcpy(current_meta->path, value, sizeof(current_meta->path));
             return 0;
         }
         if (!strcmp(key, "mmap_offset"))

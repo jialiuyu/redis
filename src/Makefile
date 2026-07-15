@@ -435,6 +435,7 @@ REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet
                     vemb_v16_remote_meta.o vemb_v16_ub_rpc.o vemb_v16_topology.o \
                     vemb_v16_migration_outbox.o \
                     vemb_v16_shared_allocator.o vemb_v16_mapped_region.o \
+                    vemb_v16_warm_region_layout.o \
                     vemb_v16_control_listener.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=$(OUT_DIR)/redis-cli$(PROG_SUFFIX)
