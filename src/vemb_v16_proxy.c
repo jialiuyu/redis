@@ -11,6 +11,7 @@
 #include "vemb_v16_stats.h"
 #include "macro.h"
 #include "redisassert.h"
+#include "util.h"
 #include "zmalloc.h"
 
 #include <errno.h>
@@ -492,6 +493,10 @@ static int init_job_shard_queues(vemb_v16_proxy_t *proxy) {
     return 0;
 }
 
+#ifdef __linux__
+static uint32_t proxy_available_cpu_count(void);
+#endif
+
 static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (proxy->proxy_io_worker_count == 0)
@@ -499,6 +504,46 @@ static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy) {
     if (proxy->supernode_worker_count == 0)
         return -1;
     return 0;
+}
+
+static uint32_t default_balanced_worker_count(void) {
+#ifdef __linux__
+    uint32_t cpus = proxy_available_cpu_count();
+#else
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    uint32_t cpus = online > 0 ? (uint32_t)online : 1u;
+#endif
+    uint32_t target = cpus / 4u;
+    if (target < 1u)
+        target = 1u;
+    if (target > 32u)
+        target = 32u;
+    if (target > VEMB_V16_MAX_CHANNELS)
+        target = VEMB_V16_MAX_CHANNELS;
+    return target;
+}
+
+static void apply_default_worker_counts(vemb_v16_proxy_t *proxy) {
+    assert(proxy != NULL);
+    if (proxy->proxy_io_worker_count != 0 &&
+        proxy->supernode_worker_count != 0)
+        return;
+
+    uint32_t target = default_balanced_worker_count();
+    if (proxy->proxy_io_worker_count == 0)
+        proxy->proxy_io_worker_count = target;
+    if (proxy->supernode_worker_count == 0)
+        proxy->supernode_worker_count = target;
+#ifdef __linux__
+    uint32_t available_cpus = proxy_available_cpu_count();
+#else
+    uint32_t available_cpus = target * 4u;
+#endif
+    serverLog(LL_NOTICE,
+              "vemb_v16 auto worker counts: available_cpus=%u proxy_io_threads=%u supernode_workers=%u",
+              available_cpus,
+              proxy->proxy_io_worker_count,
+              proxy->supernode_worker_count);
 }
 
 static int shard_queue_topology_ready(vemb_v16_proxy_t *proxy) {
@@ -845,6 +890,10 @@ static void publish_status_response(vemb_v16_channel_t *ch,
     publish_response(ch, &completion);
 }
 
+static int flush_tcp_response_backlog(vemb_v16_channel_t *ch) {
+    return vemb_v16_tcp_flush_response_backlog(ch);
+}
+
 static int publish_completion_batch(vemb_v16_channel_t *ch,
                                     vemb_v16_completion_t *completions,
                                     const uint16_t *ready_indices,
@@ -936,10 +985,8 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
                                                 &expected,
                                                 0,
                                                 memory_order_acq_rel,
-                                                memory_order_relaxed) &&
-        worker->notify_fd >= 0) {
-        uint64_t one = 1;
-        (void)write(worker->notify_fd, &one, sizeof(one));
+                                                memory_order_relaxed)) {
+        (void)eventfd_write(worker->job_eventfd, 1);
     }
 #endif
     return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
@@ -1511,13 +1558,70 @@ static void proxy_io_channel_deactivate(vemb_v16_channel_t *ch) {
         shutdown(ch->net_fd, SHUT_RDWR);
 }
 
-static void proxy_io_set_affinity(uint32_t worker_id) {
 #ifdef __linux__
+static uint32_t proxy_get_available_cpus(int *cpus, uint32_t cap) {
+    if (cap == 0)
+        return 0;
+
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+        return 0;
+
+    uint32_t count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE && count < cap; cpu++) {
+        if (CPU_ISSET(cpu, &allowed))
+            cpus[count++] = cpu;
+    }
+    return count;
+}
+
+static uint32_t proxy_available_cpu_count(void) {
+    int cpus[CPU_SETSIZE];
+    uint32_t count = proxy_get_available_cpus(cpus, CPU_SETSIZE);
+    if (count != 0)
+        return count;
+
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    return online > 0 ? (uint32_t)online : 1u;
+}
+
+static void proxy_set_interleaved_worker_affinity(vemb_v16_proxy_t *proxy,
+                                                  uint32_t worker_id,
+                                                  uint32_t lane) {
+    int cpus[CPU_SETSIZE];
+    uint32_t cpu_count = proxy_get_available_cpus(cpus, CPU_SETSIZE);
+    uint32_t required = 2u * proxy->proxy_io_worker_count;
+    if (proxy->supernode_worker_count > proxy->proxy_io_worker_count)
+        required = 2u * proxy->supernode_worker_count;
+    if (cpu_count == 0 || required > cpu_count)
+        return;
+
+    uint32_t cpu_index = worker_id * 2u + lane;
+    if (cpu_index >= cpu_count)
+        return;
+
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET((int)((worker_id * 2 + 1) % 96), &cpuset);
+    CPU_SET(cpus[cpu_index], &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+#endif
+
+static void proxy_io_set_affinity(vemb_v16_proxy_t *proxy, uint32_t worker_id) {
+#ifdef __linux__
+    proxy_set_interleaved_worker_affinity(proxy, worker_id, 0);
 #else
+    (void)proxy;
+    (void)worker_id;
+#endif
+}
+
+static void supernode_worker_set_affinity(vemb_v16_proxy_t *proxy,
+                                          uint32_t worker_id) {
+#ifdef __linux__
+    proxy_set_interleaved_worker_affinity(proxy, worker_id, 1);
+#else
+    (void)proxy;
     (void)worker_id;
 #endif
 }
@@ -1526,9 +1630,7 @@ static void proxy_io_set_affinity(uint32_t worker_id) {
 static void *proxy_io_poll_thread_main(void *arg) {
     vemb_v16_proxy_io_worker_t *worker = arg;
     vemb_v16_proxy_t *proxy = worker->proxy;
-
-    proxy_io_set_affinity(worker->worker_id);
-
+    proxy_io_set_affinity(proxy, worker->worker_id);
     serverLog(LL_VERBOSE, "vemb_v16 proxy io poll worker started: worker_id=%u",
               worker->worker_id);
     while (atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
@@ -1555,8 +1657,17 @@ static void *proxy_io_poll_thread_main(void *arg) {
                 proxy_io_channel_release(ch);
                 continue;
             }
-            if (n > 0)
+            if (n > 0) {
                 did_work = 1;
+#ifdef __linux__
+                if (ch->transport_type == VEMB_V16_TRANSPORT_TCP &&
+                    flush_tcp_response_backlog(ch) < 0) {
+                    proxy_io_channel_deactivate(ch);
+                    proxy_io_channel_release(ch);
+                    continue;
+                }
+#endif
+            }
 
             if (atomic_load_explicit(&ch->active, memory_order_acquire) &&
                 ch->transport_type == VEMB_V16_TRANSPORT_AERON) {
@@ -1587,7 +1698,11 @@ static void *proxy_io_poll_thread_main(void *arg) {
                 }
                 pfds[nfds] = (struct pollfd){
                     .fd = ch->net_fd,
-                    .events = POLLIN,
+                    .events = POLLIN
+#ifdef __linux__
+                        | (vemb_v16_tcp_backlog_pending(ch) ? POLLOUT : 0)
+#endif
+                    ,
                     .revents = 0,
                 };
                 poll_channels[nfds] = ch;
@@ -1618,6 +1733,14 @@ static void *proxy_io_poll_thread_main(void *arg) {
                 } else if (rc > 0) {
                     did_work = 1;
                 }
+#ifdef __linux__
+            } else if (revents & POLLOUT) {
+                if (flush_tcp_response_backlog(ch) < 0) {
+                    proxy_io_channel_deactivate(ch);
+                } else {
+                    did_work = 1;
+                }
+#endif
             } else if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 proxy_io_channel_deactivate(ch);
                 did_work = 1;
@@ -1672,19 +1795,23 @@ static void *proxy_io_epoll_thread_main(void *arg) {
         atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
         return NULL;
     }
-    worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (worker->notify_fd >= 0) {
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data = {.u64 = notify_token},
-        };
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, worker->notify_fd, &ev) != 0) {
-            close(worker->notify_fd);
-            worker->notify_fd = -1;
-        }
+    struct epoll_event notify_ev = {
+        .events = EPOLLIN,
+        .data = {.u64 = notify_token},
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, worker->notify_fd, &notify_ev) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 FATAL: proxy io notify eventfd epoll add failed: worker_id=%u fd=%d errno=%d error=%s",
+                  worker->worker_id,
+                  worker->notify_fd,
+                  errno,
+                  strerror(errno));
+        atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+        close(epfd);
+        return NULL;
     }
 
-    proxy_io_set_affinity(worker->worker_id);
+    proxy_io_set_affinity(proxy, worker->worker_id);
 
     serverLog(LL_VERBOSE, "vemb_v16 proxy io epoll worker started: worker_id=%u",
               worker->worker_id);
@@ -1815,7 +1942,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
             }
 
             if (vemb_v16_tcp_backlog_pending(ch)) {
-                int flush = vemb_v16_tcp_flush_response_backlog(ch);
+                int flush = flush_tcp_response_backlog(ch);
                 if (flush < 0) {
                     proxy_io_channel_deactivate(ch);
                     did_work = 1;
@@ -1843,6 +1970,11 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 did_work = 1;
             } else if (n > 0) {
                 did_work = 1;
+                if (flush_tcp_response_backlog(ch) < 0) {
+                    proxy_io_channel_deactivate(ch);
+                    proxy_io_channel_release(ch);
+                    continue;
+                }
             } else if (proxy_io_channel_arm_completion_notify(ch) < 0) {
                 did_work = 1;
             }
@@ -1862,9 +1994,10 @@ static void *proxy_io_epoll_thread_main(void *arg) {
 
         for (int i = 0; i < nready; i++) {
             if (events[i].data.u64 == notify_token) {
-                uint64_t value = 0;
-                if (worker->notify_fd >= 0)
-                    (void)read(worker->notify_fd, &value, sizeof(value));
+                eventfd_t value = 0;
+                while (eventfd_read(worker->notify_fd, &value) != 0 &&
+                       errno == EINTR) {
+                }
                 did_work = 1;
                 continue;
             }
@@ -1895,7 +2028,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 }
             }
             if ((revents & EPOLLOUT) && atomic_load_explicit(&ch->active, memory_order_acquire)) {
-                if (vemb_v16_tcp_flush_response_backlog(ch) < 0)
+                if (flush_tcp_response_backlog(ch) < 0)
                     proxy_io_channel_deactivate(ch);
             }
             if (revents & (EPOLLERR | EPOLLHUP)) {
@@ -1915,10 +2048,6 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                                   registered_events,
                                   i);
     }
-    if (worker->notify_fd >= 0) {
-        close(worker->notify_fd);
-        worker->notify_fd = -1;
-    }
     close(epfd);
     serverLog(LL_VERBOSE, "vemb_v16 proxy io epoll worker stopped: worker_id=%u",
               worker->worker_id);
@@ -1934,6 +2063,28 @@ static void *proxy_io_pool_thread_main(void *arg) {
 #endif
 }
 
+#ifdef __linux__
+static int proxy_io_worker_open_notify_fd(vemb_v16_proxy_io_worker_t *worker) {
+    worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (worker->notify_fd < 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 FATAL: proxy io notify eventfd create failed: worker_id=%u errno=%d error=%s",
+                  worker->worker_id, errno, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void proxy_io_worker_wake(vemb_v16_proxy_io_worker_t *worker) {
+    (void)eventfd_write(worker->notify_fd, 1);
+}
+
+static void proxy_io_worker_close_notify_fd(vemb_v16_proxy_io_worker_t *worker) {
+    close(worker->notify_fd);
+    worker->notify_fd = -1;
+}
+#endif
+
 static int start_proxy_io_pool(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
@@ -1942,14 +2093,36 @@ static int start_proxy_io_pool(vemb_v16_proxy_t *proxy) {
         proxy->proxy_io_workers[i].proxy = proxy;
 #ifdef __linux__
         proxy->proxy_io_workers[i].notify_fd = -1;
+        if (proxy_io_worker_open_notify_fd(&proxy->proxy_io_workers[i]) != 0) {
+            atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+            for (uint32_t j = 0; j < i; j++)
+                proxy_io_worker_wake(&proxy->proxy_io_workers[j]);
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_join(proxy->proxy_io_workers[j].thread, NULL);
+                proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[j]);
+            }
+            proxy->proxy_io_pool_started = 0;
+            return -1;
+        }
 #endif
         if (pthread_create(&proxy->proxy_io_workers[i].thread,
                            NULL,
                            proxy_io_pool_thread_main,
                            &proxy->proxy_io_workers[i]) != 0) {
             atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+#ifdef __linux__
             for (uint32_t j = 0; j < i; j++)
+                proxy_io_worker_wake(&proxy->proxy_io_workers[j]);
+#endif
+            for (uint32_t j = 0; j < i; j++) {
                 pthread_join(proxy->proxy_io_workers[j].thread, NULL);
+#ifdef __linux__
+                proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[j]);
+#endif
+            }
+#ifdef __linux__
+            proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[i]);
+#endif
             proxy->proxy_io_pool_started = 0;
             return -1;
         }
@@ -1962,8 +2135,16 @@ static void stop_proxy_io_pool(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (!proxy->proxy_io_pool_started)
         return;
+#ifdef __linux__
+    for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
+        proxy_io_worker_wake(&proxy->proxy_io_workers[i]);
+#endif
     for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
         pthread_join(proxy->proxy_io_workers[i].thread, NULL);
+#ifdef __linux__
+    for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
+        proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[i]);
+#endif
     proxy->proxy_io_pool_started = 0;
 }
 
@@ -2018,10 +2199,7 @@ static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx)
         return;
     }
     int notify_fd = *ctx->completion_notify_fd;
-    if (notify_fd >= 0) {
-        uint64_t one = 1;
-        (void)write(notify_fd, &one, sizeof(one));
-    }
+    (void)eventfd_write(notify_fd, 1);
 #else
     (void)ctx;
 #endif
@@ -2255,25 +2433,21 @@ static int supernode_worker_has_pending(vemb_v16_proxy_t *proxy,
 }
 
 static void supernode_worker_wait_for_jobs(vemb_v16_supernode_pool_worker_t *worker) {
-    if (worker->notify_fd < 0)
-        return;
-
     atomic_store_explicit(&worker->job_notify_armed, 1, memory_order_release);
     if (supernode_worker_has_pending(worker->proxy, worker->worker_id)) {
         atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
         return;
     }
 
-    struct pollfd pfd = {
-        .fd = worker->notify_fd,
-        .events = POLLIN,
-    };
-    int rc = poll(&pfd, 1, 10);
-    if (rc > 0 && (pfd.revents & POLLIN)) {
-        uint64_t value = 0;
-        (void)read(worker->notify_fd, &value, sizeof(value));
+    eventfd_t value = 0;
+    while (eventfd_read(worker->job_eventfd, &value) != 0 &&
+           errno == EINTR) {
     }
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
+}
+
+static void supernode_worker_wake(vemb_v16_supernode_pool_worker_t *worker) {
+    (void)eventfd_write(worker->job_eventfd, 1);
 }
 #endif
 
@@ -2285,16 +2459,10 @@ static void *supernode_pool_thread_main(void *arg) {
     if (vemb_v16_supernode_scratch_init(&scratch) != 0)
         return NULL;
 #ifdef __linux__
-    worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
 #endif
 
-#ifdef __linux__
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET((int)((worker->worker_id * 2 + 2) % 96), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-#endif
+    supernode_worker_set_affinity(proxy, worker->worker_id);
 
     serverLog(LL_VERBOSE, "vemb_v16 pooled supernode worker started: worker_id=%u",
               worker->worker_id);
@@ -2312,15 +2480,27 @@ static void *supernode_pool_thread_main(void *arg) {
     }
     serverLog(LL_VERBOSE, "vemb_v16 pooled supernode worker stopped: worker_id=%u",
               worker->worker_id);
-#ifdef __linux__
-    if (worker->notify_fd >= 0) {
-        close(worker->notify_fd);
-        worker->notify_fd = -1;
-    }
-#endif
     vemb_v16_supernode_scratch_cleanup(&scratch);
     return NULL;
 }
+
+#ifdef __linux__
+static int supernode_worker_open_eventfd(vemb_v16_supernode_pool_worker_t *worker) {
+    worker->job_eventfd = eventfd(0, EFD_CLOEXEC);
+    if (worker->job_eventfd < 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 FATAL: supernode worker eventfd create failed: worker_id=%u errno=%d error=%s",
+                  worker->worker_id, errno, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void supernode_worker_close_eventfd(vemb_v16_supernode_pool_worker_t *worker) {
+    close(worker->job_eventfd);
+    worker->job_eventfd = -1;
+}
+#endif
 
 static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
@@ -2331,16 +2511,40 @@ static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
             .proxy = proxy,
 #ifdef __linux__
             .job_notify_armed = 0,
-            .notify_fd = -1,
+            .job_eventfd = -1,
 #endif
         };
+#ifdef __linux__
+        if (supernode_worker_open_eventfd(&proxy->supernode_workers[i]) != 0) {
+            atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+            for (uint32_t j = 0; j < i; j++)
+                supernode_worker_wake(&proxy->supernode_workers[j]);
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_join(proxy->supernode_workers[j].thread, NULL);
+                supernode_worker_close_eventfd(&proxy->supernode_workers[j]);
+            }
+            proxy->supernode_pool_started = 0;
+            return -1;
+        }
+#endif
         if (pthread_create(&proxy->supernode_workers[i].thread,
                            NULL,
                            supernode_pool_thread_main,
                            &proxy->supernode_workers[i]) != 0) {
             atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+#ifdef __linux__
             for (uint32_t j = 0; j < i; j++)
+                supernode_worker_wake(&proxy->supernode_workers[j]);
+#endif
+            for (uint32_t j = 0; j < i; j++) {
                 pthread_join(proxy->supernode_workers[j].thread, NULL);
+#ifdef __linux__
+                supernode_worker_close_eventfd(&proxy->supernode_workers[j]);
+#endif
+            }
+#ifdef __linux__
+            supernode_worker_close_eventfd(&proxy->supernode_workers[i]);
+#endif
             proxy->supernode_pool_started = 0;
             return -1;
         }
@@ -2353,8 +2557,16 @@ static void stop_supernode_pool(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (!proxy->supernode_pool_started)
         return;
+#ifdef __linux__
     for (uint32_t i = 0; i < proxy->supernode_worker_count; i++)
+        supernode_worker_wake(&proxy->supernode_workers[i]);
+#endif
+    for (uint32_t i = 0; i < proxy->supernode_worker_count; i++) {
         pthread_join(proxy->supernode_workers[i].thread, NULL);
+#ifdef __linux__
+        supernode_worker_close_eventfd(&proxy->supernode_workers[i]);
+#endif
+    }
     proxy->supernode_pool_started = 0;
 }
 
@@ -2379,7 +2591,7 @@ static int scaleout_notify_connect_uds(const char *path, uint32_t timeout_ms) {
         close(fd);
         return -1;
     }
-    strcpy(addr.sun_path, path);
+    redis_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
         return -1;
@@ -2708,6 +2920,7 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
 /// Top-level control loop: accept either UDS UB/SHM control or TCP control/data.
 int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
     int rc = -1;
+    apply_default_worker_counts(proxy);
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
     if (!proxy->uds_enabled && !proxy->tcp_enabled)

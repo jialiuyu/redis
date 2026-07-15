@@ -21,6 +21,7 @@
 #define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
 #define VEMB_V16_TCP_INPUT_INITIAL_CAP (64u * 1024u)
 #define VEMB_V16_TCP_INPUT_READ_CHUNK (64u * 1024u)
+#define VEMB_V16_TCP_RESPONSE_PREFIX_CAP (sizeof(vemb_v16_net_hdr_t) + 64u)
 #define VEMB_V16_TCP_INPUT_BUFFER_LIMIT (4u * 1024u * 1024u)
 
 static int diag_should_log_req(uint32_t req_id) {
@@ -462,8 +463,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
         uint32_t net_flags = 0;
         vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-        uint8_t encoded_resps[VEMB_V16_PROXY_BATCH][64];
-        vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+        uint8_t frame_prefixes[VEMB_V16_PROXY_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
         struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
         int iovcnt = 0;
         uint32_t out = 0;
@@ -482,13 +482,13 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                              &vector_bytes) != 0)
                 tcp_mark_inline_snapshot_error(&responses[out]);
 
-            headers[out] = (vemb_v16_net_hdr_t){
+            size_t resp_payload_len = vemb_v16_resp_encoded_len(&responses[out]);
+            vemb_v16_net_hdr_t hdr = {
                 .magic = VEMB_V16_MAGIC,
                 .version = VEMB_V16_VERSION,
                 .type = VEMB_V16_NET_RESPONSE,
                 .flags = net_flags,
-                .payload_len = (uint32_t)vemb_v16_resp_encoded_len(
-                    &responses[out]) + vector_bytes,
+                .payload_len = (uint32_t)resp_payload_len + vector_bytes,
                 .channel_id = vemb_v16_channel_id(ch),
                 .req_id = responses[out].req_id,
             };
@@ -505,22 +505,23 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                           responses[out].flags,
                           responses[out].vector_bytes,
                           vector_bytes,
-                          sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes,
+                          sizeof(hdr) + resp_payload_len + vector_bytes,
                           responses[out].region_id,
                           responses[out].local_slot,
                           (unsigned long long)responses[out].owner_generation);
             }
-            iov[iovcnt++] = (struct iovec){ .iov_base = &headers[out], .iov_len = sizeof(headers[out]) };
+            uint8_t *prefix = frame_prefixes[out];
+            memcpy(prefix, &hdr, sizeof(hdr));
             size_t encoded_len = 0;
-            if (vemb_v16_resp_encode(encoded_resps[out],
-                                     sizeof(encoded_resps[out]),
+            if (vemb_v16_resp_encode(prefix + sizeof(hdr),
+                                     VEMB_V16_TCP_RESPONSE_PREFIX_CAP - sizeof(hdr),
                                      &responses[out],
                                      &encoded_len) != 0) {
                 return -1;
             }
             iov[iovcnt++] = (struct iovec){
-                .iov_base = encoded_resps[out],
-                .iov_len = encoded_len,
+                .iov_base = prefix,
+                .iov_len = sizeof(hdr) + encoded_len,
             };
             if (vector_bytes) {
                 iov[iovcnt++] = (struct iovec){ .iov_base = (void *)vector, .iov_len = vector_bytes };
@@ -538,8 +539,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
 #ifdef __linux__
     uint32_t net_flags = 0;
     vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-    uint8_t encoded_resps[VEMB_V16_PROXY_BATCH][64];
-    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+    uint8_t frame_prefixes[VEMB_V16_PROXY_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
     struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
     int iovcnt = 0;
     uint32_t out = 0;
@@ -560,7 +560,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
             tcp_mark_inline_snapshot_error(&responses[out]);
 
         size_t resp_payload_len = vemb_v16_resp_encoded_len(&responses[out]);
-        headers[out] = (vemb_v16_net_hdr_t){
+        vemb_v16_net_hdr_t hdr = {
             .magic = VEMB_V16_MAGIC,
             .version = VEMB_V16_VERSION,
             .type = VEMB_V16_NET_RESPONSE,
@@ -582,23 +582,24 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                       responses[out].flags,
                       responses[out].vector_bytes,
                       vector_bytes,
-                      sizeof(headers[out]) + resp_payload_len + vector_bytes,
+                      sizeof(hdr) + resp_payload_len + vector_bytes,
                       responses[out].region_id,
                       responses[out].local_slot,
                       (unsigned long long)responses[out].owner_generation);
         }
 
-        iov[iovcnt++] = (struct iovec){ .iov_base = &headers[out], .iov_len = sizeof(headers[out]) };
+        uint8_t *prefix = frame_prefixes[out];
+        memcpy(prefix, &hdr, sizeof(hdr));
         size_t encoded_len = 0;
-        if (vemb_v16_resp_encode(encoded_resps[out],
-                                 sizeof(encoded_resps[out]),
+        if (vemb_v16_resp_encode(prefix + sizeof(hdr),
+                                 VEMB_V16_TCP_RESPONSE_PREFIX_CAP - sizeof(hdr),
                                  &responses[out],
                                  &encoded_len) != 0) {
             return -1;
         }
         iov[iovcnt++] = (struct iovec){
-            .iov_base = encoded_resps[out],
-            .iov_len = encoded_len,
+            .iov_base = prefix,
+            .iov_len = sizeof(hdr) + encoded_len,
         };
         resp_payload_len = encoded_len;
         if (vector_bytes) {
@@ -607,7 +608,7 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 .iov_len = vector_bytes,
             };
         }
-        total_bytes += sizeof(headers[out]) + resp_payload_len + vector_bytes;
+        total_bytes += sizeof(hdr) + resp_payload_len + vector_bytes;
         out++;
     }
 

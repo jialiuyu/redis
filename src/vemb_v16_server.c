@@ -23,22 +23,22 @@ static uint32_t clamp_worker_count(long value, uint32_t max_value) {
     return (uint32_t)value;
 }
 
-static uint32_t default_proxy_io_threads(void) {
+static uint32_t default_balanced_worker_count(void) {
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    long target = cpus > 0 ? cpus / 2 : 1;
+    long target = cpus > 0 ? cpus / 4 : 1;
     if (target < 1)
         target = 1;
-    if (target > 16)
-        target = 16;
-    return clamp_worker_count(target, VEMB_V16_MAX_CHANNELS);
-}
-
-static uint32_t default_supernode_workers(void) {
-    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    long target = cpus > 0 ? cpus : 1;
     if (target > 32)
         target = 32;
     return clamp_worker_count(target, VEMB_V16_MAX_CHANNELS);
+}
+
+static uint32_t default_proxy_io_threads(void) {
+    return default_balanced_worker_count();
+}
+
+static uint32_t default_supernode_workers(void) {
+    return default_balanced_worker_count();
 }
 
 static void on_signal(int sig) {

@@ -9,8 +9,9 @@
 #   smoke: WORKERS="32 64" TS="32" CS="1" TEST_TIME=3 ./hpc_redis_max_tput.sh
 set -uo pipefail
 
-HPC=/root/gqs/codespace/UnifiedBus/hpc-redis
-MEMTIER=/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+HPC=${HPC:-$SCRIPT_DIR}
+MEMTIER=${MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark}
 MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 CLEAR_UB=/tmp/clear_ub_device
 
@@ -21,7 +22,7 @@ PORT=${PORT:-6390}
 SERVER_CPUSET=${SERVER_CPUSET:-1-96}
 CLIENT_CPUSET=${CLIENT_CPUSET:-97-191}
 TEST_TIME=${TEST_TIME:-5}
-PIPELINE=32
+PIPELINE=${PIPELINE:-32}
 # op mode: vemb (read) | vadd (write) | vsim (similarity) | vrem (delete)
 OP_MODE=${OP_MODE:-vemb}
 case "$OP_MODE" in
