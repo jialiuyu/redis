@@ -365,8 +365,6 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
 int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
         uint32_t net_flags = 0;
-        const uint8_t *vector = NULL;
-        uint32_t vector_bytes = 0;
         uint8_t encoded_resp[64];
         const void *resp_payload = encoded_resp;
         uint32_t resp_payload_len = 0;
@@ -388,15 +386,13 @@ int vemb_v16_tcp_publish_response(vemb_v16_channel_t *ch, vemb_v16_resp_t *resp)
             return -1;
         }
         resp_payload_len = (uint32_t)encoded_len;
-        return vemb_v16_net_write_frame2(vemb_v16_channel_net_fd(ch),
-                                         VEMB_V16_NET_RESPONSE,
-                                         net_flags,
-                                         vemb_v16_channel_id(ch),
-                                         resp->req_id,
-                                         resp_payload,
-                                         resp_payload_len,
-                                         vector,
-                                         vector_bytes);
+        return vemb_v16_net_write_frame(vemb_v16_channel_net_fd(ch),
+                                        VEMB_V16_NET_RESPONSE,
+                                        net_flags,
+                                        vemb_v16_channel_id(ch),
+                                        resp->req_id,
+                                        resp_payload,
+                                        resp_payload_len);
     }
 
 #ifdef __linux__
