@@ -26,11 +26,12 @@ PIPELINE=${PIPELINE:-32}
 # op mode: vemb (read) | vadd (write) | vsim (similarity) | vrem (delete)
 OP_MODE=${OP_MODE:-vemb}
 case "$OP_MODE" in
-    vemb) OP_ARGS="--ratio=0:1 --key-pattern=R:R" ;;
-    vadd) OP_ARGS="--ratio=1:0 --key-pattern=S:S" ;;
-    vsim) OP_ARGS="--vemb-v16-vsim --ratio=0:1 --key-pattern=R:R" ;;
-    vrem) OP_ARGS="--vemb-v16-vrem --ratio=1:0 --key-pattern=S:S" ;;
-    *)    echo "FAIL: unknown OP_MODE=$OP_MODE"; exit 2 ;;
+    vemb)  OP_ARGS="--ratio=0:1 --key-pattern=R:R" ;;
+    vembz) OP_ARGS="--ratio=0:1 --key-pattern=Z:Z --key-zipfian-s=${ZIPF_S:-0.99}" ;;
+    vadd)  OP_ARGS="--ratio=1:0 --key-pattern=S:S" ;;
+    vsim)  OP_ARGS="--vemb-v16-vsim --ratio=0:1 --key-pattern=R:R" ;;
+    vrem)  OP_ARGS="--vemb-v16-vrem --ratio=1:0 --key-pattern=S:S" ;;
+    *)     echo "FAIL: unknown OP_MODE=$OP_MODE"; exit 2 ;;
 esac
 # pio snw pairs (1:2 ratio up to 32:64); format: "pio:snw ..."
 WORKERS=( ${WORKERS:-1:2 2:4 4:8 8:16 16:32 32:64} )

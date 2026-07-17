@@ -110,9 +110,12 @@ ssh "$HW01" bash -s << REMOTE_EOF
         | ssh $HW02 "mkdir -p $CODE_DIR && tar -xf - -C $CODE_DIR"
     tar -cf - --exclude='.git' --exclude='*.o' --exclude='*.a' \
         --exclude='redis-server' --exclude='redis-cli' --exclude='redis-benchmark' \
-        -C hpc-redis src clients \
+        -C hpc-redis src clients deps/xxhash \
         | ssh $HW02 "mkdir -p $CODE_DIR/hpc-redis && tar -xf - -C $CODE_DIR/hpc-redis"
 
+    echo "Building libvemb_v16_client.a natively on HW03 (x86_64)..."
+    ssh $HW02 "cd $CODE_DIR/hpc-redis/clients/c && make clean 2>/dev/null; make -j\\\$(nproc) static install-headers && \
+        ls -la build/libvemb_v16_client.a"
     echo "Building memtier_benchmark natively on HW03 (x86_64)..."
     ssh $HW02 "cd $MEMTIER_DIR && rm -f memtier_benchmark && make -j\\\$(nproc) && \
         echo 'HW03 memtier build OK' && uname -m && ls -la memtier_benchmark"

@@ -872,6 +872,26 @@ static int storage_attach_ub_rpc_peer_config(
         .inbound_request = src->inbound_request,
         .outbound_response = src->outbound_response,
     };
+    /*
+     * Runtime peer attach happens via peer-view-map AFTER server startup,
+     * so the startup manifest reset path (vemb_v16_storage_reset_manifest_regions)
+     * never saw these ub_rpc_peers and never cleaned the rings. Stale magic +
+     * head/tail from previous test runs survive in the shmdev backing, causing
+     * peer_open's init_on_open check (rpc_ring_ready sees old magic -> skip init)
+     * to reuse a dirty ring. The producer then writes into a ring whose consumer
+     * head pointer is stale, so requests/responses cross past each other and
+     * nothing lands. Force-reset all 4 rings here so both sides start clean.
+     */
+    if (reset_ub_rpc_ring_backing(&peer.request, 0) != 0 ||
+        reset_ub_rpc_ring_backing(&peer.response, 1) != 0 ||
+        reset_ub_rpc_ring_backing(&peer.inbound_request, 0) != 0 ||
+        reset_ub_rpc_ring_backing(&peer.outbound_response, 1) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 runtime ub rpc peer reset rings failed: local_owner=%u peer_owner=%u",
+                  storage->local_owner_id,
+                  peer.owner_id);
+        return -1;
+    }
     RETURN_IF(vemb_v16_ub_rpc_attach_peer(&storage->ub_rpc,
                                           storage->tlc,
                                           storage->local_owner_id,

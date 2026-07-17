@@ -113,9 +113,9 @@ run_client() {
     mem_sampler_pid=$!
     # VSIM: 加 --vemb-v16-vsim 走相似度查询，其余与 VEMB 读完全一致
     #   VSIM 协议下 memtier 有 bug：跑完 --test-time 不退出（卡在 RUN #1 100%+ 循环），
-    #   必须 timeout 兜底。30s = 5s test + 25s grace；raw 文件里 RUN #1 100% 行
+    #   必须 timeout 兜底。timeout = TEST_TIME + 30s grace；raw 文件里 RUN #1 100% 行
     #   由后续 grep 兜底解析。
-    timeout 30s $CLIENT_BIND $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM --vemb-v16-vsim \
+    timeout $((TEST_TIME + 30))s $CLIENT_BIND $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM --vemb-v16-vsim \
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
         --ratio=0:1 --key-pattern=R:R --key-prefix=$KEY_PREFIX \
         --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1

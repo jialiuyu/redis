@@ -37,8 +37,15 @@ TEST_TIME=${TEST_TIME:-30}
 MEMTIER_T=${MEMTIER_T:-16}
 MEMTIER_C=${MEMTIER_C:-4}
 
+# 客户端核范围（local: HW01 NUMA1; cross-node: HW02 NUMA1）
+CLIENT_CPU_START=${CLIENT_CPU_START:-97}
+CLIENT_CPU_END=${CLIENT_CPU_END:-191}
+
 # 派生值
 CORES_PER_INSTANCE=$IO_THREADS
+# 每实例 memtier 独占核组大小（保证调度公平，避免 12 进程争抢 95 核造成实例间不均衡）
+TOTAL_CLIENT_CORES=$((CLIENT_CPU_END - CLIENT_CPU_START + 1))
+CORES_PER_MEMTIER=$(( TOTAL_CLIENT_CORES / NUM_INSTANCES ))
 
 LOCAL_RESULT_DIR="benchmark/results/vemb_multi_instance_baseline"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -108,24 +115,39 @@ start)
     ;;
 stop)
     redis-cli -p $PORT --timeout 2 SHUTDOWN NOSAVE 2>/dev/null || true
-    pkill -9 -f "redis-server.*:$PORT " 2>/dev/null || true
+    # 双重 kill：pkill 模式 + ss 精确找 PID（pkill "redis-server.*:PORT" 末尾带或不带空格都匹配）
+    pkill -9 -f "redis-server.*:$PORT" 2>/dev/null || true
+    # 兜底：ss 找端口对应 PID（处理 pkill 未匹配的残留）
+    for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do
+        kill -9 "$pid" 2>/dev/null || true
+    done
     ;;
 prefill)
     cd "$CODE_DIR"
     VEC300=$(seq -s " " 1 $DIM | sed "s/[0-9]*/0.1/g")
-    total=$((KEY_MAX - KEY_MIN + 1))
-    chunk=$(( (total + 7) / 8 ))
-    for w in $(seq 0 7); do
-        start=$((KEY_MIN + w * chunk))
-        end=$((start + chunk - 1))
-        [ $end -gt $KEY_MAX ] && end=$KEY_MAX
-        [ $start -gt $KEY_MAX ] && continue
-        (for i in $(seq $start $end); do
-            echo "VADD myvectors VALUES $DIM $VEC300 item:$i"
-        done | ./src/redis-cli -p $PORT --pipe) &
+    expected=$((KEY_MAX - KEY_MIN + 1))
+    # 单 redis-cli --pipe + VCARD 验证 + VEMB probe（不只查数量，验证 key 真的在）+ 失败重试
+    for attempt in 1 2 3 4 5; do
+        # 先 DEL 旧 vset 避免脏数据（VCARD 可能来自上次残留）
+        ./src/redis-cli -p $PORT DEL myvectors >/dev/null 2>&1
+        sleep 0.2
+        {
+            for i in $(seq $KEY_MIN $KEY_MAX); do
+                echo "VADD myvectors VALUES $DIM $VEC300 item:$i"
+            done
+        } | ./src/redis-cli -p $PORT --pipe >/dev/null 2>&1
+        # VCARD 验证
+        card=$(./src/redis-cli -p $PORT VCARD myvectors 2>/dev/null)
+        [ -z "$card" ] && card=0
+        # VEMB probe：查一个应该存在的 key，验证响应非空
+        probe=$(./src/redis-cli -p $PORT VEMB myvectors item:$KEY_MIN 2>/dev/null | wc -c)
+        if [ "$card" -ge "$expected" ] && [ "$probe" -gt 100 ]; then
+            echo "instance $iid: prefill OK card=$card expected=$expected probe_bytes=$probe (attempt $attempt)"
+            break
+        fi
+        echo "instance $iid: prefill attempt $attempt card=$card expected=$expected probe_bytes=$probe, retrying..."
+        sleep 2
     done
-    wait
-    echo "instance $iid: prefill done keys [$KEY_MIN-$KEY_MAX]"
     ;;
 pid)
     ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1
@@ -199,9 +221,9 @@ log "Connectivity OK"
 log "=== Step 2: Prefill $NUM_KEYS vectors across $NUM_INSTANCES instances ==="
 
 for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh prefill $i" 2>/dev/null &
+    log "  prefill instance $i..."
+    ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh prefill $i"
 done
-wait
 log "Prefill done."
 
 # ============================================================================
@@ -272,16 +294,32 @@ done
 RUN_START=$(get_ts)
 
 # Launch all memtier in parallel
+# SHARED_CLIENT_CPU=1（默认）: 所有 memtier 共享 CLIENT_CPU_START-END（跟历史一致，可能不均但峰值高）
+# SHARED_CLIENT_CPU=0: 每实例独立绑核组（稳定可复现，但单实例上限略低）
+SHARED_CLIENT_CPU=${SHARED_CLIENT_CPU:-1}
 PIDS=""
 for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     PORT=$((BASE_PORT + i))
     read KEY_MIN_I KEY_MAX_I <<< $(ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh keyrange $i" 2>/dev/null)
     remote_out="/tmp/${RESULT_PREFIX}_inst${i}.log"
 
-    if [ "$LOCAL_BENCH" = "1" ]; then
-        ssh "$JUMP" "numactl --membind=1 taskset -c 97-191 bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+    if [ "$SHARED_CLIENT_CPU" = "1" ]; then
+        # 共享绑核：所有 memtier 共享 CLIENT_CPU_START-END
+        if [ "$LOCAL_BENCH" = "1" ]; then
+            ssh "$JUMP" "numactl --membind=1 taskset -c $CLIENT_CPU_START-$CLIENT_CPU_END bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+        else
+            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CLIENT_CPU_START-$CLIENT_CPU_END bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+        fi
     else
-        ssh "$JUMP" "ssh $CLIENT \"bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+        # 独立绑核：每实例独占核组
+        CPM=$CORES_PER_MEMTIER
+        CSTART=$((CLIENT_CPU_START + i * CPM))
+        CEND=$((CSTART + CPM - 1))
+        if [ "$LOCAL_BENCH" = "1" ]; then
+            ssh "$JUMP" "numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+        else
+            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+        fi
     fi
     PIDS="$PIDS $!"
 done
