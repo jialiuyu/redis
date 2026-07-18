@@ -31,9 +31,8 @@ typedef enum vemb_v16_warm_slot_cold_state {
 
 typedef struct vemb_v16_warm_slot_meta {
     _Atomic uint32_t state;
-    uint32_t region_id;
-    uint32_t local_slot;
     uint32_t bytes;
+    uint32_t reserved0;
     _Atomic uint64_t owner_generation;
     _Atomic uint64_t write_seq;
     uint64_t key_hash;

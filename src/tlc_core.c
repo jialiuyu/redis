@@ -32,8 +32,6 @@
 #define TLC_CORE_KEY_META_MIN_SHARD_CAPACITY 64u
 #define TLC_CORE_LOCATION_CACHE_PROBES 4u
 #define TLC_CORE_LOCATION_CACHE_MIN_CAPACITY 1024u
-#define TLC_CORE_LOCATION_CACHE_KEY_WORDS \
-    ((VEMB_V16_MAX_KEY_LEN + sizeof(uint64_t) - 1u) / sizeof(uint64_t))
 
 #define SEQLOCK_STATE_STABLE UINT64_C(0)
 #define SEQLOCK_STATE_WRITING UINT64_C(1)
@@ -72,14 +70,11 @@ typedef struct tlc_core_hold_layer {
 typedef struct tlc_core_location_cache_entry {
     atomic_uint_fast64_t seq;
     atomic_uint_fast64_t key_hash;
+    atomic_uint_fast64_t key_fingerprint;
     atomic_uint_fast32_t key_len;
-    atomic_uint_fast32_t region_id;
     atomic_uint_fast32_t region_index;
     atomic_uint_fast32_t local_slot;
-    atomic_uint_fast32_t bytes;
-    atomic_uint_fast64_t offset;
     atomic_uint_fast64_t owner_generation;
-    atomic_uint_fast64_t key_words[TLC_CORE_LOCATION_CACHE_KEY_WORDS];
 } tlc_core_location_cache_entry_t;
 
 typedef struct tlc_core_location_cache {
@@ -560,6 +555,7 @@ static void location_cache_put(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                const tlc_warm_location_t *location);
+static uint64_t key_fingerprint(const char *key, uint32_t key_len);
 
 static void key_meta_set_tombstone_locked(tlc_core_t *core,
                                           tlc_core_key_meta_entry_t *meta,
@@ -645,20 +641,6 @@ static int32_t hot_get(tlc_core_t *core, uint64_t key_hash) {
     return -1;
 }
 
-static uint64_t location_cache_key_word(const char *key,
-                                        uint32_t key_len,
-                                        uint32_t word_index) {
-    uint64_t word = 0;
-    uint32_t off = word_index * (uint32_t)sizeof(uint64_t);
-    if (off >= key_len)
-        return 0;
-    uint32_t bytes = key_len - off;
-    if (bytes > sizeof(uint64_t))
-        bytes = sizeof(uint64_t);
-    memcpy(&word, key + off, bytes);
-    return word;
-}
-
 static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
     uint64_t target = requested_capacity ?
         (uint64_t)requested_capacity * 2u :
@@ -677,15 +659,11 @@ static int location_cache_init(tlc_core_t *core, uint32_t requested_capacity) {
         tlc_core_location_cache_entry_t *entry = &cache->entries[i];
         atomic_init(&entry->seq, SEQLOCK_EMPTY);
         atomic_init(&entry->key_hash, 0);
+        atomic_init(&entry->key_fingerprint, 0);
         atomic_init(&entry->key_len, 0);
-        atomic_init(&entry->region_id, TLC_CORE_INVALID_REGION_ID);
         atomic_init(&entry->region_index, UINT32_MAX);
         atomic_init(&entry->local_slot, TLC_CORE_INVALID_SLOT);
-        atomic_init(&entry->bytes, 0);
-        atomic_init(&entry->offset, 0);
         atomic_init(&entry->owner_generation, 0);
-        for (uint32_t w = 0; w < TLC_CORE_LOCATION_CACHE_KEY_WORDS; w++)
-            atomic_init(&entry->key_words[w], 0);
     }
     return 0;
 }
@@ -703,20 +681,12 @@ static int location_cache_entry_key_matches(
         const char *key,
         uint32_t key_len,
         uint64_t key_hash) {
+    uint64_t fp = key_fingerprint(key, key_len);
     if (atomic_load_explicit(&entry->key_hash, memory_order_relaxed) != key_hash ||
-        atomic_load_explicit(&entry->key_len, memory_order_relaxed) != key_len) {
+        atomic_load_explicit(&entry->key_len, memory_order_relaxed) != key_len ||
+        atomic_load_explicit(&entry->key_fingerprint,
+                             memory_order_relaxed) != fp) {
         return 0;
-    }
-    uint32_t words =
-        (key_len + (uint32_t)sizeof(uint64_t) - 1u) /
-        (uint32_t)sizeof(uint64_t);
-    for (uint32_t i = 0; i < words; i++) {
-        uint64_t want = location_cache_key_word(key, key_len, i);
-        uint64_t got =
-            atomic_load_explicit(&entry->key_words[i],
-                                 memory_order_relaxed);
-        if (got != want)
-            return 0;
     }
     return 1;
 }
@@ -748,17 +718,14 @@ static void location_cache_store_entry(tlc_core_location_cache_entry_t *entry,
     if (location_cache_try_begin_write(entry, &seq) != 0)
         return;
 
-    uint32_t words = (key_len + (uint32_t)sizeof(uint64_t) - 1u) / (uint32_t)sizeof(uint64_t);
-    for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_KEY_WORDS; i++) {
-        uint64_t word = i < words ?  location_cache_key_word(key, key_len, i) : 0;
-        atomic_store_explicit(&entry->key_words[i], word, memory_order_relaxed);
-    }
-    atomic_store_explicit(&entry->region_id, location->region_id, memory_order_relaxed);
+    atomic_store_explicit(&entry->key_fingerprint,
+                          key_fingerprint(key, key_len),
+                          memory_order_relaxed);
     atomic_store_explicit(&entry->region_index, location->region_index, memory_order_relaxed);
     atomic_store_explicit(&entry->local_slot, location->local_slot, memory_order_relaxed);
-    atomic_store_explicit(&entry->bytes, location->bytes, memory_order_relaxed);
-    atomic_store_explicit(&entry->offset, location->offset, memory_order_relaxed);
-    atomic_store_explicit(&entry->owner_generation, location->owner_generation, memory_order_relaxed);
+    atomic_store_explicit(&entry->owner_generation,
+                          location->owner_generation,
+                          memory_order_relaxed);
     atomic_store_explicit(&entry->key_hash, key_hash, memory_order_relaxed);
     atomic_store_explicit(&entry->key_len, key_len, memory_order_relaxed);
     atomic_store_explicit(&entry->seq, seq + SEQLOCK_VERSION_STEP, memory_order_release);
@@ -794,6 +761,28 @@ static void location_cache_put(tlc_core_t *core,
         }
     }
     location_cache_store_entry(victim, key, key_len, key_hash, location);
+}
+
+static int location_cache_fill_hint(tlc_core_t *core,
+                                    uint32_t region_index,
+                                    uint32_t local_slot,
+                                    uint64_t owner_generation,
+                                    tlc_warm_location_t *location) {
+    tlc_core_warm_region_runtime_t *region =
+        warm_region_by_index(&core->warm, region_index);
+    RETURN_IF(!region ||
+              local_slot >= region->capacity_slots ||
+              !location,
+              -1);
+    *location = (tlc_warm_location_t){
+        .region_id = region->region_id,
+        .region_index = region_index,
+        .local_slot = local_slot,
+        .bytes = core->value_size,
+        .offset = (uint64_t)local_slot * region->value_size,
+        .owner_generation = owner_generation,
+    };
+    return 0;
 }
 
 static int warm_regions_init(tlc_core_t *core, const tlc_core_config_t *config) {
@@ -995,6 +984,12 @@ typedef struct warm_slot_snapshot {
     uint64_t key_fingerprint;
 } warm_slot_snapshot_t;
 
+typedef struct warm_slot_read_snapshot_fast {
+    uint64_t stable_seq;
+    uint64_t owner_generation;
+    uint64_t key_hash;
+} warm_slot_read_snapshot_fast_t;
+
 static void warm_slot_record_read_access(vemb_v16_warm_slot_meta_t *slot_meta) {
 #if TLC_CORE_ALLOW_LRU_EVICTION
     uint32_t clock_bit = atomic_load_explicit(&slot_meta->clock_bit, memory_order_relaxed);
@@ -1038,6 +1033,28 @@ static tlc_core_warm_verify_rc_t warm_slot_read_snapshot(
     return TLC_CORE_WARM_VERIFY_OK;
 }
 
+// Fast read snapshot for the hot copy path; keep only the fields needed to
+// validate a location hint before/after payload copy.
+static tlc_core_warm_verify_rc_t warm_slot_read_snapshot_fast(
+                                  vemb_v16_warm_slot_meta_t *slot_meta,
+                                  warm_slot_read_snapshot_fast_t *snapshot) {
+    uint32_t state = atomic_load_explicit(&slot_meta->state, memory_order_acquire);
+    if (state != VEMB_V16_WARM_SLOT_READY)
+        return TLC_CORE_WARM_VERIFY_MISS;
+    uint64_t seq1 = atomic_load_explicit(&slot_meta->write_seq, memory_order_acquire);
+    if (seqlock_seq_is_writing(seq1))
+        return TLC_CORE_WARM_VERIFY_BUSY;
+    snapshot->stable_seq = seq1;
+    snapshot->owner_generation =
+        atomic_load_explicit(&slot_meta->owner_generation, memory_order_relaxed);
+    snapshot->key_hash = slot_meta->key_hash;
+    atomic_thread_fence(memory_order_acquire);
+    uint64_t seq2 = atomic_load_explicit(&slot_meta->write_seq, memory_order_acquire);
+    if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
+        return TLC_CORE_WARM_VERIFY_BUSY;
+    return TLC_CORE_WARM_VERIFY_OK;
+}
+
 static int warm_slot_snapshot_matches(const warm_slot_snapshot_t *snapshot,
                                       uint64_t key_hash,
                                       uint64_t fp,
@@ -1060,8 +1077,7 @@ static void warm_slot_write_commit(
         const void *value,
         uint32_t value_size) {
     atomic_fetch_add_explicit(&slot_meta->owner_generation, 1, memory_order_acq_rel);
-    slot_meta->region_id = region->region_id;
-    slot_meta->local_slot = slot;
+    slot_meta->reserved0 = 0;
     slot_meta->bytes = value_size;
     slot_meta->key_hash = key_hash;
     slot_meta->key_fingerprint = fp;
@@ -1149,74 +1165,6 @@ static int resolve_warm_region_for_location(
     return 0;
 }
 
-static int location_cache_validate_location(tlc_core_t *core,
-                                            uint64_t key_hash,
-                                            const tlc_warm_location_t *cached,
-                                            tlc_warm_location_t *location) {
-    tlc_core_warm_region_runtime_t *region = NULL;
-    uint32_t region_index = UINT32_MAX;
-    if (resolve_warm_region_for_location(core,
-                                         cached,
-                                         &region,
-                                         &region_index) != 0) {
-        return -1;
-    }
-
-    for (uint32_t attempt = 0; attempt < TLC_CORE_WARM_BUSY_RETRIES; attempt++) {
-        tlc_core_warm_verify_rc_t rc = warm_slot_probe_status(
-                                          region,
-                                          region_index,
-                                          cached->local_slot,
-                                          key_hash,
-                                          0,
-                                          cached->bytes,
-                                          cached->owner_generation,
-                                          location);
-        if (rc == TLC_CORE_WARM_VERIFY_OK)
-            return 0;
-        if (rc != TLC_CORE_WARM_VERIFY_BUSY)
-            return -1;
-        cpu_relax();
-    }
-    return -1;
-}
-
-static int location_cache_get(tlc_core_t *core,
-                              const char *key,
-                              uint32_t key_len,
-                              uint64_t key_hash,
-                              tlc_warm_location_t *location) {
-    RETURN_IF(!key_valid(key, key_len) || !location, -1);
-
-    tlc_core_location_cache_t *cache = &core->location_cache;
-    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, cache->mask);
-    for (uint32_t i = 0; i < TLC_CORE_LOCATION_CACHE_PROBES; i++) {
-        tlc_core_location_cache_entry_t *entry = &cache->entries[(slot + i) & cache->mask];
-        uint64_t seq1 = atomic_load_explicit(&entry->seq, memory_order_acquire);
-        if (seq1 == SEQLOCK_EMPTY || seqlock_seq_is_writing(seq1))
-            continue;
-        if (!location_cache_entry_key_matches(entry, key, key_len, key_hash))
-            continue;
-
-        tlc_warm_location_t cached = {
-            .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
-            .region_index = atomic_load_explicit(&entry->region_index, memory_order_relaxed),
-            .local_slot = atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
-            .bytes = atomic_load_explicit(&entry->bytes, memory_order_relaxed),
-            .offset = atomic_load_explicit(&entry->offset, memory_order_relaxed),
-            .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
-        };
-        uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
-        if (seq1 != seq2 || seqlock_seq_is_writing(seq2))
-            continue;
-        return (location_cache_validate_location(core,
-                                                 key_hash,
-                                                 &cached,
-                                                 location) == 0 ? 0 : -1);
-    }
-    return -1;
-}
-
 static int location_cache_peek(tlc_core_t *core,
                                const char *key,
                                uint32_t key_len,
@@ -1231,18 +1179,19 @@ static int location_cache_peek(tlc_core_t *core,
         if (seq1 == SEQLOCK_EMPTY || seqlock_seq_is_writing(seq1)) continue;
         if (!location_cache_entry_key_matches(entry, key, key_len, key_hash)) continue;
 
-        tlc_warm_location_t cached = {
-            .region_id = atomic_load_explicit(&entry->region_id, memory_order_relaxed),
-            .region_index = atomic_load_explicit(&entry->region_index, memory_order_relaxed),
-            .local_slot = atomic_load_explicit(&entry->local_slot, memory_order_relaxed),
-            .bytes = atomic_load_explicit(&entry->bytes, memory_order_relaxed),
-            .offset = atomic_load_explicit(&entry->offset, memory_order_relaxed),
-            .owner_generation = atomic_load_explicit(&entry->owner_generation, memory_order_relaxed),
-        };
+        uint32_t region_index =
+            atomic_load_explicit(&entry->region_index, memory_order_relaxed);
+        uint32_t local_slot =
+            atomic_load_explicit(&entry->local_slot, memory_order_relaxed);
+        uint64_t owner_generation =
+            atomic_load_explicit(&entry->owner_generation, memory_order_relaxed);
         uint64_t seq2 = atomic_load_explicit(&entry->seq, memory_order_acquire);
         if (seq1 != seq2 || seqlock_seq_is_writing(seq2)) continue;
-        *location = cached;
-        return 0;
+        return location_cache_fill_hint(core,
+                                        region_index,
+                                        local_slot,
+                                        owner_generation,
+                                        location);
     }
     return -1;
 }
@@ -1620,76 +1569,77 @@ static int warm_put(tlc_core_t *core,
     uint8_t tried[TLC_CORE_MAX_WARM_REGIONS] = {0};
     uint32_t attempted_regions = 0;
     uint32_t start = vnode_lower_bound(warm, vemb_v16_mix32_u64(key_hash));
-    for (uint32_t pass = 0; pass < 2; pass++) {
-        uint32_t want_local = pass == 0 ? 1u : 0u;
-        for (uint32_t i = 0; i < warm->vnode_count; i++) {
-            uint32_t vnode_pos = (start + i) % warm->vnode_count;
-            uint32_t region_index = warm->vnodes[vnode_pos].region_index;
-            if (region_index >= warm->region_count || tried[region_index])
-                continue;
-            tlc_core_warm_region_runtime_t *region = &warm->regions[region_index];
-            if ((region->is_local ? 1u : 0u) != want_local)
-                continue;
-            tried[region_index] = 1;
-            attempted_regions++;
-            if (!region->mapped_addr || value_size != region->value_size) continue;
-            if (warm_place_in_region(region, core, region_index, key_hash, fp,
-                                     value, value_size, location) == 0) {
-                atomic_fetch_add_explicit(region->is_local ?
-                                          &core->warm_alloc_local :
-                                          &core->warm_alloc_remote,
-                                          1, memory_order_relaxed);
-                if (attempted_regions > 1) {
-                    atomic_fetch_add_explicit(&core->warm_alloc_fallback,
-                                              1, memory_order_relaxed);
-                }
-                return 0;
-            }
-            serverLog(LL_NOTICE,
-                      "tlc warm region switch: reason=%s key_hash=%llu want_local=%u attempted_regions=%u vnode_pos=%u region_index=%u region_id=%u alloc_rc=%d capacity_slots=%u",
-                      "set_no_place",
-                      (unsigned long long)key_hash,
-                      want_local,
-                      attempted_regions,
-                      vnode_pos,
-                      region_index,
-                      region->region_id,
-                      VEMB_V16_WARM_REGION_SLOT_ACQUIRE_FULL,
-                      region->capacity_slots);
+    uint32_t runtime_count = warm_runtime_region_count(warm);
+    int has_local_region = 0;
+    for (uint32_t i = 0; i < warm->region_count; i++) {
+        if (warm->regions[i].is_local) {
+            has_local_region = 1;
+            break;
         }
-        uint32_t runtime_count = warm_runtime_region_count(warm);
+    }
+    if (!has_local_region) {
         for (uint32_t i = 0; i < runtime_count; i++) {
-            uint32_t region_index = warm->region_count + i;
-            tlc_core_warm_region_runtime_t *region = &warm->runtime_regions[i];
-            if ((region->is_local ? 1u : 0u) != want_local)
-                continue;
-            attempted_regions++;
-            if (!region->mapped_addr || value_size != region->value_size)
-                continue;
-            if (warm_place_in_region(region, core, region_index, key_hash, fp,
-                                     value, value_size, location) == 0) {
-                atomic_fetch_add_explicit(region->is_local ?
-                                          &core->warm_alloc_local :
-                                          &core->warm_alloc_remote,
-                                          1, memory_order_relaxed);
-                if (attempted_regions > 1) {
-                    atomic_fetch_add_explicit(&core->warm_alloc_fallback,
-                                              1, memory_order_relaxed);
-                }
-                return 0;
+            if (warm->runtime_regions[i].is_local) {
+                has_local_region = 1;
+                break;
             }
-            serverLog(LL_NOTICE,
-                      "tlc warm region switch: reason=%s key_hash=%llu want_local=%u attempted_regions=%u vnode_pos=%u region_index=%u region_id=%u alloc_rc=%d capacity_slots=%u",
-                      "set_no_place_runtime",
-                      (unsigned long long)key_hash,
-                      want_local,
-                      attempted_regions,
-                      i,
-                      region_index,
-                      region->region_id,
-                      VEMB_V16_WARM_REGION_SLOT_ACQUIRE_FULL,
-                      region->capacity_slots);
         }
+    }
+    for (uint32_t i = 0; i < warm->vnode_count; i++) {
+        uint32_t vnode_pos = (start + i) % warm->vnode_count;
+        uint32_t region_index = warm->vnodes[vnode_pos].region_index;
+        if (region_index >= warm->region_count || tried[region_index])
+            continue;
+        tlc_core_warm_region_runtime_t *region = &warm->regions[region_index];
+        if (has_local_region && !region->is_local)
+            continue;
+        tried[region_index] = 1;
+        attempted_regions++;
+        if (!region->mapped_addr || value_size != region->value_size)
+            continue;
+        if (warm_place_in_region(region, core, region_index, key_hash, fp,
+                                 value, value_size, location) == 0) {
+            atomic_fetch_add_explicit(&core->warm_alloc_local,
+                                      1,
+                                      memory_order_relaxed);
+            return 0;
+        }
+        serverLog(LL_NOTICE,
+                  "tlc warm region switch: reason=%s key_hash=%llu attempted_regions=%u vnode_pos=%u region_index=%u region_id=%u alloc_rc=%d capacity_slots=%u",
+                  "local_set_no_place",
+                  (unsigned long long)key_hash,
+                  attempted_regions,
+                  vnode_pos,
+                  region_index,
+                  region->region_id,
+                  VEMB_V16_WARM_REGION_SLOT_ACQUIRE_FULL,
+                  region->capacity_slots);
+    }
+    for (uint32_t i = 0; i < runtime_count; i++) {
+        uint32_t region_index = warm->region_count + i;
+        tlc_core_warm_region_runtime_t *region = &warm->runtime_regions[i];
+        if (has_local_region && !region->is_local)
+            continue;
+        attempted_regions++;
+        if (!region->mapped_addr || value_size != region->value_size)
+            continue;
+        if (warm_place_in_region(region, core, region_index, key_hash, fp,
+                                 value, value_size, location) == 0) {
+            atomic_fetch_add_explicit(&core->warm_alloc_local,
+                                      1,
+                                      memory_order_relaxed);
+            return 0;
+        }
+        serverLog(LL_NOTICE,
+                  "tlc warm region switch: reason=%s key_hash=%llu attempted_regions=%u runtime_region_index=%u region_index=%u region_id=%u alloc_rc=%d capacity_slots=%u",
+                  "local_set_no_place_runtime",
+                  (unsigned long long)key_hash,
+                  attempted_regions,
+                  i,
+                  region_index,
+                  region->region_id,
+                  VEMB_V16_WARM_REGION_SLOT_ACQUIRE_FULL,
+                  region->capacity_slots);
     }
     serverLog(LL_WARNING,
               "tlc warm put failed: key_hash=%llu key_len=%u value_size=%u attempted_regions=%u warm_capacity=%u",
@@ -1970,22 +1920,22 @@ int tlc_core_copy_warm_location_value(tlc_core_t *core,
     uint32_t attempts = retry_budget ? retry_budget : 1u;
     vemb_v16_warm_slot_meta_t *slot_meta = &region->slot_meta[location->local_slot];
     for (uint32_t attempt = 0; attempt < attempts; attempt++) {
-        warm_slot_snapshot_t snapshot;
-        tlc_core_warm_verify_rc_t rc = warm_slot_read_snapshot(slot_meta, &snapshot);
+        warm_slot_read_snapshot_fast_t snapshot;
+        tlc_core_warm_verify_rc_t rc = warm_slot_read_snapshot_fast(slot_meta, &snapshot);
         if (rc == TLC_CORE_WARM_VERIFY_BUSY) {
             cpu_relax();
             continue;
         }
         if (rc != TLC_CORE_WARM_VERIFY_OK ||
-            !warm_slot_snapshot_matches(&snapshot,
-                                        key_hash,
-                                        0,
-                                        location->bytes,
-                                        location->owner_generation)) {
+            snapshot.key_hash != key_hash ||
+            (location->owner_generation != 0 &&
+             snapshot.owner_generation != location->owner_generation)) {
             break;
         }
 
-        sve_streaming_load_f32(region->mapped_addr + location->offset, value_out, location->bytes);
+        sve_streaming_load_f32(region->mapped_addr + location->offset,
+                               value_out,
+                               core->value_size);
         atomic_thread_fence(memory_order_acquire);
         uint64_t seq2 = atomic_load_explicit(&slot_meta->write_seq, memory_order_acquire);
         if (snapshot.stable_seq == seq2 && seqlock_seq_is_stable(seq2)) {
@@ -2123,9 +2073,6 @@ static int tlc_core_get_warm_location_raw(tlc_core_t *core,
                                           uint32_t key_len,
                                           uint64_t key_hash,
                                           tlc_warm_location_t *location) {
-    if (location_cache_get(core, key, key_len, key_hash, location) == 0) {
-        return 0;
-    }
     int32_t hot_idx = hot_get(core, key_hash);
     if (warm_validate_idx(core, hot_idx, key, key_len, key_hash, location) == 0) {
         goto found;
@@ -2166,11 +2113,11 @@ int tlc_core_get_warm_location(tlc_core_t *core,
     return 0;
 }
 
-int tlc_core_get_cached_warm_location(tlc_core_t *core,
-                                      const char *key,
-                                      uint32_t key_len,
-                                      uint64_t key_hash,
-                                      tlc_warm_location_t *location) {
+int tlc_core_get_warm_location_hint(tlc_core_t *core,
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    tlc_warm_location_t *location) {
     RETURN_IF(!key_valid(key, key_len), -1);
     RETURN_IF(key_meta_blocks_source_access(core, key, key_len, key_hash), -1);
     int rc = location_cache_peek(core, key, key_len, key_hash, location);
@@ -2996,7 +2943,7 @@ int tlc_core_validate_warm_location(tlc_core_t *core,
             uint32_t cold_state = atomic_load_explicit(
                         &slot_meta->cold_state, memory_order_acquire);
             serverLog(LL_NOTICE,
-                      "tlc diag stale warm location: key_hash=%llu location_region_id=%u location_region_index=%u location_slot=%u location_offset=%llu location_bytes=%u location_generation=%llu current_state=%u current_region_id=%u current_slot=%u current_key_hash=%llu current_fp=%llu current_bytes=%u current_generation=%llu current_write_seq=%llu current_cold_state=%u",
+                      "tlc diag stale warm location: key_hash=%llu location_region_id=%u location_region_index=%u location_slot=%u location_offset=%llu location_bytes=%u location_generation=%llu current_state=%u current_key_hash=%llu current_fp=%llu current_bytes=%u current_generation=%llu current_write_seq=%llu current_cold_state=%u",
                       (unsigned long long)key_hash,
                       location->region_id,
                       region_index,
@@ -3005,8 +2952,6 @@ int tlc_core_validate_warm_location(tlc_core_t *core,
                       location->bytes,
                       (unsigned long long)location->owner_generation,
                       state,
-                      slot_meta->region_id,
-                      slot_meta->local_slot,
                       (unsigned long long)slot_meta->key_hash,
                       (unsigned long long)slot_meta->key_fingerprint,
                       slot_meta->bytes,

@@ -44,11 +44,9 @@ struct vemb_v16_tlc_remote_meta_publisher {
     vemb_v16_tlc_t *tlc;
 };
 
-static atomic_uint_fast32_t remote_meta_stale_logs = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t remote_meta_async_drop_logs = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t remote_meta_publish_busy_logs = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t remote_meta_publish_evict_logs = ATOMIC_VAR_INIT(0);
-static atomic_uint_fast32_t remote_meta_set_conflict_logs = ATOMIC_VAR_INIT(0);
 
 struct vemb_v16_tlc_access_snapshot {
     atomic_uint_fast32_t refcount;
@@ -785,15 +783,15 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
     return 0;
 }
 
-int vemb_v16_tlc_get_cached_handle(vemb_v16_tlc_t *tlc,
-                                   const char *key,
-                                   uint32_t key_len,
-                                   uint64_t key_hash,
-                                   vemb_v16_vector_handle_t *handle,
-                                   uint32_t *warm_slot) {
+int vemb_v16_tlc_get_handle_hint(vemb_v16_tlc_t *tlc,
+                                 const char *key,
+                                 uint32_t key_len,
+                                 uint64_t key_hash,
+                                 vemb_v16_vector_handle_t *handle,
+                                 uint32_t *warm_slot) {
     tlc_warm_location_t location = {0};
-    if (tlc_core_get_cached_warm_location(tlc->core, key, key_len,
-                                          key_hash, &location) != 0) {
+    if (tlc_core_get_warm_location_hint(tlc->core, key, key_len,
+                                        key_hash, &location) != 0) {
         return -1;
     }
     if (warm_slot) *warm_slot = location.local_slot;
@@ -899,36 +897,6 @@ void vemb_v16_tlc_set_owner_resolver(vemb_v16_tlc_t *tlc,
                                      void *arg) {
     tlc->owner_resolver = resolver;
     tlc->owner_resolver_arg = arg;
-}
-
-static vemb_v16_remote_meta_view_t *remote_meta_view_for_key(
-        vemb_v16_tlc_t *tlc,
-        vemb_v16_tlc_access_snapshot_t *snapshot,
-        const char *key,
-        uint32_t key_len,
-        uint64_t key_hash) {
-    RETURN_IF(!snapshot || snapshot->remote_meta_view_count == 0, NULL);
-    uint32_t owner_id = tlc->owner_resolver(key_hash,
-                                            key,
-                                            key_len,
-                                            tlc->owner_resolver_arg);
-    for (uint32_t i = 0; i < snapshot->remote_meta_view_count; i++) {
-        if (snapshot->remote_meta_views[i].owner_id == owner_id)
-            return snapshot->remote_meta_views[i].view;
-    }
-    return NULL;
-}
-
-static vemb_v16_remote_meta_view_t *remote_meta_view_for_owner(
-        vemb_v16_tlc_access_snapshot_t *snapshot,
-        uint32_t owner_id) {
-    if (!snapshot)
-        return NULL;
-    for (uint32_t i = 0; i < snapshot->remote_meta_view_count; i++) {
-        if (snapshot->remote_meta_views[i].owner_id == owner_id)
-            return snapshot->remote_meta_views[i].view;
-    }
-    return NULL;
 }
 
 uint32_t vemb_v16_tlc_flush_remote_meta_publishes(vemb_v16_tlc_t *tlc,
@@ -1632,135 +1600,6 @@ int vemb_v16_tlc_migration_rpc_local_handler(
     return 0;
 }
 
-static int validate_remote_handle(vemb_v16_tlc_t *tlc,
-                                  uint64_t key_hash,
-                                  const vemb_v16_vector_handle_t *candidate) {
-    tlc_warm_location_t location = {
-        .region_id = candidate->region_id,
-        .region_index = UINT32_MAX,
-        .local_slot = candidate->local_slot,
-        .bytes = candidate->bytes,
-        .offset = candidate->offset,
-        .owner_generation = candidate->owner_generation,
-    };
-    return tlc_core_validate_warm_location(tlc->core, key_hash, &location);
-}
-
-static int repair_remote_meta_async(vemb_v16_tlc_t *tlc,
-                                    uint32_t owner_id,
-                                    const char *key,
-                                    uint32_t key_len,
-                                    uint64_t key_hash,
-                                    const vemb_v16_vector_handle_t *handle) {
-    vemb_v16_tlc_access_snapshot_t *snapshot = access_snapshot_acquire(tlc);
-    vemb_v16_remote_meta_view_t *target_view =
-        remote_meta_view_for_owner(snapshot, owner_id);
-    int rc = enqueue_remote_meta_publish(tlc,
-                                         target_view,
-                                         key,
-                                         key_len,
-                                         key_hash,
-                                         handle,
-                                         1);
-    access_snapshot_release(snapshot);
-    return rc;
-}
-
-static int lookup_vsim_key2_via_rpc(vemb_v16_tlc_t *tlc,
-                                    vemb_v16_tlc_access_snapshot_t *snapshot,
-                                    uint32_t local_owner_id,
-                                    uint32_t owner_id,
-                                    const char *key2,
-                                    uint32_t key2_len,
-                                    uint64_t key2_hash,
-                                    vemb_v16_vector_handle_t *handle,
-                                    vemb_v16_tlc_lookup_source_t *source) {
-    RETURN_IF(!snapshot || !snapshot->lookup_rpc ||
-              owner_id == local_owner_id ||
-              !key2 || key2_len == 0 || key2_len > VEMB_V16_MAX_KEY_LEN,
-              -1);
-    vemb_v16_ub_lookup_rpc_req_t req = {
-        .request_id = atomic_fetch_add_explicit(
-            &tlc->ub_lookup_rpc_next_request_id,
-            1,
-            memory_order_relaxed),
-        .src_owner_id = local_owner_id,
-        .dst_owner_id = owner_id,
-        .op = VEMB_V16_UB_LOOKUP_RPC_LOOKUP_HANDLE,
-        .flags = 0,
-        .key_hash = key2_hash,
-        .key_len = key2_len,
-        .timeout_ns = 0,
-    };
-    memcpy(req.key, key2, key2_len);
-    vemb_v16_ub_lookup_rpc_resp_t resp = {0};
-    uint64_t rpc_start = vemb_v16_monotonic_ns();
-    tlc_counter_add(&tlc->ub_lookup_rpc_count, 1);
-    int rc = snapshot->lookup_rpc(snapshot->lookup_rpc_arg, &req, &resp);
-    tlc_counter_add(&tlc->ub_lookup_rpc_ns,
-                    vemb_v16_monotonic_ns() - rpc_start);
-    if (rc != 0) {
-        tlc_counter_add(&tlc->ub_lookup_rpc_error, 1);
-        return -1;
-    }
-    if (resp.status == VEMB_V16_UB_LOOKUP_RPC_NOT_FOUND) {
-        tlc_counter_add(&tlc->ub_lookup_rpc_not_found, 1);
-        return -1;
-    }
-    if (resp.status == VEMB_V16_UB_LOOKUP_RPC_BUSY) {
-        tlc_counter_add(&tlc->ub_lookup_rpc_busy, 1);
-        return -1;
-    }
-    if (resp.status == VEMB_V16_UB_LOOKUP_RPC_TIMEOUT) {
-        tlc_counter_add(&tlc->ub_lookup_rpc_timeout, 1);
-        return -1;
-    }
-    if (resp.status != VEMB_V16_UB_LOOKUP_RPC_OK ||
-        resp.key_hash != key2_hash) {
-        tlc_counter_add(&tlc->ub_lookup_rpc_error, 1);
-        return -1;
-    }
-    tlc_counter_add(&tlc->ub_lookup_rpc_ok, 1);
-
-    if (resp.kind == VEMB_V16_UB_LOOKUP_RPC_KIND_HANDLE) {
-        tlc_counter_add(&tlc->ub_lookup_rpc_handle, 1);
-        vemb_v16_vector_handle_t candidate = {
-            .region_id = resp.region_id,
-            .bytes = resp.bytes,
-            .local_slot = resp.local_slot,
-            .offset = resp.offset,
-            .key_hash = key2_hash,
-            .owner_generation = resp.owner_generation,
-        };
-        if (validate_remote_handle(tlc, key2_hash, &candidate) != 0) {
-            tlc_core_note_remote_meta_stale(tlc->core);
-            if (tlc_log_should(&remote_meta_stale_logs)) {
-                serverLog(LL_NOTICE,
-                          "vemb_v16 ub rpc handle stale: owner=%u key_hash=%llu region=%u slot=%u generation=%llu",
-                          owner_id,
-                          (unsigned long long)key2_hash,
-                          candidate.region_id,
-                          candidate.local_slot,
-                          (unsigned long long)candidate.owner_generation);
-            }
-            return -1;
-        }
-        *handle = candidate;
-        *source = VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC;
-        (void)repair_remote_meta_async(tlc,
-                                       owner_id,
-                                       key2,
-                                       key2_len,
-                                       key2_hash,
-                                       &candidate);
-        return 0;
-    }
-    if (resp.kind == VEMB_V16_UB_LOOKUP_RPC_KIND_SNAPSHOT)
-        tlc_counter_add(&tlc->ub_lookup_rpc_snapshot, 1);
-    tlc_counter_add(&tlc->ub_lookup_rpc_error, 1);
-    return -1;
-}
-
 int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   const char *key2,
                                   uint32_t key2_len,
@@ -1771,135 +1610,32 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
     *source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
     memset(timing, 0, sizeof(*timing));
 
-    vemb_v16_tlc_access_snapshot_t *snapshot = access_snapshot_acquire(tlc);
-    int try_local = 1;
-    uint32_t owner_id = UINT32_MAX;
-    uint32_t local_owner_id = UINT32_MAX;
-    vemb_v16_remote_meta_view_t *remote_meta = NULL;
-    if (snapshot &&
-        snapshot->remote_meta_view_count > 0 &&
-        tlc->owner_resolver &&
-        tlc->remote_meta_view) {
-        owner_id = tlc->owner_resolver(key2_hash,
-                                       key2,
-                                       key2_len,
-                                       tlc->owner_resolver_arg);
-        local_owner_id = tlc->remote_meta_view->header->owner_supernode_id;
-        remote_meta = remote_meta_view_for_owner(snapshot, owner_id);
-        try_local = owner_id == local_owner_id;
-    }
-
     uint64_t stage_start = vemb_v16_monotonic_ns();
-    if (try_local &&
-        vemb_v16_tlc_get_handle(tlc,
+    if (vemb_v16_tlc_get_handle_hint(tlc,
+                                     key2,
+                                     key2_len,
+                                     key2_hash,
+                                     handle,
+                                     NULL) == 0) {
+        timing->local_lookup_count = 1;
+        timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
+        *source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
+        return 0;
+    }
+    timing->local_lookup_count = 1;
+    timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
+    stage_start = vemb_v16_monotonic_ns();
+    if (vemb_v16_tlc_get_handle(tlc,
                                 key2,
                                 key2_len,
                                 key2_hash,
                                 handle,
                                 NULL) == 0) {
-        timing->local_lookup_count = 1;
-        timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
+        timing->local_lookup_ns += vemb_v16_monotonic_ns() - stage_start;
         *source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
-        access_snapshot_release(snapshot);
         return 0;
     }
-    timing->local_lookup_count = 1;
-    timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
-
-    if (!remote_meta)
-        remote_meta = remote_meta_view_for_key(tlc,
-                                               snapshot,
-                                               key2,
-                                               key2_len,
-                                               key2_hash);
-    if (remote_meta) {
-        vemb_v16_remote_meta_handle_t remote_handle = {0};
-        vemb_v16_remote_meta_lookup_result_t lookup_result = {0};
-        stage_start = vemb_v16_monotonic_ns();
-        int remote_rc = vemb_v16_remote_meta_lookup_with_result(
-            remote_meta,
-            key2,
-            key2_len,
-            key2_hash,
-            tlc->remote_meta_retry_budget,
-            &remote_handle,
-            &lookup_result);
-        timing->remote_meta_lookup_count = 1;
-        timing->remote_meta_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
-        tlc_counter_add(&tlc->remote_meta_lookup_way_probe, lookup_result.probes);
-        if (remote_rc == VEMB_V16_REMOTE_META_OK) {
-            tlc_counter_add(&tlc->remote_meta_lookup_hit, 1);
-            vemb_v16_vector_handle_t candidate = {
-                .region_id = remote_handle.region_id,
-                .bytes = remote_handle.bytes,
-                .local_slot = remote_handle.local_slot,
-                .offset = remote_handle.offset,
-                .key_hash = key2_hash,
-                .owner_generation = remote_handle.owner_generation,
-            };
-            if (validate_remote_handle(tlc, key2_hash, &candidate) != 0) {
-                tlc_core_note_remote_meta_stale(tlc->core);
-                if (tlc_log_should(&remote_meta_stale_logs)) {
-                    serverLog(LL_NOTICE,
-                              "vemb_v16 remote_meta stale: owner=%u key_hash=%llu region=%u slot=%u generation=%llu",
-                              owner_id,
-                              (unsigned long long)key2_hash,
-                              candidate.region_id,
-                              candidate.local_slot,
-                              (unsigned long long)candidate.owner_generation);
-                }
-                if (lookup_vsim_key2_via_rpc(tlc,
-                                             snapshot,
-                                             local_owner_id,
-                                             owner_id,
-                                             key2,
-                                             key2_len,
-                                             key2_hash,
-                                             handle,
-                                             source) == 0) {
-                    access_snapshot_release(snapshot);
-                    return 0;
-                }
-                access_snapshot_release(snapshot);
-                return -1;
-            }
-            *handle = candidate;
-            *source = VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE;
-            access_snapshot_release(snapshot);
-            return 0;
-        } else if (remote_rc == VEMB_V16_REMOTE_META_BUSY) {
-            tlc_counter_add(&tlc->remote_meta_lookup_busy, 1);
-        } else {
-            tlc_counter_add(&tlc->remote_meta_lookup_miss, 1);
-            if (remote_meta->header->ways &&
-                lookup_result.probes >= remote_meta->header->ways) {
-                tlc_counter_add(&tlc->remote_meta_lookup_set_conflict, 1);
-                if (tlc_log_should(&remote_meta_set_conflict_logs)) {
-                    serverLog(LL_NOTICE,
-                              "vemb_v16 remote_meta set conflict miss: owner=%u key_hash=%llu set=%u probes=%u ways=%u",
-                              remote_meta->header->owner_supernode_id,
-                              (unsigned long long)key2_hash,
-                              lookup_result.set_id,
-                              lookup_result.probes,
-                              remote_meta->header->ways);
-                }
-            }
-        }
-    }
-
-    if (lookup_vsim_key2_via_rpc(tlc,
-                                 snapshot,
-                                 local_owner_id,
-                                 owner_id,
-                                 key2,
-                                 key2_len,
-                                 key2_hash,
-                                 handle,
-                                 source) == 0) {
-        access_snapshot_release(snapshot);
-        return 0;
-    }
-    access_snapshot_release(snapshot);
+    timing->local_lookup_ns += vemb_v16_monotonic_ns() - stage_start;
     return -1;
 }
 

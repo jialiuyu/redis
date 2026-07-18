@@ -159,11 +159,14 @@ int tlc_core_get_warm_location(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                tlc_warm_location_t *location);
-int tlc_core_get_cached_warm_location(tlc_core_t *core,
-                                      const char *key,
-                                      uint32_t key_len,
-                                      uint64_t key_hash,
-                                      tlc_warm_location_t *location);
+/* Hint-only cache lookup. Callers must tolerate stale results and validate
+ * before dereferencing payload on correctness-sensitive paths.
+ */
+int tlc_core_get_warm_location_hint(tlc_core_t *core,
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    tlc_warm_location_t *location);
 int tlc_core_put(tlc_core_t *core,
                  const char *key,
                  uint32_t key_len,

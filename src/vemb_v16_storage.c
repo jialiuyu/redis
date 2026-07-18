@@ -140,9 +140,8 @@ static void warm_region_layout_init_slot_meta(
     vemb_v16_warm_slot_meta_t *slots =
         vemb_v16_warm_region_slot_meta(header);
     memset(slots, 0, sizeof(*slots) * capacity_slots);
+    (void)region_id;
     for (uint32_t slot = 0; slot < capacity_slots; slot++) {
-        slots[slot].region_id = region_id;
-        slots[slot].local_slot = slot;
         atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
         atomic_init(&slots[slot].owner_generation, 0);
         atomic_init(&slots[slot].write_seq, 0);

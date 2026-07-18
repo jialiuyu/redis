@@ -182,11 +182,6 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
     RETURN_IF(op != VEMB_V16_OP_VEMB_INLINE, -1);
     completion->inline_vector = completion_alloc_inline_snapshot(vector_bytes);
     RETURN_IF(!completion->inline_vector, -1);
-    /*
-     * Release may run on the copy-failed path below, so publish the snapshot
-     * length as soon as the snapshot exists instead of waiting for load
-     * success.
-     */
     completion->inline_vector_bytes = vector_bytes;
 
     uint32_t vector_len = 0;
@@ -377,12 +372,12 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
     }
 
     if (needs_payload_snapshot &&
-        vemb_v16_tlc_get_cached_handle(tlc,
-                                       vemb_job->key,
-                                       vemb_job->key_len,
-                                       job->key_hash,
-                                       &handle,
-                                       &warm_slot) == 0) {
+        vemb_v16_tlc_get_handle_hint(tlc,
+                                     vemb_job->key,
+                                     vemb_job->key_len,
+                                     job->key_hash,
+                                     &handle,
+                                     &warm_slot) == 0) {
         lookup_ns = timing_acc_add_if_sampled(&primary_lookup,
                                               sample,
                                               lookup_start);
@@ -1003,25 +998,6 @@ void vemb_v16_supernode_handle_vadd_job(vemb_v16_supernode_ctx_t *ctx,
                                       handle.bytes);
                         }
                         err_reason = "delta_publish";
-                    }
-                    if (handle.bytes > 0 &&
-                        completion.status == VEMB_V16_STATUS_OK &&
-                        vemb_v16_tlc_remote_meta_owner_view_count(tlc) > 1 &&
-                        enqueue_remote_meta_publish(tlc,
-                                                    tlc->remote_meta_view,
-                                                    vadd_job->key,
-                                                    vadd_job->key_len,
-                                                    job->key_hash,
-                                                    &handle,
-                                                    0) != 0 &&
-                        diag_should_log_req(job->req_id)) {
-                        serverLog(LL_WARNING,
-                                  "vemb_v16 vadd remote meta publish enqueue failed: req_id=%u key_hash=%llu region_id=%u offset=%llu bytes=%u",
-                                  job->req_id,
-                                  (unsigned long long)job->key_hash,
-                                  handle.region_id,
-                                  (unsigned long long)handle.offset,
-                                  handle.bytes);
                     }
                 }
             }

@@ -45,9 +45,8 @@ static vemb_v16_warm_region_header_t *init_test_allocator_with_slot_meta(
     allocator->capacity_slots = capacity_slots;
     vemb_v16_warm_slot_meta_t *slots =
         vemb_v16_warm_region_slot_meta(allocator);
+    (void)region_id;
     for (uint32_t i = 0; i < capacity_slots; i++) {
-        slots[i].region_id = region_id;
-        slots[i].local_slot = i;
         atomic_init(&slots[i].state, VEMB_V16_WARM_SLOT_FREE);
         atomic_init(&slots[i].owner_generation, 0);
         atomic_init(&slots[i].write_seq, 0);
@@ -91,9 +90,8 @@ static vemb_v16_warm_slot_meta_t *tlc_ut_slot_meta_acquire(
         vemb_v16_warm_slot_meta_t *slots =
             calloc(capacity_slots, sizeof(*slots));
         assert(slots);
+        (void)region_id;
         for (uint32_t slot = 0; slot < capacity_slots; slot++) {
-            slots[slot].region_id = region_id;
-            slots[slot].local_slot = slot;
             atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
             atomic_init(&slots[slot].owner_generation, 0);
             atomic_init(&slots[slot].write_seq, 0);
@@ -758,7 +756,7 @@ static uint32_t collect_keys_for_region(uint32_t wanted_region_id,
     return found;
 }
 
-static void test_multi_region_local_full_fallback_and_overwrite(void) {
+static void test_multi_region_local_only_write_and_overwrite(void) {
     enum { dim = 2 };
     float local_region[dim * 1];
     float remote_region[dim * 4];
@@ -811,19 +809,18 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     assert(h1.offset == 0);
     assert(memcmp(local_region, first, sizeof(first)) == 0);
 
+#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(vemb_v16_tlc_put(tlc, local_keys[1], (uint32_t)strlen(local_keys[1]),
                             h2_hash, second, sizeof(second),
                             &h2, &warm_slot) == 0);
-#if TLC_CORE_ALLOW_LRU_EVICTION
     assert(h2.region_id == 1);
     assert(h2.offset == 0);
     assert(memcmp(local_region, second, sizeof(second)) == 0);
 #else
-    assert(h2.region_id == 2);
-    assert(h2.offset < sizeof(remote_region));
-    assert(memcmp((uint8_t *)remote_region + h2.offset,
-                  second,
-                  sizeof(second)) == 0);
+    assert(vemb_v16_tlc_put(tlc, local_keys[1], (uint32_t)strlen(local_keys[1]),
+                            h2_hash, second, sizeof(second),
+                            &h2, &warm_slot) != 0);
+    assert(memcmp(remote_region, (float[dim * 4]){0}, sizeof(remote_region)) == 0);
 #endif
 
     assert(vemb_v16_tlc_put(tlc, local_keys[0], (uint32_t)strlen(local_keys[0]),
@@ -840,8 +837,8 @@ static void test_multi_region_local_full_fallback_and_overwrite(void) {
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_multi_region_all_full_evicts_committed_warm(void) {
-    enum { dim = 2, max_vectors = 2 };
+static void test_multi_region_local_full_respects_local_only_write(void) {
+    enum { dim = 2 };
     float region1[dim];
     float region2[dim];
     float vector[dim];
@@ -871,39 +868,42 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     };
     vemb_v16_vector_handle_t handle = {0};
     uint32_t warm_slot = 0;
-    char key[32];
+    const char *key0 = "full:0";
+    const char *key1 = "full:1";
 
+    memset(region1, 0, sizeof(region1));
+    memset(region2, 0, sizeof(region2));
     init_test_allocator(&alloc1, 10, 1);
     init_test_allocator(&alloc2, 20, 1);
-    assert(vemb_v16_tlc_create(&tlc, dim, max_vectors,
+    assert(vemb_v16_tlc_create(&tlc, dim, 2,
                                     regions, 2, 8) == 0);
     fill_vector(vector, dim, 700);
-    for (uint32_t i = 0; i < max_vectors; i++) {
-        snprintf(key, sizeof(key), "full:%u", i);
-        uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
-        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
-                                vector, sizeof(vector),
-                                &handle, &warm_slot) == 0);
-        assert(handle.bytes == sizeof(vector));
-    }
+    uint64_t key0_hash = vemb_v16_xxh3_64_str(key0, strlen(key0));
+    uint64_t key1_hash = vemb_v16_xxh3_64_str(key1, strlen(key1));
+
+    assert(vemb_v16_tlc_put(tlc, key0, (uint32_t)strlen(key0), key0_hash,
+                            vector, sizeof(vector),
+                            &handle, &warm_slot) == 0);
+    assert(handle.region_id == 10);
+    assert(handle.bytes == sizeof(vector));
 
     memset(&handle, 0xff, sizeof(handle));
-    snprintf(key, sizeof(key), "full:%u", max_vectors);
-    uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
 #if TLC_CORE_ALLOW_LRU_EVICTION
-    assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+    assert(vemb_v16_tlc_put(tlc, key1, (uint32_t)strlen(key1), key1_hash,
                             vector, sizeof(vector),
                             &handle, &warm_slot) == 0);
     assert(warm_slot != UINT32_MAX);
     assert(handle.bytes == sizeof(vector));
+    assert(handle.region_id == 10);
     assert(handle.owner_generation >= 2);
     tlc_core_stats_t stats;
     tlc_core_get_stats(tlc->core, &stats);
     assert(stats.warm_region_count == 2);
     assert(stats.warm_region_full_count >= 1);
     assert(stats.warm_alloc_cold_spill == 0);
+    assert(stats.warm_alloc_remote == 0);
 #else
-    assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+    assert(vemb_v16_tlc_put(tlc, key1, (uint32_t)strlen(key1), key1_hash,
                             vector, sizeof(vector),
                             &handle, &warm_slot) != 0);
     tlc_core_stats_t stats;
@@ -911,7 +911,9 @@ static void test_multi_region_all_full_evicts_committed_warm(void) {
     assert(stats.warm_region_count == 2);
     assert(stats.warm_region_full_count >= 1);
     assert(stats.warm_eviction_success == 0);
+    assert(stats.warm_alloc_remote == 0);
 #endif
+    assert(memcmp(region2, (float[dim]){0}, sizeof(region2)) == 0);
     vemb_v16_tlc_destroy(tlc);
 }
 
@@ -1044,7 +1046,12 @@ static void test_vsim_key2_lookup_local_source(void) {
 static uint32_t fixed_owner_resolver(uint64_t key_hash,
                                      const char *key,
                                      uint32_t key_len,
-                                     void *arg);
+                                     void *arg) {
+    (void)key_hash;
+    (void)key;
+    (void)key_len;
+    return *(uint32_t *)arg;
+}
 
 static void test_vsim_key2_lookup_remote_source(void) {
     enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
@@ -1128,9 +1135,9 @@ static void test_vsim_key2_lookup_remote_source(void) {
                                          &remote_handle,
                                          &source,
                                          &timing) == 0);
-    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE);
+    assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL);
     assert(timing.local_lookup_count == 1);
-    assert(timing.remote_meta_lookup_count == 1);
+    assert(timing.remote_meta_lookup_count == 0);
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
@@ -1221,6 +1228,11 @@ static void test_remote_meta_async_publish_flush(void) {
     free(meta_base);
 }
 
+#if 0
+/* Legacy VSIM fallback coverage kept for reference only.
+ * Local Write + Global Read mode no longer routes active lookup flow through
+ * UB RPC fallback / remote-owner repair semantics in this unit suite.
+ */
 static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
     enum { dim = 2, max_vectors = 4, remote_entries = 4, remote_buckets = 8 };
     float region[dim * max_vectors];
@@ -2151,8 +2163,9 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     free(owner2_base);
     free(owner1_base);
 }
+#endif
 
-static void test_shared_slot_meta_local_set_before_remote(void) {
+static void test_local_regions_preferred_remote_ignored_for_normal_write(void) {
     enum { dim = 2, max_vectors = 6 };
     float local0[dim], local1[dim], remote[dim * 4];
     vemb_v16_warm_region_header_t alloc0, alloc1, alloc_remote;
@@ -2191,7 +2204,7 @@ static void test_shared_slot_meta_local_set_before_remote(void) {
     };
     float vector[dim];
     uint32_t local_writes = 0;
-    uint32_t remote_writes = 0;
+    uint32_t write_failures = 0;
 
     memset(local0, 0, sizeof(local0));
     memset(local1, 0, sizeof(local1));
@@ -2208,33 +2221,30 @@ static void test_shared_slot_meta_local_set_before_remote(void) {
         uint32_t warm_slot = UINT32_MAX;
         snprintf(key, sizeof(key), "local-first:%u", i);
         uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
-        assert(vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
-                                vector, sizeof(vector), &handle,
-                                &warm_slot) == 0);
-        if (handle.region_id == 100 || handle.region_id == 101)
-            local_writes++;
-        if (handle.region_id == 200)
-            remote_writes++;
+        if (vemb_v16_tlc_put(tlc, key, (uint32_t)strlen(key), key_hash,
+                             vector, sizeof(vector), &handle,
+                             &warm_slot) == 0) {
+            if (handle.region_id == 100 || handle.region_id == 101)
+                local_writes++;
+        } else {
+            write_failures++;
+        }
     }
 #if TLC_CORE_ALLOW_LRU_EVICTION
     assert(local_writes == 3);
-    assert(remote_writes == 0);
+    assert(write_failures == 0);
 #else
     assert(local_writes == 2);
-    assert(remote_writes == 1);
+    assert(write_failures == 1);
 #endif
     assert_region_stats(tlc, 100, 1, 1);
     assert_region_stats(tlc, 101, 1, 1);
-#if TLC_CORE_ALLOW_LRU_EVICTION
     assert_region_stats(tlc, 200, 0, 0);
-#else
-    assert_region_stats(tlc, 200, 1, 0);
-#endif
 
     vemb_v16_tlc_destroy(tlc);
 }
 
-static void test_runtime_attach_remote_region_after_create(void) {
+static void test_runtime_attach_remote_region_after_create_keeps_remote_read_only(void) {
     enum { dim = 2, max_vectors = 8 };
     float local_region[dim];
     float remote_region[dim * 4];
@@ -2293,19 +2303,18 @@ static void test_runtime_attach_remote_region_after_create(void) {
 
     {
         const char *key = "runtime-remote";
-        tlc_warm_location_t location = {0};
+        vemb_v16_vector_handle_t handle = {0};
+        uint32_t warm_slot = UINT32_MAX;
         uint64_t key_hash = vemb_v16_xxh3_64_str(key, strlen(key));
-        assert(tlc_core_put_location_epoch(tlc->core,
-                                           key,
-                                           (uint32_t)strlen(key),
-                                           key_hash,
-                                           vector,
-                                           sizeof(vector),
-                                           0,
-                                           0,
-                                           &location) == 0);
-        assert(location.region_id == 301);
-        assert_region_stats(tlc, 301, 1, 0);
+        assert(vemb_v16_tlc_put(tlc,
+                                key,
+                                (uint32_t)strlen(key),
+                                key_hash,
+                                vector,
+                                sizeof(vector),
+                                &handle,
+                                &warm_slot) != 0);
+        assert_region_stats(tlc, 301, 0, 0);
     }
 
     vemb_v16_tlc_destroy(tlc);
@@ -3474,20 +3483,14 @@ int main(void) {
     test_prefill_distribution_stays_warm();
 #endif
     test_concurrent_distinct_keys();
-    test_multi_region_local_full_fallback_and_overwrite();
-    test_multi_region_all_full_evicts_committed_warm();
+    test_multi_region_local_only_write_and_overwrite();
+    test_multi_region_local_full_respects_local_only_write();
     test_shared_slot_meta_two_tlcs_unique_slots();
     test_vsim_key2_lookup_local_source();
     test_vsim_key2_lookup_remote_source();
     test_remote_meta_async_publish_flush();
-    test_vsim_key2_lookup_rpc_fallback_and_repair();
-    test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair();
-    test_vsim_key2_lookup_ub_ring_rpc_concurrent();
-    test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict();
-    test_vsim_key2_lookup_remote_meta_stale();
-    test_vsim_key2_lookup_remote_owner_routing();
-    test_shared_slot_meta_local_set_before_remote();
-    test_runtime_attach_remote_region_after_create();
+    test_local_regions_preferred_remote_ignored_for_normal_write();
+    test_runtime_attach_remote_region_after_create_keeps_remote_read_only();
     test_migration_snapshot_apply_rejects_stale();
     test_put_with_epoch_rejects_stale_epoch();
     test_migration_source_cutover_rejects_old_owner_access();

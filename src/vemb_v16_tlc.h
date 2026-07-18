@@ -189,12 +189,12 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
                             uint64_t key_hash,
                             vemb_v16_vector_handle_t *handle,
                             uint32_t *warm_slot);
-int vemb_v16_tlc_get_cached_handle(vemb_v16_tlc_t *tlc,
-                                   const char *key,
-                                   uint32_t key_len,
-                                   uint64_t key_hash,
-                                   vemb_v16_vector_handle_t *handle,
-                                   uint32_t *warm_slot);
+int vemb_v16_tlc_get_handle_hint(vemb_v16_tlc_t *tlc,
+                                 const char *key,
+                                 uint32_t key_len,
+                                 uint64_t key_hash,
+                                 vemb_v16_vector_handle_t *handle,
+                                 uint32_t *warm_slot);
 int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   const char *key2,
                                   uint32_t key2_len,
