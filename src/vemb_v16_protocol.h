@@ -689,6 +689,16 @@ typedef struct vemb_v16_stats {
     uint64_t remote_meta_repair_enqueue;
     uint64_t remote_meta_repair_ok;
     uint64_t remote_meta_repair_drop;
+    uint64_t payload_cache_hit;
+    uint64_t payload_cache_miss;
+    uint64_t payload_cache_fill;
+    uint64_t payload_cache_update;
+    uint64_t payload_cache_evict;
+    uint64_t payload_cache_invalidate;
+    uint64_t payload_batch_leader;
+    uint64_t payload_batch_follower;
+    uint64_t payload_batch_wait_hit;
+    uint64_t payload_batch_wait_fallback;
     uint64_t warm_region_hash_local_pct;
     uint64_t moved_count;
     uint64_t stale_count;

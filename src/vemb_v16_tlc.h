@@ -17,6 +17,7 @@ typedef struct vemb_v16_remote_meta_view vemb_v16_remote_meta_view_t;
 typedef struct vemb_v16_tlc vemb_v16_tlc_t;
 typedef struct vemb_v16_tlc_remote_meta_publisher
     vemb_v16_tlc_remote_meta_publisher_t;
+typedef struct vemb_v16_payload_snapshot vemb_v16_payload_snapshot_t;
 typedef struct vemb_v16_ub_rpc vemb_v16_ub_rpc_t;
 typedef struct vemb_v16_tlc_access_snapshot
     vemb_v16_tlc_access_snapshot_t;
@@ -103,6 +104,32 @@ typedef struct vemb_v16_tlc_migration_progress {
     uint64_t barrier_seq;
 } vemb_v16_tlc_migration_progress_t;
 
+struct vemb_v16_payload_snapshot {
+    atomic_uint_fast32_t refcount;
+    uint32_t payload_bytes;
+    uint32_t reserved;
+    uint8_t payload[];
+};
+
+typedef struct vemb_v16_tlc_payload_cache_entry {
+    uint32_t occupied;
+    uint32_t key_len;
+    uint32_t vector_bytes;
+    uint32_t access_count;
+    uint64_t key_hash;
+    uint64_t owner_generation;
+    vemb_v16_payload_snapshot_t *snapshot;
+    char key[VEMB_V16_MAX_KEY_LEN];
+} vemb_v16_tlc_payload_cache_entry_t;
+
+typedef struct vemb_v16_tlc_payload_cache_shard {
+    pthread_mutex_t lock;
+    uint32_t lock_init;
+    uint32_t capacity;
+    uint32_t mask;
+    vemb_v16_tlc_payload_cache_entry_t *entries;
+} vemb_v16_tlc_payload_cache_shard_t;
+
 struct vemb_v16_tlc {
     uint32_t vector_dim;
     uint32_t value_size;
@@ -171,6 +198,18 @@ struct vemb_v16_tlc {
     atomic_uint_fast64_t remote_meta_repair_enqueue;
     atomic_uint_fast64_t remote_meta_repair_ok;
     atomic_uint_fast64_t remote_meta_repair_drop;
+    vemb_v16_tlc_payload_cache_shard_t *payload_cache_shards;
+    uint32_t payload_cache_shard_count;
+    atomic_uint_fast64_t payload_cache_hit;
+    atomic_uint_fast64_t payload_cache_miss;
+    atomic_uint_fast64_t payload_cache_fill;
+    atomic_uint_fast64_t payload_cache_update;
+    atomic_uint_fast64_t payload_cache_evict;
+    atomic_uint_fast64_t payload_cache_invalidate;
+    atomic_uint_fast64_t payload_batch_leader;
+    atomic_uint_fast64_t payload_batch_follower;
+    atomic_uint_fast64_t payload_batch_wait_hit;
+    atomic_uint_fast64_t payload_batch_wait_fallback;
 };
 
 int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
@@ -289,6 +328,39 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
                              void *dst,
                              uint32_t dst_bytes,
                              uint32_t *vector_bytes);
+int vemb_v16_tlc_acquire_payload_snapshot(
+    vemb_v16_tlc_t *tlc,
+    const char *key,
+    uint32_t key_len,
+    uint64_t key_hash,
+    const vemb_v16_vector_handle_t *handle,
+    uint32_t vector_bytes,
+    vemb_v16_payload_snapshot_t **snapshot_out);
+int vemb_v16_tlc_update_payload_cache(vemb_v16_tlc_t *tlc,
+                                      const char *key,
+                                      uint32_t key_len,
+                                      uint64_t key_hash,
+                                      const vemb_v16_vector_handle_t *handle,
+                                      const void *payload,
+                                      uint32_t vector_bytes);
+void vemb_v16_tlc_invalidate_payload_cache(vemb_v16_tlc_t *tlc,
+                                           const char *key,
+                                           uint32_t key_len,
+                                           uint64_t key_hash);
+vemb_v16_payload_snapshot_t *vemb_v16_payload_snapshot_create(
+    uint32_t payload_bytes);
+vemb_v16_payload_snapshot_t *vemb_v16_payload_snapshot_from_payload(
+    const uint8_t *payload);
+void vemb_v16_payload_snapshot_retain(vemb_v16_payload_snapshot_t *snapshot);
+void vemb_v16_payload_snapshot_release(vemb_v16_payload_snapshot_t *snapshot);
+static inline uint8_t *vemb_v16_payload_snapshot_payload(
+    vemb_v16_payload_snapshot_t *snapshot) {
+    return snapshot ? snapshot->payload : NULL;
+}
+static inline const uint8_t *vemb_v16_payload_snapshot_const_payload(
+    const vemb_v16_payload_snapshot_t *snapshot) {
+    return snapshot ? snapshot->payload : NULL;
+}
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats);
 

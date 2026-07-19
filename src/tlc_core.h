@@ -295,6 +295,16 @@ int tlc_core_copy_warm_location_value(tlc_core_t *core,
                                       void *value_out,
                                       uint32_t value_out_size,
                                       uint32_t retry_budget);
+int tlc_core_payload_batch_enter(tlc_core_t *core,
+                                 const char *key,
+                                 uint32_t key_len,
+                                 uint64_t key_hash,
+                                 int *is_leader);
+void tlc_core_payload_batch_leave(tlc_core_t *core,
+                                  const char *key,
+                                  uint32_t key_len,
+                                  uint64_t key_hash,
+                                  int is_leader);
 void tlc_core_note_remote_meta_stale(tlc_core_t *core);
 void tlc_core_get_stats(tlc_core_t *core, tlc_core_stats_t *stats);
 uint32_t tlc_core_get_region_stats(tlc_core_t *core,

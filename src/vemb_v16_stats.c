@@ -227,4 +227,14 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->remote_meta_repair_enqueue += src->remote_meta_repair_enqueue;
     dst->remote_meta_repair_ok += src->remote_meta_repair_ok;
     dst->remote_meta_repair_drop += src->remote_meta_repair_drop;
+    dst->payload_cache_hit += src->payload_cache_hit;
+    dst->payload_cache_miss += src->payload_cache_miss;
+    dst->payload_cache_fill += src->payload_cache_fill;
+    dst->payload_cache_update += src->payload_cache_update;
+    dst->payload_cache_evict += src->payload_cache_evict;
+    dst->payload_cache_invalidate += src->payload_cache_invalidate;
+    dst->payload_batch_leader += src->payload_batch_leader;
+    dst->payload_batch_follower += src->payload_batch_follower;
+    dst->payload_batch_wait_hit += src->payload_batch_wait_hit;
+    dst->payload_batch_wait_fallback += src->payload_batch_wait_fallback;
 }

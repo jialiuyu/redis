@@ -247,6 +247,17 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.bitmap_lock_success,
            (unsigned long long)stats.bitmap_lock_failure,
            (unsigned long long)stats.sample_vector_load_ns);
+    serverLog(LL_NOTICE, "vemb_v16 stats: payload_cache_hit=%llu payload_cache_miss=%llu payload_cache_fill=%llu payload_cache_update=%llu payload_cache_evict=%llu payload_cache_invalidate=%llu batch_leader=%llu batch_follower=%llu batch_wait_hit=%llu batch_wait_fallback=%llu",
+           (unsigned long long)stats.payload_cache_hit,
+           (unsigned long long)stats.payload_cache_miss,
+           (unsigned long long)stats.payload_cache_fill,
+           (unsigned long long)stats.payload_cache_update,
+           (unsigned long long)stats.payload_cache_evict,
+           (unsigned long long)stats.payload_cache_invalidate,
+           (unsigned long long)stats.payload_batch_leader,
+           (unsigned long long)stats.payload_batch_follower,
+           (unsigned long long)stats.payload_batch_wait_hit,
+           (unsigned long long)stats.payload_batch_wait_fallback);
     serverLog(LL_NOTICE, "vemb_v16 stats: migration moved=%llu stale=%llu ask=%llu forward=%llu duplicate=%llu source_gc=%llu gc_safe_watermark=%llu baseline_sent=%llu baseline_skipped=%llu baseline_error=%llu baseline_retry_queued=%llu baseline_retry_sent=%llu baseline_retry_pending=%llu",
            (unsigned long long)stats.moved_count,
            (unsigned long long)stats.stale_count,

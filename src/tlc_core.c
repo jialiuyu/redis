@@ -109,6 +109,8 @@ typedef struct tlc_core_key_meta_entry {
     uint32_t target_owner;
     uint32_t tombstone;
     uint32_t shard_id;
+    uint32_t payload_batch_active;
+    uint32_t payload_batch_waiters;
     tlc_warm_location_t location;
     char key[VEMB_V16_MAX_KEY_LEN];
 } tlc_core_key_meta_entry_t;
@@ -452,6 +454,8 @@ static void key_meta_init_entry_locked(tlc_core_key_meta_entry_t *entry,
     entry->target_owner = UINT32_MAX;
     entry->tombstone = 0;
     entry->shard_id = 0;
+    entry->payload_batch_active = 0;
+    entry->payload_batch_waiters = 0;
     entry->location = tlc_invalid_location;
 }
 
@@ -1988,6 +1992,62 @@ int tlc_core_create(tlc_core_t **out, const tlc_core_config_t *config) {
 
     *out = core;
     return 0;
+}
+
+int tlc_core_payload_batch_enter(tlc_core_t *core,
+                                 const char *key,
+                                 uint32_t key_len,
+                                 uint64_t key_hash,
+                                 int *is_leader) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !is_leader || !valid_key, -1);
+
+    *is_leader = 0;
+    tlc_core_key_meta_shard_t *shard =
+        key_meta_shard_for_hash(core, key_hash);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
+    if (!meta || meta->tombstone) {
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        return -1;
+    }
+    if (meta->payload_batch_active) {
+        meta->payload_batch_waiters++;
+        *is_leader = 0;
+    } else {
+        meta->payload_batch_active = 1;
+        meta->payload_batch_waiters = 0;
+        *is_leader = 1;
+    }
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+    return 0;
+}
+
+void tlc_core_payload_batch_leave(tlc_core_t *core,
+                                  const char *key,
+                                  uint32_t key_len,
+                                  uint64_t key_hash,
+                                  int is_leader) {
+    int valid_key = key_valid(key, key_len);
+    RETURN_IF(!core || !valid_key);
+
+    tlc_core_key_meta_shard_t *shard =
+        key_meta_shard_for_hash(core, key_hash);
+    bitmap_lock_blocking(&core->key_meta_locks, shard->lock_id);
+    tlc_core_key_meta_entry_t *meta =
+        key_meta_find_locked(core, key, key_len, key_hash, 0);
+    if (!meta) {
+        bitmap_unlock(&core->key_meta_locks, shard->lock_id);
+        return;
+    }
+    if (is_leader) {
+        meta->payload_batch_active = 0;
+        meta->payload_batch_waiters = 0;
+    } else if (meta->payload_batch_waiters > 0) {
+        meta->payload_batch_waiters--;
+    }
+    bitmap_unlock(&core->key_meta_locks, shard->lock_id);
 }
 
 int tlc_core_attach_warm_region(tlc_core_t *core,

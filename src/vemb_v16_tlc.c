@@ -16,6 +16,9 @@
 #define VEMB_V16_REMOTE_META_PUBLISH_QUEUE_CAP 1024u
 #define VEMB_V16_TLC_LOG_LIMIT 32u
 #define VEMB_V16_TLC_VECTOR_COPY_RETRIES 1024u
+#define VEMB_V16_TLC_PAYLOAD_CACHE_SHARDS 64u
+#define VEMB_V16_TLC_PAYLOAD_CACHE_MIN_SHARD_CAPACITY 16u
+#define VEMB_V16_TLC_PAYLOAD_BATCH_WAIT_SPINS 2048u
 
 typedef struct vemb_v16_remote_meta_publish_event {
     vemb_v16_remote_meta_view_t *target_view;
@@ -224,6 +227,38 @@ static uint64_t tlc_counter_load(atomic_uint_fast64_t *counter) {
     return atomic_load_explicit(counter, memory_order_relaxed);
 }
 
+vemb_v16_payload_snapshot_t *vemb_v16_payload_snapshot_create(
+        uint32_t payload_bytes) {
+    size_t alloc_bytes = sizeof(vemb_v16_payload_snapshot_t) + payload_bytes;
+    vemb_v16_payload_snapshot_t *snapshot = zmalloc(alloc_bytes);
+    RETURN_IF(!snapshot, NULL);
+    atomic_init(&snapshot->refcount, 1);
+    snapshot->payload_bytes = payload_bytes;
+    snapshot->reserved = 0;
+    return snapshot;
+}
+
+vemb_v16_payload_snapshot_t *vemb_v16_payload_snapshot_from_payload(
+        const uint8_t *payload) {
+    RETURN_IF(!payload, NULL);
+    return (vemb_v16_payload_snapshot_t *)(payload -
+        offsetof(vemb_v16_payload_snapshot_t, payload));
+}
+
+void vemb_v16_payload_snapshot_retain(vemb_v16_payload_snapshot_t *snapshot) {
+    RETURN_IF(!snapshot);
+    atomic_fetch_add_explicit(&snapshot->refcount, 1, memory_order_acq_rel);
+}
+
+void vemb_v16_payload_snapshot_release(vemb_v16_payload_snapshot_t *snapshot) {
+    RETURN_IF(!snapshot);
+    uint32_t prev = atomic_fetch_sub_explicit(&snapshot->refcount,
+                                              1,
+                                              memory_order_acq_rel);
+    if (prev == 1)
+        zfree(snapshot);
+}
+
 static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
     atomic_init(&tlc->ub_lookup_rpc_next_request_id, 1);
     atomic_init(&tlc->remote_meta_lookup_hit, 0);
@@ -252,6 +287,204 @@ static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
     atomic_init(&tlc->remote_meta_repair_enqueue, 0);
     atomic_init(&tlc->remote_meta_repair_ok, 0);
     atomic_init(&tlc->remote_meta_repair_drop, 0);
+    atomic_init(&tlc->payload_cache_hit, 0);
+    atomic_init(&tlc->payload_cache_miss, 0);
+    atomic_init(&tlc->payload_cache_fill, 0);
+    atomic_init(&tlc->payload_cache_update, 0);
+    atomic_init(&tlc->payload_cache_evict, 0);
+    atomic_init(&tlc->payload_cache_invalidate, 0);
+    atomic_init(&tlc->payload_batch_leader, 0);
+    atomic_init(&tlc->payload_batch_follower, 0);
+    atomic_init(&tlc->payload_batch_wait_hit, 0);
+    atomic_init(&tlc->payload_batch_wait_fallback, 0);
+}
+
+static int payload_cache_entry_matches(
+        const vemb_v16_tlc_payload_cache_entry_t *entry,
+        const char *key,
+        uint32_t key_len,
+        uint64_t key_hash) {
+    return entry->occupied &&
+           entry->key_hash == key_hash &&
+           entry->key_len == key_len &&
+           memcmp(entry->key, key, key_len) == 0;
+}
+
+static vemb_v16_tlc_payload_cache_shard_t *payload_cache_shard_for_hash(
+        vemb_v16_tlc_t *tlc,
+        uint64_t key_hash) {
+    uint32_t shard_index = vemb_v16_mix32_u64(key_hash) &
+        (tlc->payload_cache_shard_count - 1u);
+    return &tlc->payload_cache_shards[shard_index];
+}
+
+static int payload_cache_init(vemb_v16_tlc_t *tlc) {
+    uint32_t shard_count = VEMB_V16_TLC_PAYLOAD_CACHE_SHARDS;
+    uint64_t target_capacity = (uint64_t)tlc->max_vectors / 8u;
+    uint64_t per_shard_target = (target_capacity + shard_count - 1u) /
+        shard_count;
+    uint32_t shard_capacity = vemb_v16_pow2_ceil_u32(
+        (uint32_t)per_shard_target);
+    if (shard_capacity < VEMB_V16_TLC_PAYLOAD_CACHE_MIN_SHARD_CAPACITY)
+        shard_capacity = VEMB_V16_TLC_PAYLOAD_CACHE_MIN_SHARD_CAPACITY;
+
+    tlc->payload_cache_shards = zcalloc(sizeof(*tlc->payload_cache_shards) *
+                                        shard_count);
+    RETURN_IF(!tlc->payload_cache_shards, -1);
+    tlc->payload_cache_shard_count = shard_count;
+    for (uint32_t i = 0; i < shard_count; i++) {
+        vemb_v16_tlc_payload_cache_shard_t *shard =
+            &tlc->payload_cache_shards[i];
+        shard->entries = zcalloc(sizeof(*shard->entries) * shard_capacity);
+        if (!shard->entries)
+            return -1;
+        if (pthread_mutex_init(&shard->lock, NULL) != 0)
+            return -1;
+        shard->lock_init = 1;
+        shard->capacity = shard_capacity;
+        shard->mask = shard_capacity - 1u;
+    }
+    return 0;
+}
+
+static void payload_cache_destroy(vemb_v16_tlc_t *tlc) {
+    RETURN_IF(!tlc || !tlc->payload_cache_shards);
+    for (uint32_t i = 0; i < tlc->payload_cache_shard_count; i++) {
+        vemb_v16_tlc_payload_cache_shard_t *shard =
+            &tlc->payload_cache_shards[i];
+        if (shard->entries) {
+            for (uint32_t j = 0; j < shard->capacity; j++) {
+                if (shard->entries[j].snapshot) {
+                    vemb_v16_payload_snapshot_release(
+                        shard->entries[j].snapshot);
+                }
+            }
+            zfree(shard->entries);
+        }
+        if (shard->lock_init)
+            pthread_mutex_destroy(&shard->lock);
+    }
+    zfree(tlc->payload_cache_shards);
+    tlc->payload_cache_shards = NULL;
+    tlc->payload_cache_shard_count = 0;
+}
+
+static int payload_cache_lookup(vemb_v16_tlc_t *tlc,
+                                const char *key,
+                                uint32_t key_len,
+                                uint64_t key_hash,
+                                uint64_t owner_generation,
+                                uint32_t vector_bytes,
+                                vemb_v16_payload_snapshot_t **snapshot_out) {
+    RETURN_IF(!tlc || !key || !snapshot_out, -1);
+    *snapshot_out = NULL;
+    vemb_v16_tlc_payload_cache_shard_t *shard =
+        payload_cache_shard_for_hash(tlc, key_hash);
+    pthread_mutex_lock(&shard->lock);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
+    for (uint32_t i = 0; i < shard->capacity; i++) {
+        vemb_v16_tlc_payload_cache_entry_t *entry =
+            &shard->entries[(slot + i) & shard->mask];
+        if (!entry->occupied)
+            break;
+        if (!payload_cache_entry_matches(entry, key, key_len, key_hash))
+            continue;
+        if (!entry->snapshot ||
+            entry->owner_generation != owner_generation ||
+            entry->vector_bytes != vector_bytes) {
+            pthread_mutex_unlock(&shard->lock);
+            return -1;
+        }
+        entry->access_count++;
+        vemb_v16_payload_snapshot_retain(entry->snapshot);
+        *snapshot_out = entry->snapshot;
+        pthread_mutex_unlock(&shard->lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&shard->lock);
+    return -1;
+}
+
+static void payload_cache_publish(vemb_v16_tlc_t *tlc,
+                                  const char *key,
+                                  uint32_t key_len,
+                                  uint64_t key_hash,
+                                  uint64_t owner_generation,
+                                  uint32_t vector_bytes,
+                                  vemb_v16_payload_snapshot_t *snapshot) {
+    RETURN_IF(!tlc || !key || !snapshot);
+    vemb_v16_tlc_payload_cache_shard_t *shard =
+        payload_cache_shard_for_hash(tlc, key_hash);
+    pthread_mutex_lock(&shard->lock);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
+    vemb_v16_tlc_payload_cache_entry_t *target = NULL;
+    vemb_v16_tlc_payload_cache_entry_t *evict = &shard->entries[slot];
+    for (uint32_t i = 0; i < shard->capacity; i++) {
+        vemb_v16_tlc_payload_cache_entry_t *entry =
+            &shard->entries[(slot + i) & shard->mask];
+        if (!entry->occupied) {
+            target = entry;
+            break;
+        }
+        if (payload_cache_entry_matches(entry, key, key_len, key_hash)) {
+            target = entry;
+            break;
+        }
+        if (!entry->snapshot && !target)
+            target = entry;
+    }
+    if (!target)
+        target = evict;
+
+    vemb_v16_payload_snapshot_t *old_snapshot = target->snapshot;
+    int replacing = target->occupied != 0;
+    target->occupied = 1;
+    target->key_hash = key_hash;
+    target->key_len = key_len;
+    target->vector_bytes = vector_bytes;
+    target->owner_generation = owner_generation;
+    target->access_count = 1;
+    memcpy(target->key, key, key_len);
+    vemb_v16_payload_snapshot_retain(snapshot);
+    target->snapshot = snapshot;
+    pthread_mutex_unlock(&shard->lock);
+
+    if (old_snapshot)
+        vemb_v16_payload_snapshot_release(old_snapshot);
+    tlc_counter_add(replacing ? &tlc->payload_cache_update
+                              : &tlc->payload_cache_fill,
+                    1);
+    if (target == evict && replacing)
+        tlc_counter_add(&tlc->payload_cache_evict, 1);
+}
+
+void vemb_v16_tlc_invalidate_payload_cache(vemb_v16_tlc_t *tlc,
+                                           const char *key,
+                                           uint32_t key_len,
+                                           uint64_t key_hash) {
+    RETURN_IF(!tlc || !key || key_len == 0);
+    vemb_v16_tlc_payload_cache_shard_t *shard =
+        payload_cache_shard_for_hash(tlc, key_hash);
+    pthread_mutex_lock(&shard->lock);
+    uint32_t slot = vemb_v16_hash_mask_u64(key_hash, shard->mask);
+    for (uint32_t i = 0; i < shard->capacity; i++) {
+        vemb_v16_tlc_payload_cache_entry_t *entry =
+            &shard->entries[(slot + i) & shard->mask];
+        if (!entry->occupied)
+            break;
+        if (!payload_cache_entry_matches(entry, key, key_len, key_hash))
+            continue;
+        vemb_v16_payload_snapshot_t *snapshot = entry->snapshot;
+        entry->snapshot = NULL;
+        entry->owner_generation = 0;
+        entry->vector_bytes = 0;
+        pthread_mutex_unlock(&shard->lock);
+        if (snapshot)
+            vemb_v16_payload_snapshot_release(snapshot);
+        tlc_counter_add(&tlc->payload_cache_invalidate, 1);
+        return;
+    }
+    pthread_mutex_unlock(&shard->lock);
 }
 
 int publish_remote_meta_to_view(vemb_v16_tlc_t *tlc,
@@ -701,7 +934,8 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
         .local_region_weight = local_region_weight,
     };
     if (bitmap_init(&tlc->bitmap, max_vectors) != 0 ||
-        tlc_core_create(&tlc->core, &core_config) != 0) {
+        tlc_core_create(&tlc->core, &core_config) != 0 ||
+        payload_cache_init(tlc) != 0) {
         vemb_v16_tlc_destroy(tlc);
         return -1;
     }
@@ -752,6 +986,7 @@ int vemb_v16_tlc_attach_warm_region(vemb_v16_tlc_t *tlc,
 void vemb_v16_tlc_destroy(vemb_v16_tlc_t *tlc) {
     RETURN_IF(!tlc);
     remote_meta_publisher_stop(tlc);
+    payload_cache_destroy(tlc);
     bitmap_destroy(&tlc->bitmap);
     tlc_core_destroy(tlc->core);
     if (tlc->migration_progress_lock_init)
@@ -1855,6 +2090,149 @@ int vemb_v16_tlc_load_vector(const vemb_v16_tlc_t *tlc,
     return 0;
 }
 
+int vemb_v16_tlc_acquire_payload_snapshot(
+        vemb_v16_tlc_t *tlc,
+        const char *key,
+        uint32_t key_len,
+        uint64_t key_hash,
+        const vemb_v16_vector_handle_t *handle,
+        uint32_t vector_bytes,
+        vemb_v16_payload_snapshot_t **snapshot_out) {
+    RETURN_IF(!tlc || !key || !handle || !snapshot_out ||
+              key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
+              vector_bytes == 0,
+              -1);
+    *snapshot_out = NULL;
+
+    if (payload_cache_lookup(tlc,
+                             key,
+                             key_len,
+                             key_hash,
+                             handle->owner_generation,
+                             vector_bytes,
+                             snapshot_out) == 0) {
+        tlc_counter_add(&tlc->payload_cache_hit, 1);
+        return 0;
+    }
+    tlc_counter_add(&tlc->payload_cache_miss, 1);
+
+    int is_leader = 1;
+    int batch_joined = 0;
+    if (tlc_core_payload_batch_enter(tlc->core,
+                                     key,
+                                     key_len,
+                                     key_hash,
+                                     &is_leader) == 0) {
+        batch_joined = 1;
+        if (is_leader) {
+            tlc_counter_add(&tlc->payload_batch_leader, 1);
+        } else {
+            tlc_counter_add(&tlc->payload_batch_follower, 1);
+            for (uint32_t i = 0; i < VEMB_V16_TLC_PAYLOAD_BATCH_WAIT_SPINS; i++) {
+                if (payload_cache_lookup(tlc,
+                                         key,
+                                         key_len,
+                                         key_hash,
+                                         handle->owner_generation,
+                                         vector_bytes,
+                                         snapshot_out) == 0) {
+                    tlc_counter_add(&tlc->payload_cache_hit, 1);
+                    tlc_counter_add(&tlc->payload_batch_wait_hit, 1);
+                    tlc_core_payload_batch_leave(tlc->core,
+                                                 key,
+                                                 key_len,
+                                                 key_hash,
+                                                 0);
+                    return 0;
+                }
+                cpu_relax();
+                if ((i & 127u) == 127u)
+                    sched_yield();
+            }
+            tlc_counter_add(&tlc->payload_batch_wait_fallback, 1);
+            tlc_core_payload_batch_leave(tlc->core,
+                                         key,
+                                         key_len,
+                                         key_hash,
+                                         0);
+            batch_joined = 0;
+            is_leader = 1;
+        }
+    }
+
+    vemb_v16_payload_snapshot_t *snapshot =
+        vemb_v16_payload_snapshot_create(vector_bytes);
+    if (!snapshot) {
+        if (batch_joined && is_leader) {
+            tlc_core_payload_batch_leave(tlc->core,
+                                         key,
+                                         key_len,
+                                         key_hash,
+                                         1);
+        }
+        return -1;
+    }
+    uint32_t loaded_bytes = 0;
+    int rc = vemb_v16_tlc_load_vector(tlc,
+                                      handle,
+                                      snapshot->payload,
+                                      vector_bytes,
+                                      &loaded_bytes);
+    if (rc != 0 || loaded_bytes != vector_bytes) {
+        if (batch_joined && is_leader) {
+            tlc_core_payload_batch_leave(tlc->core,
+                                         key,
+                                         key_len,
+                                         key_hash,
+                                         1);
+        }
+        vemb_v16_payload_snapshot_release(snapshot);
+        return -1;
+    }
+    payload_cache_publish(tlc,
+                          key,
+                          key_len,
+                          key_hash,
+                          handle->owner_generation,
+                          vector_bytes,
+                          snapshot);
+    *snapshot_out = snapshot;
+    if (batch_joined && is_leader) {
+        tlc_core_payload_batch_leave(tlc->core,
+                                     key,
+                                     key_len,
+                                     key_hash,
+                                     1);
+    }
+    return 0;
+}
+
+int vemb_v16_tlc_update_payload_cache(vemb_v16_tlc_t *tlc,
+                                      const char *key,
+                                      uint32_t key_len,
+                                      uint64_t key_hash,
+                                      const vemb_v16_vector_handle_t *handle,
+                                      const void *payload,
+                                      uint32_t vector_bytes) {
+    RETURN_IF(!tlc || !key || !handle || !payload ||
+              key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
+              vector_bytes == 0,
+              -1);
+    vemb_v16_payload_snapshot_t *snapshot =
+        vemb_v16_payload_snapshot_create(vector_bytes);
+    RETURN_IF(!snapshot, -1);
+    memcpy(snapshot->payload, payload, vector_bytes);
+    payload_cache_publish(tlc,
+                          key,
+                          key_len,
+                          key_hash,
+                          handle->owner_generation,
+                          vector_bytes,
+                          snapshot);
+    vemb_v16_payload_snapshot_release(snapshot);
+    return 0;
+}
+
 void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
                                     vemb_v16_stats_t *stats) {
     stats->remote_meta_lookup_hit = tlc_counter_load(&tlc->remote_meta_lookup_hit);
@@ -1883,4 +2261,18 @@ void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
     stats->remote_meta_repair_enqueue = tlc_counter_load(&tlc->remote_meta_repair_enqueue);
     stats->remote_meta_repair_ok = tlc_counter_load(&tlc->remote_meta_repair_ok);
     stats->remote_meta_repair_drop = tlc_counter_load(&tlc->remote_meta_repair_drop);
+    stats->payload_cache_hit = tlc_counter_load(&tlc->payload_cache_hit);
+    stats->payload_cache_miss = tlc_counter_load(&tlc->payload_cache_miss);
+    stats->payload_cache_fill = tlc_counter_load(&tlc->payload_cache_fill);
+    stats->payload_cache_update = tlc_counter_load(&tlc->payload_cache_update);
+    stats->payload_cache_evict = tlc_counter_load(&tlc->payload_cache_evict);
+    stats->payload_cache_invalidate =
+        tlc_counter_load(&tlc->payload_cache_invalidate);
+    stats->payload_batch_leader = tlc_counter_load(&tlc->payload_batch_leader);
+    stats->payload_batch_follower =
+        tlc_counter_load(&tlc->payload_batch_follower);
+    stats->payload_batch_wait_hit =
+        tlc_counter_load(&tlc->payload_batch_wait_hit);
+    stats->payload_batch_wait_fallback =
+        tlc_counter_load(&tlc->payload_batch_wait_fallback);
 }
