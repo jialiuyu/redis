@@ -30,9 +30,6 @@ int vemb_v16_ub_rpc_create(vemb_v16_ub_rpc_t **out,
                            uint32_t timeout_ms,
                            const vemb_v16_ub_rpc_peer_t *peers,
                            uint32_t peer_count);
-void vemb_v16_ub_rpc_install_lookup_runtime(vemb_v16_tlc_t *tlc,
-                                            vemb_v16_ub_rpc_t *rpc,
-                                            vemb_v16_ub_rpc_t **old_out);
 int vemb_v16_ub_rpc_attach_peer(vemb_v16_ub_rpc_t **rpc_io,
                                 vemb_v16_tlc_t *tlc,
                                 uint32_t local_owner_id,
@@ -45,9 +42,6 @@ int vemb_v16_ub_rpc_reset_response_ring(
 int vemb_v16_ub_rpc_has_peer(vemb_v16_ub_rpc_t *rpc, uint32_t owner_id);
 void vemb_v16_ub_rpc_destroy(vemb_v16_ub_rpc_t *rpc);
 void vemb_v16_ub_rpc_release(vemb_v16_ub_rpc_t *rpc);
-int vemb_v16_ub_rpc_lookup(void *arg,
-                           const vemb_v16_ub_lookup_rpc_req_t *req,
-                           vemb_v16_ub_lookup_rpc_resp_t *resp);
 int vemb_v16_ub_rpc_migrate_request(
     void *arg,
     const vemb_v16_ub_migration_rpc_req_t *req,

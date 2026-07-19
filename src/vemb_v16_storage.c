@@ -6,6 +6,7 @@
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
 #include "vemb_v16_util.h"
+#include "util.h"
 #include "zmalloc.h"
 
 #include <assert.h>
@@ -689,7 +690,6 @@ static int storage_ub_rpc_init(vemb_v16_storage_ctx_t *storage,
                   manifest->ub_rpc_peer_count);
         return -1;
     }
-    vemb_v16_ub_rpc_install_lookup_runtime(storage->tlc, storage->ub_rpc, NULL);
     serverLog(LL_NOTICE,
               "vemb_v16 ub rpc ready: local_owner=%u peers=%u timeout_ms=%u",
               local_owner_id,

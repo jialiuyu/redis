@@ -551,10 +551,10 @@ static void key_meta_note_source_fence_transition(tlc_core_t *core,
 }
 
 static void location_cache_put(tlc_core_t *core,
-                               const char *key,
-                               uint32_t key_len,
-                               uint64_t key_hash,
-                               const tlc_warm_location_t *location);
+                                    const char *key,
+                                    uint32_t key_len,
+                                    uint64_t key_hash,
+                                    const tlc_warm_location_t *location);
 static uint64_t key_fingerprint(const char *key, uint32_t key_len);
 
 static void key_meta_set_tombstone_locked(tlc_core_t *core,

@@ -585,6 +585,11 @@ static void migration_control_fill_resp(
         vemb_v16_migration_control_resp_t *resp,
         uint8_t status,
         const tlc_core_key_migration_info_t *info) {
+    if (!info) {
+        memset(resp, 0, sizeof(*resp));
+        resp->status = status;
+        return;
+    }
     resp->status = status;
     resp->key_hash = info->key_hash;
     resp->key_version = info->key_version;

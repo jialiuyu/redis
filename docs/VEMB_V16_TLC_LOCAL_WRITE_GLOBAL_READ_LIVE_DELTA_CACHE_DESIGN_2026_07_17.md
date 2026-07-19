@@ -35,8 +35,9 @@
 
 - 扩容/迁移主流程还没有按 `Local Write + Global Read + Live Delta Atomic Migration + cache` 完整收敛
 - `remote_meta` / `lookup_rpc` / 相关统计和 wiring 仍有残留，但已不属于 P0/P1 correctness 主路径完成条件
-- cache 命名还没完全统一成 `hint` 语义命名
-- `location_cache_entry` 字段还没有继续压缩
+- `lookup_rpc` runtime install / swap wiring 已从真实初始化路径移除
+- core 内部继续保留 `location_cache` 命名，语义已降级为 hint-only
+- `location_cache_entry` 已压缩到 hash/fingerprint/region_index/local_slot/generation
 - migration 期间的 `source + target pair probe` 还没正式收口
 
 ### 0.3 建议下一个断点起手
@@ -530,10 +531,13 @@ try_resolve_warm_location()
 
 - 已完成：
   - 收缩 `tlc_core_get_cached_warm_location()` 到轻量 hint cache
-- 仍未完成：
-  - 收缩 `remote_meta` 到可选层并清理残留 wiring / stats / bench 输出
-  - 统一 cache/hint 命名
-  - 缩减 cache entry 字段
+  - 收缩 `remote_meta` 到可选层并清理主路径 `lookup_rpc` runtime wiring
+  - 清理 `remote_meta_publish_*` / `ub_lookup_rpc_*` server 与 bench 输出
+  - 保持 `location_cache` 命名不变，但明确为 hint-only 语义
+  - 缩减 `location_cache_entry` 字段
+- 后续只保留低优先级兼容残留：
+  - wire protocol 中的 lookup RPC frame/type
+  - `remote_meta` attach/init 与独立 UT 覆盖
 
 ### P2
 

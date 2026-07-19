@@ -120,24 +120,6 @@ struct vemb_v16_ub_rpc {
 static void vemb_v16_ub_rpc_destroy_final(vemb_v16_ub_rpc_t *rpc);
 void vemb_v16_ub_rpc_release(vemb_v16_ub_rpc_t *rpc);
 
-static vemb_v16_ub_rpc_t *lookup_runtime_acquire(vemb_v16_tlc_t *tlc) {
-    if (!tlc)
-        return NULL;
-    for (;;) {
-        vemb_v16_ub_rpc_t *rpc = atomic_load_explicit(
-            &tlc->current_lookup_rpc_runtime,
-            memory_order_acquire);
-        if (!rpc)
-            return NULL;
-        atomic_fetch_add_explicit(&rpc->refcount, 1, memory_order_acq_rel);
-        if (rpc == atomic_load_explicit(&tlc->current_lookup_rpc_runtime,
-                                        memory_order_acquire)) {
-            return rpc;
-        }
-        vemb_v16_ub_rpc_release(rpc);
-    }
-}
-
 void vemb_v16_ub_rpc_release(vemb_v16_ub_rpc_t *rpc) {
     if (!rpc)
         return;
@@ -695,92 +677,6 @@ static int publish_with_deadline(vemb_v16_ub_rpc_t *rpc,
     return -1;
 }
 
-int vemb_v16_ub_rpc_lookup(void *arg,
-                           const vemb_v16_ub_lookup_rpc_req_t *req,
-                           vemb_v16_ub_lookup_rpc_resp_t *resp) {
-    vemb_v16_tlc_t *tlc = arg;
-    if (!tlc || !req || !resp)
-        return -1;
-    vemb_v16_ub_rpc_t *rpc = lookup_runtime_acquire(tlc);
-    if (!rpc)
-        return -1;
-    memset(resp, 0, sizeof(*resp));
-    resp->request_id = req->request_id;
-    resp->key_hash = req->key_hash;
-
-    if (req->dst_owner_id == rpc->local_owner_id) {
-        int local_rc = vemb_v16_tlc_lookup_rpc_local_handler(rpc->tlc, req, resp);
-        vemb_v16_ub_rpc_release(rpc);
-        return local_rc;
-    }
-
-    vemb_v16_ub_rpc_peer_state_t *peer = find_peer(rpc, req->dst_owner_id);
-    if (!peer) {
-        resp->status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
-        log_limited(&rpc->error_logs,
-                    LL_WARNING,
-                    "vemb_v16 ub rpc peer missing: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
-                    req->dst_owner_id,
-                    req->request_id,
-                    req->key_hash,
-                    NULL,
-                    ENOENT);
-        vemb_v16_ub_rpc_release(rpc);
-        return 0;
-    }
-
-    vemb_v16_ub_rpc_pending_t *pending =
-        pending_claim(peer, req->request_id);
-    if (!pending) {
-        resp->status = VEMB_V16_UB_LOOKUP_RPC_BUSY;
-        log_limited(&rpc->ring_full_logs,
-                    LL_NOTICE,
-                    "vemb_v16 ub rpc pending full: owner=%u request_id=%llu key_hash=%llu path=%s errno=%d error=%s",
-                    req->dst_owner_id,
-                    req->request_id,
-                    req->key_hash,
-                    NULL,
-                    EAGAIN);
-        vemb_v16_ub_rpc_release(rpc);
-        return 0;
-    }
-
-    vemb_v16_ub_rpc_wire_req_t wire_req = {
-        .magic = VEMB_V16_UB_RPC_MAGIC,
-        .version = VEMB_V16_UB_RPC_VERSION,
-        .kind = VEMB_V16_UB_RPC_FRAME_LOOKUP,
-        .u.lookup = *req,
-    };
-    uint64_t timeout_ns = timeout_from_req_ns(rpc, req);
-    uint64_t deadline_ns = vemb_v16_monotonic_ns() + timeout_ns;
-    uint32_t status = VEMB_V16_UB_LOOKUP_RPC_OK;
-    int rc = publish_with_deadline(rpc,
-                                   &peer->request,
-                                   &wire_req,
-                                   deadline_ns,
-                                   req->dst_owner_id,
-                                   req->request_id,
-                                   req->key_hash,
-                                   &status);
-    if (rc != 0) {
-        pending_release_waiting(pending);
-        resp->status = status;
-        vemb_v16_ub_rpc_release(rpc);
-        return 0;
-    }
-
-    vemb_v16_ub_rpc_wire_resp_t wire_resp;
-    memset(&wire_resp, 0, sizeof(wire_resp));
-    (void)pending_wait(rpc, peer, pending, &wire_req, &wire_resp,
-                       deadline_ns);
-    if (wire_resp.kind == VEMB_V16_UB_RPC_FRAME_LOOKUP)
-        *resp = wire_resp.u.lookup;
-    else
-        resp->status = VEMB_V16_UB_LOOKUP_RPC_ERROR;
-    vemb_v16_ub_rpc_release(rpc);
-    return 0;
-}
-
 int vemb_v16_ub_rpc_migrate_request(
     void *arg,
     const vemb_v16_ub_migration_rpc_req_t *req,
@@ -1086,16 +982,6 @@ static void peer_state_export_config(vemb_v16_ub_rpc_peer_t *dst,
     dst->outbound_response = src->outbound_response.config;
 }
 
-void vemb_v16_ub_rpc_install_lookup_runtime(vemb_v16_tlc_t *tlc,
-                                            vemb_v16_ub_rpc_t *rpc,
-                                            vemb_v16_ub_rpc_t **old_out) {
-    vemb_v16_tlc_install_lookup_runtime(tlc,
-                                        rpc,
-                                        rpc ? vemb_v16_ub_rpc_lookup : NULL,
-                                        tlc,
-                                        old_out);
-}
-
 int vemb_v16_ub_rpc_create(vemb_v16_ub_rpc_t **out,
                            vemb_v16_tlc_t *tlc,
                            uint32_t local_owner_id,
@@ -1145,15 +1031,6 @@ int vemb_v16_ub_rpc_create(vemb_v16_ub_rpc_t **out,
         return -1;
     }
     rpc->thread_started = 1;
-    /*
-     * Keep the historical create() behavior for standalone TLC tests:
-     * first runtime install happens automatically, while later hot-swap
-     * callers still publish explicitly through attach/install.
-     */
-    if (!atomic_load_explicit(&tlc->current_lookup_rpc_runtime,
-                              memory_order_acquire)) {
-        vemb_v16_ub_rpc_install_lookup_runtime(tlc, rpc, NULL);
-    }
     *out = rpc;
     return 0;
 }
@@ -1184,10 +1061,8 @@ int vemb_v16_ub_rpc_attach_peer(vemb_v16_ub_rpc_t **rpc_io,
                                      peers,
                                      peer_count) != 0,
               -1);
-    vemb_v16_ub_rpc_t *old_rpc = NULL;
-    vemb_v16_ub_rpc_install_lookup_runtime(tlc, new_rpc, &old_rpc);
-    if (old_rpc && old_rpc != new_rpc)
-        vemb_v16_ub_rpc_destroy(old_rpc);
+    if (rpc && rpc != new_rpc)
+        vemb_v16_ub_rpc_destroy(rpc);
     *rpc_io = new_rpc;
     return 0;
 }
@@ -1222,7 +1097,5 @@ static void vemb_v16_ub_rpc_destroy_final(vemb_v16_ub_rpc_t *rpc) {
 void vemb_v16_ub_rpc_destroy(vemb_v16_ub_rpc_t *rpc) {
     if (!rpc)
         return;
-    if (rpc->tlc)
-        vemb_v16_tlc_clear_lookup_runtime(rpc->tlc, rpc);
     vemb_v16_ub_rpc_retire(rpc);
 }

@@ -54,9 +54,6 @@ struct vemb_v16_tlc_access_snapshot {
     uint32_t remote_meta_view_count;
     vemb_v16_tlc_remote_meta_owner_view_t
         remote_meta_views[VEMB_V16_TLC_MAX_REMOTE_META_VIEWS];
-    vemb_v16_tlc_lookup_rpc_fn lookup_rpc;
-    void *lookup_rpc_arg;
-    vemb_v16_ub_rpc_t *lookup_rpc_runtime;
 };
 
 static void access_snapshot_release(vemb_v16_tlc_access_snapshot_t *snapshot);
@@ -81,9 +78,6 @@ static vemb_v16_tlc_access_snapshot_t *access_snapshot_clone(
     memcpy(snapshot->remote_meta_views,
            src->remote_meta_views,
            sizeof(snapshot->remote_meta_views));
-    snapshot->lookup_rpc = src->lookup_rpc;
-    snapshot->lookup_rpc_arg = src->lookup_rpc_arg;
-    snapshot->lookup_rpc_runtime = src->lookup_rpc_runtime;
     return snapshot;
 }
 
@@ -134,12 +128,6 @@ static void tlc_sync_access_snapshot_legacy_fields(
     memcpy(tlc->remote_meta_views,
            snapshot->remote_meta_views,
            sizeof(tlc->remote_meta_views));
-    tlc->lookup_rpc = snapshot->lookup_rpc;
-    tlc->lookup_rpc_arg = snapshot->lookup_rpc_arg;
-    tlc->lookup_rpc_runtime = snapshot->lookup_rpc_runtime;
-    atomic_store_explicit(&tlc->current_lookup_rpc_runtime,
-                          snapshot->lookup_rpc_runtime,
-                          memory_order_release);
 }
 
 static vemb_v16_tlc_access_snapshot_t *access_snapshot_publish(
@@ -225,7 +213,6 @@ static uint64_t tlc_counter_load(atomic_uint_fast64_t *counter) {
 }
 
 static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
-    atomic_init(&tlc->ub_lookup_rpc_next_request_id, 1);
     atomic_init(&tlc->remote_meta_lookup_hit, 0);
     atomic_init(&tlc->remote_meta_lookup_miss, 0);
     atomic_init(&tlc->remote_meta_lookup_busy, 0);
@@ -240,15 +227,6 @@ static void tlc_init_counters(vemb_v16_tlc_t *tlc) {
     atomic_init(&tlc->remote_meta_publish_update, 0);
     atomic_init(&tlc->remote_meta_publish_evict, 0);
     atomic_init(&tlc->remote_meta_publish_ns, 0);
-    atomic_init(&tlc->ub_lookup_rpc_count, 0);
-    atomic_init(&tlc->ub_lookup_rpc_ok, 0);
-    atomic_init(&tlc->ub_lookup_rpc_not_found, 0);
-    atomic_init(&tlc->ub_lookup_rpc_busy, 0);
-    atomic_init(&tlc->ub_lookup_rpc_timeout, 0);
-    atomic_init(&tlc->ub_lookup_rpc_error, 0);
-    atomic_init(&tlc->ub_lookup_rpc_handle, 0);
-    atomic_init(&tlc->ub_lookup_rpc_snapshot, 0);
-    atomic_init(&tlc->ub_lookup_rpc_ns, 0);
     atomic_init(&tlc->remote_meta_repair_enqueue, 0);
     atomic_init(&tlc->remote_meta_repair_ok, 0);
     atomic_init(&tlc->remote_meta_repair_drop, 0);
@@ -639,7 +617,6 @@ int vemb_v16_tlc_create(vemb_v16_tlc_t **out,
     tlc_init_counters(tlc);
     atomic_init(&tlc->remote_meta_publisher, NULL);
     atomic_init(&tlc->runtime_warm_region_count, 0);
-    atomic_init(&tlc->current_lookup_rpc_runtime, NULL);
     vemb_v16_tlc_access_snapshot_t *initial_snapshot =
         access_snapshot_create_empty();
     if (!initial_snapshot) {
@@ -819,18 +796,6 @@ typedef struct vemb_v16_tlc_owner_view_update {
     vemb_v16_remote_meta_view_t *view;
 } vemb_v16_tlc_owner_view_update_t;
 
-typedef struct vemb_v16_tlc_lookup_rpc_update {
-    vemb_v16_tlc_lookup_rpc_fn fn;
-    void *arg;
-} vemb_v16_tlc_lookup_rpc_update_t;
-
-typedef struct vemb_v16_tlc_lookup_runtime_update {
-    vemb_v16_ub_rpc_t *rpc;
-    vemb_v16_tlc_lookup_rpc_fn fn;
-    void *arg;
-    vemb_v16_ub_rpc_t *old_rpc;
-} vemb_v16_tlc_lookup_runtime_update_t;
-
 static int mutate_remote_meta_owner_view(
         vemb_v16_tlc_access_snapshot_t *snapshot,
         void *arg) {
@@ -849,36 +814,6 @@ static int mutate_remote_meta_owner_view(
             .owner_id = update->owner_id,
             .view = update->view,
         };
-    return 0;
-}
-
-static int mutate_lookup_rpc(vemb_v16_tlc_access_snapshot_t *snapshot,
-                             void *arg) {
-    vemb_v16_tlc_lookup_rpc_update_t *update = arg;
-    snapshot->lookup_rpc = update->fn;
-    snapshot->lookup_rpc_arg = update->arg;
-    snapshot->lookup_rpc_runtime = NULL;
-    return 0;
-}
-
-static int mutate_lookup_runtime(vemb_v16_tlc_access_snapshot_t *snapshot,
-                                 void *arg) {
-    vemb_v16_tlc_lookup_runtime_update_t *update = arg;
-    update->old_rpc = snapshot->lookup_rpc_runtime;
-    snapshot->lookup_rpc_runtime = update->rpc;
-    snapshot->lookup_rpc = update->fn;
-    snapshot->lookup_rpc_arg = update->arg;
-    return 0;
-}
-
-static int mutate_clear_lookup_runtime(vemb_v16_tlc_access_snapshot_t *snapshot,
-                                       void *arg) {
-    vemb_v16_ub_rpc_t *rpc = arg;
-    if (snapshot->lookup_rpc_runtime != rpc)
-        return 1;
-    snapshot->lookup_rpc_runtime = NULL;
-    snapshot->lookup_rpc = NULL;
-    snapshot->lookup_rpc_arg = NULL;
     return 0;
 }
 
@@ -932,44 +867,6 @@ uint32_t vemb_v16_tlc_remote_meta_owner_view_count(vemb_v16_tlc_t *tlc) {
     uint32_t count = snapshot ? snapshot->remote_meta_view_count : 0;
     access_snapshot_release(snapshot);
     return count;
-}
-
-void vemb_v16_tlc_set_lookup_rpc(vemb_v16_tlc_t *tlc,
-                                 vemb_v16_tlc_lookup_rpc_fn fn,
-                                 void *arg) {
-    vemb_v16_tlc_lookup_rpc_update_t update = {
-        .fn = fn,
-        .arg = arg,
-    };
-    (void)access_snapshot_update(tlc, mutate_lookup_rpc, &update);
-}
-
-void vemb_v16_tlc_install_lookup_runtime(vemb_v16_tlc_t *tlc,
-                                         vemb_v16_ub_rpc_t *rpc,
-                                         vemb_v16_tlc_lookup_rpc_fn fn,
-                                         void *arg,
-                                         vemb_v16_ub_rpc_t **old_out) {
-    if (old_out)
-        *old_out = NULL;
-    if (!tlc)
-        return;
-    vemb_v16_tlc_lookup_runtime_update_t update = {
-        .rpc = rpc,
-        .fn = fn,
-        .arg = arg,
-        .old_rpc = NULL,
-    };
-    if (access_snapshot_update(tlc, mutate_lookup_runtime, &update) != 0)
-        return;
-    if (old_out)
-        *old_out = update.old_rpc;
-}
-
-void vemb_v16_tlc_clear_lookup_runtime(vemb_v16_tlc_t *tlc,
-                                       vemb_v16_ub_rpc_t *rpc) {
-    if (!tlc || !rpc)
-        return;
-    (void)access_snapshot_update(tlc, mutate_clear_lookup_runtime, rpc);
 }
 
 int vemb_v16_tlc_lookup_rpc_local_handler(
@@ -1871,15 +1768,15 @@ void vemb_v16_tlc_get_runtime_stats(vemb_v16_tlc_t *tlc,
     stats->remote_meta_publish_update = tlc_counter_load(&tlc->remote_meta_publish_update);
     stats->remote_meta_publish_evict = tlc_counter_load(&tlc->remote_meta_publish_evict);
     stats->remote_meta_publish_ns = tlc_counter_load(&tlc->remote_meta_publish_ns);
-    stats->ub_lookup_rpc_count = tlc_counter_load(&tlc->ub_lookup_rpc_count);
-    stats->ub_lookup_rpc_ok = tlc_counter_load(&tlc->ub_lookup_rpc_ok);
-    stats->ub_lookup_rpc_not_found = tlc_counter_load(&tlc->ub_lookup_rpc_not_found);
-    stats->ub_lookup_rpc_busy = tlc_counter_load(&tlc->ub_lookup_rpc_busy);
-    stats->ub_lookup_rpc_timeout = tlc_counter_load(&tlc->ub_lookup_rpc_timeout);
-    stats->ub_lookup_rpc_error = tlc_counter_load(&tlc->ub_lookup_rpc_error);
-    stats->ub_lookup_rpc_handle = tlc_counter_load(&tlc->ub_lookup_rpc_handle);
-    stats->ub_lookup_rpc_snapshot = tlc_counter_load(&tlc->ub_lookup_rpc_snapshot);
-    stats->ub_lookup_rpc_ns = tlc_counter_load(&tlc->ub_lookup_rpc_ns);
+    stats->ub_lookup_rpc_count = 0;
+    stats->ub_lookup_rpc_ok = 0;
+    stats->ub_lookup_rpc_not_found = 0;
+    stats->ub_lookup_rpc_busy = 0;
+    stats->ub_lookup_rpc_timeout = 0;
+    stats->ub_lookup_rpc_error = 0;
+    stats->ub_lookup_rpc_handle = 0;
+    stats->ub_lookup_rpc_snapshot = 0;
+    stats->ub_lookup_rpc_ns = 0;
     stats->remote_meta_repair_enqueue = tlc_counter_load(&tlc->remote_meta_repair_enqueue);
     stats->remote_meta_repair_ok = tlc_counter_load(&tlc->remote_meta_repair_ok);
     stats->remote_meta_repair_drop = tlc_counter_load(&tlc->remote_meta_repair_drop);

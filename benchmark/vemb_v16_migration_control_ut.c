@@ -65,8 +65,6 @@ static vemb_v16_warm_slot_meta_t *migration_ut_slot_meta_acquire(
             calloc(capacity_slots, sizeof(*slots));
         assert(slots);
         for (uint32_t slot = 0; slot < capacity_slots; slot++) {
-            slots[slot].region_id = region_id;
-            slots[slot].local_slot = slot;
             atomic_init(&slots[slot].state, VEMB_V16_WARM_SLOT_FREE);
             atomic_init(&slots[slot].owner_generation, 0);
             atomic_init(&slots[slot].write_seq, 0);
@@ -1027,7 +1025,7 @@ static void run_vrem_job_with_flags(vemb_v16_storage_ctx_t *storage,
 }
 
 static void test_proxy_migration_control_primitives(void) {
-    enum { dim = 2, max_vectors = 4 };
+    enum { dim = 2, max_vectors = 8 };
     char manifest_path[128];
     char uds_path[128];
     char shm1[64];
@@ -2900,7 +2898,7 @@ static void test_storage_coordinated_scaleout_waits_for_full_active(void) {
 static void test_supernode_vadd_pushes_migration_delta(void) {
     enum {
         dim = 2,
-        max_vectors = 256,
+        max_vectors = 512,
         large_range_key_count = 129,
         large_range_page_limit = 17,
     };

@@ -280,28 +280,6 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.response_ring_depth,
            (unsigned long long)stats.job_shard_queue_depth,
            (unsigned long long)stats.completion_ring_depth);
-    serverLog(LL_NOTICE,
-              "vemb_v16 stats: remote_meta hit=%llu miss=%llu busy=%llu probes=%llu async_enqueue=%llu async_drop=%llu publish_ok=%llu insert=%llu update=%llu evict=%llu repair_enqueue=%llu repair_ok=%llu rpc_count=%llu rpc_ok=%llu rpc_not_found=%llu rpc_busy=%llu rpc_timeout=%llu rpc_error=%llu rpc_handle=%llu rpc_snapshot=%llu",
-              (unsigned long long)stats.remote_meta_lookup_hit,
-              (unsigned long long)stats.remote_meta_lookup_miss,
-              (unsigned long long)stats.remote_meta_lookup_busy,
-              (unsigned long long)stats.remote_meta_lookup_way_probe,
-              (unsigned long long)stats.remote_meta_publish_async_enqueue,
-              (unsigned long long)stats.remote_meta_publish_async_drop,
-              (unsigned long long)stats.remote_meta_publish_ok,
-              (unsigned long long)stats.remote_meta_publish_insert,
-              (unsigned long long)stats.remote_meta_publish_update,
-              (unsigned long long)stats.remote_meta_publish_evict,
-              (unsigned long long)stats.remote_meta_repair_enqueue,
-              (unsigned long long)stats.remote_meta_repair_ok,
-              (unsigned long long)stats.ub_lookup_rpc_count,
-              (unsigned long long)stats.ub_lookup_rpc_ok,
-              (unsigned long long)stats.ub_lookup_rpc_not_found,
-              (unsigned long long)stats.ub_lookup_rpc_busy,
-              (unsigned long long)stats.ub_lookup_rpc_timeout,
-              (unsigned long long)stats.ub_lookup_rpc_error,
-              (unsigned long long)stats.ub_lookup_rpc_handle,
-              (unsigned long long)stats.ub_lookup_rpc_snapshot);
     if (stats.timing_job_count) {
         double total_avg = (double)stats.timing_job_total_ns /
             (double)stats.timing_job_count;
