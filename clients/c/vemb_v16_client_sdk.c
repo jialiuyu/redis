@@ -2,16 +2,25 @@
 
 #include "vemb_v16_client_sdk.h"
 #include "../../src/vemb_v16_net.h"
+/* Ring header is C11 (<stdatomic.h>). Pulled in here — NOT from the
+ * public SDK header — so C++ consumers stay clean. */
+#include "../../src/vemb_v16_client_ring.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
+
+#ifdef USE_ARM_SVE
+#include <arm_sve.h>
+#endif
 
 #define VEMB_V16_SDK_MAX_ENDPOINTS 16
 /* Must match benchmark/vemb_v16_bench.c VEMB_V16_BENCH_HASH_VNODES so that
@@ -113,8 +122,19 @@ int vemb_v16_build_combined_key(char *out, size_t out_cap,
                                 const char *set_name, const char *elem_name,
                                 uint32_t *out_len)
 {
-    size_t set_len = strlen(set_name);
     size_t elem_len = strlen(elem_name);
+    if (set_name == NULL || *set_name == '\0') {
+        /* 无 set_name：key = elem_name (无分隔符) */
+        if (elem_len >= out_cap) {
+            fprintf(stderr, "vemb_v16_client: combined key too long: %zu >= %zu\n",
+                    elem_len, out_cap);
+            return -1;
+        }
+        memcpy(out, elem_name, elem_len);
+        *out_len = (uint32_t)elem_len;
+        return 0;
+    }
+    size_t set_len = strlen(set_name);
     size_t total = set_len + 1 + elem_len;
     if (total >= out_cap) {
         fprintf(stderr, "vemb_v16_client: combined key too long: %zu >= %zu\n",
@@ -1319,7 +1339,8 @@ static int client_pipeline_execute_with_redirect(
         uint32_t count,
         uint8_t  *out_entry_status,    /* [count], PIPE_ENTRY_* */
         vemb_v16_pipe_entry_aux_t *out_entry_aux,  /* [count], optional */
-        uint32_t max_inflight)
+        uint32_t max_inflight,
+        uint8_t  **out_inline_bufs)    /* [count], per-entry inline capture, NULL OK */
 {
     if (!client || !keys || !key_lens || count == 0 || !out_entry_status)
         return -1;
@@ -1460,8 +1481,9 @@ static int client_pipeline_execute_with_redirect(
                                        keys[src_idx], key_lens[src_idx],
                                        payloads ? payloads[src_idx] : NULL,
                                        0);  /* no ASK flag on initial send */
-                    if (sdk_write_request(target->fd, target->channel_id,
-                                          req.req_id, &req) != 0) {
+                    int dbg_wrc = sdk_write_request(target->fd, target->channel_id,
+                                          req.req_id, &req);
+                    if (dbg_wrc != 0) {
                         /* I/O error — mark remaining entries ERR. */
                         for (uint32_t k = group_cursor; k < group_count; k++) {
                             out_entry_status[group_indices[k]] = PIPE_ENTRY_ERR;
@@ -1491,8 +1513,12 @@ static int client_pipeline_execute_with_redirect(
 
                     vemb_v16_resp_t resp;
                     memset(&resp, 0, sizeof(resp));
-                    if (recv_resp_backend(target->fd, target->channel_id,
-                                          &resp, NULL, 0, NULL) != 0) {
+                    uint8_t *inl_buf = out_inline_bufs ? out_inline_bufs[src_idx] : NULL;
+                    uint32_t inl_cap = inl_buf ? client->dim * sizeof(float) : 0;
+                    uint32_t inl_bytes = 0;
+                    int dbg_rc = recv_resp_backend(target->fd, target->channel_id,
+                                          &resp, inl_buf, inl_cap, &inl_bytes);
+                    if (dbg_rc != 0) {
                         /* I/O catastrophe on recv — mark this + remaining ERR. */
                         out_entry_status[src_idx] = PIPE_ENTRY_ERR;
                         for (uint32_t k = burst_tail; k < burst_head; k++) {
@@ -1567,7 +1593,10 @@ static int client_pipeline_execute_with_redirect(
                                               ask_req.req_id, &ask_req) != 0 ||
                             recv_resp_backend(ask_target->fd,
                                               ask_target->channel_id,
-                                              &resp, NULL, 0, NULL) != 0) {
+                                              &resp,
+                                              out_inline_bufs ? out_inline_bufs[src_idx] : NULL,
+                                              out_inline_bufs ? client->dim * sizeof(float) : 0,
+                                              NULL) != 0) {
                             out_entry_status[src_idx] = PIPE_ENTRY_ERR;
                             break;
                         }
@@ -1661,7 +1690,7 @@ int vemb_v16_client_vadd(vemb_v16_client_t *c,
                          const float *vector,
                          uint32_t dim)
 {
-    if (!c || !set_name || !elem_name || !vector || dim != c->dim)
+    if (!c || !elem_name || !vector || dim != c->dim)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -1688,7 +1717,7 @@ int vemb_v16_client_vemb_handle(vemb_v16_client_t *c,
                                 uint32_t *out_dim,
                                 uint32_t *out_region_id)
 {
-    if (!c || !set_name || !elem_name)
+    if (!c || !elem_name)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -1720,7 +1749,7 @@ int vemb_v16_client_vrem(vemb_v16_client_t *c,
                          const char *set_name,
                          const char *elem_name)
 {
-    if (!c || !set_name || !elem_name)
+    if (!c || !elem_name)
         return -1;
 
     char combined[VEMB_V16_MAX_KEY_LEN];
@@ -1751,7 +1780,7 @@ int vemb_v16_client_vemb_vector(vemb_v16_client_t *c,
                                 uint32_t out_cap,
                                 uint32_t *out_dim)
 {
-    if (!c || !set_name || !elem_name || !out_vector || out_cap == 0)
+    if (!c || !elem_name || !out_vector || out_cap == 0)
         return -1;
 
     /* Fast path: get a handle from the server, then read the vector directly
@@ -1815,7 +1844,7 @@ int vemb_v16_client_vsim(vemb_v16_client_t *c,
                          uint32_t dim,
                          float *out_score)
 {
-    if (!c || !set_name || !elem_name ||
+    if (!c || !elem_name ||
         !query_vector || dim != c->dim || !out_score)
         return -1;
 
@@ -1875,7 +1904,7 @@ int vemb_v16_client_vadd_pipeline(vemb_v16_client_t *c,
             c, VEMB_V16_OP_VADD,
             key_ptrs, key_lens,
             payload_ptrs, count,
-            status, NULL, max_inflight) != 0)
+            status, NULL, max_inflight, NULL) != 0)
         return -1;
 
     /* Check for errors. */
@@ -1890,6 +1919,7 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
                                   const char **set_names,
                                   const char **elem_names,
                                   uint32_t count,
+                                  float *out_vectors,
                                   vemb_v16_pipeline_resp_t *out_resps,
                                   uint32_t max_inflight)
 {
@@ -1909,26 +1939,46 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
         key_ptrs[i] = combined_keys[i];
     }
 
+    /* VEMB_INLINE: server returns the vector inline in the response.
+     * VEMB_HANDLE is rejected on TCP/sniff transport (see
+     * tcp_vemb_read_requires_inline_op in proxy.c). */
+    uint32_t vec_bytes = c->dim * sizeof(float);
+    /* Heap-allocate inline capture buffers — VLAs would blow the stack
+     * for large count × dim. */
+    uint8_t *inline_blob = malloc((size_t)count * vec_bytes);
+    uint8_t **inline_ptrs = malloc((size_t)count * sizeof(uint8_t *));
+    if (!inline_blob || !inline_ptrs) {
+        free(inline_blob); free(inline_ptrs);
+        return -1;
+    }
+    for (uint32_t i = 0; i < count; i++)
+        inline_ptrs[i] = inline_blob + (size_t)i * vec_bytes;
+
     uint8_t status[count];
     vemb_v16_pipe_entry_aux_t aux[count];
-    if (client_pipeline_execute_with_redirect(
-            c, VEMB_V16_OP_VEMB_HANDLE,
+    int engine_rc = client_pipeline_execute_with_redirect(
+            c, VEMB_V16_OP_VEMB_INLINE,
             key_ptrs, key_lens,
             NULL, count,
-            status, aux, max_inflight) != 0)
-        return -1;
+            status, aux, max_inflight, inline_ptrs);
 
-    /* Translate engine status → out_resps. */
+    if (engine_rc != 0) {
+        free(inline_blob); free(inline_ptrs);
+        return -1;
+    }
+
+    /* Translate engine status → out_resps + copy inline vectors. */
     for (uint32_t i = 0; i < count; i++) {
         vemb_v16_pipeline_resp_t *out = &out_resps[i];
         memset(out, 0, sizeof(*out));
         switch (status[i]) {
         case PIPE_ENTRY_OK:
             out->status    = 0;
-            out->offset    = aux[i].offset;
-            out->bytes     = aux[i].bytes;
-            out->dim       = aux[i].dim;
-            out->region_id = aux[i].region_id;
+            out->dim       = aux[i].dim > 0 ? aux[i].dim : c->dim;
+            out->bytes     = vec_bytes;
+            if (out_vectors)
+                memcpy(out_vectors + i * c->dim,
+                       inline_ptrs[i], vec_bytes);
             break;
         case PIPE_ENTRY_NOT_FOUND:
             out->status = 1;
@@ -1938,6 +1988,7 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
             break;
         }
     }
+    free(inline_blob); free(inline_ptrs);
     return 0;
 }
 
@@ -2119,7 +2170,7 @@ int vemb_v16_client_vsim_pipeline(vemb_v16_client_t *c,
             c, VEMB_V16_OP_VSIM_INLINE,
             key_ptrs, key_lens,
             payload_ptrs, count,
-            status, aux, max_inflight) != 0)
+            status, aux, max_inflight, NULL) != 0)
         return -1;
 
     /* Translate engine status → out_scores. */
@@ -2204,7 +2255,7 @@ int vemb_v16_client_vsim_repeat(vemb_v16_client_t *c,
                                  float *out_score, int *out_found,
                                  uint32_t max_inflight)
 {
-    if (!c || !set_name || !elem_name || !query_vector || repeat == 0)
+    if (!c || !elem_name || !query_vector || repeat == 0)
         return -1;
 
 #define REPEAT_BATCH 4096
@@ -2241,7 +2292,7 @@ int vemb_v16_client_vemb_repeat(vemb_v16_client_t *c,
                                  const char *set_name, const char *elem_name,
                                  uint32_t repeat, uint32_t max_inflight)
 {
-    if (!c || !set_name || !elem_name || repeat == 0)
+    if (!c || !elem_name || repeat == 0)
         return -1;
 
 #define REPEAT_BATCH 4096
@@ -2258,7 +2309,7 @@ int vemb_v16_client_vemb_repeat(vemb_v16_client_t *c,
                      ? (repeat - offset) : REPEAT_BATCH;
         memset(batch_resps, 0, sizeof(batch_resps[0]) * n);
         if (vemb_v16_client_vemb_pipeline(c, batch_sets, batch_elems,
-                                          n, batch_resps, max_inflight) != 0) {
+                                          n, NULL, batch_resps, max_inflight) != 0) {
             return -1;
         }
     }
@@ -2271,7 +2322,7 @@ int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
                                  const float *vector, uint32_t repeat,
                                  uint32_t max_inflight)
 {
-    if (!c || !set_name || !elem_name || !vector || repeat == 0)
+    if (!c || !elem_name || !vector || repeat == 0)
         return -1;
 
 #define REPEAT_BATCH 4096
@@ -2294,4 +2345,297 @@ int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
     }
     return 0;
 #undef REPEAT_BATCH
+}
+
+/* ===================================================================== *
+ *  Aeron transport (UDS control + POSIX SHM SPSC ring)
+ * ===================================================================== */
+
+#define VEMB_V16_AERON_UDS_TIMEOUT_MS 5000u
+
+struct vemb_v16_aeron_channel {
+    vemb_v16_channel_desc_t    desc;
+    vemb_v16_client_ring_t    *req_ring;
+    vemb_v16_client_ring_t    *resp_ring;
+    char                       uds_path[108];  /* sockaddr_un::sun_path cap */
+    /* warm region (lazy; opened by vemb_v16_aeron_open_warm_region) */
+    void                      *warm_mapping_addr;
+    size_t                     warm_mapping_bytes;
+    const uint8_t             *warm_mapped_addr;   /* data-area pointer */
+    uint64_t                   warm_region_bytes;
+};
+
+/* Connect to a UDS endpoint with a fixed receive/send timeout. Returns
+ * fd on success, -1 on error. Mirrors benchmark/vemb_v16_bench.c:190
+ * connect_uds, but reuses vemb_v16_net_set_timeouts for the timeouts. */
+static int vemb_v16_aeron_uds_connect(const char *uds_path) {
+    if (!uds_path || !uds_path[0]) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    vemb_v16_net_set_timeouts(fd, VEMB_V16_AERON_UDS_TIMEOUT_MS);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, uds_path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* UDS control op: alloc a channel for the requested dim. Fills desc. */
+static int vemb_v16_aeron_uds_alloc(int fd, uint32_t dim,
+                                    vemb_v16_channel_desc_t *desc) {
+    uint8_t op = VEMB_V16_CTRL_ALLOC_CHANNEL;
+    vemb_v16_alloc_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.vector_dim = dim;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    memset(desc, 0, sizeof(*desc));
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0)            return -1;
+    if (vemb_v16_net_write_full(fd, &req,  sizeof(req))  != 0)        return -1;
+    if (vemb_v16_net_read_full (fd, &status, sizeof(status)) != 0)    return -1;
+    if (status != VEMB_V16_STATUS_OK)                                 return -1;
+    if (vemb_v16_net_read_full (fd, desc,   sizeof(*desc))   != 0)    return -1;
+    return 0;
+}
+
+/* UDS control op: close a specific channel by id. */
+static int vemb_v16_aeron_uds_close(int fd, uint64_t channel_id) {
+    uint8_t op = VEMB_V16_CTRL_CLOSE_CHANNEL;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    if (vemb_v16_net_write_full(fd, &op,         sizeof(op))         != 0) return -1;
+    if (vemb_v16_net_write_full(fd, &channel_id, sizeof(channel_id)) != 0) return -1;
+    if (vemb_v16_net_read_full (fd, &status,     sizeof(status))     != 0) return -1;
+    return status == VEMB_V16_STATUS_OK ? 0 : -1;
+}
+
+/* UDS control op: close all channels. *closed receives server-reported
+ * count. */
+static int vemb_v16_aeron_uds_close_all(int fd, uint64_t *closed) {
+    uint8_t op = VEMB_V16_CTRL_CLOSE_ALL_CHANNELS;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    uint64_t n = 0;
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op))         != 0) return -1;
+    if (vemb_v16_net_read_full (fd, &status, sizeof(status)) != 0) return -1;
+    if (status != VEMB_V16_STATUS_OK)                         return -1;
+    if (vemb_v16_net_read_full (fd, &n, sizeof(n))           != 0) return -1;
+    if (closed) *closed = n;
+    return 0;
+}
+
+/* Open a POSIX SHM ring by name + slot_size. */
+static int vemb_v16_aeron_ring_open(const char *name,
+                                    uint32_t slot_size,
+                                    vemb_v16_client_ring_t **out) {
+    if (!name || !name[0] || slot_size == 0 || !out) return -1;
+    int fd = shm_open(name, O_RDWR, 0666);
+    if (fd < 0) return -1;
+    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
+    void *ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) return -1;
+    *out = (vemb_v16_client_ring_t *)ptr;
+    return 0;
+}
+
+static void vemb_v16_aeron_ring_close(vemb_v16_client_ring_t *r,
+                                      uint32_t slot_size) {
+    if (!r || slot_size == 0) return;
+    munmap(r, vemb_v16_client_ring_bytes(slot_size));
+}
+
+/* Best-effort server-side close notification. Errors are swallowed
+ * because the rings are already unmapped locally by the caller. */
+static void vemb_v16_aeron_notify_close(const char *uds_path,
+                                        uint64_t channel_id) {
+    if (!uds_path || !uds_path[0]) return;
+    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (fd < 0) return;
+    vemb_v16_aeron_uds_close(fd, channel_id);
+    close(fd);
+}
+
+vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
+                                              uint32_t dim) {
+    if (!uds_path || !uds_path[0] || dim == 0) return NULL;
+
+    vemb_v16_aeron_channel_t *ch = calloc(1, sizeof(*ch));
+    if (!ch) return NULL;
+    strncpy(ch->uds_path, uds_path, sizeof(ch->uds_path) - 1);
+
+    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (fd < 0) { free(ch); return NULL; }
+    int rc = vemb_v16_aeron_uds_alloc(fd, dim, &ch->desc);
+    close(fd);
+    if (rc != 0) {
+        free(ch);
+        return NULL;
+    }
+
+    if (vemb_v16_aeron_ring_open(ch->desc.request_ring_name,
+                                 ch->desc.request_ring_slot_size,
+                                 &ch->req_ring) != 0) {
+        vemb_v16_aeron_notify_close(uds_path, ch->desc.channel_id);
+        free(ch);
+        return NULL;
+    }
+    if (vemb_v16_aeron_ring_open(ch->desc.response_ring_name,
+                                 ch->desc.response_ring_slot_size,
+                                 &ch->resp_ring) != 0) {
+        vemb_v16_aeron_ring_close(ch->req_ring, ch->desc.request_ring_slot_size);
+        vemb_v16_aeron_notify_close(uds_path, ch->desc.channel_id);
+        free(ch);
+        return NULL;
+    }
+    return ch;
+}
+
+void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return;
+    if (ch->warm_mapping_addr) {
+        munmap(ch->warm_mapping_addr, ch->warm_mapping_bytes);
+        ch->warm_mapping_addr = NULL;
+        ch->warm_mapping_bytes = 0;
+        ch->warm_mapped_addr   = NULL;
+        ch->warm_region_bytes  = 0;
+    }
+    vemb_v16_aeron_ring_close(ch->req_ring,  ch->desc.request_ring_slot_size);
+    vemb_v16_aeron_ring_close(ch->resp_ring, ch->desc.response_ring_slot_size);
+    vemb_v16_aeron_notify_close(ch->uds_path, ch->desc.channel_id);
+    free(ch);
+}
+
+int vemb_v16_aeron_close_all(const char *uds_path) {
+    if (!uds_path || !uds_path[0]) return -1;
+    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (fd < 0) return -1;
+    uint64_t closed = 0;
+    int rc = vemb_v16_aeron_uds_close_all(fd, &closed);
+    close(fd);
+    if (rc != 0) return -1;
+    return (int)(closed > INT_MAX ? INT_MAX : closed);
+}
+
+uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return 0;
+    return ch->desc.channel_id;
+}
+
+int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
+                                   const void *buf, uint32_t len) {
+    if (!ch) return -3;
+    return vemb_v16_client_publish(ch->req_ring, buf, len);
+}
+
+int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
+                                 void *buf, uint32_t max_len) {
+    if (!ch) return -3;
+    return vemb_v16_client_poll(ch->resp_ring, buf, max_len);
+}
+
+int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return -1;
+    /* Idempotent: unmap previous mapping if any. */
+    if (ch->warm_mapping_addr) {
+        munmap(ch->warm_mapping_addr, ch->warm_mapping_bytes);
+        ch->warm_mapping_addr = NULL;
+        ch->warm_mapping_bytes = 0;
+        ch->warm_mapped_addr   = NULL;
+        ch->warm_region_bytes  = 0;
+    }
+    void *mapping_addr = NULL;
+    size_t mapping_bytes = 0;
+    void *mapped_addr = NULL;
+    uint64_t region_bytes = 0;
+    if (vemb_v16_open_warm_region(&ch->desc, &mapping_addr, &mapping_bytes,
+                                  &mapped_addr, &region_bytes) != 0) {
+        return -1;
+    }
+    ch->warm_mapping_addr = mapping_addr;
+    ch->warm_mapping_bytes = mapping_bytes;
+    ch->warm_mapped_addr   = (const uint8_t *)mapped_addr;
+    ch->warm_region_bytes  = region_bytes;
+    return 0;
+}
+
+int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
+                               uint64_t offset, uint32_t bytes,
+                               void *out, uint32_t cap) {
+    if (!ch || !out)                                   return -1;
+    if (!ch->warm_mapped_addr)                         return -1;
+    if (bytes == 0 || bytes > cap)                     return -1;
+    /* Bounds check against the server-reported region size. */
+    if (offset > ch->warm_region_bytes ||
+        (uint64_t)bytes > ch->warm_region_bytes - offset) return -1;
+    sve_streaming_load_f32(ch->warm_mapped_addr + offset, out, bytes);
+    return (int)bytes;
+}
+
+/* =====================================================================
+ *  SVE-aware streaming load — backs vemb_v16_aeron_read_vector and the
+ *  protocol.cpp VEMB_INLINE copy path. Ported from src/sve_operation.c
+ *  with all server-side deps stripped. Plain memcpy fallback when the
+ *  SDK is built without -DUSE_ARM_SVE.
+ * ===================================================================== */
+
+void sve_streaming_load(const void *src, void *dst, size_t size) {
+#ifdef USE_ARM_SVE
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)dst;
+    size_t off = 0;
+    while (off < size) {
+        svbool_t pg = svwhilelt_b8_u64((uint64_t)off, (uint64_t)size);
+        svuint8_t v = svld1_u8(pg, &s[off]);
+        svst1_u8(pg, &d[off], v);
+        off += svcntb();
+    }
+#else
+    if (size) memcpy(dst, src, size);
+#endif
+}
+
+void sve_streaming_load_f32(const void *src, void *dst, size_t size) {
+#ifdef USE_ARM_SVE
+    if ((((uintptr_t)src | (uintptr_t)dst | size) & (sizeof(float) - 1u)) != 0) {
+        sve_streaming_load(src, dst, size);
+        return;
+    }
+    const size_t vl = svcntw();
+    size_t rem = size / sizeof(float);
+    const float *srcp = (const float *)src;
+    float *dstp = (float *)dst;
+
+    svbool_t pg = svptrue_b32();
+    while (rem >= vl * 4u) {
+        __builtin_prefetch(srcp + vl * 8u, 0, 3);
+        svfloat32_t v0 = svld1_f32(pg, srcp);
+        svfloat32_t v1 = svld1_f32(pg, srcp + vl);
+        svfloat32_t v2 = svld1_f32(pg, srcp + vl * 2u);
+        svfloat32_t v3 = svld1_f32(pg, srcp + vl * 3u);
+        svst1_f32(pg, dstp, v0);
+        svst1_f32(pg, dstp + vl, v1);
+        svst1_f32(pg, dstp + vl * 2u, v2);
+        svst1_f32(pg, dstp + vl * 3u, v3);
+        srcp += vl * 4u;
+        dstp += vl * 4u;
+        rem  -= vl * 4u;
+    }
+    while (rem >= vl) {
+        svfloat32_t v = svld1_f32(pg, srcp);
+        svst1_f32(pg, dstp, v);
+        srcp += vl;
+        dstp += vl;
+        rem  -= vl;
+    }
+    if (rem > 0) {
+        svbool_t tail = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+        svfloat32_t v = svld1_f32(tail, srcp);
+        svst1_f32(tail, dstp, v);
+    }
+#else
+    if (size) memcpy(dst, src, size);
+#endif
 }
