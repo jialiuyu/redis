@@ -1263,13 +1263,13 @@ error_response:
 
 /// Response scheduling: drain SuperNode completions and publish by transport.
 static int drain_completions(vemb_v16_channel_t *ch) {
-    vemb_v16_completion_t completions[VEMB_V16_PROXY_BATCH];
-    uint16_t ready_indices[VEMB_V16_PROXY_BATCH];
+    vemb_v16_completion_t completions[VEMB_V16_PROXY_RESPONSE_BATCH];
+    uint16_t ready_indices[VEMB_V16_PROXY_RESPONSE_BATCH];
     uint32_t n;
     uint32_t total = 0;
     while ((n = vemb_v16_aeron_poll_batch(&ch->completion_ring,
                                           completions,
-                                          VEMB_V16_PROXY_BATCH)) != 0) {
+                                          VEMB_V16_PROXY_RESPONSE_BATCH)) != 0) {
         total += n;
         uint32_t ready_count = 0;
         for (uint32_t i = 0; i < n; i++) {
@@ -2298,7 +2298,8 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
     for (uint32_t work_id = 0; work_id < proxy->job_shard_proxy_count; work_id++) {
         uint32_t queue_index = shard_queue_index(proxy, work_id, sn_work_id);
         vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
-        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_refs, VEMB_V16_PROXY_BATCH);
+        uint32_t n = vemb_v16_aeron_poll_batch(
+            ring, job_refs, VEMB_V16_PROXY_DRAIN_SHARD_QUEUES_BATCH);
         if (!n) continue;
 
         did_work += (int)n;
@@ -2388,14 +2389,14 @@ static int drain_job_return_queues(vemb_v16_proxy_t *proxy,
               0);
 
     int reclaimed = 0;
-    vemb_v16_job_return_t returns[VEMB_V16_PROXY_BATCH];
+    vemb_v16_job_return_t returns[VEMB_V16_PROXY_JOB_RETURN_BATCH];
     for (uint32_t sn_id = 0; sn_id < proxy->job_shard_supernode_count; sn_id++) {
         uint32_t queue_index = shard_queue_index(proxy, proxy_worker_id, sn_id);
         vemb_v16_aeron_ring_t *ring = &proxy->job_return_queues[queue_index].ring;
         uint32_t n;
         while ((n = vemb_v16_aeron_poll_batch(ring,
                                               returns,
-                                              VEMB_V16_PROXY_BATCH)) != 0) {
+                                              VEMB_V16_PROXY_JOB_RETURN_BATCH)) != 0) {
             reclaimed += (int)n;
             for (uint32_t i = 0; i < n; i++) {
                 vemb_v16_job_return_t *ret = &returns[i];

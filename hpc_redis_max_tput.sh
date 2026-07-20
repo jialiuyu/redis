@@ -22,7 +22,7 @@ PORT=${PORT:-6390}
 SERVER_CPUSET=${SERVER_CPUSET:-1-96}
 CLIENT_CPUSET=${CLIENT_CPUSET:-97-191}
 TEST_TIME=${TEST_TIME:-5}
-PIPELINE=${PIPELINE:-32}
+PIPELINE=${PIPELINE:-1}
 # op mode: vemb (read) | vadd (write) | vsim (similarity) | vrem (delete)
 OP_MODE=${OP_MODE:-vemb}
 case "$OP_MODE" in
@@ -44,6 +44,7 @@ RAWDIR=$OUTDIR/raw
 mkdir -p "$RAWDIR"
 TSV=$OUTDIR/summary.tsv
 PIDFILE=/tmp/hpc_max_tput_server_${PORT}.pid
+CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 
 printf 'pio\tsnw\tt\tc\ttxc\tops_sec\thits\tp50_ms\tp99_ms\tcpu_cores\trun_ops\tmem_base_mb\tmem_peak_mb\tmem_avg_mb\n' > "$TSV"
 declare -A OPS
@@ -97,31 +98,48 @@ prefill() {
 
 # ───────── 汇总某 PID 所有 TID 的 (utime+stime) jiffies ─────────
 get_cpu_jiffies() {
-    local pid=$1 sum=0 f rest
-    for f in /proc/$pid/task/*/stat; do
-        [ -r "$f" ] || continue
-        rest=$(sed 's/.*)//' "$f")
-        set -- $rest
-        sum=$(( sum + ${12:-0} + ${13:-0} ))
-    done
-    echo "$sum"
+    local pid=$1 rest
+    [ -n "$pid" ] || { echo ""; return; }
+    [ -r "/proc/$pid/stat" ] || { echo ""; return; }
+    rest=$(sed 's/.*)//' "/proc/$pid/stat" 2>/dev/null) || { echo ""; return; }
+    set -- $rest
+    [ -n "${12:-}" ] && [ -n "${13:-}" ] || { echo ""; return; }
+    echo $(( ${12:-0} + ${13:-0} ))
+}
+
+resolve_server_pid() {
+    local pid=""
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    pid=$(pgrep -f "redis-server.*:$PORT " | head -1)
+    if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
+        echo "$pid"
+        return 0
+    fi
+    return 1
 }
 
 run_client() {
     local pio=$1 snw=$2 t=$3 c=$4
     local tag=pio${pio}_snw${snw}_t${t}_c${c}
     local raw=$RAWDIR/${tag}.txt
-    local j0 j1 cores
+    local pid j0 j1 cores
     local mem_base_mb mem_peak_mb mem_avg_mb mem_samples_file mem_sampler_pid
-    j0=$(get_cpu_jiffies "$SERVER_PID")
+    pid=$(resolve_server_pid) || pid=""
+    j0=$(get_cpu_jiffies "$pid")
     # ── 内存采集 - 启动 sampler ──
     # VmRSS 不含 warm region mmap（pfn-map），warm region reserved = 1024 MB 固定开销不在列中
-    mem_base_mb=$(awk '/^VmRSS:/{printf "%.0f", $2/1024}' /proc/$SERVER_PID/status 2>/dev/null)
-    echo 1 > /proc/$SERVER_PID/clear_refs 2>/dev/null || true
+    mem_base_mb=$(awk '/^VmRSS:/{printf "%.0f", $2/1024}' /proc/$pid/status 2>/dev/null)
+    [ -n "$pid" ] && echo 1 > /proc/$pid/clear_refs 2>/dev/null || true
     mem_samples_file=/tmp/mem_samples_${tag}.log
     rm -f "$mem_samples_file"
-    ( while kill -0 "$SERVER_PID" 2>/dev/null; do
-        awk '/^VmRSS:/{print $2}' /proc/$SERVER_PID/status 2>/dev/null
+    ( while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do
+        awk '/^VmRSS:/{print $2}' /proc/$pid/status 2>/dev/null
         sleep 0.5
       done > "$mem_samples_file" ) &
     mem_sampler_pid=$!
@@ -131,16 +149,21 @@ run_client() {
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
         $OP_ARGS --key-prefix=$KEY_PREFIX \
         --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
-    j1=$(get_cpu_jiffies "$SERVER_PID")
+    pid=$(resolve_server_pid) || pid="$pid"
+    j1=$(get_cpu_jiffies "$pid")
     # ── 内存采集 - 停止 sampler + 读结果 ──
     kill "$mem_sampler_pid" 2>/dev/null || true
     wait "$mem_sampler_pid" 2>/dev/null || true
     sleep 0.2
-    mem_peak_mb=$(awk '/^VmHWM:/{printf "%.0f", $2/1024}' /proc/$SERVER_PID/status 2>/dev/null)
+    mem_peak_mb=$(awk '/^VmHWM:/{printf "%.0f", $2/1024}' /proc/$pid/status 2>/dev/null)
     mem_avg_mb=$(awk '{s+=$1;n++} END{if(n>0) printf "%.0f", s/n/1024}' "$mem_samples_file" 2>/dev/null)
     rm -f "$mem_samples_file"
     # 高并发时 server 线程 churn (连接线程退出) 会丢 jiffies → delta 负; clamp 成 NA
-    cores=$(awk -v d=$(( j1 - j0 )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
+    if [ -z "$j0" ] || [ -z "$j1" ]; then
+        cores="NA"
+    else
+        cores=$(awk -v d=$(( j1 - j0 )) -v tt=$TEST_TIME -v hz=$CLK_TCK 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/hz/tt }')
+    fi
     local tot; tot=$(grep '^Totals' "$raw" | tail -1)
     local ops hits p50 p99
     ops=$(echo "$tot" | awk '{print $2}')

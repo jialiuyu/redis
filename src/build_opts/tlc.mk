@@ -1,13 +1,34 @@
 # src/build_opts/tlc.mk — Three-layer cache module
 # Usage: make USE_TLC=yes (requires USE_SVE2=yes)
+# Optional experiment knobs:
+#   VEMB_V16_PROXY_REQUEST_BATCH=<n>
+#   VEMB_V16_PROXY_DRAIN_SHARD_QUEUES_BATCH=<n>
+#   VEMB_V16_PROXY_JOB_RETURN_BATCH=<n>
+#   VEMB_V16_PROXY_RESPONSE_BATCH=<n>
 
 USE_TLC ?= no
+VEMB_V16_PROXY_REQUEST_BATCH ?=
+VEMB_V16_PROXY_DRAIN_SHARD_QUEUES_BATCH ?=
+VEMB_V16_PROXY_JOB_RETURN_BATCH ?=
+VEMB_V16_PROXY_RESPONSE_BATCH ?=
 
 ifeq ($(USE_TLC),yes)
     ifneq ($(USE_SVE2),yes)
         $(error USE_TLC=yes requires USE_SVE2=yes — three_layer_cache_ub.c uses SVE intrinsics)
     endif
     FEATURE_CFLAGS  += -DUSE_TLC
+    ifneq ($(strip $(VEMB_V16_PROXY_REQUEST_BATCH)),)
+        FEATURE_CFLAGS += -DVEMB_V16_PROXY_REQUEST_BATCH=$(VEMB_V16_PROXY_REQUEST_BATCH)
+    endif
+    ifneq ($(strip $(VEMB_V16_PROXY_DRAIN_SHARD_QUEUES_BATCH)),)
+        FEATURE_CFLAGS += -DVEMB_V16_PROXY_DRAIN_SHARD_QUEUES_BATCH=$(VEMB_V16_PROXY_DRAIN_SHARD_QUEUES_BATCH)
+    endif
+    ifneq ($(strip $(VEMB_V16_PROXY_JOB_RETURN_BATCH)),)
+        FEATURE_CFLAGS += -DVEMB_V16_PROXY_JOB_RETURN_BATCH=$(VEMB_V16_PROXY_JOB_RETURN_BATCH)
+    endif
+    ifneq ($(strip $(VEMB_V16_PROXY_RESPONSE_BATCH)),)
+        FEATURE_CFLAGS += -DVEMB_V16_PROXY_RESPONSE_BATCH=$(VEMB_V16_PROXY_RESPONSE_BATCH)
+    endif
     FEATURE_LDFLAGS +=
     FEATURE_OBJS    += three_layer_cache_ub.o
 endif

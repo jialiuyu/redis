@@ -110,14 +110,14 @@ int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
     vemb_v16_client_ring_t *request_ring = vemb_v16_channel_request_ring(ch);
 
     vemb_v16_req_t *req_buf =
-        zmalloc(sizeof(*req_buf) * VEMB_V16_PROXY_BATCH);
+        zmalloc(sizeof(*req_buf) * VEMB_V16_PROXY_REQUEST_BATCH);
     if (!req_buf)
         return -1;
 
     uint32_t req_count = vemb_v16_client_poll_batch(request_ring,
                                                     req_buf,
                                                     sizeof(req_buf[0]),
-                                                    VEMB_V16_PROXY_BATCH);
+                                                    VEMB_V16_PROXY_REQUEST_BATCH);
     if (req_count == 0) {
         zfree(req_buf);
         return 0;

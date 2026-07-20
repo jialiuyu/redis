@@ -279,10 +279,10 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
                                           uint32_t *published,
                                           size_t *out_len) {
     uint32_t net_flags = 0;
-    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-    const uint8_t *vectors[VEMB_V16_PROXY_BATCH];
-    uint32_t vector_bytes[VEMB_V16_PROXY_BATCH];
-    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+    vemb_v16_resp_t responses[VEMB_V16_PROXY_RESPONSE_BATCH];
+    const uint8_t *vectors[VEMB_V16_PROXY_RESPONSE_BATCH];
+    uint32_t vector_bytes[VEMB_V16_PROXY_RESPONSE_BATCH];
+    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_RESPONSE_BATCH];
     uint32_t out = 0;
     size_t total_bytes = 0;
 
@@ -458,9 +458,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                         uint32_t *published) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
         uint32_t net_flags = 0;
-        vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-        uint8_t frame_prefixes[VEMB_V16_PROXY_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
-        struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
+        vemb_v16_resp_t responses[VEMB_V16_PROXY_RESPONSE_BATCH];
+        uint8_t frame_prefixes[VEMB_V16_PROXY_RESPONSE_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
+        struct iovec iov[VEMB_V16_PROXY_RESPONSE_BATCH * 3u];
         int iovcnt = 0;
         uint32_t out = 0;
 
@@ -534,9 +534,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
 
 #ifdef __linux__
     uint32_t net_flags = 0;
-    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-    uint8_t frame_prefixes[VEMB_V16_PROXY_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
-    struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
+    vemb_v16_resp_t responses[VEMB_V16_PROXY_RESPONSE_BATCH];
+    uint8_t frame_prefixes[VEMB_V16_PROXY_RESPONSE_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
+    struct iovec iov[VEMB_V16_PROXY_RESPONSE_BATCH * 3u];
     int iovcnt = 0;
     uint32_t out = 0;
     size_t total_bytes = 0;
@@ -771,7 +771,7 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
 int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
                                     uint32_t proxy_io_worker_id) {
     uint32_t count = 0;
-    while (count < VEMB_V16_PROXY_BATCH) {
+    while (count < VEMB_V16_PROXY_REQUEST_BATCH) {
         int rc = channel_read_tcp_request_from_input(ch, proxy_io_worker_id);
         if (rc < 0)
             return -1;
@@ -779,14 +779,14 @@ int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
             break;
         count++;
     }
-    if (count >= VEMB_V16_PROXY_BATCH)
+    if (count >= VEMB_V16_PROXY_REQUEST_BATCH)
         return (int)count;
 
     int fill_rc = fill_tcp_input_buffer(ch);
     if (fill_rc < 0)
         return -1;
 
-    while (count < VEMB_V16_PROXY_BATCH) {
+    while (count < VEMB_V16_PROXY_REQUEST_BATCH) {
         int rc = channel_read_tcp_request_from_input(ch, proxy_io_worker_id);
         if (rc < 0)
             return -1;
