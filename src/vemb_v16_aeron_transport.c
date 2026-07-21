@@ -123,11 +123,14 @@ int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
         return 0;
     }
 
-    for (uint32_t i = 0; i < req_count; i++) {
-        vemb_v16_proxy_handle_request(ch, &req_buf[i],
-                       (int)vemb_v16_channel_request_slot_size(ch),
-                       proxy_io_worker_id);
-    }
+    int req_lens[VEMB_V16_PROXY_BATCH];
+    for (uint32_t i = 0; i < req_count; i++)
+        req_lens[i] = (int)vemb_v16_channel_request_slot_size(ch);
+    vemb_v16_proxy_handle_request_batch(ch,
+                                        req_buf,
+                                        req_lens,
+                                        req_count,
+                                        proxy_io_worker_id);
     zfree(req_buf);
     return (int)req_count;
 }

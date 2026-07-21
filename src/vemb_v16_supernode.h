@@ -17,6 +17,9 @@ typedef struct vemb_v16_supernode_ctx {
     atomic_int *completion_notify_armed;
     int *completion_notify_fd;
     vemb_v16_aeron_ring_t *completion_ring;
+    vemb_v16_completion_t *completion_batch;
+    uint32_t *completion_batch_count;
+    uint32_t completion_batch_capacity;
     vemb_v16_storage_ctx_t *storage;
     vemb_v16_channel_counters_t *stats;
     sve_operation_stats_t *sve_stats;
@@ -24,10 +27,13 @@ typedef struct vemb_v16_supernode_ctx {
 
 typedef struct vemb_v16_supernode_scratch {
     vemb_v16_job_ref_t *job_refs;
+    vemb_v16_completion_t *completion_batch;
 } vemb_v16_supernode_scratch_t;
 
 void vemb_v16_completion_release_inline_snapshot(
     vemb_v16_completion_t *completion);
+void vemb_v16_supernode_flush_completion_batch(vemb_v16_supernode_ctx_t *ctx,
+                                               int notify);
 int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch);
 void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch);
 void vemb_v16_supernode_handle_base_job(vemb_v16_supernode_ctx_t *ctx,

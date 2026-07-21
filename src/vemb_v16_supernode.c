@@ -128,8 +128,8 @@ static int snapshot_vemb_payload(vemb_v16_supernode_ctx_t *ctx,
 
 static void vemb_v16_notify_completion_consumer(vemb_v16_supernode_ctx_t *ctx) {
 #ifdef __linux__
-    if (!ctx->completion_notify_armed || !ctx->completion_notify_fd)
-        return;
+    RETURN_IF(!ctx->completion_notify_armed);
+    RETURN_IF(!ctx->completion_notify_fd);
     int expected = 1;
     if (!atomic_compare_exchange_strong_explicit(ctx->completion_notify_armed,
                                                  &expected,
@@ -140,7 +140,7 @@ static void vemb_v16_notify_completion_consumer(vemb_v16_supernode_ctx_t *ctx) {
     }
 
     int notify_fd = *ctx->completion_notify_fd;
-    if (notify_fd >= 0) {
+    if (likely(notify_fd >= 0)) {
         uint64_t one = 1;
         (void)write(notify_fd, &one, sizeof(one));
     }
@@ -149,14 +149,43 @@ static void vemb_v16_notify_completion_consumer(vemb_v16_supernode_ctx_t *ctx) {
 #endif
 }
 
-static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
-                                        const vemb_v16_completion_t *completion) {
-    while (vemb_v16_aeron_publish(ctx->completion_ring, completion) != 0 &&
+void vemb_v16_supernode_flush_completion_batch(vemb_v16_supernode_ctx_t *ctx,
+                                               int notify) {
+    uint32_t count = *ctx->completion_batch_count;
+    RETURN_IF(count == 0);
+
+    while (vemb_v16_aeron_publish_batch(ctx->completion_ring,
+                                        ctx->completion_batch,
+                                        count) != 0 &&
            atomic_load_explicit(ctx->running, memory_order_relaxed) &&
            atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
         cpu_relax();
     }
-    vemb_v16_notify_completion_consumer(ctx);
+    *ctx->completion_batch_count = 0;
+    if (notify)
+        vemb_v16_notify_completion_consumer(ctx);
+}
+
+static void vemb_v16_publish_completion(vemb_v16_supernode_ctx_t *ctx,
+                                        const vemb_v16_completion_t *completion) {
+    if (!ctx->completion_batch || !ctx->completion_batch_count ||
+        ctx->completion_batch_capacity == 0) {
+        while (vemb_v16_aeron_publish(ctx->completion_ring, completion) != 0 &&
+               atomic_load_explicit(ctx->running, memory_order_relaxed) &&
+               atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
+            cpu_relax();
+        }
+        vemb_v16_notify_completion_consumer(ctx);
+        return;
+    }
+
+    uint32_t count = *ctx->completion_batch_count;
+    if (count == ctx->completion_batch_capacity) {
+        vemb_v16_supernode_flush_completion_batch(ctx, 0);
+        count = 0;
+    }
+    ctx->completion_batch[count] = *completion;
+    *ctx->completion_batch_count = count + 1;
 }
 
 void vemb_v16_supernode_handle_base_job(vemb_v16_supernode_ctx_t *ctx,
@@ -737,11 +766,18 @@ int vemb_v16_supernode_scratch_init(vemb_v16_supernode_scratch_t *scratch) {
         vemb_v16_supernode_scratch_cleanup(scratch);
         return -1;
     }
+    scratch->completion_batch = zmalloc(sizeof(*scratch->completion_batch) *
+                                        VEMB_V16_SUPERNODE_BATCH);
+    if (!scratch->completion_batch) {
+        vemb_v16_supernode_scratch_cleanup(scratch);
+        return -1;
+    }
     return 0;
 }
 
 void vemb_v16_supernode_scratch_cleanup(vemb_v16_supernode_scratch_t *scratch) {
     assert(scratch != NULL);
     zfree(scratch->job_refs);
+    zfree(scratch->completion_batch);
     memset(scratch, 0, sizeof(*scratch));
 }
