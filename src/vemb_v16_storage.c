@@ -2,6 +2,7 @@
 
 #include "cpu_relax.h"
 #include "macro.h"
+#include "util.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
