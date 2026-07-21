@@ -207,6 +207,7 @@ protected:
     uint32_t m_req_id;
     uint32_t m_dim;
     uint32_t m_max_vectors;
+    bool m_handle_mode;
 
     /* warm region (mmap'd once per connection), aligned with benchmark */
     uint8_t *m_warm_mapping_addr;
@@ -231,7 +232,9 @@ public:
 
     void set_vsim_mode(bool enable);
     void set_vrem_mode(bool enable);
+    void set_handle_mode(bool enable);
     void set_dim(uint32_t dim);
+    uint32_t get_dim(void) const { return m_dim; }
     void build_vsim_template(void);
 
     virtual int select_db(int db);
@@ -250,6 +253,19 @@ public:
 
     int write_hello(void);
     int parse_welcome(void);
+    int set_channel_desc(const vemb_v16_channel_desc_t *desc);
+    int build_aeron_set_request(const char *key, int key_len,
+                                const char *value, int value_len,
+                                int expiry, unsigned int offset,
+                                vemb_v16_req_t *req, size_t *req_len);
+    int build_aeron_get_request(const char *key, int key_len,
+                                unsigned int offset,
+                                vemb_v16_req_t *req, size_t *req_len);
+    int parse_aeron_response(const vemb_v16_resp_t *resp,
+                             const uint8_t *inline_data,
+                             uint32_t inline_bytes,
+                             const uint8_t *warm_mapped_addr,
+                             uint64_t warm_region_bytes);
 
 private:
     int open_warm_region(const vemb_v16_channel_desc_t *desc);

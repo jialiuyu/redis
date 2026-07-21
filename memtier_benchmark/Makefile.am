@@ -30,8 +30,10 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBEVENT_OPENSSL_CFLAGS) \
 	$(LIBCRYPTO_CFLAGS) \
 	$(LIBSSL_CFLAGS) \
-	-I$(top_srcdir)/../hpc-redis/clients/c/build/include \
-	-I$(top_srcdir)/../hpc-redis/src
+	-DSVE_OP_STANDALONE \
+	-I$(top_srcdir)/../clients/c \
+	-I$(top_srcdir)/../clients/c/internal \
+	-I$(top_srcdir)/../src
 memtier_benchmark_SOURCES = \
 	memtier_benchmark.cpp memtier_benchmark.h \
 	client.cpp client.h \
@@ -45,6 +47,13 @@ memtier_benchmark_SOURCES = \
 	item.cpp item.h \
 	file_io.cpp file_io.h \
 	config_types.cpp config_types.h \
+	../clients/c/vemb_v16_client_sdk.c \
+	../src/vemb_v16_net.c \
+	../src/vemb_v16_client_topology.c \
+	../src/vemb_v16_topology.c \
+	../src/sve_operation.c ../src/sve_operation.h \
+	../src/monotonic.c ../src/monotonic.h \
+	../src/redisassert.c ../src/redisassert.h \
 	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
 	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_encoding.h
@@ -54,12 +63,7 @@ memtier_benchmark_LDADD = \
 	$(LIBEVENT_LIBS) \
 	$(LIBEVENT_OPENSSL_LIBS) \
 	$(LIBCRYPTO_LIBS) \
-	$(LIBSSL_LIBS) \
-	$(top_srcdir)/../hpc-redis/clients/c/build/libvemb_v16_client.a
-
-# 显式声明 .a 依赖，确保 make 在链接前知悉（autotools 不会自动从 LDADD 推导 file deps）
-memtier_benchmark_DEPENDENCIES = \
-	$(top_srcdir)/../hpc-redis/clients/c/build/libvemb_v16_client.a
+	$(LIBSSL_LIBS)
 
 
 @CODE_COVERAGE_RULES@

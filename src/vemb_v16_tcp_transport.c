@@ -669,10 +669,7 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
     }
     if (req->channel_id == 0)
         req->channel_id = vemb_v16_channel_id(ch);
-    *req_len = (int)((req->op == VEMB_V16_OP_VADD ||
-                      req->op == VEMB_V16_OP_VSIM_INLINE) ?
-        vemb_v16_req_inline_len(req->vector_bytes) :
-        vemb_v16_req_handle_len());
+    *req_len = (int)hdr.payload_len;
     vemb_v16_tcp_input_consume(ch, frame_len);
     return 1;
 }

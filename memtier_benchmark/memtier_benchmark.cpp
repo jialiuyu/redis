@@ -424,6 +424,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_command_key_pattern,
         o_command_ratio,
         o_vemb_v16_dim,
+        o_vemb_v16_handle,
         o_vemb_v16_vsim,
         o_vemb_v16_vrem,
         o_vemb_v16_endpoints,
@@ -506,6 +507,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "command-key-pattern",        1, 0, o_command_key_pattern },
         { "command-ratio",              1, 0, o_command_ratio },
         { "vemb-v16-dim",               1, 0, o_vemb_v16_dim },
+        { "vemb-v16-handle",            0, 0, o_vemb_v16_handle },
         { "vemb-v16-vsim",              0, 0, o_vemb_v16_vsim },
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
         { "vemb-v16-endpoints",         1, 0, o_vemb_v16_endpoints },
@@ -883,6 +885,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 case o_vemb_v16_dim:
                     cfg->vemb_v16_dim = (uint32_t)strtoul(optarg, NULL, 10);
                     break;
+                case o_vemb_v16_handle:
+                    cfg->vemb_v16_handle = true;
+                    break;
                 case o_vemb_v16_vsim:
                     cfg->vemb_v16_vsim = true;
                     break;
@@ -1086,6 +1091,7 @@ void usage() {
             "\n"
             "VEMB V16 Options:\n"
             "      --vemb-v16-dim=DIM         Vector dimension for vemb_v16 protocol (default: 0)\n"
+            "      --vemb-v16-handle          Read vectors via warm-region handles instead of inline payloads\n"
             "      --vemb-v16-vsim            Use VSIM_INLINE instead of VEMB_HANDLE for vemb_v16 reads\n"
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
             "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
@@ -1121,6 +1127,7 @@ struct cg_thread {
         if (m_config->protocol == PROTOCOL_VEMB_V16) {
             vemb_v16_protocol *vp = (vemb_v16_protocol*)m_protocol;
             if (m_config->vemb_v16_dim > 0) vp->set_dim(m_config->vemb_v16_dim);
+            if (m_config->vemb_v16_handle) vp->set_handle_mode(true);
             if (m_config->vemb_v16_vsim) vp->set_vsim_mode(true);
             if (m_config->vemb_v16_vrem) vp->set_vrem_mode(true);
         }

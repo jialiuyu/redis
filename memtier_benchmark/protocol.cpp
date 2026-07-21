@@ -38,6 +38,31 @@
 
 #include "vemb_v16_client_sdk.h"
 
+extern "C" {
+void sve_streaming_load_f32(const void *src, void *dst, size_t size);
+}
+
+static int vemb_v16_copy_handle_vector(const vemb_v16_resp_t *resp,
+                                       const uint8_t *warm_mapped_addr,
+                                       uint64_t warm_region_bytes,
+                                       char **out_value) {
+    if (!resp || !out_value || !warm_mapped_addr || resp->vector_bytes == 0)
+        return -1;
+    if (resp->vector_offset > warm_region_bytes ||
+        resp->vector_bytes > warm_region_bytes - resp->vector_offset) {
+        return -1;
+    }
+
+    char *value = (char *)malloc(resp->vector_bytes);
+    if (!value)
+        return -1;
+
+    const uint8_t *src = warm_mapped_addr + resp->vector_offset;
+    sve_streaming_load_f32(src, value, resp->vector_bytes);
+    *out_value = value;
+    return 0;
+}
+
 /////////////////////////////////////////////////////////////////////////
 
 abstract_protocol::abstract_protocol() :
@@ -1261,6 +1286,7 @@ int memcache_binary_protocol::write_arbitrary_command(const char *val, int val_l
 
 vemb_v16_protocol::vemb_v16_protocol(uint32_t dim, uint32_t max_vectors)
     : m_channel_id(0), m_req_id(1), m_dim(dim), m_max_vectors(max_vectors),
+      m_handle_mode(false),
       m_warm_mapping_addr(NULL), m_warm_mapping_bytes(0),
       m_warm_mapped_addr(NULL), m_warm_region_bytes(0),
       m_vsim_mode(false), m_vsim_query_vector(NULL),
@@ -1340,6 +1366,11 @@ void vemb_v16_protocol::set_vrem_mode(bool enable)
     m_vrem_mode = enable;
 }
 
+void vemb_v16_protocol::set_handle_mode(bool enable)
+{
+    m_handle_mode = enable;
+}
+
 void vemb_v16_protocol::set_dim(uint32_t dim)
 {
     if (dim == m_dim || dim == 0) return;
@@ -1367,7 +1398,9 @@ void vemb_v16_protocol::set_dim(uint32_t dim)
 abstract_protocol* vemb_v16_protocol::clone(void)
 {
     vemb_v16_protocol *p = new vemb_v16_protocol(m_dim, m_max_vectors);
+    p->set_handle_mode(m_handle_mode);
     p->set_vsim_mode(m_vsim_mode);
+    p->set_vrem_mode(m_vrem_mode);
     return p;
 }
 
@@ -1458,13 +1491,88 @@ int vemb_v16_protocol::parse_welcome(void)
     m_channel_id = desc.channel_id;
     build_vsim_template();
 
-    /* The benchmark client sends vectors inline (VADD) and receives them
-     * inline (VEMB/VSIM), so the warm-region mmap is not required here.
-     * Skipping it avoids a ~157MB mapping per connection, which becomes
-     * prohibitive with many threads/endpoints. */
-    (void)desc;
+    if (m_handle_mode && !m_vsim_mode) {
+        if (open_warm_region(&desc) != 0) {
+            benchmark_error_log("error: failed to open VEMB warm region for handle mode.\n");
+            return -1;
+        }
+    }
 
     return 1;
+}
+
+int vemb_v16_protocol::set_channel_desc(const vemb_v16_channel_desc_t *desc)
+{
+    if (!desc)
+        return -1;
+
+    m_channel_id = desc->channel_id;
+    build_vsim_template();
+    return 0;
+}
+
+int vemb_v16_protocol::build_aeron_set_request(const char *key, int key_len,
+                                               const char *value,
+                                               int value_len,
+                                               int expiry,
+                                               unsigned int offset,
+                                               vemb_v16_req_t *req,
+                                               size_t *req_len)
+{
+    (void)expiry;
+    (void)offset;
+    (void)value_len;
+
+    if (!req || !req_len)
+        return -1;
+
+    uint32_t actual_key_len = (key_len < (int)VEMB_V16_MAX_KEY_LEN)
+        ? (uint32_t)key_len : VEMB_V16_MAX_KEY_LEN - 1;
+
+    memset(req, 0, sizeof(*req));
+    req->op = m_vrem_mode ? VEMB_V16_OP_VREM : VEMB_V16_OP_VADD;
+    req->req_id = m_req_id++;
+    req->channel_id = m_channel_id;
+    req->key_len = actual_key_len;
+    memcpy(req->key, key, actual_key_len);
+    req->key_hash = vemb_v16_xxh3_64_str(req->key, req->key_len);
+
+    if (m_vrem_mode) {
+        *req_len = offsetof(vemb_v16_req_t, key) + req->key_len;
+        return 0;
+    }
+
+    req->dim = m_dim;
+    req->vector_bytes = m_dim * sizeof(float);
+    memcpy(req->vector, value, req->vector_bytes);
+    *req_len = offsetof(vemb_v16_req_t, vector) + req->vector_bytes;
+    return 0;
+}
+
+int vemb_v16_protocol::build_aeron_get_request(const char *key, int key_len,
+                                               unsigned int offset,
+                                               vemb_v16_req_t *req,
+                                               size_t *req_len)
+{
+    (void)offset;
+
+    if (!req || !req_len || m_vsim_mode)
+        return -1;
+
+    uint32_t actual_key_len = (key_len < (int)VEMB_V16_MAX_KEY_LEN)
+        ? (uint32_t)key_len : VEMB_V16_MAX_KEY_LEN - 1;
+
+    memset(req, 0, sizeof(*req));
+    req->op = m_handle_mode ? VEMB_V16_OP_VEMB_HANDLE : VEMB_V16_OP_VEMB_INLINE;
+    req->req_id = m_req_id++;
+    req->channel_id = m_channel_id;
+    req->key_len = actual_key_len;
+    req->dim = m_dim;
+    req->vector_bytes = m_dim * sizeof(float);
+    memcpy(req->key, key, actual_key_len);
+    req->key_hash = vemb_v16_xxh3_64_str(req->key, req->key_len);
+    *req_len = offsetof(vemb_v16_req_t, key) + req->key_len;
+    return 0;
 }
 
 int vemb_v16_protocol::write_command_set(const char *key, int key_len,
@@ -1566,9 +1674,16 @@ int vemb_v16_protocol::write_command_get(const char *key, int key_len,
     if (evbuffer_reserve_space(m_write_buf, total, vec, 1) < 1)
         return -1;
 
-    ssize_t len = vemb_v16_serialize_vemb_inline(vec[0].iov_base, vec[0].iov_len,
-                                                  m_channel_id, m_req_id++,
-                                                  key, actual_key_len, m_dim);
+    ssize_t len;
+    if (m_handle_mode) {
+        len = vemb_v16_serialize_vemb(vec[0].iov_base, vec[0].iov_len,
+                                      m_channel_id, m_req_id++,
+                                      key, actual_key_len, m_dim);
+    } else {
+        len = vemb_v16_serialize_vemb_inline(vec[0].iov_base, vec[0].iov_len,
+                                             m_channel_id, m_req_id++,
+                                             key, actual_key_len, m_dim);
+    }
     if (len < 0)
         return -1;
 
@@ -1612,8 +1727,6 @@ int vemb_v16_protocol::parse_response()
     if (consumed < 0)
         return -1;
 
-    (void)inline_bytes;  /* inline vector is already included in consumed bytes */
-
     if (resp.status == VEMB_V16_STATUS_OK) {
         m_last_response.incr_hits();
     } else if (resp.status == VEMB_V16_STATUS_NOT_FOUND) {
@@ -1622,8 +1735,72 @@ int vemb_v16_protocol::parse_response()
         m_last_response.set_error();
     }
 
+    if (m_keep_value && resp.status == VEMB_V16_STATUS_OK &&
+        (resp.op == VEMB_V16_OP_VEMB_HANDLE || resp.op == VEMB_V16_OP_VEMB_INLINE) &&
+        resp.vector_bytes > 0) {
+        char *value = NULL;
+        if (resp.op == VEMB_V16_OP_VEMB_INLINE) {
+            if (inline_bytes != resp.vector_bytes) {
+                return -1;
+            }
+            value = (char *)malloc(resp.vector_bytes);
+            if (!value)
+                return -1;
+            sve_streaming_load_f32(data + consumed - inline_bytes,
+                                   value,
+                                   resp.vector_bytes);
+        } else if (vemb_v16_copy_handle_vector(&resp,
+                                               m_warm_mapped_addr,
+                                               m_warm_region_bytes,
+                                               &value) != 0) {
+            return -1;
+        }
+        m_last_response.set_value(value, resp.vector_bytes);
+    }
+
     evbuffer_drain(m_read_buf, (size_t)consumed);
     m_last_response.set_total_len((unsigned int)consumed);
+    return 1;
+}
+
+int vemb_v16_protocol::parse_aeron_response(const vemb_v16_resp_t *resp,
+                                            const uint8_t *inline_data,
+                                            uint32_t inline_bytes,
+                                            const uint8_t *warm_mapped_addr,
+                                            uint64_t warm_region_bytes)
+{
+    if (!resp)
+        return -1;
+
+    m_last_response.clear();
+
+    if (resp->status == VEMB_V16_STATUS_OK) {
+        m_last_response.incr_hits();
+    } else if (resp->status != VEMB_V16_STATUS_NOT_FOUND) {
+        m_last_response.set_error();
+    }
+
+    if (m_keep_value && resp->status == VEMB_V16_STATUS_OK &&
+        (resp->op == VEMB_V16_OP_VEMB_HANDLE || resp->op == VEMB_V16_OP_VEMB_INLINE) &&
+        resp->vector_bytes > 0) {
+        char *value = NULL;
+        if (resp->op == VEMB_V16_OP_VEMB_INLINE) {
+            if (!inline_data || inline_bytes != resp->vector_bytes)
+                return -1;
+            value = (char *)malloc(resp->vector_bytes);
+            if (!value)
+                return -1;
+            sve_streaming_load_f32(inline_data, value, resp->vector_bytes);
+        } else if (vemb_v16_copy_handle_vector(resp,
+                                               warm_mapped_addr,
+                                               warm_region_bytes,
+                                               &value) != 0) {
+            return -1;
+        }
+        m_last_response.set_value(value, resp->vector_bytes);
+    }
+
+    m_last_response.set_total_len((unsigned int)sizeof(*resp) + inline_bytes);
     return 1;
 }
 
@@ -1742,4 +1919,3 @@ void keylist::clear(void)
     m_keys_count = 0;
     m_buffer_ptr = m_buffer;
 }
-

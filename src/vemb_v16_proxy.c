@@ -1221,7 +1221,7 @@ static int tcp_vemb_read_requires_inline_op(vemb_v16_channel_t *ch,
         return 0;
     if (req->op != VEMB_V16_OP_VEMB_HANDLE)
         return 0;
-    return -1;
+    return 0;
 }
 
 /// Request scheduling: validate protocol input and enqueue execution jobs.
@@ -1264,10 +1264,7 @@ void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
             continue;
         }
 
-        size_t min_len = (req->op == VEMB_V16_OP_VADD ||
-                          req->op == VEMB_V16_OP_VSIM_INLINE) ?
-            vemb_v16_req_inline_len(req->vector_bytes) :
-            vemb_v16_req_handle_len();
+        size_t min_len = vemb_v16_req_encoded_len(req);
         if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
             req->vector_bytes > sizeof(req->vector)) {
             publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
@@ -1329,9 +1326,7 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         goto error_response;
     }
 
-    size_t min_len = (req->op == VEMB_V16_OP_VADD ||
-                      req->op == VEMB_V16_OP_VSIM_INLINE) ?
-        vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
+    size_t min_len = vemb_v16_req_encoded_len(req);
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {
         goto error_response;

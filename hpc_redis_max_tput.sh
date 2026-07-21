@@ -11,7 +11,7 @@ set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 HPC=${HPC:-$SCRIPT_DIR}
-MEMTIER=${MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark}
+MEMTIER=${MEMTIER:-$HPC/memtier_benchmark/memtier_benchmark}
 BENCH=${BENCH:-$HPC/benchmark/vemb_v16_bench}
 MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 CLEAR_UB=/tmp/clear_ub_device
@@ -29,11 +29,12 @@ PREFILL_THREADS=${PREFILL_THREADS:-16}
 PREFILL_PIPELINE=${PREFILL_PIPELINE:-16}
 VEMB_READ_MODE=${VEMB_READ_MODE:-inline}
 # op mode: vemb (read) | vadd (write) | vsim (similarity) | vrem (delete)
-#          vemb_handle (UB shared, server returns handle only)
+#          vemb_handle / vemb-handle (TCP handle-only read, client loads warm region)
 OP_MODE=${OP_MODE:-vemb}
 OP_MODE_CANON=$(printf '%s' "$OP_MODE" | tr '[:upper:]' '[:lower:]')
 VEMB_READ_MODE_CANON=$(printf '%s' "$VEMB_READ_MODE" | tr '[:upper:]' '[:lower:]')
 CLIENT_IMPL=memtier
+SERVER_IMPL=redis
 case "$VEMB_READ_MODE_CANON" in
     inline|vector-handle) ;;
     *) echo "FAIL: unknown VEMB_READ_MODE=$VEMB_READ_MODE (use inline|vector-handle)"; exit 2 ;;
@@ -50,7 +51,9 @@ case "$OP_MODE_CANON" in
     vadd)        OP_ARGS="--ratio=1:0 --key-pattern=S:S" ;;
     vsim)        OP_ARGS="--vemb-v16-vsim --ratio=0:1 --key-pattern=R:R" ;;
     vrem)        OP_ARGS="--vemb-v16-vrem --ratio=1:0 --key-pattern=S:S" ;;
-    vemb_handle) CLIENT_IMPL=bench; BENCH_MODE=vemb-handle ;;
+    vemb_handle|vemb-handle)
+        OP_ARGS="--vemb-v16-handle --ratio=0:1 --key-pattern=R:R"
+        ;;
     *)           echo "FAIL: unknown OP_MODE=$OP_MODE"; exit 2 ;;
 esac
 # pio snw pairs (1:2 ratio up to 32:64); format: "pio:snw ..."
@@ -98,7 +101,7 @@ start_server() {
     cd "$HPC"
     local PIN_S=""
     [ -n "$SERVER_CPUSET" ] && PIN_S="taskset -c $SERVER_CPUSET"
-    if [ "$CLIENT_IMPL" = "bench" ]; then
+    if [ "$SERVER_IMPL" = "aeron" ]; then
         rm -f "$SOCKET"
         $PIN_S ./src/vemb_v16_server \
             --transport aeron \
@@ -134,7 +137,13 @@ start_server() {
 prefill() {
     local PIN_C_PRE=""
     [ -n "$CLIENT_CPUSET" ] && PIN_C_PRE="taskset -c $CLIENT_CPUSET"
-    if [ "$CLIENT_IMPL" = "bench" ]; then
+    if [ "$SERVER_IMPL" = "aeron" ]; then
+        $PIN_C_PRE $BENCH --transport aeron --socket "$SOCKET" \
+            --mode vadd --dim $DIM --prefill $NUM_KEYS --ops 0 \
+            --threads $PREFILL_THREADS --pipeline $PREFILL_PIPELINE \
+            --timeout-ms $(( TEST_TIME * 1000 + 180000 )) \
+            --no-pin >$RAWDIR/prefill.log 2>&1
+    elif [ "$CLIENT_IMPL" = "bench" ]; then
         $PIN_C_PRE $BENCH --transport aeron --socket "$SOCKET" \
             --mode vadd --dim $DIM --prefill $NUM_KEYS --ops 0 \
             --threads $PREFILL_THREADS --pipeline $PREFILL_PIPELINE \
@@ -180,7 +189,12 @@ run_client() {
     mem_sampler_pid=$!
     local PIN_C=""
     [ -n "$CLIENT_CPUSET" ] && PIN_C="taskset -c $CLIENT_CPUSET"
-    if [ "$CLIENT_IMPL" = "bench" ]; then
+    if [ "$SERVER_IMPL" = "aeron" ]; then
+        $PIN_C $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+            --unix-socket "$SOCKET" -t $t -c $c --pipeline=$PIPELINE \
+            $OP_ARGS --key-prefix=$KEY_PREFIX \
+            --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
+    elif [ "$CLIENT_IMPL" = "bench" ]; then
         local calib_raw=$RAWDIR/${tag}.calib.txt
         local calib_ops=${BENCH_CALIB_OPS:-2000}
         local target_qps target_ops_total ops_per_thread

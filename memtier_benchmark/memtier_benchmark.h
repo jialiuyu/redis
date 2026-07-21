@@ -107,6 +107,7 @@ struct benchmark_config {
     struct arbitrary_command_list* arbitrary_commands;
     const char *hdr_prefix;
     uint32_t vemb_v16_dim;
+    bool     vemb_v16_handle;
     bool     vemb_v16_vsim;
     bool     vemb_v16_vrem;
     const char *vemb_v16_endpoints;
