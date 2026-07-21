@@ -35,6 +35,10 @@ KEY_MAX=99999
 PIPELINE=${PIPELINE:-16}
 DIM=${DIM:-300}
 NUM_KEYS=100000
+# RAW=1 走 VEMB raw 二进制路径（server 端 INT8 量化字节直传，跳过反量化+DIM 次 sprintf）
+RAW=${RAW:-0}
+RAW_SUFFIX=""
+[ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
 
 LOCAL_RESULT_DIR="benchmark/results/vemb_cross_baseline"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -186,13 +190,14 @@ key_min=$7
 key_max=$8
 pipeline=$9
 out_file=${10}
+raw_suffix=${11:-}
 
 cd "$memtier_dir"
 ./memtier_benchmark \
     -h "$host" -p "$port" \
     --hide-histogram --test-time="$test_time" --select-db=0 \
     -c "$clients" -t "$threads" --pipeline="$pipeline" \
-    --command="VEMB myvectors __key__" \
+    --command="VEMB myvectors __key__${raw_suffix}" \
     --command-key-pattern=R \
     --key-prefix=item: \
     --key-minimum="$key_min" --key-maximum="$key_max" \
@@ -260,7 +265,7 @@ for threads in "${THREADS_LIST[@]}"; do
 
     RUN_START=$(get_ts)
     J0=$(ssh "$JUMP" "ssh $SERVER 'bash /tmp/get_remote_jiffies.sh $SERVER_PID'" 2>/dev/null)
-    ssh "$JUMP" "ssh $CLIENT \"bash /tmp/$BENCH_SCRIPT_NAME $threads $CLIENTS_PER_THREAD $TEST_TIME $SERVER_HOST $SERVER_PORT $MEMTIER_DIR $KEY_MIN $KEY_MAX $PIPELINE $remote_out\""
+    ssh "$JUMP" "ssh $CLIENT \"bash /tmp/$BENCH_SCRIPT_NAME $threads $CLIENTS_PER_THREAD $TEST_TIME $SERVER_HOST $SERVER_PORT $MEMTIER_DIR $KEY_MIN $KEY_MAX $PIPELINE $remote_out '$RAW_SUFFIX'\""
     RUN_END=$(get_ts)
     J1=$(ssh "$JUMP" "ssh $SERVER 'bash /tmp/get_remote_jiffies.sh $SERVER_PID'" 2>/dev/null)
 

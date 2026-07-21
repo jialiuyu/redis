@@ -2365,6 +2365,14 @@ static int isValidDBfilename(char *val, const char **err) {
     return 1;
 }
 
+static int isValidVembV16Transport(char *val, const char **err) {
+    if (strcmp(val, "sniff") && strcmp(val, "aeron")) {
+        *err = "vemb-v16-transport must be 'sniff' or 'aeron'";
+        return 0;
+    }
+    return 1;
+}
+
 static int isValidAOFfilename(char *val, const char **err) {
     if (!strcmp(val, "")) {
         *err = "appendfilename can't be empty";
@@ -3311,6 +3319,7 @@ standardConfig static_configs[] = {
     createBoolConfig("vemb-v16-reset-warm-regions", NULL, MODIFIABLE_CONFIG, server.vemb_v16_reset_warm_regions, 0, NULL, NULL),
     createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-proxy-io-threads", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_proxy_io_threads, 0, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("vemb-v16-transport", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_transport, "sniff", isValidVembV16Transport, NULL),
 
     /* Special configs */
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),

@@ -33,6 +33,10 @@ DIM=${DIM:-300}
 NUM_KEYS=${NUM_KEYS:-100000}
 PIPELINE=${PIPELINE:-16}
 TEST_TIME=${TEST_TIME:-30}
+# RAW=1 走 VEMB raw 二进制路径（INT8 量化字节直传，server 跳过反量化+DIM 次 sprintf）
+RAW=${RAW:-0}
+RAW_SUFFIX=""
+[ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
 # 每实例 memtier 的 -t 和 -c
 MEMTIER_T=${MEMTIER_T:-16}
 MEMTIER_C=${MEMTIER_C:-4}
@@ -40,6 +44,15 @@ MEMTIER_C=${MEMTIER_C:-4}
 # 客户端核范围（local: HW01 NUMA1; cross-node: HW02 NUMA1）
 CLIENT_CPU_START=${CLIENT_CPU_START:-97}
 CLIENT_CPU_END=${CLIENT_CPU_END:-191}
+# CLIENT_CPUSET: 任意 taskset 范围字符串（如 HW06 NUMA1 "24-47,72-95"）。
+# 如果设置，覆盖 CLIENT_CPU_START-END。
+CLIENT_CPUSET=${CLIENT_CPUSET:-}
+# 派生：脚本里绑核用 CLIENT_CPU_SPEC
+if [ -n "$CLIENT_CPUSET" ]; then
+    CLIENT_CPU_SPEC="$CLIENT_CPUSET"
+else
+    CLIENT_CPU_SPEC="$CLIENT_CPU_START-$CLIENT_CPU_END"
+fi
 
 # 派生值
 CORES_PER_INSTANCE=$IO_THREADS
@@ -245,13 +258,14 @@ key_min=$7
 key_max=$8
 pipeline=$9
 out_file=${10}
+raw_suffix=${11:-}
 
 cd "$memtier_dir"
 ./memtier_benchmark \
     -h "$host" -p "$port" \
     --hide-histogram --test-time="$test_time" --select-db=0 \
     -c "$clients" -t "$threads" --pipeline="$pipeline" \
-    --command="VEMB myvectors __key__" \
+    --command="VEMB myvectors __key__${raw_suffix}" \
     --command-key-pattern=R \
     --key-prefix=item: \
     --key-minimum="$key_min" --key-maximum="$key_max" \
@@ -304,21 +318,21 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     remote_out="/tmp/${RESULT_PREFIX}_inst${i}.log"
 
     if [ "$SHARED_CLIENT_CPU" = "1" ]; then
-        # 共享绑核：所有 memtier 共享 CLIENT_CPU_START-END
+        # 共享绑核：所有 memtier 共享 CLIENT_CPU_SPEC（支持离散范围如 HW06 NUMA1 "24-47,72-95"）
         if [ "$LOCAL_BENCH" = "1" ]; then
-            ssh "$JUMP" "numactl --membind=1 taskset -c $CLIENT_CPU_START-$CLIENT_CPU_END bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+            ssh "$JUMP" "numactl --membind=1 taskset -c $CLIENT_CPU_SPEC bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'" 2>/dev/null &
         else
-            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CLIENT_CPU_START-$CLIENT_CPU_END bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CLIENT_CPU_SPEC bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'\"" 2>/dev/null &
         fi
     else
-        # 独立绑核：每实例独占核组
+        # 独立绑核：每实例独占核组（仅支持 CLIENT_CPU_START-END 连续范围）
         CPM=$CORES_PER_MEMTIER
         CSTART=$((CLIENT_CPU_START + i * CPM))
         CEND=$((CSTART + CPM - 1))
         if [ "$LOCAL_BENCH" = "1" ]; then
-            ssh "$JUMP" "numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+            ssh "$JUMP" "numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'" 2>/dev/null &
         else
-            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'\"" 2>/dev/null &
         fi
     fi
     PIDS="$PIDS $!"

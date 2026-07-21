@@ -1953,6 +1953,7 @@ struct redisServer {
     int vemb_v16_reset_warm_regions;
     int vemb_v16_supernode_workers;
     int vemb_v16_proxy_io_threads;
+    char *vemb_v16_transport;       /* "sniff" (default) or "aeron" */
     vemb_v16_proxy_t *vemb_v16_proxy;
     pthread_t vemb_v16_proxy_thread;
     /* Networking */
