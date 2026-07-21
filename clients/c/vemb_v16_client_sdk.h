@@ -363,6 +363,92 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
                               uint64_t *out_region_bytes);
 void vemb_v16_close_warm_region(void *mapping_addr, size_t mapping_bytes);
 
+/* =====================================================================
+ *  Aeron transport (UDS control + POSIX SHM SPSC ring)
+ * =====================================================================
+ *
+ * Side-channel transport that bypasses TCP/libevent. Each channel is a
+ * bi-directional SPSC ring pair (req → server, resp ← server) backed by
+ * POSIX shared memory. Channel allocation/deallocation goes through a
+ * small UDS control connection (VEMB_V16_CTRL_*).
+ *
+ * The handle is opaque — callers never touch the ring layout. The
+ * header is therefore safe to include from C++ translation units
+ * without a C11 <stdatomic.h> dependency.
+ *
+ * Typical workflow:
+ *   vemb_v16_aeron_close_all(uds);                 // best-effort cleanup
+ *   ch = vemb_v16_aeron_open(uds, dim);            // alloc + map
+ *   ... build vemb_v16_req_t with channel_id =
+ *         vemb_v16_aeron_channel_id(ch) ...
+ *   vemb_v16_aeron_publish_request(ch, &req, n);   // non-blocking
+ *   n = vemb_v16_aeron_poll_response(ch, &resp,    // non-blocking
+ *                                    sizeof(resp));
+ *   vemb_v16_aeron_close(ch);
+ */
+
+typedef struct vemb_v16_aeron_channel vemb_v16_aeron_channel_t;
+
+/* Allocate and map one channel via the UDS control plane.
+ *   uds_path  — typically VEMB_V16_UDS_PATH ("/tmp/vemb_v16.sock")
+ *   dim       — vector dimension; server uses it to size ring slots
+ * Returns NULL on any failure (UDS missing, alloc rejected, SHM open
+ * error). Caller owns the returned handle and must release it with
+ * vemb_v16_aeron_close(). */
+vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
+                                              uint32_t dim);
+
+/* Close one channel: unmaps both rings and notifies the server to
+ * release its state. Safe to call with NULL (no-op). UDS errors are
+ * swallowed — the rings are still unmapped locally. */
+void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch);
+
+/* Close every channel currently registered on the given UDS endpoint.
+ * Returns the server-reported count closed (>= 0) or -1 on protocol
+ * error. Intended for best-effort stale-state cleanup before a run. */
+int vemb_v16_aeron_close_all(const char *uds_path);
+
+/* Channel id — stamp this into vemb_v16_req_t::channel_id when building
+ * request frames via vemb_v16_serialize_* or by hand. Returns 0 if ch
+ * is NULL. */
+uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch);
+
+/* Non-blocking publish into the request ring.
+ * Returns:
+ *    0   on success
+ *   -1   if the ring is full (drain responses and retry)
+ *   -2   if len > slot_size (programming error)
+ *   -3   if ch is NULL */
+int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
+                                   const void *buf, uint32_t len);
+
+/* Non-blocking poll from the response ring.
+ * Returns bytes copied into buf (>0) on success, 0 if empty, -3 if
+ * ch is NULL. If max_len exceeds the ring slot size, only slot_size
+ * bytes are copied. */
+int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
+                                 void *buf, uint32_t max_len);
+
+/* Open the warm region referenced by this channel's server-provided
+ * channel_desc (mmap of /dev/obmm_shmdev* or POSIX SHM). Required before
+ * vemb_v16_aeron_read_vector() can dereference VEMB_HANDLE offsets.
+ * Idempotent: a second call unmaps and re-maps.
+ * Returns 0 on success, -1 on failure. */
+int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch);
+
+/* Read a vector via the (offset, bytes) pair returned in a VEMB_HANDLE
+ * response. Requires vemb_v16_aeron_open_warm_region() to have succeeded.
+ *   ch     — channel with warm region mapped
+ *   offset — resp.vector_offset from VEMB_HANDLE response
+ *   bytes  — resp.vector_bytes (typically dim * sizeof(float))
+ *   out    — caller buffer
+ *   cap    — capacity of out in bytes
+ * Returns bytes copied (>0) on success, -1 if warm region not mapped or
+ * offset/bytes are out of range. */
+int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
+                               uint64_t offset, uint32_t bytes,
+                               void *out, uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif

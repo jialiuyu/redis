@@ -2,16 +2,25 @@
 
 #include "vemb_v16_client_sdk.h"
 #include "../../src/vemb_v16_net.h"
+/* Ring header is C11 (<stdatomic.h>). Pulled in here — NOT from the
+ * public SDK header — so C++ consumers stay clean. */
+#include "../../src/vemb_v16_client_ring.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
+
+#ifdef USE_ARM_SVE
+#include <arm_sve.h>
+#endif
 
 #define VEMB_V16_SDK_MAX_ENDPOINTS 16
 /* Must match benchmark/vemb_v16_bench.c VEMB_V16_BENCH_HASH_VNODES so that
@@ -2294,4 +2303,297 @@ int vemb_v16_client_vadd_repeat(vemb_v16_client_t *c,
     }
     return 0;
 #undef REPEAT_BATCH
+}
+
+/* ===================================================================== *
+ *  Aeron transport (UDS control + POSIX SHM SPSC ring)
+ * ===================================================================== */
+
+#define VEMB_V16_AERON_UDS_TIMEOUT_MS 5000u
+
+struct vemb_v16_aeron_channel {
+    vemb_v16_channel_desc_t    desc;
+    vemb_v16_client_ring_t    *req_ring;
+    vemb_v16_client_ring_t    *resp_ring;
+    char                       uds_path[108];  /* sockaddr_un::sun_path cap */
+    /* warm region (lazy; opened by vemb_v16_aeron_open_warm_region) */
+    void                      *warm_mapping_addr;
+    size_t                     warm_mapping_bytes;
+    const uint8_t             *warm_mapped_addr;   /* data-area pointer */
+    uint64_t                   warm_region_bytes;
+};
+
+/* Connect to a UDS endpoint with a fixed receive/send timeout. Returns
+ * fd on success, -1 on error. Mirrors benchmark/vemb_v16_bench.c:190
+ * connect_uds, but reuses vemb_v16_net_set_timeouts for the timeouts. */
+static int vemb_v16_aeron_uds_connect(const char *uds_path) {
+    if (!uds_path || !uds_path[0]) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    vemb_v16_net_set_timeouts(fd, VEMB_V16_AERON_UDS_TIMEOUT_MS);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, uds_path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* UDS control op: alloc a channel for the requested dim. Fills desc. */
+static int vemb_v16_aeron_uds_alloc(int fd, uint32_t dim,
+                                    vemb_v16_channel_desc_t *desc) {
+    uint8_t op = VEMB_V16_CTRL_ALLOC_CHANNEL;
+    vemb_v16_alloc_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.vector_dim = dim;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    memset(desc, 0, sizeof(*desc));
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op)) != 0)            return -1;
+    if (vemb_v16_net_write_full(fd, &req,  sizeof(req))  != 0)        return -1;
+    if (vemb_v16_net_read_full (fd, &status, sizeof(status)) != 0)    return -1;
+    if (status != VEMB_V16_STATUS_OK)                                 return -1;
+    if (vemb_v16_net_read_full (fd, desc,   sizeof(*desc))   != 0)    return -1;
+    return 0;
+}
+
+/* UDS control op: close a specific channel by id. */
+static int vemb_v16_aeron_uds_close(int fd, uint64_t channel_id) {
+    uint8_t op = VEMB_V16_CTRL_CLOSE_CHANNEL;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    if (vemb_v16_net_write_full(fd, &op,         sizeof(op))         != 0) return -1;
+    if (vemb_v16_net_write_full(fd, &channel_id, sizeof(channel_id)) != 0) return -1;
+    if (vemb_v16_net_read_full (fd, &status,     sizeof(status))     != 0) return -1;
+    return status == VEMB_V16_STATUS_OK ? 0 : -1;
+}
+
+/* UDS control op: close all channels. *closed receives server-reported
+ * count. */
+static int vemb_v16_aeron_uds_close_all(int fd, uint64_t *closed) {
+    uint8_t op = VEMB_V16_CTRL_CLOSE_ALL_CHANNELS;
+    uint8_t status = VEMB_V16_STATUS_ERR;
+    uint64_t n = 0;
+    if (vemb_v16_net_write_full(fd, &op, sizeof(op))         != 0) return -1;
+    if (vemb_v16_net_read_full (fd, &status, sizeof(status)) != 0) return -1;
+    if (status != VEMB_V16_STATUS_OK)                         return -1;
+    if (vemb_v16_net_read_full (fd, &n, sizeof(n))           != 0) return -1;
+    if (closed) *closed = n;
+    return 0;
+}
+
+/* Open a POSIX SHM ring by name + slot_size. */
+static int vemb_v16_aeron_ring_open(const char *name,
+                                    uint32_t slot_size,
+                                    vemb_v16_client_ring_t **out) {
+    if (!name || !name[0] || slot_size == 0 || !out) return -1;
+    int fd = shm_open(name, O_RDWR, 0666);
+    if (fd < 0) return -1;
+    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
+    void *ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) return -1;
+    *out = (vemb_v16_client_ring_t *)ptr;
+    return 0;
+}
+
+static void vemb_v16_aeron_ring_close(vemb_v16_client_ring_t *r,
+                                      uint32_t slot_size) {
+    if (!r || slot_size == 0) return;
+    munmap(r, vemb_v16_client_ring_bytes(slot_size));
+}
+
+/* Best-effort server-side close notification. Errors are swallowed
+ * because the rings are already unmapped locally by the caller. */
+static void vemb_v16_aeron_notify_close(const char *uds_path,
+                                        uint64_t channel_id) {
+    if (!uds_path || !uds_path[0]) return;
+    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (fd < 0) return;
+    vemb_v16_aeron_uds_close(fd, channel_id);
+    close(fd);
+}
+
+vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
+                                              uint32_t dim) {
+    if (!uds_path || !uds_path[0] || dim == 0) return NULL;
+
+    vemb_v16_aeron_channel_t *ch = calloc(1, sizeof(*ch));
+    if (!ch) return NULL;
+    strncpy(ch->uds_path, uds_path, sizeof(ch->uds_path) - 1);
+
+    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (fd < 0) { free(ch); return NULL; }
+    int rc = vemb_v16_aeron_uds_alloc(fd, dim, &ch->desc);
+    close(fd);
+    if (rc != 0) {
+        free(ch);
+        return NULL;
+    }
+
+    if (vemb_v16_aeron_ring_open(ch->desc.request_ring_name,
+                                 ch->desc.request_ring_slot_size,
+                                 &ch->req_ring) != 0) {
+        vemb_v16_aeron_notify_close(uds_path, ch->desc.channel_id);
+        free(ch);
+        return NULL;
+    }
+    if (vemb_v16_aeron_ring_open(ch->desc.response_ring_name,
+                                 ch->desc.response_ring_slot_size,
+                                 &ch->resp_ring) != 0) {
+        vemb_v16_aeron_ring_close(ch->req_ring, ch->desc.request_ring_slot_size);
+        vemb_v16_aeron_notify_close(uds_path, ch->desc.channel_id);
+        free(ch);
+        return NULL;
+    }
+    return ch;
+}
+
+void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return;
+    if (ch->warm_mapping_addr) {
+        munmap(ch->warm_mapping_addr, ch->warm_mapping_bytes);
+        ch->warm_mapping_addr = NULL;
+        ch->warm_mapping_bytes = 0;
+        ch->warm_mapped_addr   = NULL;
+        ch->warm_region_bytes  = 0;
+    }
+    vemb_v16_aeron_ring_close(ch->req_ring,  ch->desc.request_ring_slot_size);
+    vemb_v16_aeron_ring_close(ch->resp_ring, ch->desc.response_ring_slot_size);
+    vemb_v16_aeron_notify_close(ch->uds_path, ch->desc.channel_id);
+    free(ch);
+}
+
+int vemb_v16_aeron_close_all(const char *uds_path) {
+    if (!uds_path || !uds_path[0]) return -1;
+    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (fd < 0) return -1;
+    uint64_t closed = 0;
+    int rc = vemb_v16_aeron_uds_close_all(fd, &closed);
+    close(fd);
+    if (rc != 0) return -1;
+    return (int)(closed > INT_MAX ? INT_MAX : closed);
+}
+
+uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return 0;
+    return ch->desc.channel_id;
+}
+
+int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
+                                   const void *buf, uint32_t len) {
+    if (!ch) return -3;
+    return vemb_v16_client_publish(ch->req_ring, buf, len);
+}
+
+int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
+                                 void *buf, uint32_t max_len) {
+    if (!ch) return -3;
+    return vemb_v16_client_poll(ch->resp_ring, buf, max_len);
+}
+
+int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return -1;
+    /* Idempotent: unmap previous mapping if any. */
+    if (ch->warm_mapping_addr) {
+        munmap(ch->warm_mapping_addr, ch->warm_mapping_bytes);
+        ch->warm_mapping_addr = NULL;
+        ch->warm_mapping_bytes = 0;
+        ch->warm_mapped_addr   = NULL;
+        ch->warm_region_bytes  = 0;
+    }
+    void *mapping_addr = NULL;
+    size_t mapping_bytes = 0;
+    void *mapped_addr = NULL;
+    uint64_t region_bytes = 0;
+    if (vemb_v16_open_warm_region(&ch->desc, &mapping_addr, &mapping_bytes,
+                                  &mapped_addr, &region_bytes) != 0) {
+        return -1;
+    }
+    ch->warm_mapping_addr = mapping_addr;
+    ch->warm_mapping_bytes = mapping_bytes;
+    ch->warm_mapped_addr   = (const uint8_t *)mapped_addr;
+    ch->warm_region_bytes  = region_bytes;
+    return 0;
+}
+
+int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
+                               uint64_t offset, uint32_t bytes,
+                               void *out, uint32_t cap) {
+    if (!ch || !out)                                   return -1;
+    if (!ch->warm_mapped_addr)                         return -1;
+    if (bytes == 0 || bytes > cap)                     return -1;
+    /* Bounds check against the server-reported region size. */
+    if (offset > ch->warm_region_bytes ||
+        (uint64_t)bytes > ch->warm_region_bytes - offset) return -1;
+    sve_streaming_load_f32(ch->warm_mapped_addr + offset, out, bytes);
+    return (int)bytes;
+}
+
+/* =====================================================================
+ *  SVE-aware streaming load — backs vemb_v16_aeron_read_vector and the
+ *  protocol.cpp VEMB_INLINE copy path. Ported from src/sve_operation.c
+ *  with all server-side deps stripped. Plain memcpy fallback when the
+ *  SDK is built without -DUSE_ARM_SVE.
+ * ===================================================================== */
+
+void sve_streaming_load(const void *src, void *dst, size_t size) {
+#ifdef USE_ARM_SVE
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)dst;
+    size_t off = 0;
+    while (off < size) {
+        svbool_t pg = svwhilelt_b8_u64((uint64_t)off, (uint64_t)size);
+        svuint8_t v = svld1_u8(pg, &s[off]);
+        svst1_u8(pg, &d[off], v);
+        off += svcntb();
+    }
+#else
+    if (size) memcpy(dst, src, size);
+#endif
+}
+
+void sve_streaming_load_f32(const void *src, void *dst, size_t size) {
+#ifdef USE_ARM_SVE
+    if ((((uintptr_t)src | (uintptr_t)dst | size) & (sizeof(float) - 1u)) != 0) {
+        sve_streaming_load(src, dst, size);
+        return;
+    }
+    const size_t vl = svcntw();
+    size_t rem = size / sizeof(float);
+    const float *srcp = (const float *)src;
+    float *dstp = (float *)dst;
+
+    svbool_t pg = svptrue_b32();
+    while (rem >= vl * 4u) {
+        __builtin_prefetch(srcp + vl * 8u, 0, 3);
+        svfloat32_t v0 = svld1_f32(pg, srcp);
+        svfloat32_t v1 = svld1_f32(pg, srcp + vl);
+        svfloat32_t v2 = svld1_f32(pg, srcp + vl * 2u);
+        svfloat32_t v3 = svld1_f32(pg, srcp + vl * 3u);
+        svst1_f32(pg, dstp, v0);
+        svst1_f32(pg, dstp + vl, v1);
+        svst1_f32(pg, dstp + vl * 2u, v2);
+        svst1_f32(pg, dstp + vl * 3u, v3);
+        srcp += vl * 4u;
+        dstp += vl * 4u;
+        rem  -= vl * 4u;
+    }
+    while (rem >= vl) {
+        svfloat32_t v = svld1_f32(pg, srcp);
+        svst1_f32(pg, dstp, v);
+        srcp += vl;
+        dstp += vl;
+        rem  -= vl;
+    }
+    if (rem > 0) {
+        svbool_t tail = svwhilelt_b32_u64(0UL, (uint64_t)rem);
+        svfloat32_t v = svld1_f32(tail, srcp);
+        svst1_f32(tail, dstp, v);
+    }
+#else
+    if (size) memcpy(dst, src, size);
+#endif
 }

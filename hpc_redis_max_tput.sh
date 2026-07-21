@@ -7,6 +7,8 @@
 #
 # 用法: PORT=6390 ./hpc_redis_max_tput.sh
 #   smoke: WORKERS="32 64" TS="32" CS="1" TEST_TIME=3 ./hpc_redis_max_tput.sh
+#   aeron: TRANSPORT=aeron CLIENT_IMPL=memtier OP_MODE=vemb \
+#         WORKERS="8:16" TS="4" CS="8" TEST_TIME=5 ./hpc_redis_max_tput.sh
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -15,7 +17,13 @@ MEMTIER=${MEMTIER:-$HPC/memtier_benchmark/memtier_benchmark}
 BENCH=${BENCH:-$HPC/benchmark/vemb_v16_bench}
 MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 CLEAR_UB=/tmp/clear_ub_device
-SOCKET=${SOCKET:-/tmp/hpc_vemb_v16_aeron_${PORT:-6390}.sock}
+# SOCKET: aeron UDS path.
+#   - CLIENT_IMPL=bench path: passed to vemb_v16_server via --socket
+#   - CLIENT_IMPL=memtier path: redis-server hardcodes UDS to
+#     VEMB_V16_UDS_PATH (/tmp/vemb_v16.sock, vemb_v16_protocol.h:15);
+#     memtier runner uses the same constant. SOCKET var has no effect
+#     in this path unless you edit VEMB_V16_UDS_PATH and rebuild.
+SOCKET=${SOCKET:-/tmp/vemb_v16.sock}
 
 DIM=300
 NUM_KEYS=${NUM_KEYS:-10000}
@@ -28,6 +36,16 @@ PIPELINE=${PIPELINE:-32}
 PREFILL_THREADS=${PREFILL_THREADS:-16}
 PREFILL_PIPELINE=${PREFILL_PIPELINE:-16}
 VEMB_READ_MODE=${VEMB_READ_MODE:-inline}
+# transport: tcp (default, libevent RESP/sniff) | aeron (UDS + SHM SPSC ring,
+#            side-channel runner bypassing libevent; requires memtier built
+#            with vemb_v16_aeron_runner.cpp)
+TRANSPORT=${TRANSPORT:-tcp}
+TRANSPORT_CANON=$(printf '%s' "$TRANSPORT" | tr '[:upper:]' '[:lower:]')
+case "$TRANSPORT_CANON" in
+    tcp|aeron) ;;
+    *) echo "FAIL: unknown TRANSPORT=$TRANSPORT (use tcp|aeron)"; exit 2 ;;
+esac
+[ "$TRANSPORT_CANON" = "aeron" ] && MEMTIER_TRANSPORT_ARG="--vemb-v16-transport=aeron" || MEMTIER_TRANSPORT_ARG=""
 # op mode: vemb (read) | vadd (write) | vsim (similarity) | vrem (delete)
 #          vemb_handle / vemb-handle (TCP handle-only read, client loads warm region)
 OP_MODE=${OP_MODE:-vemb}
@@ -151,6 +169,7 @@ prefill() {
             --no-pin >$RAWDIR/prefill.log 2>&1
     else
         $PIN_C_PRE $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+            $MEMTIER_TRANSPORT_ARG \
             -s 127.0.0.1 -p $PORT -t 1 -c 1 -n $NUM_KEYS \
             --ratio=1:0 --key-pattern=S:S --key-prefix=$KEY_PREFIX \
             --key-minimum=1 --key-maximum=$NUM_KEYS >$RAWDIR/prefill.log 2>&1
@@ -216,6 +235,7 @@ run_client() {
             --timeout-ms $(( TEST_TIME * 2000 + 60000 )) --no-pin >"$raw" 2>&1
     else
         $PIN_C $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+            $MEMTIER_TRANSPORT_ARG \
             -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
             $OP_ARGS --key-prefix=$KEY_PREFIX \
             --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
