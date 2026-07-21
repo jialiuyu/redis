@@ -61,6 +61,7 @@
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "vemb_v16_aeron_runner.h"
 
 
 static int log_level = 0;
@@ -428,6 +429,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_vemb_v16_vsim,
         o_vemb_v16_vrem,
         o_vemb_v16_endpoints,
+        o_vemb_v16_transport,
         o_tls,
         o_tls_cert,
         o_tls_key,
@@ -511,6 +513,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "vemb-v16-vsim",              0, 0, o_vemb_v16_vsim },
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
         { "vemb-v16-endpoints",         1, 0, o_vemb_v16_endpoints },
+        { "vemb-v16-transport",         1, 0, o_vemb_v16_transport },
         { "rate-limiting",              1, 0, o_rate_limiting },
         { NULL,                         0, 0, 0 }
     };
@@ -886,6 +889,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     cfg->vemb_v16_dim = (uint32_t)strtoul(optarg, NULL, 10);
                     break;
                 case o_vemb_v16_handle:
+                    /* VEMB_HANDLE is the default read mode; flag kept for
+                     * script compatibility (hpc_redis_max_tput.sh passes it
+                     * when VEMB_READ_MODE=vector-handle). No-op here. */
                     cfg->vemb_v16_handle = true;
                     break;
                 case o_vemb_v16_vsim:
@@ -896,6 +902,14 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     break;
                 case o_vemb_v16_endpoints:
                     cfg->vemb_v16_endpoints = optarg;
+                    break;
+                case o_vemb_v16_transport:
+                    if (strcmp(optarg, "tcp") != 0 &&
+                        strcmp(optarg, "aeron") != 0) {
+                        fprintf(stderr, "error: --vemb-v16-transport must be 'tcp' or 'aeron' (got %s)\n", optarg);
+                        return -1;
+                    }
+                    cfg->vemb_v16_transport = optarg;
                     break;
                 case o_command_ratio: {
                     if (cfg->arbitrary_commands->size() == 0) {
@@ -1094,7 +1108,10 @@ void usage() {
             "      --vemb-v16-handle          Read vectors via warm-region handles instead of inline payloads\n"
             "      --vemb-v16-vsim            Use VSIM_INLINE instead of VEMB_HANDLE for vemb_v16 reads\n"
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
+            "      --vemb-v16-handle          Force VEMB_HANDLE read mode (default; flag for script compat)\n"
             "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
+            "      --vemb-v16-transport=tcp|aeron  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
+            "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput)\n"
             "\n"
             "WAIT Options:\n"
             "      --wait-ratio=RATIO         Set:Wait ratio (default is no WAIT commands - 1:0)\n"
@@ -1193,6 +1210,15 @@ void size_to_str(unsigned long int size, char *buf, int buf_len)
 
 run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj_gen)
 {
+    /* Aeron side-channel: bypass libevent stack entirely. Treat nullptr as "tcp"
+     * (default) so existing invocations keep working. */
+    if (cfg->protocol == PROTOCOL_VEMB_V16 &&
+        cfg->vemb_v16_transport &&
+        strcmp(cfg->vemb_v16_transport, "aeron") == 0) {
+        fprintf(stderr, "[RUN #%u] Aeron side-channel runner engaged\n", run_id);
+        return vemb_v16_aeron_run(cfg, obj_gen);
+    }
+
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
 
     // prepare threads data

@@ -111,6 +111,9 @@ struct benchmark_config {
     bool     vemb_v16_vsim;
     bool     vemb_v16_vrem;
     const char *vemb_v16_endpoints;
+    /* transport: "tcp" (default, libevent RESP/sniff) or "aeron"
+     * (UDS + POSIX SHM SPSC ring, side-channel runner bypassing libevent). */
+    const char *vemb_v16_transport;
     unsigned int request_rate;
     unsigned int request_per_interval;
     unsigned int request_interval_microsecond;

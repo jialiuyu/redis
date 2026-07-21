@@ -16,7 +16,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
-CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*'
 
 EXTRA_DIST = README.md COPYING
 
@@ -25,14 +24,11 @@ completionsdir=$(BASH_COMPLETION_DIR)
 completions_DATA=bash-completion/memtier_benchmark
 
 memtier_benchmark_CPPFLAGS = \
-	$(CODE_COVERAGE_CFLAGS) \
 	$(LIBEVENT_CFLAGS) \
 	$(LIBEVENT_OPENSSL_CFLAGS) \
 	$(LIBCRYPTO_CFLAGS) \
 	$(LIBSSL_CFLAGS) \
-	-DSVE_OP_STANDALONE \
-	-I$(top_srcdir)/../clients/c \
-	-I$(top_srcdir)/../clients/c/internal \
+	-I$(top_srcdir)/../clients/c/build/include \
 	-I$(top_srcdir)/../src
 memtier_benchmark_SOURCES = \
 	memtier_benchmark.cpp memtier_benchmark.h \
@@ -47,27 +43,22 @@ memtier_benchmark_SOURCES = \
 	item.cpp item.h \
 	file_io.cpp file_io.h \
 	config_types.cpp config_types.h \
-	../clients/c/vemb_v16_client_sdk.c \
-	../src/vemb_v16_net.c \
-	../src/vemb_v16_client_topology.c \
-	../src/vemb_v16_topology.c \
-	../src/sve_operation.c ../src/sve_operation.h \
-	../src/monotonic.c ../src/monotonic.h \
-	../src/redisassert.c ../src/redisassert.h \
+	vemb_v16_aeron_runner.cpp vemb_v16_aeron_runner.h \
 	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
 	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_encoding.h
 
 memtier_benchmark_LDADD = \
-	$(CODE_COVERAGE_LIBS) \
 	$(LIBEVENT_LIBS) \
 	$(LIBEVENT_OPENSSL_LIBS) \
 	$(LIBCRYPTO_LIBS) \
-	$(LIBSSL_LIBS)
+	$(LIBSSL_LIBS) \
+	$(top_srcdir)/../clients/c/build/libvemb_v16_client.a
 
+# 显式声明 .a 依赖，确保 make 在链接前知悉（autotools 不会自动从 LDADD 推导 file deps）
+memtier_benchmark_DEPENDENCIES = \
+	$(top_srcdir)/../clients/c/build/libvemb_v16_client.a
 
-@CODE_COVERAGE_RULES@
-memtier_benchmark_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
 dist_man1_MANS = memtier_benchmark.1
 

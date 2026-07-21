@@ -29,16 +29,6 @@ CXXFLAGS="-O2 -g -Wall"
 # Checks for programs.
 AC_PROG_CXX
 
-# Coverage
-m4_ifdef([AX_CODE_COVERAGE], [
-AX_CODE_COVERAGE
-], [
-AC_SUBST([CODE_COVERAGE_CFLAGS], [])
-AC_SUBST([CODE_COVERAGE_LIBS], [])
-AC_SUBST([CODE_COVERAGE_LDFLAGS], [])
-AC_SUBST([CODE_COVERAGE_RULES], [])
-])
-
 # Checks for header files.
 AC_HEADER_STDC
 AC_HEADER_DIRENT
