@@ -18,15 +18,10 @@
 
 /// TCP transport implementation.
 
-#define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
 #define VEMB_V16_TCP_INPUT_INITIAL_CAP (64u * 1024u)
 #define VEMB_V16_TCP_INPUT_READ_CHUNK (64u * 1024u)
 #define VEMB_V16_TCP_RESPONSE_PREFIX_CAP (sizeof(vemb_v16_net_hdr_t) + 64u)
 #define VEMB_V16_TCP_INPUT_BUFFER_LIMIT (4u * 1024u * 1024u)
-
-static int diag_should_log_req(uint32_t req_id) {
-    return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
-}
 
 static int tcp_response_needs_inline_snapshot(const vemb_v16_resp_t *resp) {
     return resp->status == VEMB_V16_STATUS_OK &&
@@ -223,20 +218,6 @@ static uint8_t *encode_tcp_response_bytes(vemb_v16_channel_t *ch,
                   resp->vector_bytes);
         tcp_mark_inline_snapshot_error(resp);
     }
-    if (diag_should_log_req(resp->req_id)) {
-        serverLog(LL_DEBUG,
-                  "vemb_v16 diag tcp encode single: channel_id=%llu req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u region_id=%u local_slot=%u owner_generation=%llu",
-                  (unsigned long long)vemb_v16_channel_id(ch),
-                  resp->req_id,
-                  resp->op,
-                  resp->status,
-                  resp->flags,
-                  resp->vector_bytes,
-                  vector_bytes,
-                  resp->region_id,
-                  resp->local_slot,
-                  (unsigned long long)resp->owner_generation);
-    }
 
     size_t resp_bytes = vemb_v16_resp_encoded_len(resp);
     size_t bytes = tcp_response_wire_size(resp, net_flags, vector_bytes);
@@ -309,24 +290,6 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
             .channel_id = vemb_v16_channel_id(ch),
             .req_id = responses[out].req_id,
         };
-        if (diag_should_log_req(responses[out].req_id)) {
-            serverLog(LL_DEBUG,
-                      "vemb_v16 diag tcp encode batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
-                      (unsigned long long)vemb_v16_channel_id(ch),
-                      i,
-                      out,
-                      n,
-                      responses[out].req_id,
-                      responses[out].op,
-                      responses[out].status,
-                      responses[out].flags,
-                      responses[out].vector_bytes,
-                      vector_bytes[out],
-                      sizeof(headers[out]) + sizeof(responses[out]) + vector_bytes[out],
-                      responses[out].region_id,
-                      responses[out].local_slot,
-                      (unsigned long long)responses[out].owner_generation);
-        }
         total_bytes += sizeof(headers[out]) + headers[out].payload_len;
         out++;
     }
@@ -488,24 +451,6 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                 .channel_id = vemb_v16_channel_id(ch),
                 .req_id = responses[out].req_id,
             };
-            if (diag_should_log_req(responses[out].req_id)) {
-                serverLog(LL_DEBUG,
-                          "vemb_v16 diag tcp writev batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
-                          (unsigned long long)vemb_v16_channel_id(ch),
-                          completion_index,
-                          out,
-                          ready_count,
-                          responses[out].req_id,
-                          responses[out].op,
-                          responses[out].status,
-                          responses[out].flags,
-                          responses[out].vector_bytes,
-                          vector_bytes,
-                          sizeof(hdr) + resp_payload_len + vector_bytes,
-                          responses[out].region_id,
-                          responses[out].local_slot,
-                          (unsigned long long)responses[out].owner_generation);
-            }
             uint8_t *prefix = frame_prefixes[out];
             memcpy(prefix, &hdr, sizeof(hdr));
             size_t encoded_len = 0;
@@ -565,25 +510,6 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
             .channel_id = vemb_v16_channel_id(ch),
             .req_id = responses[out].req_id,
         };
-        if (diag_should_log_req(responses[out].req_id)) {
-            serverLog(LL_DEBUG,
-                      "vemb_v16 diag tcp writev batch: channel_id=%llu completion_index=%u out_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u resp_vector_bytes=%u inline_vector_bytes=%u frame_bytes=%zu region_id=%u local_slot=%u owner_generation=%llu",
-                      (unsigned long long)vemb_v16_channel_id(ch),
-                      completion_index,
-                      out,
-                      ready_count,
-                      responses[out].req_id,
-                      responses[out].op,
-                      responses[out].status,
-                      responses[out].flags,
-                      responses[out].vector_bytes,
-                      vector_bytes,
-                      sizeof(hdr) + resp_payload_len + vector_bytes,
-                      responses[out].region_id,
-                      responses[out].local_slot,
-                      (unsigned long long)responses[out].owner_generation);
-        }
-
         uint8_t *prefix = frame_prefixes[out];
         memcpy(prefix, &hdr, sizeof(hdr));
         size_t encoded_len = 0;
@@ -747,19 +673,6 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
                      req.op == VEMB_V16_OP_VSIM_INLINE) ?
         vemb_v16_req_inline_len(req.vector_bytes) :
         vemb_v16_req_handle_len());
-    if (diag_should_log_req(req.req_id)) {
-        serverLog(LL_DEBUG,
-                  "vemb_v16 diag tcp request recv: proxy_worker=%u channel_id=%llu hdr_req_id=%u req_id=%u op=%u flags=%u payload_len=%u key_hash=%llu vector_bytes=%u",
-                  proxy_io_worker_id,
-                  (unsigned long long)vemb_v16_channel_id(ch),
-                  hdr.req_id,
-                  req.req_id,
-                  req.op,
-                  req.flags,
-                  hdr.payload_len,
-                  (unsigned long long)req.key_hash,
-                  req.vector_bytes);
-    }
     vemb_v16_tcp_input_consume(ch, frame_len);
     vemb_v16_proxy_handle_request(ch, &req, req_len, proxy_io_worker_id);
     if (vemb_v16_channel_net_fd(ch) < 0)

@@ -638,12 +638,6 @@ typedef struct vemb_v16_stats {
     uint64_t proxy_response_ring_full;
     uint64_t supernode_completion_publish;
     uint64_t supernode_completion_ring_full;
-    uint64_t sample_count;
-    uint64_t sample_table_lookup_ns;
-    uint64_t sample_bitmap_lock_ns;
-    uint64_t sample_bitmap_unlock_ns;
-    uint64_t sample_vector_load_ns;
-    uint64_t sample_completion_publish_ns;
     uint64_t bitmap_lock_success;
     uint64_t bitmap_lock_failure;
     uint64_t request_ring_depth;
@@ -703,27 +697,6 @@ typedef struct vemb_v16_stats {
     uint64_t migration_baseline_retry_queued;
     uint64_t migration_baseline_retry_sent;
     uint64_t migration_baseline_retry_pending;
-    uint64_t timing_job_count;
-    uint64_t timing_job_total_ns;
-    uint64_t timing_job_total_max_ns;
-    uint64_t timing_primary_lookup_count;
-    uint64_t timing_primary_lookup_ns;
-    uint64_t timing_primary_lookup_max_ns;
-    uint64_t timing_secondary_lookup_count;
-    uint64_t timing_secondary_lookup_ns;
-    uint64_t timing_secondary_lookup_max_ns;
-    uint64_t timing_remote_meta_lookup_count;
-    uint64_t timing_remote_meta_lookup_ns;
-    uint64_t timing_remote_meta_lookup_max_ns;
-    uint64_t timing_payload_local_slice_count;
-    uint64_t timing_payload_local_slice_ns;
-    uint64_t timing_payload_local_slice_max_ns;
-    uint64_t timing_payload_remote_slice_count;
-    uint64_t timing_payload_remote_slice_ns;
-    uint64_t timing_payload_remote_slice_max_ns;
-    uint64_t timing_compute_count;
-    uint64_t timing_compute_ns;
-    uint64_t timing_compute_max_ns;
 } vemb_v16_stats_t;
 
 static inline size_t vemb_v16_req_handle_len(void) {
