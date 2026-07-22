@@ -78,6 +78,12 @@ void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
                                          const int *req_lens,
                                          uint32_t req_count,
                                          uint32_t proxy_io_worker_id);
+void vemb_v16_proxy_handle_request_ptr_batch(
+    vemb_v16_channel_t *ch,
+    const vemb_v16_req_t *const *reqs,
+    int req_len,
+    uint32_t req_count,
+    uint32_t proxy_io_worker_id);
 int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy,
                                      vemb_v16_channel_desc_t *desc);
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,

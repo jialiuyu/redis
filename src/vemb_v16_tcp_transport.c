@@ -633,6 +633,52 @@ int vemb_v16_tcp_has_buffered_requests(vemb_v16_channel_t *ch) {
     return pending >= sizeof(hdr) + (size_t)hdr.payload_len;
 }
 
+static int decode_tcp_key_only_request(vemb_v16_req_t *req,
+                                       const uint8_t *src,
+                                       size_t len) {
+    RETURN_IF(len < 24u, -1);
+    const uint8_t *p = src;
+    uint8_t op_flags = vemb_v16_proto_get_u8(&p);
+    uint8_t op = op_flags & VEMB_V16_TCP_REQ_OP_MASK;
+    if (op != VEMB_V16_OP_VEMB_HANDLE &&
+        op != VEMB_V16_OP_VEMB_INLINE &&
+        op != VEMB_V16_OP_VREM &&
+        op != VEMB_V16_OP_PING) {
+        return 0;
+    }
+
+    uint32_t key_len = vemb_v16_proto_get_u8(&p);
+    uint32_t dim = vemb_v16_proto_get_u16(&p);
+    RETURN_IF(key_len > VEMB_V16_MAX_KEY_LEN || dim > VEMB_V16_MAX_DIM, -1);
+    RETURN_IF(len != 24u + (size_t)key_len, -1);
+    if (op == VEMB_V16_OP_PING) {
+        RETURN_IF(key_len != 0 || dim != 0, -1);
+    } else if (op == VEMB_V16_OP_VREM) {
+        RETURN_IF(key_len == 0 || dim != 0, -1);
+    } else {
+        RETURN_IF(key_len == 0 || dim == 0, -1);
+    }
+
+    req->op = op;
+    req->flags = vemb_v16_req_flags_from_wire(op_flags &
+                                              VEMB_V16_TCP_REQ_FLAG_MASK);
+    req->reserved0 = 0;
+    req->req_id = vemb_v16_proto_get_u32(&p);
+    req->channel_id = vemb_v16_proto_get_u64(&p);
+    req->key_hash = 0;
+    req->key_len = key_len;
+    req->key2_len = 0;
+    req->key2_hash = 0;
+    req->topology_epoch = vemb_v16_proto_get_u64(&p);
+    req->dim = dim;
+    req->vector_bytes = (op == VEMB_V16_OP_VREM ||
+                         op == VEMB_V16_OP_PING) ? 0 : dim * sizeof(float);
+    req->reserved1 = 0;
+    memcpy(req->key, p, key_len);
+    req->key_hash = vemb_v16_xxh3_64_str(req->key, req->key_len);
+    return 1;
+}
+
 /// TCP transport: decode one buffered request frame into a request slot.
 static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
                                                vemb_v16_req_t *req,
@@ -661,11 +707,17 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
         return 0;
 
     *req_len = 0;
-    memset(req, 0, sizeof(*req));
-    if (vemb_v16_req_decode(req,
-                            frame + sizeof(hdr),
-                            hdr.payload_len) != 0) {
+    int decode_rc = decode_tcp_key_only_request(req,
+                                                frame + sizeof(hdr),
+                                                hdr.payload_len);
+    if (decode_rc < 0)
         return -1;
+    if (decode_rc == 0) {
+        if (vemb_v16_req_decode(req,
+                                frame + sizeof(hdr),
+                                hdr.payload_len) != 0) {
+            return -1;
+        }
     }
     if (req->channel_id == 0)
         req->channel_id = vemb_v16_channel_id(ch);

@@ -783,6 +783,22 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
     return 0;
 }
 
+int vemb_v16_tlc_get_handle_stable_read(vemb_v16_tlc_t *tlc,
+                                        const char *key,
+                                        uint32_t key_len,
+                                        uint64_t key_hash,
+                                        vemb_v16_vector_handle_t *handle,
+                                        uint32_t *warm_slot) {
+    tlc_warm_location_t location = {0};
+    if (tlc_core_get_warm_location_stable_read(tlc->core, key, key_len,
+                                               key_hash, &location) != 0) {
+        return -1;
+    }
+    if (warm_slot) *warm_slot = location.local_slot;
+    make_handle(tlc, key_hash, &location, handle);
+    return 0;
+}
+
 int vemb_v16_tlc_get_cached_handle(vemb_v16_tlc_t *tlc,
                                    const char *key,
                                    uint32_t key_len,

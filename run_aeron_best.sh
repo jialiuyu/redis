@@ -21,7 +21,7 @@
 
 set -uo pipefail
 
-HPC=/root/gqs/codespace/UnifiedBus/test_hpc
+HPC=${HPC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)}
 REDIS=$HPC/src/redis-server
 MEMTIER=$HPC/memtier_benchmark/memtier_benchmark
 MANIFEST=$HPC/examples/vemb_v16_warm_regions_111.yaml

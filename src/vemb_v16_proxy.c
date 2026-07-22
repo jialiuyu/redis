@@ -912,11 +912,19 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
         for (uint32_t i = 0; i < ready_count; i++)
             completion_release_payload(&completions[ready_indices[i]]);
     } else {
-        for (uint32_t i = 0; i < ready_count; i++) {
-            uint16_t idx = ready_indices[i];
-            publish_response(ch, &completions[idx]);
-            completion_release_payload(&completions[idx]);
+        vemb_v16_resp_t resps[VEMB_V16_PROXY_BATCH];
+        for (uint32_t i = 0; i < ready_count; i++)
+            vemb_v16_make_response_from(&resps[i],
+                                        &completions[ready_indices[i]]);
+        if (vemb_v16_aeron_publish_response_batch(ch,
+                                                  resps,
+                                                  ready_count) != 0) {
+            for (uint32_t i = 0; i < ready_count; i++)
+                completion_release_payload(&completions[ready_indices[i]]);
+            return -1;
         }
+        for (uint32_t i = 0; i < ready_count; i++)
+            completion_release_payload(&completions[ready_indices[i]]);
     }
     return 0;
 }
@@ -1224,27 +1232,28 @@ static int tcp_vemb_read_requires_inline_op(vemb_v16_channel_t *ch,
     return 0;
 }
 
-/// Request scheduling: validate protocol input and enqueue execution jobs.
-void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
-                                         const vemb_v16_req_t *reqs,
-                                         const int *req_lens,
-                                         uint32_t req_count,
-                                         uint32_t proxy_io_worker_id) {
+static void vemb_v16_proxy_handle_request_ptr_batch_internal(
+    vemb_v16_channel_t *ch,
+    const vemb_v16_req_t *const *reqs,
+    const int *req_lens,
+    int common_req_len,
+    uint32_t req_count,
+    uint32_t proxy_io_worker_id) {
     vemb_v16_pending_job_publish_t pending[VEMB_V16_PROXY_BATCH];
     vemb_v16_job_ref_t refs[VEMB_V16_PROXY_BATCH];
-    uint32_t pending_req_indices[VEMB_V16_PROXY_BATCH];
+    const vemb_v16_req_t *pending_reqs[VEMB_V16_PROXY_BATCH];
     uint32_t pending_count = 0;
 
     assert(req_count <= VEMB_V16_PROXY_BATCH);
     for (uint32_t i = 0; i < req_count; i++) {
-        const vemb_v16_req_t *req = &reqs[i];
-        int req_len = req_lens[i];
+        const vemb_v16_req_t *req = reqs[i];
+        int req_len = req_lens ? req_lens[i] : common_req_len;
 
         if (req->op == VEMB_V16_OP_PING) {
             if (prepare_request_job(ch, req, 0, proxy_io_worker_id,
                                     &pending[pending_count]) == 0) {
                 refs[pending_count] = pending[pending_count].ref;
-                pending_req_indices[pending_count] = i;
+                pending_reqs[pending_count] = req;
                 pending_count++;
             } else {
                 publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
@@ -1273,7 +1282,7 @@ void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
         if (prepare_request_job(ch, req, key_len, proxy_io_worker_id,
                                 &pending[pending_count]) == 0) {
             refs[pending_count] = pending[pending_count].ref;
-            pending_req_indices[pending_count] = i;
+            pending_reqs[pending_count] = req;
             pending_count++;
         } else {
             publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
@@ -1302,8 +1311,41 @@ void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
         job_pool_release_slot(pending[i].pool, pending[i].slot_id, 0);
     for (uint32_t i = 0; i < pending_count; i++)
         publish_status_response(ch,
-                                &reqs[pending_req_indices[i]],
+                                pending_reqs[i],
                                 VEMB_V16_STATUS_ERR);
+}
+
+/// Request scheduling: validate protocol input and enqueue execution jobs.
+void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
+                                         const vemb_v16_req_t *reqs,
+                                         const int *req_lens,
+                                         uint32_t req_count,
+                                         uint32_t proxy_io_worker_id) {
+    const vemb_v16_req_t *req_ptrs[VEMB_V16_PROXY_BATCH];
+
+    assert(req_count <= VEMB_V16_PROXY_BATCH);
+    for (uint32_t i = 0; i < req_count; i++)
+        req_ptrs[i] = &reqs[i];
+    vemb_v16_proxy_handle_request_ptr_batch_internal(ch,
+                                                     req_ptrs,
+                                                     req_lens,
+                                                     0,
+                                                     req_count,
+                                                     proxy_io_worker_id);
+}
+
+void vemb_v16_proxy_handle_request_ptr_batch(
+    vemb_v16_channel_t *ch,
+    const vemb_v16_req_t *const *reqs,
+    int req_len,
+    uint32_t req_count,
+    uint32_t proxy_io_worker_id) {
+    vemb_v16_proxy_handle_request_ptr_batch_internal(ch,
+                                                     reqs,
+                                                     NULL,
+                                                     req_len,
+                                                     req_count,
+                                                     proxy_io_worker_id);
 }
 
 void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,

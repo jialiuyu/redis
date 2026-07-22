@@ -251,8 +251,20 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
         completion.vector_bytes = vemb_job->vector_bytes;
     }
 
-    if (vemb_v16_tlc_get_handle(tlc, vemb_job->key, vemb_job->key_len,
-                                job->key_hash, &handle, &warm_slot) != 0) {
+    int handle_rc = (!needs_payload_snapshot && !migration_active) ?
+        vemb_v16_tlc_get_handle_stable_read(tlc,
+                                            vemb_job->key,
+                                            vemb_job->key_len,
+                                            job->key_hash,
+                                            &handle,
+                                            &warm_slot) :
+        vemb_v16_tlc_get_handle(tlc,
+                                vemb_job->key,
+                                vemb_job->key_len,
+                                job->key_hash,
+                                &handle,
+                                &warm_slot);
+    if (handle_rc != 0) {
         tlc_core_key_migration_info_t redirect_info = {0};
         if (migration_active &&
             job_key_is_source_cutover(tlc,
