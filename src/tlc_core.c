@@ -2166,6 +2166,18 @@ int tlc_core_get_warm_location(tlc_core_t *core,
     return 0;
 }
 
+int tlc_core_get_warm_location_stable_read(tlc_core_t *core,
+                                           const char *key,
+                                           uint32_t key_len,
+                                           uint64_t key_hash,
+                                           tlc_warm_location_t *location) {
+    RETURN_IF(!key_valid(key, key_len), -1);
+    if (tlc_core_source_fence_active(core) || tombstone_filter_active(core)) {
+        return tlc_core_get_warm_location(core, key, key_len, key_hash, location);
+    }
+    return tlc_core_get_warm_location_raw(core, key, key_len, key_hash, location);
+}
+
 int tlc_core_get_cached_warm_location(tlc_core_t *core,
                                       const char *key,
                                       uint32_t key_len,

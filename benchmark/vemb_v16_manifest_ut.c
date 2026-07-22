@@ -530,17 +530,13 @@ static void test_manifest_remote_meta_owner_views_route_key2(void) {
 
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     assert(vemb_v16_tlc_lookup_vsim_key2(storage->tlc,
                                          key,
                                          (uint32_t)strlen(key),
                                          key_hash,
                                          &handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE);
-    assert(timing.local_lookup_count == 1);
-    assert(timing.remote_meta_lookup_count == 1);
     assert(handle.region_id == remote_handle.region_id);
     assert(handle.offset == remote_handle.offset);
     assert(handle.bytes == remote_handle.bytes);

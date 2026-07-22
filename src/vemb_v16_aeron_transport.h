@@ -18,5 +18,8 @@ int vemb_v16_aeron_listen(vemb_v16_proxy_t *proxy,
 void vemb_v16_aeron_handle_control_fd(vemb_v16_proxy_t *proxy, int fd);
 int vemb_v16_aeron_publish_response(vemb_v16_channel_t *ch,
                                     const vemb_v16_resp_t *resp);
+int vemb_v16_aeron_publish_response_batch(vemb_v16_channel_t *ch,
+                                          const vemb_v16_resp_t *resps,
+                                          uint32_t count);
 
 #endif

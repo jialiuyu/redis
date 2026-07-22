@@ -131,4 +131,18 @@ run_with_retry "aeron ping" \
     --mode ping \
     --timeout-ms 5000
 
+run_with_retry "aeron vemb-handle" \
+    "$BENCH" \
+    --transport aeron \
+    --socket "$SHM_SOCKET" \
+    --dim 16 \
+    --prefill 32 \
+    --keyspace 32 \
+    --ops 32 \
+    --threads 1 \
+    --pipeline 1 \
+    --mode vemb-handle \
+    --timeout-ms 15000 \
+    --no-pin
+
 printf '[ok] vemb_v16 transport smoke passed\n'

@@ -49,6 +49,25 @@ static inline int vemb_v16_client_publish(vemb_v16_client_ring_t *ring,
     return 0;
 }
 
+static inline int vemb_v16_client_publish_batch(vemb_v16_client_ring_t *ring,
+                                                const void *slots,
+                                                uint32_t len,
+                                                uint32_t count) {
+    if (count == 0) return 0;
+    if (len > ring->slot_size) return -2;
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    if (tail - head + count > ring->slot_count) return -1;
+    const uint8_t *src = slots;
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(ring->slots + ((tail + i) & ring->slot_mask) * ring->slot_size,
+               src + (size_t)i * len,
+               len);
+    }
+    atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
+    return 0;
+}
+
 static inline int vemb_v16_client_poll(vemb_v16_client_ring_t *ring,
                                        void *data,
                                        uint32_t max_len) {
@@ -83,6 +102,28 @@ static inline uint32_t vemb_v16_client_poll_batch(vemb_v16_client_ring_t *ring,
     }
     atomic_store_explicit(&ring->head, head + available, memory_order_release);
     return (uint32_t)available;
+}
+
+static inline uint32_t vemb_v16_client_peek_batch(vemb_v16_client_ring_t *ring,
+                                                  const void **slots,
+                                                  uint32_t max_count) {
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
+    uint64_t available = tail - head;
+    if (available == 0 || max_count == 0) return 0;
+    if (available > max_count) available = max_count;
+    for (uint32_t i = 0; i < (uint32_t)available; i++) {
+        slots[i] = ring->slots +
+            ((head + i) & ring->slot_mask) * ring->slot_size;
+    }
+    return (uint32_t)available;
+}
+
+static inline void vemb_v16_client_consume_batch(vemb_v16_client_ring_t *ring,
+                                                 uint32_t count) {
+    if (count == 0) return;
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    atomic_store_explicit(&ring->head, head + count, memory_order_release);
 }
 
 static inline uint64_t vemb_v16_client_available(vemb_v16_client_ring_t *ring) {

@@ -38,6 +38,7 @@ static inline int vemb_v16_aeron_ring_init(vemb_v16_aeron_ring_t *ring,
     return 0;
 }
 
+// vemb_v16_aeron_publish
 static inline int vemb_v16_aeron_publish(vemb_v16_aeron_ring_t *ring,
                                          const void *slot) {
     uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
@@ -48,6 +49,27 @@ static inline int vemb_v16_aeron_publish(vemb_v16_aeron_ring_t *ring,
            slot,
            ring->slot_size);
     atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
+    return 0;
+}
+
+static inline int vemb_v16_aeron_publish_batch(vemb_v16_aeron_ring_t *ring,
+                                               const void *slots,
+                                               uint32_t count) {
+    if (count == 0)
+        return 0;
+
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+    if (tail - head + count > ring->slot_count)
+        return -1;
+
+    const uint8_t *src = slots;
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(ring->slots + ((tail + i) & ring->slot_mask) * ring->slot_size,
+               src + (size_t)i * ring->slot_size,
+               ring->slot_size);
+    }
+    atomic_store_explicit(&ring->tail, tail + count, memory_order_release);
     return 0;
 }
 

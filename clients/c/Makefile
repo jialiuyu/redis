@@ -21,6 +21,15 @@ PIC_FLAGS = -fPIC
 # _GNU_SOURCE is defined at the top of each .c file; we do NOT add -D_GNU_SOURCE
 # here to avoid a redefinition warning.
 
+# AArch64: enable SVE so sve_streaming_load_f32 uses vector loads instead of
+# plain memcpy (matches redis-server FINAL_CFLAGS in src/Makefile:182).
+ARCH_MACHINE := $(shell uname -m)
+ifeq ($(ARCH_MACHINE),aarch64)
+ARCH_FLAGS ?= -DUSE_ARM_SVE -march=armv8.2-a+sve
+else
+ARCH_FLAGS ?=
+endif
+
 # ---- paths (absolute, so `make -C` works from anywhere) ----
 THIS_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SDK_DIR := $(THIS_DIR)
@@ -59,7 +68,7 @@ PUBLIC_HEADERS := \
 	$(INC_DIR)/vemb_v16_hash.h
 
 # ---- compile flags shared across all .c ----
-ALL_CFLAGS := $(CFLAGS) $(PIC_FLAGS) $(WARN_FLAGS) $(INCLUDES)
+ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(PIC_FLAGS) $(WARN_FLAGS) $(INCLUDES)
 
 # ---- targets ----
 .PHONY: all static shared install-headers example example_so clean

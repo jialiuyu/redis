@@ -7,13 +7,23 @@
 #
 # 用法: PORT=6390 ./hpc_redis_max_tput.sh
 #   smoke: WORKERS="32 64" TS="32" CS="1" TEST_TIME=3 ./hpc_redis_max_tput.sh
+#   aeron: TRANSPORT=aeron CLIENT_IMPL=memtier OP_MODE=vemb \
+#         WORKERS="8:16" TS="4" CS="8" TEST_TIME=5 ./hpc_redis_max_tput.sh
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 HPC=${HPC:-$SCRIPT_DIR}
-MEMTIER=${MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark}
+MEMTIER=${MEMTIER:-$HPC/memtier_benchmark/memtier_benchmark}
+BENCH=${BENCH:-$HPC/benchmark/vemb_v16_bench}
 MANIFEST=${MANIFEST:-$HPC/examples/vemb_v16_warm_regions_111.yaml}
 CLEAR_UB=/tmp/clear_ub_device
+# SOCKET: aeron UDS path.
+#   - CLIENT_IMPL=bench path: passed to vemb_v16_server via --socket
+#   - CLIENT_IMPL=memtier path: redis-server hardcodes UDS to
+#     VEMB_V16_UDS_PATH (/tmp/vemb_v16.sock, vemb_v16_protocol.h:15);
+#     memtier runner uses the same constant. SOCKET var has no effect
+#     in this path unless you edit VEMB_V16_UDS_PATH and rebuild.
+SOCKET=${SOCKET:-/tmp/vemb_v16.sock}
 
 DIM=300
 NUM_KEYS=${NUM_KEYS:-10000}
@@ -23,15 +33,46 @@ SERVER_CPUSET=${SERVER_CPUSET:-1-96}
 CLIENT_CPUSET=${CLIENT_CPUSET:-97-191}
 TEST_TIME=${TEST_TIME:-5}
 PIPELINE=${PIPELINE:-32}
+PREFILL_THREADS=${PREFILL_THREADS:-16}
+PREFILL_PIPELINE=${PREFILL_PIPELINE:-16}
+VEMB_READ_MODE=${VEMB_READ_MODE:-inline}
+# transport: tcp (default, libevent RESP/sniff) | aeron (UDS + SHM SPSC ring,
+#            side-channel runner bypassing libevent; requires memtier built
+#            with vemb_v16_aeron_runner.cpp)
+TRANSPORT=${TRANSPORT:-tcp}
+TRANSPORT_CANON=$(printf '%s' "$TRANSPORT" | tr '[:upper:]' '[:lower:]')
+case "$TRANSPORT_CANON" in
+    tcp|aeron) ;;
+    *) echo "FAIL: unknown TRANSPORT=$TRANSPORT (use tcp|aeron)"; exit 2 ;;
+esac
+[ "$TRANSPORT_CANON" = "aeron" ] && MEMTIER_TRANSPORT_ARG="--vemb-v16-transport=aeron" || MEMTIER_TRANSPORT_ARG=""
 # op mode: vemb (read) | vadd (write) | vsim (similarity) | vrem (delete)
+#          vemb_handle / vemb-handle (TCP handle-only read, client loads warm region)
 OP_MODE=${OP_MODE:-vemb}
-case "$OP_MODE" in
-    vemb)  OP_ARGS="--ratio=0:1 --key-pattern=R:R" ;;
-    vembz) OP_ARGS="--ratio=0:1 --key-pattern=Z:Z --key-zipfian-s=${ZIPF_S:-0.99}" ;;
-    vadd)  OP_ARGS="--ratio=1:0 --key-pattern=S:S" ;;
-    vsim)  OP_ARGS="--vemb-v16-vsim --ratio=0:1 --key-pattern=R:R" ;;
-    vrem)  OP_ARGS="--vemb-v16-vrem --ratio=1:0 --key-pattern=S:S" ;;
-    *)     echo "FAIL: unknown OP_MODE=$OP_MODE"; exit 2 ;;
+OP_MODE_CANON=$(printf '%s' "$OP_MODE" | tr '[:upper:]' '[:lower:]')
+VEMB_READ_MODE_CANON=$(printf '%s' "$VEMB_READ_MODE" | tr '[:upper:]' '[:lower:]')
+CLIENT_IMPL=memtier
+SERVER_IMPL=redis
+case "$VEMB_READ_MODE_CANON" in
+    inline|vector-handle) ;;
+    *) echo "FAIL: unknown VEMB_READ_MODE=$VEMB_READ_MODE (use inline|vector-handle)"; exit 2 ;;
+esac
+case "$OP_MODE_CANON" in
+    vemb)
+        OP_ARGS="--ratio=0:1 --key-pattern=R:R"
+        [ "$VEMB_READ_MODE_CANON" = "vector-handle" ] && OP_ARGS="--vemb-v16-handle $OP_ARGS"
+        ;;
+    vembz)
+        OP_ARGS="--ratio=0:1 --key-pattern=Z:Z --key-zipfian-s=${ZIPF_S:-0.99}"
+        [ "$VEMB_READ_MODE_CANON" = "vector-handle" ] && OP_ARGS="--vemb-v16-handle $OP_ARGS"
+        ;;
+    vadd)        OP_ARGS="--ratio=1:0 --key-pattern=S:S" ;;
+    vsim)        OP_ARGS="--vemb-v16-vsim --ratio=0:1 --key-pattern=R:R" ;;
+    vrem)        OP_ARGS="--vemb-v16-vrem --ratio=1:0 --key-pattern=S:S" ;;
+    vemb_handle|vemb-handle)
+        OP_ARGS="--vemb-v16-handle --ratio=0:1 --key-pattern=R:R"
+        ;;
+    *)           echo "FAIL: unknown OP_MODE=$OP_MODE"; exit 2 ;;
 esac
 # pio snw pairs (1:2 ratio up to 32:64); format: "pio:snw ..."
 WORKERS=( ${WORKERS:-1:2 2:4 4:8 8:16 16:32 32:64} )
@@ -54,12 +95,19 @@ log() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
 kill_server() {
     [ -f "$PIDFILE" ] && { local p; p=$(cat "$PIDFILE" 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; sleep 0.5; kill -9 "$p" 2>/dev/null; rm -f "$PIDFILE"; }
-    pkill -9 -f "redis-server.*:$PORT " 2>/dev/null
+    pkill -9 -f "redis-server.*:$PORT " 2>/dev/null || true
+    pkill -9 -f "vemb_v16_server.*$SOCKET" 2>/dev/null || true
+    rm -f "$SOCKET"
     sleep 0.5
 }
 
 wait_port() {
     for _ in $(seq 1 50); do ss -tln | grep -q ":$PORT " && return 0; sleep 0.2; done
+    return 1
+}
+
+wait_socket() {
+    for _ in $(seq 1 50); do [ -S "$SOCKET" ] && return 0; sleep 0.2; done
     return 1
 }
 
@@ -71,29 +119,61 @@ start_server() {
     cd "$HPC"
     local PIN_S=""
     [ -n "$SERVER_CPUSET" ] && PIN_S="taskset -c $SERVER_CPUSET"
-    local hz_flag=""
-    [ -n "${REDIS_HZ:-}" ] && hz_flag="--hz $REDIS_HZ"
-    $PIN_S ./src/redis-server \
-        --port $PORT --bind 0.0.0.0 --protected-mode no \
-        --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-        --vemb-v16-max-vectors 131072 \
-        --vemb-v16-warm-regions-manifest "$MANIFEST" \
-        --vemb-v16-reset-warm-regions yes \
-        --vemb-v16-proxy-io-threads $pio --vemb-v16-supernode-workers $snw \
-        $hz_flag \
-        --daemonize yes --pidfile $PIDFILE --logfile "$logfile" --loglevel notice \
-        >/dev/null 2>&1
-    wait_port || { echo "FAIL: pio=$pio snw=$snw server did not listen (see $logfile)"; return 1; }
-    SERVER_PID=$(cat "$PIDFILE" 2>/dev/null)
+    if [ "$SERVER_IMPL" = "aeron" ]; then
+        rm -f "$SOCKET"
+        $PIN_S ./src/vemb_v16_server \
+            --transport aeron \
+            --socket "$SOCKET" \
+            --proxy-io-threads $pio \
+            --supernode-workers $snw \
+            --warm-regions-manifest "$MANIFEST" \
+            --reset-warm-regions \
+            --dim $DIM \
+            --max-vectors 131072 \
+            --loglevel notice >"$logfile" 2>&1 &
+        SERVER_PID=$!
+        echo "$SERVER_PID" > "$PIDFILE"
+        wait_socket || { echo "FAIL: pio=$pio snw=$snw aeron server did not create socket (see $logfile)"; return 1; }
+    else
+        local hz_flag=""
+        [ -n "${REDIS_HZ:-}" ] && hz_flag="--hz $REDIS_HZ"
+        $PIN_S ./src/redis-server \
+            --port $PORT --bind 0.0.0.0 --protected-mode no \
+            --vemb-v16-enabled yes --vemb-v16-dim $DIM \
+            --vemb-v16-max-vectors 131072 \
+            --vemb-v16-warm-regions-manifest "$MANIFEST" \
+            --vemb-v16-reset-warm-regions yes \
+            --vemb-v16-proxy-io-threads $pio --vemb-v16-supernode-workers $snw \
+            $hz_flag \
+            --daemonize yes --pidfile $PIDFILE --logfile "$logfile" --loglevel notice \
+            >/dev/null 2>&1
+        wait_port || { echo "FAIL: pio=$pio snw=$snw server did not listen (see $logfile)"; return 1; }
+        SERVER_PID=$(cat "$PIDFILE" 2>/dev/null)
+    fi
 }
 
 prefill() {
     local PIN_C_PRE=""
     [ -n "$CLIENT_CPUSET" ] && PIN_C_PRE="taskset -c $CLIENT_CPUSET"
-    $PIN_C_PRE $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-        -s 127.0.0.1 -p $PORT -t 1 -c 1 -n $NUM_KEYS \
-        --ratio=1:0 --key-pattern=S:S --key-prefix=$KEY_PREFIX \
-        --key-minimum=1 --key-maximum=$NUM_KEYS >$RAWDIR/prefill.log 2>&1
+    if [ "$SERVER_IMPL" = "aeron" ]; then
+        $PIN_C_PRE $BENCH --transport aeron --socket "$SOCKET" \
+            --mode vadd --dim $DIM --prefill $NUM_KEYS --ops 0 \
+            --threads $PREFILL_THREADS --pipeline $PREFILL_PIPELINE \
+            --timeout-ms $(( TEST_TIME * 1000 + 180000 )) \
+            --no-pin >$RAWDIR/prefill.log 2>&1
+    elif [ "$CLIENT_IMPL" = "bench" ]; then
+        $PIN_C_PRE $BENCH --transport aeron --socket "$SOCKET" \
+            --mode vadd --dim $DIM --prefill $NUM_KEYS --ops 0 \
+            --threads $PREFILL_THREADS --pipeline $PREFILL_PIPELINE \
+            --timeout-ms $(( TEST_TIME * 1000 + 180000 )) \
+            --no-pin >$RAWDIR/prefill.log 2>&1
+    else
+        $PIN_C_PRE $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+            $MEMTIER_TRANSPORT_ARG \
+            -s 127.0.0.1 -p $PORT -t 1 -c 1 -n $NUM_KEYS \
+            --ratio=1:0 --key-pattern=S:S --key-prefix=$KEY_PREFIX \
+            --key-minimum=1 --key-maximum=$NUM_KEYS >$RAWDIR/prefill.log 2>&1
+    fi
 }
 
 # ───────── 汇总某 PID 所有 TID 的 (utime+stime) jiffies ─────────
@@ -128,10 +208,38 @@ run_client() {
     mem_sampler_pid=$!
     local PIN_C=""
     [ -n "$CLIENT_CPUSET" ] && PIN_C="taskset -c $CLIENT_CPUSET"
-    $PIN_C $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
-        -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
-        $OP_ARGS --key-prefix=$KEY_PREFIX \
-        --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
+    if [ "$SERVER_IMPL" = "aeron" ]; then
+        $PIN_C $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+            --unix-socket "$SOCKET" -t $t -c $c --pipeline=$PIPELINE \
+            $OP_ARGS --key-prefix=$KEY_PREFIX \
+            --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
+    elif [ "$CLIENT_IMPL" = "bench" ]; then
+        local calib_raw=$RAWDIR/${tag}.calib.txt
+        local calib_ops=${BENCH_CALIB_OPS:-2000}
+        local target_qps target_ops_total ops_per_thread
+        $PIN_C $BENCH --transport aeron --socket "$SOCKET" \
+            --mode "$BENCH_MODE" --dim $DIM --prefill 0 --keyspace $NUM_KEYS \
+            --ops $calib_ops --threads $t --pipeline $c \
+            --timeout-ms $(( TEST_TIME * 1000 + 60000 )) --no-pin >"$calib_raw" 2>&1
+        target_qps=$(sed -n 's/.* qps=\([0-9.][0-9.]*\) .*/\1/p' "$calib_raw" | tail -1)
+        if [ -z "$target_qps" ]; then
+            echo "FAIL: calibration failed for $tag"
+            cat "$calib_raw" >&2
+            return 1
+        fi
+        target_ops_total=$(awk -v q="$target_qps" -v tt="$TEST_TIME" 'BEGIN{printf "%.0f", q * tt * 1.05}')
+        ops_per_thread=$(awk -v total="$target_ops_total" -v th="$t" 'BEGIN{v=int((total + th - 1) / th); if (v < 1) v = 1; print v}')
+        $PIN_C $BENCH --transport aeron --socket "$SOCKET" \
+            --mode "$BENCH_MODE" --dim $DIM --prefill 0 --keyspace $NUM_KEYS \
+            --ops "$ops_per_thread" --threads $t --pipeline $c \
+            --timeout-ms $(( TEST_TIME * 2000 + 60000 )) --no-pin >"$raw" 2>&1
+    else
+        $PIN_C $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+            $MEMTIER_TRANSPORT_ARG \
+            -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
+            $OP_ARGS --key-prefix=$KEY_PREFIX \
+            --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
+    fi
     j1=$(get_cpu_jiffies "$SERVER_PID")
     # ── 内存采集 - 停止 sampler + 读结果 ──
     kill "$mem_sampler_pid" 2>/dev/null || true
@@ -142,13 +250,21 @@ run_client() {
     rm -f "$mem_samples_file"
     # 高并发时 server 线程 churn (连接线程退出) 会丢 jiffies → delta 负; clamp 成 NA
     cores=$(awk -v d=$(( j1 - j0 )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
-    local tot; tot=$(grep '^Totals' "$raw" | tail -1)
-    local ops hits p50 p99
-    ops=$(echo "$tot" | awk '{print $2}')
-    hits=$(echo "$tot" | awk '{print $3}')
-    p50=$(echo "$tot" | awk '{print $6}')
-    p99=$(echo "$tot" | awk '{print $7}')
-    local runops; runops=$(grep 'RUN #1 100%' "$raw" | grep -oE 'avg: *[0-9.,]+' | head -1 | grep -oE '[0-9.,]+')
+    local ops hits p50 p99 runops
+    if [ "$CLIENT_IMPL" = "bench" ]; then
+        ops=$(sed -n 's/.* qps=\([0-9.][0-9.]*\) .*/\1/p' "$raw" | tail -1)
+        hits=$(sed -n 's/.* ok=\([0-9][0-9]*\) fail=.*/\1/p' "$raw" | tail -1)
+        p50="NA"
+        p99="NA"
+        runops="$ops"
+    else
+        local tot; tot=$(grep '^Totals' "$raw" | tail -1)
+        ops=$(echo "$tot" | awk '{print $2}')
+        hits=$(echo "$tot" | awk '{print $3}')
+        p50=$(echo "$tot" | awk '{print $6}')
+        p99=$(echo "$tot" | awk '{print $7}')
+        runops=$(grep 'RUN #1 100%' "$raw" | grep -oE 'avg: *[0-9.,]+' | head -1 | grep -oE '[0-9.,]+')
+    fi
     [ -z "$ops" ] && ops=0; [ -z "$runops" ] && runops=0
     [ -z "$mem_base_mb" ] && mem_base_mb=0; [ -z "$mem_peak_mb" ] && mem_peak_mb=0; [ -z "$mem_avg_mb" ] && mem_avg_mb=0
     local eff=$ops

@@ -1,0 +1,41 @@
+aclocal.m4
+autom4te.cache
+config.guess
+config.h.in
+config.h.in~
+config.h
+config.sub
+configure
+compile
+depcomp
+install-sh
+ltmain.sh
+m4
+Makefile.in
+missing
+*.o
+/memtier_benchmark
+.deps
+Makefile
+config.log
+config.status
+libtool
+stamp-h1
+*.DS_Store
+.vscode/*
+.idea/*
+
+# tls helper related files
+tests/tls/*
+
+# memtier outputs
+*.hgrm
+*.txt
+!/tests/test_requirements.txt
+__pycache__
+
+# Code coverage with lcov/gcov
+*.gcno
+*.gcov
+*.gcda
+*.info
