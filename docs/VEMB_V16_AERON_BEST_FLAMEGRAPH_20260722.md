@@ -70,7 +70,7 @@ Notes:
 | P1 stack reqs | `zmalloc` / `zfree` in Aeron request poll | Replace per-poll heap request buffer with stack batch buffer | allocator hotspot disappears | Useful but incomplete because full request-slot memcpy remains |
 | P1 peek | `[libc.so.6]` leaf around 24.61% from full request-slot copy | Peek Aeron request ring slots and pass request pointers to proxy | `[libc.so.6]` leaf around 5.86%; request scheduler becomes top leaf | Biggest request-side win; kept |
 | P1 handle-only scheduler | `vemb_v16_proxy_handle_request_ptr_batch_internal` | Specialized all-`VEMB_HANDLE` Aeron scheduler | Throughput and p99 regressed in polluted window | Not retained; retry only on idle host if needed |
-| TCP key-only decode | Full `vemb_v16_req_t` clear/decode for key-only TCP requests | Decode key-only payload directly without clearing vector area | Not flamegraphed yet | Expected to help TCP inline/handle request decode, but no clean A/B yet |
+| TCP key-only decode | Full `vemb_v16_req_t` clear/decode for key-only TCP requests | Decode key-only payload directly without clearing vector area | Follow-up host-mt run recorded | Helped TCP inline decode modestly; see host-mt follow-up |
 | P2 response batch | `drain_completions` around 19.96%, `publish_response` around 12.86% leaf | Convert ready completions to `vemb_v16_resp_t[]` and batch publish response ring | `drain_completions` around 10.70%, batch publish leaf around 3.84% | Total throughput improves; per-core gain is small |
 
 ## Hotspots
@@ -442,6 +442,46 @@ ops/core/sec    : ~553814
 This default command uses TCP `VEMB_INLINE`, not `vector-handle`; the fast
 decoder covers that path. Compare against a pre-fast-decode build with the same
 command and an idle host if a precise TCP A/B is needed.
+
+Follow-up on 2026-07-22:
+
+```text
+src/vemb_v16_tcp_transport.c
+  TCP now builds a request pointer batch and calls
+  vemb_v16_proxy_handle_request_ptr_batch() directly.
+
+src/vemb_v16_proxy.c
+  vemb_v16_proxy_handle_request_batch() wrapper removed.
+```
+
+Host-mt validation:
+
+```text
+NUM_KEYS=100000 WORKERS='21:21' TS='64' CS='4' TEST_TIME=30 \
+  bash hpc_redis_max_tput.sh
+
+ops/sec         : 11771274.05
+hits/sec        : 11771274.05
+p50 / p99       : 0.70300 / 0.86300 ms
+server CPU cores: 21.10
+ops/core/sec    : ~557880
+```
+
+Flamegraph artifact:
+
+```text
+perf/server_flamegraph_host_mt_read_21_21_t64_c4_20260722_153218.svg
+```
+
+Interpretation:
+
+```text
+Against the earlier same-day TCP inline run above, throughput moved from
+11.586M to 11.771M ops/sec while CPU stayed roughly flat. This is a modest
+positive result, and the larger value is that TCP and Aeron now share the same
+pointer-batch scheduler entry instead of keeping a TCP-only request-batch
+wrapper.
+```
 
 ### P1: Batch Proxy Response Publishing
 

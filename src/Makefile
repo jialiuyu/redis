@@ -57,6 +57,9 @@ WARN=-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -W
 OPT=$(OPTIMIZATION)
 
 SKIP_VEC_SETS?=no
+PROXY_REQUEST_BATCH ?=
+PROXY_RESPONSE_BATCH ?=
+PROXY_QUEUE_BATCH ?=
 # Detect if the compiler supports C11 _Atomic.
 # NUMBER_SIGN_CHAR is a workaround to support both GNU Make 4.3 and older versions.
 NUMBER_SIGN_CHAR := \#
@@ -180,6 +183,15 @@ FINAL_LDFLAGS += $(FEATURE_LDFLAGS)
 FINAL_LIBS    += $(FEATURE_LIBS)
 # Enable ARM SVE intrinsics for vector load/store paths (sve_operation.c, tlc_core.c)
 FINAL_CFLAGS += -DUSE_ARM_SVE -march=armv8.2-a+sve
+ifneq ($(strip $(PROXY_REQUEST_BATCH)),)
+FINAL_CFLAGS += -DPROXY_REQUEST_BATCH=$(PROXY_REQUEST_BATCH)
+endif
+ifneq ($(strip $(PROXY_RESPONSE_BATCH)),)
+FINAL_CFLAGS += -DPROXY_RESPONSE_BATCH=$(PROXY_RESPONSE_BATCH)
+endif
+ifneq ($(strip $(PROXY_QUEUE_BATCH)),)
+FINAL_CFLAGS += -DPROXY_QUEUE_BATCH=$(PROXY_QUEUE_BATCH)
+endif
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -648,6 +660,15 @@ VEMB_V16_EXTRA_CFLAGS ?=
 VEMB_V16_CFLAGS = -O3 -Wall -Wextra -pthread -std=gnu11 -I. -DVEMB_V16_MAX_CHANNELS=$(VEMB_V16_MAX_CHANNELS)
 ifeq ($(USE_SVE),yes)
 VEMB_V16_CFLAGS += -DUSE_SVE -DUSE_ARM_SVE -march=armv8.2-a+sve
+endif
+ifneq ($(strip $(PROXY_REQUEST_BATCH)),)
+VEMB_V16_CFLAGS += -DPROXY_REQUEST_BATCH=$(PROXY_REQUEST_BATCH)
+endif
+ifneq ($(strip $(PROXY_RESPONSE_BATCH)),)
+VEMB_V16_CFLAGS += -DPROXY_RESPONSE_BATCH=$(PROXY_RESPONSE_BATCH)
+endif
+ifneq ($(strip $(PROXY_QUEUE_BATCH)),)
+VEMB_V16_CFLAGS += -DPROXY_QUEUE_BATCH=$(PROXY_QUEUE_BATCH)
 endif
 VEMB_V16_CFLAGS += $(VEMB_V16_EXTRA_CFLAGS)
 

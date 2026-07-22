@@ -9,7 +9,15 @@
 #include <stdint.h>
 
 #define VEMB_V16_TCP_RESPONSE_BACKLOG_LIMIT (4u * 1024u * 1024u)
-#define VEMB_V16_PROXY_BATCH 32u
+#ifndef PROXY_REQUEST_BATCH
+#define PROXY_REQUEST_BATCH 32u
+#endif
+#ifndef PROXY_RESPONSE_BATCH
+#define PROXY_RESPONSE_BATCH 32u
+#endif
+#ifndef PROXY_QUEUE_BATCH
+#define PROXY_QUEUE_BATCH 32u
+#endif
 #define VEMB_V16_SUPERNODE_STATE_CLOSING (1u << 31)
 #define VEMB_V16_PROXY_IO_STATE_CLOSING (1u << 31)
 
@@ -73,11 +81,6 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
                                    const vemb_v16_req_t *req,
                                    int req_len,
                                    uint32_t proxy_io_worker_id);
-void vemb_v16_proxy_handle_request_batch(vemb_v16_channel_t *ch,
-                                         const vemb_v16_req_t *reqs,
-                                         const int *req_lens,
-                                         uint32_t req_count,
-                                         uint32_t proxy_io_worker_id);
 void vemb_v16_proxy_handle_request_ptr_batch(
     vemb_v16_channel_t *ch,
     const vemb_v16_req_t *const *reqs,

@@ -18,7 +18,13 @@
 #include <unistd.h>
 #endif
 
+#ifndef VEMB_V16_SUPERNODE_BATCH
+#ifdef PROXY_QUEUE_BATCH
+#define VEMB_V16_SUPERNODE_BATCH PROXY_QUEUE_BATCH
+#else
 #define VEMB_V16_SUPERNODE_BATCH 32u
+#endif
+#endif
 
 typedef struct vemb_v16_inline_snapshot {
     uint32_t payload_bytes;
