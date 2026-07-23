@@ -112,9 +112,18 @@ int vemb_v16_server_integration_init(void) {
         }
     }
 
+    /* Transport selection.  Default is "sniff" — UDS listener for direct
+     * VEMB V16 SHM clients + Redis-port sniff (fd inject) for VEMB frames
+     * arriving on port 6379.  "aeron" enables only the UDS listener for a
+     * pure SHM/Aeron datapath (no sniff on Redis ports). */
+    const char *vemb_transport =
+        (server.vemb_v16_transport && server.vemb_v16_transport[0])
+            ? server.vemb_v16_transport : "sniff";
+
     /* Enable Aeron/UDS listener so direct VEMB V16 clients can connect to
-     * /tmp/vemb_v16.sock.  This coexists with inject — the proxy main loop
-     * drains both the UDS accept queue and the inject pipe each iteration. */
+     * /tmp/vemb_v16.sock.  In sniff mode this coexists with inject — the
+     * proxy main loop drains both the UDS accept queue and the inject pipe
+     * each iteration. */
     if (vemb_v16_proxy_enable_uds(server.vemb_v16_proxy) != 0) {
         serverLog(LL_WARNING, "vemb_v16_proxy_enable_uds failed");
         vemb_v16_proxy_destroy(server.vemb_v16_proxy);
@@ -124,16 +133,22 @@ int vemb_v16_server_integration_init(void) {
     serverLog(LL_NOTICE, "VEMB V16 UDS listener enabled: %s", VEMB_V16_UDS_PATH);
 
     /* Enable inject pipe so Redis accept path can hand off VEMB connections.
-     * Sniff is always on for VEMB V16 — it rides the Redis accept loop on every
-     * listening fd (port, TLS, bind) and steals fds whose first bytes match the
-     * VEMB magic.  No per-port opt-in needed. */
-    if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
-        serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
-        vemb_v16_proxy_destroy(server.vemb_v16_proxy);
-        server.vemb_v16_proxy = NULL;
-        return -1;
+     * Sniff rides the Redis accept loop on every listening fd (port, TLS,
+     * bind) and steals fds whose first bytes match the VEMB magic.  Skipped
+     * in pure "aeron" mode where clients must connect to the UDS socket
+     * directly. */
+    if (strcmp(vemb_transport, "aeron") != 0) {
+        if (vemb_v16_proxy_enable_inject(server.vemb_v16_proxy) != 0) {
+            serverLog(LL_WARNING, "vemb_v16_proxy_enable_inject failed");
+            vemb_v16_proxy_destroy(server.vemb_v16_proxy);
+            server.vemb_v16_proxy = NULL;
+            return -1;
+        }
+        serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports (transport=%s)",
+                  vemb_transport);
+    } else {
+        serverLog(LL_NOTICE, "VEMB V16 transport=aeron: sniff disabled, clients must use UDS+SHM");
     }
-    serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports");
 
     if (pthread_create(&server.vemb_v16_proxy_thread, NULL,
                        proxy_run_thread, server.vemb_v16_proxy) != 0) {
@@ -255,6 +270,11 @@ static void vemb_async_peek_handler(connection *conn) {
 int vemb_v16_sniff_and_handoff(connection *conn) {
     /* Fast path: proxy not running (VEMB V16 disabled) */
     if (!server.vemb_v16_proxy)
+        return 0;
+    /* Pure aeron mode: no sniff/inject path. Clients must connect to the
+     * UDS socket directly; anything arriving on Redis ports is RESP. */
+    if (server.vemb_v16_transport &&
+        !strcmp(server.vemb_v16_transport, "aeron"))
         return 0;
     /* Cannot sniff through TLS */
     if (connIsTLS(conn))

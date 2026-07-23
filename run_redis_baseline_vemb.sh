@@ -10,6 +10,10 @@
 #
 # 用法: PORT=6392 ./run_redis_baseline_vemb.sh
 #   单点: NS="4" TS="32" CS="32" TEST_TIME=30 ./run_redis_baseline_vemb.sh
+#   RESP3 对比: PROTO=resp3 NS="4" TS="32" CS="32" TEST_TIME=30 ./run_redis_baseline_vemb.sh
+#   二进制 raw: RAW=1 PROTO=resp2 NS="4" TS="32" CS="32" TEST_TIME=30 ./run_redis_baseline_vemb.sh
+#   PROTO 取值: resp2（默认，memtier 不发 HELLO）/ resp3（memtier 发 HELLO 3）
+#   RAW=1: 加 raw 走 server 端 INT8 量化字节直传（跳过反量化+300 次 sprintf）
 set -uo pipefail
 
 REDIS=/root/gqs/codespace/redis-8.6.3
@@ -21,11 +25,21 @@ SERVER_BIND="numactl --membind=0 taskset -c 0-95"
 CLIENT_BIND="numactl --membind=1 taskset -c 96-191"
 
 DIM=300
-NUM_KEYS=10000
+NUM_KEYS=${NUM_KEYS:-10000}
 KEY_PREFIX="item:"
 PORT=${PORT:-6392}
 TEST_TIME=${TEST_TIME:-5}
-PIPELINE=32
+PIPELINE=${PIPELINE:-32}
+# RESP 协议版本：resp2（默认，memtier 不发 HELLO）或 resp3（memtier 发 HELLO 3）
+PROTO=${PROTO:-resp2}
+case "$PROTO" in
+    resp2|resp3) ;;
+    *) echo "ERROR: PROTO must be resp2 or resp3 (got: $PROTO)"; exit 2;;
+esac
+# RAW=1 走 VEMB raw 二进制路径（INT8 量化字节直传，server 跳过反量化+300 次 sprintf）
+RAW=${RAW:-0}
+RAW_SUFFIX=""
+[ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
 # io-threads to sweep
 NS=( ${NS:-1 2 4 8 16 32 64} )
 # memtier -t values
@@ -33,14 +47,14 @@ TS=( ${TS:-1 1 1 4 8 16 32 32 32} )
 # memtier -c values (paired with TS)
 CS=( ${CS:-1 64 200 64 32 16 8 2 1} )
 
-OUTDIR=${OUTDIR:-/tmp/redis_baseline_vemb_max_tput}
+OUTDIR=${OUTDIR:-/tmp/redis_baseline_vemb_max_tput_${PROTO}_raw${RAW}}
 RAWDIR=$OUTDIR/raw
 mkdir -p "$RAWDIR"
 TSV=$OUTDIR/summary.tsv
 PIDFILE=/tmp/redis_vemb_baseline.pid
 VADD_PIPE=/tmp/vadd_pipe_vemb.txt
 
-printf 'N\tt\tc\ttxc\tops_sec\tp50_ms\tp99_ms\tcpu_cores\trun_ops\tmem_base_mb\tmem_peak_mb\tmem_avg_mb\n' > "$TSV"
+printf 'proto\tN\tt\tc\ttxc\tops_sec\tp50_ms\tp99_ms\tcpu_cores\trun_ops\tmem_base_mb\tmem_peak_mb\tmem_avg_mb\n' > "$TSV"
 declare -A OPS
 BEST_OPS=0; BEST_KEY=""
 
@@ -124,9 +138,13 @@ run_client() {
       done > "$mem_samples_file" ) &
     mem_sampler_pid=$!
     # VEMB 通过 RESP module 命令走；用 memtier --command 自定义命令
-    #   VEMB myvectors __key__ — 取 key 对应的向量
+    #   VEMB myvectors __key__ [raw] — 取 key 对应的向量；RAW=1 加 raw 走二进制路径
     #   __key__ 会被 memtier 替换为按 key-pattern 生成的 element 名
-    timeout $((TEST_TIME + 30))s $CLIENT_BIND $MEMTIER --command="VEMB myvectors __key__" --command-key-pattern=R \
+    # PROTO=resp3 时加 --protocol=resp3，memtier 发 HELLO 3 握手；resp2 不加（memtier 默认不发 HELLO）
+    local proto_flag=""
+    [ "$PROTO" = "resp3" ] && proto_flag="--protocol=resp3"
+    timeout $((TEST_TIME + 30))s $CLIENT_BIND $MEMTIER --command="VEMB myvectors __key__${RAW_SUFFIX}" --command-key-pattern=R \
+        $proto_flag \
         --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE --test-time=$TEST_TIME >"$raw" 2>&1
     j1=$(get_cpu_jiffies "$SERVER_PID")
@@ -148,17 +166,17 @@ run_client() {
     [ -z "$mem_base_mb" ] && mem_base_mb=0; [ -z "$mem_peak_mb" ] && mem_peak_mb=0; [ -z "$mem_avg_mb" ] && mem_avg_mb=0
     local eff=$ops
     awk "BEGIN{exit !($ops < 1)}" && [ "$runops" != 0 ] && eff=$runops
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$n" "$t" "$c" "$((t*c))" "$ops" "$p50" "$p99" "$cores" "$runops" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$PROTO" "$n" "$t" "$c" "$((t*c))" "$ops" "$p50" "$p99" "$cores" "$runops" \
         "$mem_base_mb" "$mem_peak_mb" "$mem_avg_mb" >> "$TSV"
     local k="N${n}|t${t}|c${c}"
     OPS[$k]=$eff
     awk "BEGIN{exit !($eff > $BEST_OPS)}" && { BEST_OPS=$eff; BEST_KEY="$k"; }
-    printf '   N=%-2s t%-2s c%-2s  ops=%-12s p50=%-8s p99=%-8s cores=%-5s  mem=%s/%sMB\n' \
-        "$n" "$t" "$c" "$eff" "$p50" "$p99" "$cores" "$mem_base_mb" "$mem_peak_mb"
+    printf '   [%s] N=%-2s t%-2s c%-2s  ops=%-12s p50=%-8s p99=%-8s cores=%-5s  mem=%s/%sMB\n' \
+        "$PROTO" "$n" "$t" "$c" "$eff" "$p50" "$p99" "$cores" "$mem_base_mb" "$mem_peak_mb"
 }
 
-log "vanilla redis VEMB max-tput sweep — ${#NS[@]} N × ${#TS[@]} memtier pts = $(( ${#NS[@]}*${#TS[@]} )) runs"
+log "vanilla redis VEMB max-tput sweep [PROTO=$PROTO] — ${#NS[@]} N × ${#TS[@]} memtier pts = $(( ${#NS[@]}*${#TS[@]} )) runs"
 gen_vadd_pipe
 for n in "${NS[@]}"; do
     log "N=$n (io-threads) — starting server"

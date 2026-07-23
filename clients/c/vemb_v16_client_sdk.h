@@ -155,6 +155,7 @@ int vemb_v16_client_vemb_pipeline(vemb_v16_client_t *c,
                                   const char **set_names,
                                   const char **elem_names,
                                   uint32_t count,
+                                  float *out_vectors,      /* [count * dim], caller-allocated */
                                   vemb_v16_pipeline_resp_t *out_resps,
                                   uint32_t max_inflight);
 
@@ -268,8 +269,9 @@ uint64_t vemb_v16_client_channel_id(const vemb_v16_client_t *client);
  */
 
 /*
- * Build combined key: set_name + '\0' + elem_name
- * Used by the RESP path; native-protocol callers may skip this.
+ * Build combined key.
+ *   set_name != NULL && != ""  →  key = set_name + '\0' + elem_name
+ *   set_name == NULL || == ""  →  key = elem_name  (no separator)
  * Returns 0 on success, -1 on error.
  */
 int vemb_v16_build_combined_key(char *out, size_t out_cap,
@@ -436,16 +438,20 @@ int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
  * Returns 0 on success, -1 on failure. */
 int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch);
 
-/* Read a vector via the (offset, bytes) pair returned in a VEMB_HANDLE
- * response. Requires vemb_v16_aeron_open_warm_region() to have succeeded.
- *   ch     — channel with warm region mapped
- *   offset — resp.vector_offset from VEMB_HANDLE response
- *   bytes  — resp.vector_bytes (typically dim * sizeof(float))
- *   out    — caller buffer
- *   cap    — capacity of out in bytes
- * Returns bytes copied (>0) on success, -1 if warm region not mapped or
+/* Read a vector via the (region_id, offset, bytes) tuple returned in a
+ * VEMB_HANDLE response. Requires vemb_v16_aeron_open_warm_region() to have
+ * succeeded.  When multiple warm regions are mapped, region_id selects
+ * which mapping to dereference.
+ *   ch        — channel with warm region(s) mapped
+ *   region_id — resp.region_id from VEMB_HANDLE response
+ *   offset    — resp.vector_offset from VEMB_HANDLE response
+ *   bytes     — resp.vector_bytes (typically dim * sizeof(float))
+ *   out       — caller buffer
+ *   cap       — capacity of out in bytes
+ * Returns bytes copied (>0) on success, -1 if region_id not found or
  * offset/bytes are out of range. */
 int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
+                               uint32_t region_id,
                                uint64_t offset, uint32_t bytes,
                                void *out, uint32_t cap);
 

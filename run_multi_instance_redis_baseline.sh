@@ -33,6 +33,12 @@ DIM=${DIM:-300}
 NUM_KEYS=${NUM_KEYS:-100000}
 PIPELINE=${PIPELINE:-16}
 TEST_TIME=${TEST_TIME:-30}
+# RAW=1 走 VEMB raw 二进制路径（INT8 量化字节直传，server 跳过反量化+DIM 次 sprintf）
+RAW=${RAW:-0}
+RAW_SUFFIX=""
+[ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
+# 100G NIC 统计：sar -n DEV 1 监听 server 端网卡。本地回环不需要。
+NIC_IFACE=${NIC_IFACE:-eth4}
 # 每实例 memtier 的 -t 和 -c
 MEMTIER_T=${MEMTIER_T:-16}
 MEMTIER_C=${MEMTIER_C:-4}
@@ -40,6 +46,15 @@ MEMTIER_C=${MEMTIER_C:-4}
 # 客户端核范围（local: HW01 NUMA1; cross-node: HW02 NUMA1）
 CLIENT_CPU_START=${CLIENT_CPU_START:-97}
 CLIENT_CPU_END=${CLIENT_CPU_END:-191}
+# CLIENT_CPUSET: 任意 taskset 范围字符串（如 HW06 NUMA1 "24-47,72-95"）。
+# 如果设置，覆盖 CLIENT_CPU_START-END。
+CLIENT_CPUSET=${CLIENT_CPUSET:-}
+# 派生：脚本里绑核用 CLIENT_CPU_SPEC
+if [ -n "$CLIENT_CPUSET" ]; then
+    CLIENT_CPU_SPEC="$CLIENT_CPUSET"
+else
+    CLIENT_CPU_SPEC="$CLIENT_CPU_START-$CLIENT_CPU_END"
+fi
 
 # 派生值
 CORES_PER_INSTANCE=$IO_THREADS
@@ -245,13 +260,14 @@ key_min=$7
 key_max=$8
 pipeline=$9
 out_file=${10}
+raw_suffix=${11:-}
 
 cd "$memtier_dir"
 ./memtier_benchmark \
     -h "$host" -p "$port" \
     --hide-histogram --test-time="$test_time" --select-db=0 \
     -c "$clients" -t "$threads" --pipeline="$pipeline" \
-    --command="VEMB myvectors __key__" \
+    --command="VEMB myvectors __key__${raw_suffix}" \
     --command-key-pattern=R \
     --key-prefix=item: \
     --key-minimum="$key_min" --key-maximum="$key_max" \
@@ -293,6 +309,14 @@ done
 
 RUN_START=$(get_ts)
 
+# === 100G NIC 利用率采集（仅跨节点场景；本地回环走 lo，跳过）===
+SAR_LOG=""
+if [ "$LOCAL_BENCH" != "1" ]; then
+    SAR_LOG="/tmp/sar_nic_${RESULT_PREFIX}.log"
+    ssh "$JUMP" "rm -f $SAR_LOG; nohup sar -n DEV 1 $((TEST_TIME + 5)) > $SAR_LOG 2>&1 &" 2>/dev/null
+    log "  sar -n DEV 1 started on $JUMP (iface=$NIC_IFACE, sampling ${TEST_TIME}s)"
+fi
+
 # Launch all memtier in parallel
 # SHARED_CLIENT_CPU=1（默认）: 所有 memtier 共享 CLIENT_CPU_START-END（跟历史一致，可能不均但峰值高）
 # SHARED_CLIENT_CPU=0: 每实例独立绑核组（稳定可复现，但单实例上限略低）
@@ -304,21 +328,21 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
     remote_out="/tmp/${RESULT_PREFIX}_inst${i}.log"
 
     if [ "$SHARED_CLIENT_CPU" = "1" ]; then
-        # 共享绑核：所有 memtier 共享 CLIENT_CPU_START-END
+        # 共享绑核：所有 memtier 共享 CLIENT_CPU_SPEC（支持离散范围如 HW06 NUMA1 "24-47,72-95"）
         if [ "$LOCAL_BENCH" = "1" ]; then
-            ssh "$JUMP" "numactl --membind=1 taskset -c $CLIENT_CPU_START-$CLIENT_CPU_END bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+            ssh "$JUMP" "numactl --membind=1 taskset -c $CLIENT_CPU_SPEC bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'" 2>/dev/null &
         else
-            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CLIENT_CPU_START-$CLIENT_CPU_END bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CLIENT_CPU_SPEC bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'\"" 2>/dev/null &
         fi
     else
-        # 独立绑核：每实例独占核组
+        # 独立绑核：每实例独占核组（仅支持 CLIENT_CPU_START-END 连续范围）
         CPM=$CORES_PER_MEMTIER
         CSTART=$((CLIENT_CPU_START + i * CPM))
         CEND=$((CSTART + CPM - 1))
         if [ "$LOCAL_BENCH" = "1" ]; then
-            ssh "$JUMP" "numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out" 2>/dev/null &
+            ssh "$JUMP" "numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'" 2>/dev/null &
         else
-            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out\"" 2>/dev/null &
+            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'\"" 2>/dev/null &
         fi
     fi
     PIDS="$PIDS $!"
@@ -407,13 +431,28 @@ AVG_LAT=$(awk "BEGIN{ if($VALID_INSTANCES>0) printf \"%.3f\", $AVG_LAT_SUM / $VA
 AVG_P99=$(awk "BEGIN{ if($VALID_INSTANCES>0) printf \"%.3f\", $P99_SUM / $VALID_INSTANCES; else print \"N/A\" }")
 TOTAL_GB_SEC=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_KB_SEC / 1024.0 / 1024.0 }")
 
+# === NIC 利用率解析（仅跨节点场景）===
+NIC_UTIL_STR="N/A"
+if [ "$LOCAL_BENCH" != "1" ] && [ -n "$SAR_LOG" ]; then
+    sleep 2  # 等 sar flush 最后样本
+    NIC_UTIL_STR=$(ssh "$JUMP" "awk '\$2==\"$NIC_IFACE\" && NF>=9 {sum+=\$NF; n++} END {if(n>0) printf \"%.1f\", sum/n; else print \"N/A\"}' $SAR_LOG 2>/dev/null" 2>/dev/null)
+    [ -z "$NIC_UTIL_STR" ] && NIC_UTIL_STR="N/A"
+    log "  NIC $NIC_IFACE util: ${NIC_UTIL_STR}%"
+fi
+
+# ops/sec/core 派生
+OPS_PER_CORE="N/A"
+if [ "$TOTAL_CORES" != "0" ] && [ -n "$TOTAL_CORES" ]; then
+    OPS_PER_CORE=$(awk "BEGIN{ c=$TOTAL_CORES+0; if(c>0) printf \"%.0f\", $TOTAL_OPS/c; else print \"N/A\" }")
+fi
+
 echo ""
 log "=== Aggregate Results ==="
 {
-    printf "%-12s %14s %12s %12s %12s %10s\n" \
-        "instances" "total_ops/sec" "avg_lat(ms)" "avg_p99(ms)" "wire_GB/s" "cores"
-    printf "%-12s %14s %12s %12s %12s %10s\n" \
-        "$NUM_INSTANCES" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P99" "$TOTAL_GB_SEC" "$TOTAL_CORES"
+    printf "%-12s %14s %12s %12s %12s %10s %12s %12s\n" \
+        "instances" "total_ops/sec" "avg_lat(ms)" "avg_p99(ms)" "wire_GB/s" "cores" "ops/core/s" "NIC_util%"
+    printf "%-12s %14s %12s %12s %12s %10s %12s %12s\n" \
+        "$NUM_INSTANCES" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P99" "$TOTAL_GB_SEC" "$TOTAL_CORES" "$OPS_PER_CORE" "$NIC_UTIL_STR"
 } | tee "$LOCAL_RESULT_DIR/${RESULT_PREFIX}_summary.txt"
 
 echo ""

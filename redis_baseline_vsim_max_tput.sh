@@ -126,7 +126,7 @@ run_client() {
     # VSIM 通过 RESP module 命令走；用 memtier --command 自定义命令
     #   VSIM myset ELE __key__ — 用已 prefill 的 element 名做 KNN 查询基准
     #   __key__ 会被 memtier 替换为按 key-pattern 生成的 element 名
-    timeout 30s $CLIENT_BIND $MEMTIER --command="VSIM myset ELE __key__" --command-key-pattern=R \
+    timeout 60s $CLIENT_BIND $MEMTIER --command="VSIM myset ELE __key__" --command-key-pattern=R \
         --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE --test-time=$TEST_TIME >"$raw" 2>&1
     j1=$(get_cpu_jiffies "$SERVER_PID")

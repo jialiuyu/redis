@@ -129,7 +129,7 @@ run_client() {
       done > "$mem_samples_file" ) &
     mem_sampler_pid=$!
     # VREM 通过 RESP module 命令；--command-key-pattern=S 顺序删保证命中
-    timeout 30s $CLIENT_BIND $MEMTIER --command="VREM myset __key__" --command-key-pattern=S \
+    timeout 60s $CLIENT_BIND $MEMTIER --command="VREM myset __key__" --command-key-pattern=S \
         --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE --test-time=$TEST_TIME >"$raw" 2>&1
     j1=$(get_cpu_jiffies "$SERVER_PID")

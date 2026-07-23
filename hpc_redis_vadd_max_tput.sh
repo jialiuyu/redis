@@ -24,7 +24,7 @@ CLIENT_BIND="numactl --membind=1 taskset -c 96-191"
 
 DIM=300
 MAX_VECTORS=1048576
-NUM_KEYS=800000
+NUM_KEYS=50000
 KEY_PREFIX="item:"
 PORT=${PORT:-6390}
 TEST_TIME=${TEST_TIME:-5}
@@ -109,7 +109,7 @@ run_client() {
     mem_sampler_pid=$!
     # VADD = 默认 SET 路径（无 --vemb-v16-vrem），ratio=1:0 全写，S:S 顺序插/覆盖
     #   memtier binary 协议有跟 VSIM/VREM 同样的不退出 bug，timeout 30s 兜底
-    timeout 30s $CLIENT_BIND $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+    timeout 60s $CLIENT_BIND $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
         --ratio=1:0 --key-pattern=S:S --key-prefix=$KEY_PREFIX \
         --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1
