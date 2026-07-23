@@ -334,6 +334,7 @@ static void *worker_main(void *arg) {
                 unsigned int hits = 0, misses = 0;
                 if (resp_buf.status == VEMB_V16_STATUS_OK) {
                     int n = vemb_v16_aeron_read_vector(w->channels[ch],
+                                                       resp_buf.region_id,
                                                        resp_buf.vector_offset,
                                                        resp_buf.vector_bytes,
                                                        vec_scratch,
@@ -416,6 +417,7 @@ static void *worker_main(void *arg) {
                         unsigned int hits = 0, misses = 0;
                         if (resp_buf.status == VEMB_V16_STATUS_OK) {
                             int n = vemb_v16_aeron_read_vector(w->channels[ch],
+                                                               resp_buf.region_id,
                                                                resp_buf.vector_offset,
                                                                resp_buf.vector_bytes,
                                                                vec_scratch,

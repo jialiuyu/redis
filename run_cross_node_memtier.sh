@@ -33,6 +33,9 @@ KEY_PREFIX="item:"
 THREADS_LIST=( ${THREADS_LIST:-4 8 16} )
 CLIENTS_PER_THREAD=${CLIENTS_PER_THREAD:-4}
 PIPELINE=32
+# 100G NIC 统计：sar -n DEV 1 监听 server 端口所在网卡（默认 eth4=192.168.1.111 mlx5_0）
+# 本地回环不需要 NIC 统计；只 100G 跨节点场景启用。
+NIC_IFACE=${NIC_IFACE:-eth4}
 
 LOCAL_RESULT_DIR="benchmark/results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -294,6 +297,8 @@ CORES=()
 MEM_BASE_MB=()
 MEM_PEAK_MB=()
 MEM_AVG_MB=()
+# 网卡利用率（sar -n DEV %ifutil 平均，跨节点场景）
+NIC_UTIL=()
 SAMPLER_SSH_PID=""
 
 # Upload jiffies helper to HW01（sum utime+stime across all TIDs）
@@ -346,6 +351,13 @@ for threads in "${THREADS_LIST[@]}"; do
 
     RUN_START=$(get_ts)
     J0=$(ssh "$HW01" "bash /tmp/get_jiffies.sh $SERVER_PID" 2>/dev/null)
+
+    # === NIC 利用率采集（sar -n DEV 1 后台跑，bench 期间累积）===
+    # sar 在 server (HW01) 后台启动，跑 (BENCH_TIME+5) 秒后自动退出；
+    # 输出到 /tmp/sar_nic_${RESULT_PREFIX}_t${threads}.log，结束后 awk 提取 eth4 %ifutil 平均。
+    sar_log="/tmp/sar_nic_${RESULT_PREFIX}_t${threads}.log"
+    ssh "$HW01" "rm -f $sar_log; nohup sar -n DEV 1 $((BENCH_TIME + 5)) > $sar_log 2>&1 &" 2>/dev/null
+    log "  sar -n DEV 1 started on HW01 (iface=$NIC_IFACE, sampling ${BENCH_TIME}s)"
 
     # VEMB
     ssh "$HW01" "ssh $HW02 \"bash /tmp/$BENCH_SCRIPT_NAME vemb $threads $CLIENTS_PER_THREAD $BENCH_TIME $SERVER_HOST $SERVER_PORT $MEMTIER_DIR $BENCH_DIM $KEY_PREFIX 1 $NUM_KEYS $PIPELINE $vemb_out\""
@@ -448,6 +460,15 @@ for threads in "${THREADS_LIST[@]}"; do
 
     cores=$(awk "BEGIN{ if(\"${J0:-}\"==\"\" || \"${J1:-}\"==\"\") print \"NA\"; else printf \"%.2f\", (${J1:-0}-${J0:-0})/100.0/${BENCH_TIME} }")
 
+    # === NIC 利用率解析 ===
+    # sar 输出每行: HH:MM:SS IFACE rxpck/s txpck/s rxkB/s txkB/s ... %ifutil
+    # 取 IFACE==NIC_IFACE 的行，对最后一列 %ifutil 求平均
+    sleep 2  # 等 sar flush 最后一个样本
+    nic_util=$(ssh "$HW01" "awk '\$2==\"$NIC_IFACE\" && NF>=9 {sum+=\$NF; n++} END {if(n>0) printf \"%.1f\", sum/n; else print \"0.0\"}' $sar_log 2>/dev/null" 2>/dev/null)
+    [ -z "$nic_util" ] && nic_util="N/A"
+    log "  NIC $NIC_IFACE util: ${nic_util}%"
+    NIC_UTIL+=("$nic_util")
+
     THREAD_VAL+=("$threads")
     RUN_SEC+=("$run_sec")
     CORES+=("$cores")
@@ -482,18 +503,13 @@ fi
 
 log "=== Results Summary ==="
 {
-    printf "%-8s %-6s %12s %12s %12s %12s %12s %12s %8s %10s %10s %10s\n" \
-        "mode" "t" "ops/sec" "avg_lat" "p99_lat" "p99.9_lat" "KB/sec" "run_time(s)" "cores" "base_MB" "peak_MB" "avg_MB"
+    printf "%-8s %-6s %14s %12s %12s %12s %14s %10s %8s %10s %10s %10s %10s\n" \
+        "mode" "t" "ops/sec" "avg_lat" "p99_lat" "p99.9_lat" "KB/sec" "run_time(s)" "cores" "NIC_util%" "base_MB" "peak_MB" "avg_MB"
     for i in "${!THREAD_VAL[@]}"; do
-        printf "%-8s %-6s %12s %12s %12s %12s %12s %12s %8s %10s %10s %10s\n" \
+        printf "%-8s %-6s %14s %12s %12s %12s %14s %10s %8s %10s %10s %10s %10s\n" \
             "VEMB" "${THREAD_VAL[$i]}" \
             "${VEMB_OPS[$i]:-N/A}" "${VEMB_LAT[$i]:-N/A}" "${VEMB_P99[$i]:-N/A}" "${VEMB_P999[$i]:-N/A}" "${VEMB_KB[$i]:-N/A}" "${RUN_SEC[$i]:-N/A}" \
-            "${CORES[$i]:-N/A}" "${MEM_BASE_MB[$i]:-N/A}" "${MEM_PEAK_MB[$i]:-N/A}" "${MEM_AVG_MB[$i]:-N/A}"
-        # VSIM row disabled — pure VEMB mode
-        # printf "%-8s %-6s %12s %12s %12s %12s %12s %12s %10s %10s %10s\n" \
-        #     "VSIM" "${THREAD_VAL[$i]}" \
-        #     "${VSIM_OPS[$i]:-N/A}" "${VSIM_LAT[$i]:-N/A}" "${VSIM_P99[$i]:-N/A}" "${VSIM_P999[$i]:-N/A}" "${VSIM_KB[$i]:-N/A}" "" \
-        #     "${MEM_BASE_MB[$i]:-N/A}" "${MEM_PEAK_MB[$i]:-N/A}" "${MEM_AVG_MB[$i]:-N/A}"
+            "${CORES[$i]:-N/A}" "${NIC_UTIL[$i]:-N/A}" "${MEM_BASE_MB[$i]:-N/A}" "${MEM_PEAK_MB[$i]:-N/A}" "${MEM_AVG_MB[$i]:-N/A}"
     done
 } | tee "$SUMMARY_FILE"
 echo ""

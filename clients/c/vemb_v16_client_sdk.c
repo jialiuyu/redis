@@ -171,6 +171,8 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
     if (desc->warm_backend_type != VEMB_V16_REGION_UB)
         return -1;
     int fd = open(desc->vector_region_name, O_RDWR);
+    if (fd < 0 && (errno == EACCES || errno == EPERM))
+        fd = open(desc->vector_region_name, O_RDWR | O_SYNC);
     if (fd < 0)
         return -1;
 
@@ -2358,11 +2360,16 @@ struct vemb_v16_aeron_channel {
     vemb_v16_client_ring_t    *req_ring;
     vemb_v16_client_ring_t    *resp_ring;
     char                       uds_path[108];  /* sockaddr_un::sun_path cap */
-    /* warm region (lazy; opened by vemb_v16_aeron_open_warm_region) */
-    void                      *warm_mapping_addr;
-    size_t                     warm_mapping_bytes;
-    const uint8_t             *warm_mapped_addr;   /* data-area pointer */
-    uint64_t                   warm_region_bytes;
+    /* warm regions (lazy; opened by vemb_v16_aeron_open_warm_region) */
+    struct {
+        void          *mapping_addr;
+        size_t         mapping_bytes;
+        const uint8_t *mapped_addr;   /* data-area pointer */
+        uint64_t       region_bytes;
+        uint32_t       region_id;
+        int            valid;
+    } warm[VEMB_V16_MAX_DESC_WARM_REGIONS];
+    uint32_t                   warm_count;
 };
 
 /* Connect to a UDS endpoint with a fixed receive/send timeout. Returns
@@ -2495,13 +2502,14 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
 
 void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
     if (!ch) return;
-    if (ch->warm_mapping_addr) {
-        munmap(ch->warm_mapping_addr, ch->warm_mapping_bytes);
-        ch->warm_mapping_addr = NULL;
-        ch->warm_mapping_bytes = 0;
-        ch->warm_mapped_addr   = NULL;
-        ch->warm_region_bytes  = 0;
+    for (uint32_t i = 0; i < ch->warm_count; i++) {
+        if (ch->warm[i].valid && ch->warm[i].mapping_addr) {
+            munmap(ch->warm[i].mapping_addr, ch->warm[i].mapping_bytes);
+            ch->warm[i].mapping_addr = NULL;
+            ch->warm[i].valid = 0;
+        }
     }
+    ch->warm_count = 0;
     vemb_v16_aeron_ring_close(ch->req_ring,  ch->desc.request_ring_slot_size);
     vemb_v16_aeron_ring_close(ch->resp_ring, ch->desc.response_ring_slot_size);
     vemb_v16_aeron_notify_close(ch->uds_path, ch->desc.channel_id);
@@ -2536,41 +2544,106 @@ int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
     return vemb_v16_client_poll(ch->resp_ring, buf, max_len);
 }
 
-int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch) {
-    if (!ch) return -1;
-    /* Idempotent: unmap previous mapping if any. */
-    if (ch->warm_mapping_addr) {
-        munmap(ch->warm_mapping_addr, ch->warm_mapping_bytes);
-        ch->warm_mapping_addr = NULL;
-        ch->warm_mapping_bytes = 0;
-        ch->warm_mapped_addr   = NULL;
-        ch->warm_region_bytes  = 0;
-    }
-    void *mapping_addr = NULL;
-    size_t mapping_bytes = 0;
-    void *mapped_addr = NULL;
-    uint64_t region_bytes = 0;
-    if (vemb_v16_open_warm_region(&ch->desc, &mapping_addr, &mapping_bytes,
-                                  &mapped_addr, &region_bytes) != 0) {
-        return -1;
-    }
-    ch->warm_mapping_addr = mapping_addr;
-    ch->warm_mapping_bytes = mapping_bytes;
-    ch->warm_mapped_addr   = (const uint8_t *)mapped_addr;
-    ch->warm_region_bytes  = region_bytes;
+/* Helper: open and mmap a single warm region by path. Mirrors the O_SYNC
+ * fallback in vemb_v16_mapped_region.c:126-138 — OBMM import (remote) devices
+ * reject cacheable mmap with EPERM; O_SYNC selects non-cacheable mapping. */
+static int aeron_mmap_one_region(const char *path,
+                                  uint64_t region_bytes, uint64_t mmap_offset,
+                                  void **out_mapping_addr, size_t *out_mapping_bytes,
+                                  const uint8_t **out_mapped_addr) {
+    if (!path || !path[0] || region_bytes == 0) return -1;
+    int fd = open(path, O_RDWR);
+    if (fd < 0 && (errno == EACCES || errno == EPERM))
+        fd = open(path, O_RDWR | O_SYNC);
+    if (fd < 0) return -1;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
+    uint64_t aligned_offset = mmap_offset & ~page_mask;
+    size_t offset_delta = (size_t)(mmap_offset - aligned_offset);
+    size_t map_size = (size_t)region_bytes + offset_delta;
+
+    void *ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                     (off_t)aligned_offset);
+    close(fd);
+    if (ptr == MAP_FAILED) return -1;
+
+    *out_mapping_addr   = ptr;
+    *out_mapping_bytes  = map_size;
+    *out_mapped_addr    = (const uint8_t *)ptr + offset_delta;
     return 0;
 }
 
+int vemb_v16_aeron_open_warm_region(vemb_v16_aeron_channel_t *ch) {
+    if (!ch) return -1;
+    /* Idempotent: unmap previous mappings. */
+    for (uint32_t i = 0; i < ch->warm_count; i++) {
+        if (ch->warm[i].valid && ch->warm[i].mapping_addr)
+            munmap(ch->warm[i].mapping_addr, ch->warm[i].mapping_bytes);
+        memset(&ch->warm[i], 0, sizeof(ch->warm[i]));
+    }
+    ch->warm_count = 0;
+
+    uint32_t count = ch->desc.warm_region_count;
+    if (count > VEMB_V16_MAX_DESC_WARM_REGIONS)
+        count = VEMB_V16_MAX_DESC_WARM_REGIONS;
+
+    if (count == 0) {
+        /* Backward-compatible fallback: single region via legacy fields. */
+        void *ma = NULL; size_t mb = 0; void *md = NULL; uint64_t rb = 0;
+        if (vemb_v16_open_warm_region(&ch->desc, &ma, &mb, &md, &rb) != 0)
+            return -1;
+        ch->warm[0].mapping_addr   = ma;
+        ch->warm[0].mapping_bytes  = mb;
+        ch->warm[0].mapped_addr    = (const uint8_t *)md;
+        ch->warm[0].region_bytes   = rb;
+        ch->warm[0].region_id      = ch->desc.warm_region_id;
+        ch->warm[0].valid          = 1;
+        ch->warm_count = 1;
+        return 0;
+    }
+
+    uint32_t ok = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (aeron_mmap_one_region(ch->desc.warm_regions[i].path,
+                                   ch->desc.warm_regions[i].region_bytes,
+                                   ch->desc.warm_regions[i].mmap_offset,
+                                   &ch->warm[i].mapping_addr,
+                                   &ch->warm[i].mapping_bytes,
+                                   &ch->warm[i].mapped_addr) != 0) {
+            ch->warm[i].valid = 0;
+            continue;  /* skip inaccessible region; reads to it return -1 */
+        }
+        ch->warm[i].region_id = ch->desc.warm_regions[i].region_id;
+        ch->warm[i].region_bytes = ch->desc.warm_regions[i].region_bytes;
+        ch->warm[i].valid = 1;
+        ok++;
+    }
+    ch->warm_count = count;
+    return ok > 0 ? 0 : -1;
+}
+
 int vemb_v16_aeron_read_vector(const vemb_v16_aeron_channel_t *ch,
+                               uint32_t region_id,
                                uint64_t offset, uint32_t bytes,
                                void *out, uint32_t cap) {
     if (!ch || !out)                                   return -1;
-    if (!ch->warm_mapped_addr)                         return -1;
     if (bytes == 0 || bytes > cap)                     return -1;
+    /* Find the mapping matching region_id (linear scan, N <= 16). */
+    const uint8_t *base = NULL;
+    uint64_t region_bytes = 0;
+    for (uint32_t i = 0; i < ch->warm_count; i++) {
+        if (ch->warm[i].valid && ch->warm[i].region_id == region_id) {
+            base = ch->warm[i].mapped_addr;
+            region_bytes = ch->warm[i].region_bytes;
+            break;
+        }
+    }
+    if (!base) return -1;
     /* Bounds check against the server-reported region size. */
-    if (offset > ch->warm_region_bytes ||
-        (uint64_t)bytes > ch->warm_region_bytes - offset) return -1;
-    sve_streaming_load_f32(ch->warm_mapped_addr + offset, out, bytes);
+    if (offset > region_bytes ||
+        (uint64_t)bytes > region_bytes - offset) return -1;
+    sve_streaming_load_f32(base + offset, out, bytes);
     return (int)bytes;
 }
 

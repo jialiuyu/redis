@@ -24,8 +24,8 @@ CLIENT_BIND="numactl --membind=1 taskset -c 96-191"
 
 DIM=300
 # warm region capacity = 1GB/1200B = 894784 slot; prefill 800K 留余量
-NUM_KEYS=800000
-PREFILL_KEYS=800000
+NUM_KEYS=600000
+PREFILL_KEYS=600000
 KEY_PREFIX="item:"
 PORT=${PORT:-6390}
 TEST_TIME=${TEST_TIME:-5}
@@ -118,7 +118,7 @@ run_client() {
     mem_sampler_pid=$!
     # VREM: 加 --vemb-v16-vrem 走删除（hijack SET），ratio=1:0 全写，S:S 顺序删
     #   memtier binary 协议有跟 VSIM 同样的不退出 bug，timeout 30s 兜底
-    timeout 30s $CLIENT_BIND $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM --vemb-v16-vrem \
+    timeout 60s $CLIENT_BIND $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM --vemb-v16-vrem \
         -s 127.0.0.1 -p $PORT -t $t -c $c --pipeline=$PIPELINE \
         --ratio=1:0 --key-pattern=S:S --key-prefix=$KEY_PREFIX \
         --key-minimum=1 --key-maximum=$NUM_KEYS --test-time=$TEST_TIME >"$raw" 2>&1

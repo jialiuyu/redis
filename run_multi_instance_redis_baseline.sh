@@ -37,6 +37,8 @@ TEST_TIME=${TEST_TIME:-30}
 RAW=${RAW:-0}
 RAW_SUFFIX=""
 [ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
+# 100G NIC 统计：sar -n DEV 1 监听 server 端网卡。本地回环不需要。
+NIC_IFACE=${NIC_IFACE:-eth4}
 # 每实例 memtier 的 -t 和 -c
 MEMTIER_T=${MEMTIER_T:-16}
 MEMTIER_C=${MEMTIER_C:-4}
@@ -307,6 +309,14 @@ done
 
 RUN_START=$(get_ts)
 
+# === 100G NIC 利用率采集（仅跨节点场景；本地回环走 lo，跳过）===
+SAR_LOG=""
+if [ "$LOCAL_BENCH" != "1" ]; then
+    SAR_LOG="/tmp/sar_nic_${RESULT_PREFIX}.log"
+    ssh "$JUMP" "rm -f $SAR_LOG; nohup sar -n DEV 1 $((TEST_TIME + 5)) > $SAR_LOG 2>&1 &" 2>/dev/null
+    log "  sar -n DEV 1 started on $JUMP (iface=$NIC_IFACE, sampling ${TEST_TIME}s)"
+fi
+
 # Launch all memtier in parallel
 # SHARED_CLIENT_CPU=1（默认）: 所有 memtier 共享 CLIENT_CPU_START-END（跟历史一致，可能不均但峰值高）
 # SHARED_CLIENT_CPU=0: 每实例独立绑核组（稳定可复现，但单实例上限略低）
@@ -421,13 +431,28 @@ AVG_LAT=$(awk "BEGIN{ if($VALID_INSTANCES>0) printf \"%.3f\", $AVG_LAT_SUM / $VA
 AVG_P99=$(awk "BEGIN{ if($VALID_INSTANCES>0) printf \"%.3f\", $P99_SUM / $VALID_INSTANCES; else print \"N/A\" }")
 TOTAL_GB_SEC=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_KB_SEC / 1024.0 / 1024.0 }")
 
+# === NIC 利用率解析（仅跨节点场景）===
+NIC_UTIL_STR="N/A"
+if [ "$LOCAL_BENCH" != "1" ] && [ -n "$SAR_LOG" ]; then
+    sleep 2  # 等 sar flush 最后样本
+    NIC_UTIL_STR=$(ssh "$JUMP" "awk '\$2==\"$NIC_IFACE\" && NF>=9 {sum+=\$NF; n++} END {if(n>0) printf \"%.1f\", sum/n; else print \"N/A\"}' $SAR_LOG 2>/dev/null" 2>/dev/null)
+    [ -z "$NIC_UTIL_STR" ] && NIC_UTIL_STR="N/A"
+    log "  NIC $NIC_IFACE util: ${NIC_UTIL_STR}%"
+fi
+
+# ops/sec/core 派生
+OPS_PER_CORE="N/A"
+if [ "$TOTAL_CORES" != "0" ] && [ -n "$TOTAL_CORES" ]; then
+    OPS_PER_CORE=$(awk "BEGIN{ c=$TOTAL_CORES+0; if(c>0) printf \"%.0f\", $TOTAL_OPS/c; else print \"N/A\" }")
+fi
+
 echo ""
 log "=== Aggregate Results ==="
 {
-    printf "%-12s %14s %12s %12s %12s %10s\n" \
-        "instances" "total_ops/sec" "avg_lat(ms)" "avg_p99(ms)" "wire_GB/s" "cores"
-    printf "%-12s %14s %12s %12s %12s %10s\n" \
-        "$NUM_INSTANCES" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P99" "$TOTAL_GB_SEC" "$TOTAL_CORES"
+    printf "%-12s %14s %12s %12s %12s %10s %12s %12s\n" \
+        "instances" "total_ops/sec" "avg_lat(ms)" "avg_p99(ms)" "wire_GB/s" "cores" "ops/core/s" "NIC_util%"
+    printf "%-12s %14s %12s %12s %12s %10s %12s %12s\n" \
+        "$NUM_INSTANCES" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P99" "$TOTAL_GB_SEC" "$TOTAL_CORES" "$OPS_PER_CORE" "$NIC_UTIL_STR"
 } | tee "$LOCAL_RESULT_DIR/${RESULT_PREFIX}_summary.txt"
 
 echo ""
