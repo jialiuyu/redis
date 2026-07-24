@@ -6,6 +6,7 @@
 #include "vemb_v16_storage.h"
 #include "vemb_v16_protocol.h"
 #include "vemb_v16_control_listener.h"
+#include "vemb_v16_aeron_attach.h"   /* cross-node aeron ATTACH magic sniff */
 #include "server.h"
 #include "connection.h"
 #include "connhelpers.h"   /* callHandler ref-counting: connDecrRefs / CONN_FLAG_CLOSE_SCHEDULED */
@@ -15,6 +16,12 @@
  * the global verbosity variable that vemb_v16_log.h's serverLog macro
  * references when compiling vemb_v16_proxy.o / vemb_v16_supernode.o. */
 int vemb_v16_log_verbosity_value = LL_NOTICE;
+
+/* Accessor for proxy.c / supernode.c which can't include server.h
+ * (zmalloc.h deprecated free conflicts with their use of libc free). */
+int vemb_v16_cross_node_aeron_enabled(void) {
+    return server.vemb_v16_cross_node_aeron_enabled;
+}
 
 #include <pthread.h>
 #include <string.h>
@@ -186,14 +193,100 @@ int vemb_v16_server_integration_init(void) {
  * stuck the main thread and caused c=20+ connection drops).
  * ------------------------------------------------------------------- */
 
+/* Try to steal a new connection for cross-node aeron ATTACH.
+ *
+ * Peeks the first 24 bytes; if they exactly match VEMB_V16_AERON_ATTACH_MAGIC,
+ * consumes those bytes and hands the fd to vemb_v16_aeron_attach_handle_fd
+ * (which performs a synchronous request/response exchange then closes fd).
+ * The ATTACH magic's first 4 bytes are "VEMB" (0x424d4556), which is
+ * different from VEMB_V16_MAGIC (0x56313645 = "VEmb"), so no collision with
+ * the normal VEMB sniff path.
+ *
+ * Steals fd from conn (sets conn->fd = -1) on match so caller's connClose
+ * won't double-close.  Returns 1 on steal, 0 on no-match.  Caller handles
+ * conn cleanup (zfree / refs) — same dance as the VEMB steal paths. */
+static int vemb_try_aeron_attach_steal(connection *conn) {
+    int fd = conn->fd;
+    if (fd < 0) return 0;
+    /* Cross-node aeron is opt-in via --vemb-v16-cross-node-aeron yes.
+     * When disabled, never peek for the ATTACH magic — falls through
+     * to the normal VEMB/RESP sniff path (pre-cross-node behavior). */
+    if (!server.vemb_v16_cross_node_aeron_enabled) return 0;
+
+    /* Peek 24 bytes without consuming. If not yet available, brief poll
+     * — cross-node ATTACH is a control-plane op (channel setup, once per
+     * channel), so a <1ms blocking wait is acceptable and avoids the
+     * async-handler lifecycle complexity that was dropping connections
+     * under burst load (T*C ≥ 7). */
+    char magic_buf[VEMB_V16_AERON_ATTACH_MAGIC_LEN];
+    ssize_t n = recv(fd, magic_buf, sizeof(magic_buf), MSG_PEEK);
+    if (n < (ssize_t)sizeof(magic_buf)) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        if (poll(&pfd, 1, 100) > 0 && (pfd.revents & POLLIN)) {
+            n = recv(fd, magic_buf, sizeof(magic_buf), MSG_PEEK);
+        }
+    }
+    if (n < (ssize_t)sizeof(magic_buf))
+        return 0;
+
+    if (memcmp(magic_buf, VEMB_V16_AERON_ATTACH_MAGIC,
+               VEMB_V16_AERON_ATTACH_MAGIC_LEN) != 0)
+        return 0;
+
+    /* ATTACH magic matched. Consume the 24-byte magic from the socket
+     * buffer — vemb_v16_aeron_attach_handle_fd assumes the magic has
+     * already been read and expects to read dim/slot_size fields next. */
+    ssize_t consumed = read(fd, magic_buf, sizeof(magic_buf));
+    if (consumed != (ssize_t)sizeof(magic_buf)) {
+        serverLog(LL_WARNING,
+                  "VEMB V16 AERON ATTACH: failed to consume magic on fd %d "
+                  "(read returned %zd, expected %zu): %s",
+                  fd, consumed, sizeof(magic_buf), strerror(errno));
+        return 0;  /* let caller fall through and close */
+    }
+
+    /* Steal fd so the caller's connClose won't close it. */
+    conn->fd = -1;
+
+    serverLog(LL_NOTICE,
+              "VEMB V16 AERON ATTACH on fd %d, dispatching to attach_handle_fd",
+              fd);
+
+    int rc = vemb_v16_aeron_attach_handle_fd(server.vemb_v16_proxy, fd);
+    if (rc != 0) {
+        serverLog(LL_WARNING,
+                  "VEMB V16 AERON ATTACH handle_fd rejected fd %d (rc=%d)",
+                  fd, rc);
+    }
+
+    /* handle_fd always closes fd (success or error) per the protocol
+     * contract.  Guard the close with -1 in case of future changes. */
+    close(fd);
+    return 1;
+}
+
 /* Async peek handler: invoked by the main event loop when a pending conn
  * becomes readable. Peeks the first 8 bytes and decides:
- *   - non-VEMB magic          → RESP (redis handles)
- *   - VEMB magic + type=HELLO → data plane (proxy_inject_fd)
- *   - VEMB magic + type!=HELLO→ control plane (control_inject_fd) */
+ *   - ATTACH magic             → aeron ATTACH (steal + handle_fd)
+ *   - non-VEMB magic           → RESP (redis handles)
+ *   - VEMB magic + type=HELLO  → data plane (proxy_inject_fd)
+ *   - VEMB magic + type!=HELLO → control plane (control_inject_fd) */
 static void vemb_async_peek_handler(connection *conn) {
     int fd = conn->fd;
     if (fd < 0) return;  /* shouldn't happen */
+
+    /* Try cross-node aeron ATTACH first — needs 24 bytes peeked. If the
+     * socket buffer has fewer than 24 bytes, fall through to the VEMB/RESP
+     * 8-byte peek (which also re-checks for partial data). */
+    if (vemb_try_aeron_attach_steal(conn)) {
+        /* ATTACH magic matched and fd was stolen+handled.  Mirror the
+         * cleanup dance used by the VEMB steal paths below. */
+        connSetReadHandler(conn, NULL);
+        conn->state = CONN_STATE_CLOSED;
+        connDecrRefs(conn);
+        connClose(conn);
+        return;
+    }
 
     uint8_t buf[8];
     ssize_t n = recv(fd, buf, 8, MSG_PEEK);
@@ -283,6 +376,15 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
     int fd = conn->fd;
     if (fd < 0) return 0;
 
+    /* Cross-node aeron ATTACH: needs 24 bytes peeked.  If not yet
+     * available, fall through to the 8-byte VEMB/RESP peek. */
+    if (vemb_try_aeron_attach_steal(conn)) {
+        /* ATTACH magic matched; fd was consumed by handle_fd and stolen
+         * from conn.  Caller (networking.c acceptCommonHandler) sees
+         * return 1 and frees conn without closing fd. */
+        return 1;
+    }
+
     /* Non-blocking peek. For blocking clients the HELLO is often already in
      * the socket buffer when accept fires, so this succeeds immediately.
      * Peek 8 bytes so we can read the type field at offset 6. */
@@ -291,7 +393,21 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
     if (n >= 8) {
         uint32_t magic;
         memcpy(&magic, buf, sizeof(magic));
-        if (magic != VEMB_V16_MAGIC) return 0;  /* RESP */
+        if (magic != VEMB_V16_MAGIC) {
+            /* If the 8 bytes match the ATTACH magic prefix ("VEMB"), the
+             * 24-byte ATTACH peek above failed only because TCP hadn't
+             * delivered all 24 bytes yet. Register the async handler so
+             * EPOLLIN refires when the rest arrives — falling through to
+             * RESP here would silently swallow the ATTACH.
+             * Skipped when cross-node aeron is disabled (pre-cross-node
+             * behavior: anything non-VEMB_V16_MAGIC falls through to RESP). */
+            if (server.vemb_v16_cross_node_aeron_enabled &&
+                memcmp(buf, VEMB_V16_AERON_ATTACH_MAGIC, 4) == 0) {
+                if (connSetReadHandler(conn, vemb_async_peek_handler) == C_OK)
+                    return 2;
+            }
+            return 0;  /* RESP */
+        }
 
         /* VEMB frame — read type to choose data vs control plane. */
         uint16_t ftype;

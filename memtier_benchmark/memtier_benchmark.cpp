@@ -905,8 +905,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     break;
                 case o_vemb_v16_transport:
                     if (strcmp(optarg, "tcp") != 0 &&
-                        strcmp(optarg, "aeron") != 0) {
-                        fprintf(stderr, "error: --vemb-v16-transport must be 'tcp' or 'aeron' (got %s)\n", optarg);
+                        strcmp(optarg, "aeron") != 0 &&
+                        strcmp(optarg, "aeron-cross-node") != 0) {
+                        fprintf(stderr, "error: --vemb-v16-transport must be 'tcp', 'aeron', or 'aeron-cross-node' (got %s)\n", optarg);
                         return -1;
                     }
                     cfg->vemb_v16_transport = optarg;
@@ -1110,8 +1111,9 @@ void usage() {
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
             "      --vemb-v16-handle          Force VEMB_HANDLE read mode (default; flag for script compat)\n"
             "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
-            "      --vemb-v16-transport=tcp|aeron  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
-            "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput)\n"
+            "      --vemb-v16-transport=tcp|aeron|aeron-cross-node  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
+            "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput;\n"
+            "                               aeron-cross-node uses TCP ATTACH + UB shmdev mmap for cross-node deploy)\n"
             "\n"
             "WAIT Options:\n"
             "      --wait-ratio=RATIO         Set:Wait ratio (default is no WAIT commands - 1:0)\n"
@@ -1211,11 +1213,27 @@ void size_to_str(unsigned long int size, char *buf, int buf_len)
 run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj_gen)
 {
     /* Aeron side-channel: bypass libevent stack entirely. Treat nullptr as "tcp"
-     * (default) so existing invocations keep working. */
+     * (default) so existing invocations keep working.
+     * Both "aeron" (local UDS+SHM) and "aeron-cross-node" (TCP ATTACH + shmdev)
+     * go through the same runner; the runner branches on transport mode. */
     if (cfg->protocol == PROTOCOL_VEMB_V16 &&
         cfg->vemb_v16_transport &&
-        strcmp(cfg->vemb_v16_transport, "aeron") == 0) {
-        fprintf(stderr, "[RUN #%u] Aeron side-channel runner engaged\n", run_id);
+        (strcmp(cfg->vemb_v16_transport, "aeron") == 0 ||
+         strcmp(cfg->vemb_v16_transport, "aeron-cross-node") == 0)) {
+        /* Wire CLI flags into runner globals before dispatch. */
+        const char *mode = cfg->vemb_v16_transport;
+        const char *endpoint = cfg->vemb_v16_endpoints ? cfg->vemb_v16_endpoints : "";
+        if (strcmp(mode, "aeron-cross-node") == 0 && endpoint[0] == '\0') {
+            fprintf(stderr, "error: --vemb-v16-endpoints=HOST:PORT required with --vemb-v16-transport=aeron-cross-node\n");
+            exit(1);
+        }
+        if (strcmp(mode, "aeron") == 0 && endpoint[0] != '\0') {
+            fprintf(stderr, "error: --vemb-v16-endpoints not allowed with --vemb-v16-transport=aeron (UDS is local-only)\n");
+            exit(1);
+        }
+        vemb_v16_aeron_set_transport(mode, endpoint);
+        fprintf(stderr, "[RUN #%u] Aeron side-channel runner engaged (mode=%s)\n",
+                run_id, mode);
         return vemb_v16_aeron_run(cfg, obj_gen);
     }
 

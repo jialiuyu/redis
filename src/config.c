@@ -3320,6 +3320,7 @@ standardConfig static_configs[] = {
     createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("vemb-v16-proxy-io-threads", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_proxy_io_threads, 0, INTEGER_CONFIG, NULL, NULL),
     createStringConfig("vemb-v16-transport", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_transport, "sniff", isValidVembV16Transport, NULL),
+    createBoolConfig("vemb-v16-cross-node-aeron", NULL, IMMUTABLE_CONFIG, server.vemb_v16_cross_node_aeron_enabled, 0, NULL, NULL),
 
     /* Special configs */
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),

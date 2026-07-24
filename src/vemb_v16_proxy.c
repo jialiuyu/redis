@@ -4,6 +4,7 @@
 
 #include "cpu_relax.h"
 #include "vemb_v16_aeron_transport.h"
+#include "vemb_v16_server_integration.h"   /* vemb_v16_cross_node_aeron_enabled() */
 #include "vemb_v16_proxy_types.h"
 #include "vemb_v16_tcp_transport.h"
 #include "vemb_v16_log.h"
@@ -548,6 +549,29 @@ static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     assert(proxy->storage != NULL);
     return proxy->storage;
+}
+
+/* Populate cross-node ATTACH resp with the first local warm region that
+ * has a client_path. The client (HW02) mmap's that path to dereference
+ * VEMB_HANDLE offsets without going through TCP. */
+void vemb_v16_proxy_fill_attach_warm_region(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_aeron_attach_resp_t *resp) {
+    if (!proxy || !resp) return;
+    const vemb_v16_manifest_region_t *region =
+        vemb_v16_storage_first_local_region_with_client_path(proxy_storage(proxy));
+    if (!region) {
+        resp->warm_region_count = 0;
+        return;
+    }
+    resp->warm_region_count = 1;
+    resp->warm_region_id    = region->region_id;
+    resp->warm_backend_type = region->backend_type;
+    resp->warm_region_bytes = region->region_bytes;
+    resp->warm_mmap_offset  = region->mmap_offset;
+    resp->warm_path_len     = (uint32_t)strnlen(region->client_path, 255) + 1u;
+    strncpy(resp->warm_path, region->client_path, 255);
+    resp->warm_path[255] = 0;
 }
 
 static int migration_control_req_valid(
@@ -1577,6 +1601,101 @@ int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                                 desc);
 }
 
+/// Cross-node aeron control plane: adopt pre-built shmdev rings into a
+/// new proxy channel.  Mirrors alloc_channel_common minus the ring
+/// creation step (rings already exist in the shmdev mapping).
+int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
+                                             void *req_ring, void *resp_ring,
+                                             uint32_t req_slot, uint32_t resp_slot,
+                                             const char *shmdev_path,
+                                             uint64_t req_off, uint64_t resp_off,
+                                             uint64_t *out_channel_id) {
+    /* Slot hunt - same logic as alloc_channel_common. We can't easily
+     * refactor alloc_channel_common to accept pre-built rings, so
+     * duplicate the slot hunt + channel setup minus the ring creation. */
+    uint32_t idx = VEMB_V16_MAX_CHANNELS;
+    uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
+                                               memory_order_relaxed);
+    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
+        uint32_t candidate = (start + i) % VEMB_V16_MAX_CHANNELS;
+        if (atomic_load_explicit(&proxy->channels[candidate].slot_channel_id,
+                                 memory_order_acquire) == 0) {
+            idx = candidate; break;
+        }
+    }
+    if (idx >= VEMB_V16_MAX_CHANNELS) return -1;
+
+    vemb_v16_channel_t *ch = &proxy->channels[idx];
+    reset_closed_channel(ch);
+    ch->index = idx;
+    ch->channel_id = atomic_fetch_add_explicit(&proxy->next_channel_id, 1,
+                                               memory_order_relaxed);
+    ch->proxy = proxy;
+    ch->transport_type = VEMB_V16_TRANSPORT_AERON;  /* reuse aeron data path */
+    ch->net_fd = -1;
+    atomic_store_explicit(&ch->active, 0, memory_order_release);
+    atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
+    atomic_store_explicit(&ch->proxy_io_state, 0, memory_order_release);
+    atomic_store_explicit(&ch->supernode_state, 0, memory_order_release);
+
+    if (posix_memalign(&ch->completion_slots, 64,
+                       sizeof(vemb_v16_completion_t) *
+                       VEMB_V16_COMPLETION_RING_SIZE) != 0) {
+        cleanup_unstarted_channel(ch); return -1;
+    }
+    if (vemb_v16_aeron_ring_init(&ch->completion_ring,
+                                 ch->completion_slots,
+                                 sizeof(vemb_v16_completion_t),
+                                 VEMB_V16_COMPLETION_RING_SIZE) != 0) {
+        cleanup_unstarted_channel(ch); return -1;
+    }
+
+    /* Cross-node path: rings were already created by storage layer.
+     * Adopt the mappings directly. */
+    ch->request_ring       = (vemb_v16_client_ring_t *)req_ring;
+    ch->response_ring      = (vemb_v16_client_ring_t *)resp_ring;
+    ch->request_ring_bytes  = vemb_v16_client_ring_bytes(req_slot);
+    ch->response_ring_bytes = vemb_v16_client_ring_bytes(resp_slot);
+    snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
+             "%s@off%llu", shmdev_path, (unsigned long long)req_off);
+    snprintf(ch->response_ring_name, sizeof(ch->response_ring_name),
+             "%s@off%llu", shmdev_path, (unsigned long long)resp_off);
+
+    ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
+        .worker_id = ch->index,
+        .channel_active = &ch->active,
+        .running = &proxy->running,
+        .completion_notify_armed = NULL,
+        .completion_notify_fd = NULL,
+        .completion_ring = &ch->completion_ring,
+        .storage = proxy->storage,
+        .stats = &ch->stats,
+    };
+    atomic_store_explicit(&ch->active, 1, memory_order_release);
+
+    int pooled_proxy_io = proxy->proxy_io_worker_count != 0;
+    ch->tcp_backpressure_enabled = 0;  /* not TCP transport */
+    if (pooled_proxy_io) {
+        ch->supernode_ctx.completion_notify_armed = &ch->completion_notify_armed;
+#ifdef __linux__
+        uint32_t worker_id = ch->index % proxy->proxy_io_worker_count;
+        ch->supernode_ctx.completion_notify_fd =
+            &proxy->proxy_io_workers[worker_id].notify_fd;
+#endif
+    }
+    atomic_store_explicit(&ch->slot_channel_id, ch->channel_id,
+                          memory_order_release);
+
+    if (out_channel_id) *out_channel_id = ch->channel_id;
+    serverLog(LL_VERBOSE,
+              "vemb_v16 cross-node channel allocated: idx=%u cid=%llu shmdev=%s "
+              "req_off=%llu resp_off=%llu",
+              ch->index, (unsigned long long)ch->channel_id,
+              shmdev_path, (unsigned long long)req_off,
+              (unsigned long long)resp_off);
+    return 0;
+}
+
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
 static void close_channel(vemb_v16_channel_t *ch) {
     if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
@@ -2091,7 +2210,11 @@ static void *proxy_io_epoll_thread_main(void *arg) {
             proxy_io_channel_release(ch);
         }
 
-        int timeout_ms = did_work ? 0 : 10;
+        /* Idle epoll timeout. 1ms when cross-node aeron is enabled
+         * (avoids the fixed 10ms RTT for aeron channels with no fd
+         * wakeup). 10ms otherwise (pre-cross-node behavior). */
+        int timeout_ms = did_work ? 0 :
+            (vemb_v16_cross_node_aeron_enabled() ? 1 : 10);
         int nready = epoll_wait(epfd,
                                 events,
                                 VEMB_V16_MAX_CHANNELS,
@@ -2317,10 +2440,13 @@ static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx)
 
 static void publish_synthetic_completion(vemb_v16_supernode_ctx_t *ctx,
                                          const vemb_v16_completion_t *completion) {
+    uint32_t spins = 0;
+    int use_backoff = vemb_v16_cross_node_aeron_enabled();
     while (vemb_v16_aeron_publish(ctx->completion_ring, completion) != 0 &&
            atomic_load_explicit(ctx->running, memory_order_relaxed) &&
            atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
-        cpu_relax();
+        if (use_backoff) vemb_v16_aeron_backoff(spins++);
+        else             cpu_relax();
     }
     notify_completion_consumer_from_proxy(ctx);
 }

@@ -2,6 +2,7 @@
 
 #include "vemb_v16_client_sdk.h"
 #include "../../src/vemb_v16_net.h"
+#include "../../src/vemb_v16_aeron_attach.h"  /* cross-node ATTACH protocol */
 /* Ring header is C11 (<stdatomic.h>). Pulled in here — NOT from the
  * public SDK header — so C++ consumers stay clean. */
 #include "../../src/vemb_v16_client_ring.h"
@@ -15,6 +16,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -159,6 +162,12 @@ vemb_v16_resp_class_t vemb_v16_classify_resp_status(uint8_t status) {
     }
 }
 
+/* Forward decl: defined below (shared by ring + warm-region mmap paths). */
+static void *vemb_v16_mmap_shmdev_region(const char *path,
+                                          uint64_t offset, size_t bytes,
+                                          size_t *out_map_bytes,
+                                          size_t *out_offset_delta);
+
 int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
                               void **out_mapping_addr,
                               size_t *out_mapping_bytes,
@@ -170,30 +179,19 @@ int vemb_v16_open_warm_region(const vemb_v16_channel_desc_t *desc,
 
     if (desc->warm_backend_type != VEMB_V16_REGION_UB)
         return -1;
-    int fd = open(desc->vector_region_name, O_RDWR);
-    if (fd < 0 && (errno == EACCES || errno == EPERM))
-        fd = open(desc->vector_region_name, O_RDWR | O_SYNC);
-    if (fd < 0)
-        return -1;
 
     size_t size = desc->warm_region_bytes
         ? (size_t)desc->warm_region_bytes
         : (size_t)desc->vector_stride * desc->max_vectors;
 
-    long page_size = sysconf(_SC_PAGESIZE);
-    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
-    uint64_t aligned_offset = desc->warm_mmap_offset & ~page_mask;
-    size_t offset_delta = (size_t)(desc->warm_mmap_offset - aligned_offset);
-    size_t map_size = size + offset_delta;
-
-    void *ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-                     (off_t)aligned_offset);
-    close(fd);
-    if (ptr == MAP_FAILED)
-        return -1;
+    size_t map_bytes = 0, offset_delta = 0;
+    void *ptr = vemb_v16_mmap_shmdev_region(desc->vector_region_name,
+                                            desc->warm_mmap_offset, size,
+                                            &map_bytes, &offset_delta);
+    if (!ptr) return -1;
 
     if (out_region_bytes) *out_region_bytes = size;
-    if (out_mapping_bytes) *out_mapping_bytes = map_size;
+    if (out_mapping_bytes) *out_mapping_bytes = map_bytes;
     if (out_mapping_addr) *out_mapping_addr = ptr;
     if (out_mapped_addr) *out_mapped_addr = (uint8_t *)ptr + offset_delta;
     return 0;
@@ -2392,6 +2390,26 @@ static int vemb_v16_aeron_uds_connect(const char *uds_path) {
     return fd;
 }
 
+/* TCP connect with timeout — mirrors UDS connect semantics. */
+static int vemb_v16_aeron_tcp_connect(const char *host, uint16_t port) {
+    if (!host || !host[0]) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    vemb_v16_net_set_timeouts(fd, VEMB_V16_AERON_UDS_TIMEOUT_MS);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port  = htons(port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        close(fd); return -1;
+    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd); return -1;
+    }
+    return fd;
+}
+
 /* UDS control op: alloc a channel for the requested dim. Fills desc. */
 static int vemb_v16_aeron_uds_alloc(int fd, uint32_t dim,
                                     vemb_v16_channel_desc_t *desc) {
@@ -2454,6 +2472,54 @@ static void vemb_v16_aeron_ring_close(vemb_v16_client_ring_t *r,
     munmap(r, vemb_v16_client_ring_bytes(slot_size));
 }
 
+/* mmap a shmdev region with O_SYNC fallback. OBMM remote-region devices
+ * reject cacheable mmap; O_SYNC selects non-cacheable mapping. Try O_SYNC
+ * first (remote), fall back to O_RDWR (local). offset is page-aligned
+ * internally; callers get back the alignment delta via *out_offset_delta
+ * so they can compute the usable data pointer = base + offset_delta. */
+static void *vemb_v16_mmap_shmdev_region(const char *path,
+                                          uint64_t offset, size_t bytes,
+                                          size_t *out_map_bytes,
+                                          size_t *out_offset_delta) {
+    if (!path || !path[0] || bytes == 0) return NULL;
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
+    uint64_t aligned_offset = offset & ~page_mask;
+    size_t offset_delta = (size_t)(offset - aligned_offset);
+    size_t map_size = bytes + offset_delta;
+
+    void *ptr = NULL;
+    const int modes[] = { O_RDWR | O_SYNC, O_RDWR };
+    for (size_t i = 0; i < sizeof(modes)/sizeof(modes[0]) && !ptr; i++) {
+        int fd = open(path, modes[i]);
+        if (fd < 0) continue;
+        ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd, (off_t)aligned_offset);
+        close(fd);
+        if (ptr == MAP_FAILED) ptr = NULL;
+    }
+    if (!ptr) return NULL;
+    if (out_map_bytes)    *out_map_bytes    = map_size;
+    if (out_offset_delta) *out_offset_delta = offset_delta;
+    return ptr;
+}
+
+/* Open a shmdev ring at a specific byte offset. Used for cross-node
+ * aeron where the server returns (path, offset) instead of a POSIX SHM
+ * name. O_SYNC handling is shared with warm-region mmap via
+ * vemb_v16_mmap_shmdev_region. */
+static int vemb_v16_aeron_ring_open_shmdev(const char *path,
+                                           uint64_t ring_off,
+                                           uint32_t slot_size,
+                                           vemb_v16_client_ring_t **out) {
+    if (!path || !path[0] || slot_size == 0 || !out) return -1;
+    size_t bytes = vemb_v16_client_ring_bytes(slot_size);
+    void *ptr = vemb_v16_mmap_shmdev_region(path, ring_off, bytes, NULL, NULL);
+    if (!ptr) return -1;
+    *out = (vemb_v16_client_ring_t *)ptr;
+    return 0;
+}
+
 /* Best-effort server-side close notification. Errors are swallowed
  * because the rings are already unmapped locally by the caller. */
 static void vemb_v16_aeron_notify_close(const char *uds_path,
@@ -2500,6 +2566,96 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
     return ch;
 }
 
+vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
+                                                     uint16_t port,
+                                                     uint32_t dim) {
+    if (!host || !host[0] || dim == 0 || port == 0) return NULL;
+
+    int fd = vemb_v16_aeron_tcp_connect(host, port);
+    if (fd < 0) return NULL;
+
+    vemb_v16_aeron_attach_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.magic, VEMB_V16_AERON_ATTACH_MAGIC,
+           VEMB_V16_AERON_ATTACH_MAGIC_LEN);
+    req.dim = dim;
+    req.req_slot_size  = 0;  /* 0 = server picks */
+    req.resp_slot_size = 0;
+
+    vemb_v16_aeron_attach_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    /* Inline ATTACH exchange (write_full/read_full from vemb_v16_net.h) —
+     * avoids linking the server-only vemb_v16_aeron_attach.c into the SDK. */
+    if (vemb_v16_net_write_full(fd, &req,  sizeof(req))  != 0 ||
+        vemb_v16_net_read_full (fd, &resp, sizeof(resp)) != 0 ||
+        memcmp(resp.magic, VEMB_V16_AERON_ATTACHED_MAGIC,
+               VEMB_V16_AERON_ATTACHED_MAGIC_LEN) != 0 ||
+        resp.status != 0) {
+        close(fd);
+        return NULL;
+    }
+    close(fd);  /* TCP is handshake-only; data goes over shmdev */
+
+    vemb_v16_aeron_channel_t *ch = calloc(1, sizeof(*ch));
+    if (!ch) return NULL;
+    /* Mark this channel as cross-node so close() doesn't try to UDS
+     * notify (uds_path[0]==0 makes vemb_v16_aeron_notify_close early-return). */
+    ch->uds_path[0] = 0;
+    ch->desc.channel_id          = resp.channel_id;
+    ch->desc.request_ring_slot_size  = resp.req_slot_size;
+    ch->desc.response_ring_slot_size = resp.resp_slot_size;
+
+    if (vemb_v16_aeron_ring_open_shmdev(resp.shmdev_path,
+                                        resp.req_ring_off,
+                                        resp.req_slot_size,
+                                        &ch->req_ring) != 0) {
+        free(ch); return NULL;
+    }
+    if (vemb_v16_aeron_ring_open_shmdev(resp.shmdev_path,
+                                        resp.resp_ring_off,
+                                        resp.resp_slot_size,
+                                        &ch->resp_ring) != 0) {
+        vemb_v16_aeron_ring_close(ch->req_ring, resp.req_slot_size);
+        free(ch); return NULL;
+    }
+
+    /* Parse advertised warm region (if any) into channel desc so the
+     * runner can mmap it for VEMB_HANDLE dereference. */
+    if (resp.warm_region_count > 0 && resp.warm_path[0]) {
+        ch->desc.warm_region_count = 1;
+        ch->desc.warm_regions[0].region_id   = resp.warm_region_id;
+        ch->desc.warm_regions[0].backend_type = resp.warm_backend_type;
+        ch->desc.warm_regions[0].region_bytes = resp.warm_region_bytes;
+        ch->desc.warm_regions[0].mmap_offset  = resp.warm_mmap_offset;
+        strncpy(ch->desc.warm_regions[0].path, resp.warm_path,
+                sizeof(ch->desc.warm_regions[0].path) - 1);
+        ch->desc.warm_regions[0].path[sizeof(ch->desc.warm_regions[0].path) - 1] = 0;
+    }
+
+    fprintf(stderr, "[sdk] cross-node ch ok: cid=%llu shmdev=%s req_off=%llu resp_off=%llu req_slot=%u resp_slot=%u\n",
+            (unsigned long long)ch->desc.channel_id, resp.shmdev_path,
+            (unsigned long long)resp.req_ring_off,
+            (unsigned long long)resp.resp_ring_off,
+            resp.req_slot_size, resp.resp_slot_size);
+    fprintf(stderr, "[sdk] req_ring hdr: slot_size=%u slot_count=%u slot_mask=%u slots_off=%u head=%llu tail=%llu\n",
+            ch->req_ring->slot_size, ch->req_ring->slot_count,
+            ch->req_ring->slot_mask, ch->req_ring->slots_off,
+            (unsigned long long)ch->req_ring->head,
+            (unsigned long long)ch->req_ring->tail);
+    fprintf(stderr, "[sdk] resp_ring hdr: slot_size=%u slot_count=%u slot_mask=%u slots_off=%u head=%llu tail=%llu\n",
+            ch->resp_ring->slot_size, ch->resp_ring->slot_count,
+            ch->resp_ring->slot_mask, ch->resp_ring->slots_off,
+            (unsigned long long)ch->resp_ring->head,
+            (unsigned long long)ch->resp_ring->tail);
+    if (resp.warm_region_count > 0) {
+        fprintf(stderr, "[sdk] warm region advertised: region_id=%u backend=%u bytes=%llu mmap_off=%llu path=%s\n",
+                resp.warm_region_id, resp.warm_backend_type,
+                (unsigned long long)resp.warm_region_bytes,
+                (unsigned long long)resp.warm_mmap_offset, resp.warm_path);
+    }
+    return ch;
+}
+
 void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
     if (!ch) return;
     for (uint32_t i = 0; i < ch->warm_count; i++) {
@@ -2534,8 +2690,16 @@ uint64_t vemb_v16_aeron_channel_id(const vemb_v16_aeron_channel_t *ch) {
 
 int vemb_v16_aeron_publish_request(vemb_v16_aeron_channel_t *ch,
                                    const void *buf, uint32_t len) {
+    static uint32_t s_diag_printed = 0;
     if (!ch) return -3;
-    return vemb_v16_client_publish(ch->req_ring, buf, len);
+    int rc = vemb_v16_client_publish(ch->req_ring, buf, len);
+    if (rc != 0 && !__sync_lock_test_and_set(&s_diag_printed, 1)) {
+        fprintf(stderr, "[sdk] first publish FAIL rc=%d len=%u slot_size=%u slot_count=%u head=%llu tail=%llu\n",
+                rc, len, ch->req_ring->slot_size, ch->req_ring->slot_count,
+                (unsigned long long)ch->req_ring->head,
+                (unsigned long long)ch->req_ring->tail);
+    }
+    return rc;
 }
 
 int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
@@ -2544,32 +2708,20 @@ int vemb_v16_aeron_poll_response(vemb_v16_aeron_channel_t *ch,
     return vemb_v16_client_poll(ch->resp_ring, buf, max_len);
 }
 
-/* Helper: open and mmap a single warm region by path. Mirrors the O_SYNC
- * fallback in vemb_v16_mapped_region.c:126-138 — OBMM import (remote) devices
- * reject cacheable mmap with EPERM; O_SYNC selects non-cacheable mapping. */
+/* Helper: open and mmap a single warm region by path. OBMM remote-region
+ * devices reject cacheable mmap; O_SYNC handling is shared with the ring
+ * path via vemb_v16_mmap_shmdev_region. */
 static int aeron_mmap_one_region(const char *path,
                                   uint64_t region_bytes, uint64_t mmap_offset,
                                   void **out_mapping_addr, size_t *out_mapping_bytes,
                                   const uint8_t **out_mapped_addr) {
     if (!path || !path[0] || region_bytes == 0) return -1;
-    int fd = open(path, O_RDWR);
-    if (fd < 0 && (errno == EACCES || errno == EPERM))
-        fd = open(path, O_RDWR | O_SYNC);
-    if (fd < 0) return -1;
-
-    long page_size = sysconf(_SC_PAGESIZE);
-    uint64_t page_mask = (uint64_t)(page_size > 0 ? page_size : 4096) - 1u;
-    uint64_t aligned_offset = mmap_offset & ~page_mask;
-    size_t offset_delta = (size_t)(mmap_offset - aligned_offset);
-    size_t map_size = (size_t)region_bytes + offset_delta;
-
-    void *ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-                     (off_t)aligned_offset);
-    close(fd);
-    if (ptr == MAP_FAILED) return -1;
-
+    size_t map_bytes = 0, offset_delta = 0;
+    void *ptr = vemb_v16_mmap_shmdev_region(path, mmap_offset, (size_t)region_bytes,
+                                            &map_bytes, &offset_delta);
+    if (!ptr) return -1;
     *out_mapping_addr   = ptr;
-    *out_mapping_bytes  = map_size;
+    *out_mapping_bytes  = map_bytes;
     *out_mapped_addr    = (const uint8_t *)ptr + offset_delta;
     return 0;
 }

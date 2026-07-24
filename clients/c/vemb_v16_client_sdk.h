@@ -400,6 +400,19 @@ typedef struct vemb_v16_aeron_channel vemb_v16_aeron_channel_t;
 vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
                                               uint32_t dim);
 
+/* Open an aeron channel via cross-node TCP attach. The transport is
+ * still aeron (shmdev-backed SPSC ring), but the handshake goes over
+ * TCP because UDS is AF_LOCAL (single-host only).
+ *   host  — server hostname or IP (e.g. "192.168.1.111")
+ *   port  — server TCP port (same port redis-server listens on)
+ *   dim   — vector dimension; server uses it to size ring slots
+ * Returns NULL on any failure (TCP error, ATTACH rejected, mmap
+ * error). Caller owns the handle and must release it with
+ * vemb_v16_aeron_close(). */
+vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
+                                                     uint16_t port,
+                                                     uint32_t dim);
+
 /* Close one channel: unmaps both rings and notifies the server to
  * release its state. Safe to call with NULL (no-op). UDS errors are
  * swallowed — the rings are still unmapped locally. */

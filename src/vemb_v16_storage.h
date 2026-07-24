@@ -52,6 +52,9 @@ typedef struct vemb_v16_manifest_region {
     uint64_t mmap_offset;
     uint64_t region_bytes;
     char path[256];
+    /* Client-side view of the same region (for cross-node ATTACH resp).
+     * If empty, server falls back to `path` (loopback / single-host). */
+    char client_path[256];
 } vemb_v16_manifest_region_t;
 
 typedef struct vemb_v16_manifest_remote_meta_view {
@@ -229,6 +232,11 @@ typedef struct vemb_v16_storage_ctx {
     uint32_t peer_region_config_count;
     vemb_v16_manifest_region_t
         peer_region_configs[VEMB_V16_PEER_VIEW_MAP_MAX_REGIONS];
+    // Cached local manifest regions (kept for cross-node ATTACH resp,
+    // which needs the client_path field that warm_provider_t doesn't).
+    uint32_t local_manifest_region_count;
+    vemb_v16_manifest_region_t
+        local_manifest_regions[VEMB_V16_MAX_MANIFEST_REGIONS];
     // Cached peer-view remote-meta configs, not runtime views yet.
     uint32_t peer_remote_meta_view_config_count;
     vemb_v16_manifest_remote_meta_view_t
@@ -288,6 +296,33 @@ size_t vemb_v16_storage_vector_region_size(vemb_v16_storage_ctx_t *storage);
 sve_operation_stats_t *vemb_v16_storage_sve_stats(vemb_v16_storage_ctx_t *storage);
 void vemb_v16_storage_fill_channel_desc(vemb_v16_storage_ctx_t *storage,
                                         vemb_v16_channel_desc_t *desc);
+
+/* Allocate two adjacent ring regions in a free UB shmdev for cross-node
+ * aeron transport. Returns:
+ *   0  on success — fills out_shmdev_path, out_req_off, out_resp_off
+ *  -1  no free shmdev slot
+ *  -2  shmdev open/mmap failed
+ * Caller must NOT munmap the returned regions until channel close (the
+ * server's proxy holds the mapping for the channel lifetime).
+ *
+ * Layout within a shmdev:
+ *   [req_ring bytes][resp_ring bytes]
+ * Both rings are zero-initialized by this call. */
+int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
+                                         uint32_t resp_slot_size,
+                                         uint32_t ring_slots,
+                                         char out_shmdev_path[256],
+                                         uint64_t *out_req_off,
+                                         uint64_t *out_resp_off,
+                                         void **out_req_mapping,
+                                         void **out_resp_mapping,
+                                         size_t *out_req_bytes,
+                                         size_t *out_resp_bytes);
+
+/* Release a shmdev channel allocation. Safe to call with NULL mapping. */
+void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
+                                         void *resp_mapping, size_t resp_bytes);
+
 int vemb_v16_storage_vector_slice(vemb_v16_storage_ctx_t *storage,
                                   vemb_v16_resp_t *resp,
                                   const uint8_t **vector,
@@ -506,5 +541,12 @@ int vemb_v16_storage_migration_write_blocked_info(
     uint64_t key_hash,
     tlc_core_key_migration_info_t *info,
     vemb_v16_migration_outbox_stats_t *outbox_stats);
+
+/* Cross-node ATTACH support: return first local manifest region that has
+ * a non-empty client_path, or NULL if none configured. The returned
+ * pointer is valid for the storage's lifetime (do not free). */
+const vemb_v16_manifest_region_t *
+vemb_v16_storage_first_local_region_with_client_path(
+    const vemb_v16_storage_ctx_t *storage);
 
 #endif

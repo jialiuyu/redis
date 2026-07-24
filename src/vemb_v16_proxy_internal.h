@@ -89,6 +89,25 @@ int vemb_v16_proxy_alloc_shm_channel(vemb_v16_proxy_t *proxy,
 int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                                      int net_fd,
                                      vemb_v16_channel_desc_t *desc);
+
+/* Allocate a proxy channel for cross-node aeron transport.
+ *   proxy       - proxy context
+ *   req_ring    - already-mmaped shmdev req ring (caller holds mapping)
+ *   resp_ring   - already-mmaped shmdev resp ring
+ *   req_slot    - req ring slot size
+ *   resp_slot   - resp ring slot size
+ *   shmdev_path - shmdev path (logged for diagnostics)
+ *   req_off     - byte offset of req_ring within shmdev (logged)
+ *   resp_off    - byte offset of resp_ring within shmdev (logged)
+ *   out_channel_id - receives the assigned channel id
+ * Returns 0 on success. The proxy adopts the ring mappings (does NOT
+ * munmap them - caller's storage layer owns that). */
+int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
+                                             void *req_ring, void *resp_ring,
+                                             uint32_t req_slot, uint32_t resp_slot,
+                                             const char *shmdev_path,
+                                             uint64_t req_off, uint64_t resp_off,
+                                             uint64_t *out_channel_id);
 int vemb_v16_proxy_close_channel_by_id(vemb_v16_proxy_t *proxy,
                                        uint64_t channel_id);
 uint64_t vemb_v16_proxy_close_all_channels(vemb_v16_proxy_t *proxy);

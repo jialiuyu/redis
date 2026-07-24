@@ -35,6 +35,18 @@
 
 #include "vemb_v16_protocol.h"
 
+/* Transport mode: "aeron" (UDS+SHM, local) or "aeron-cross-node" (TCP attach + shmdev).
+ * Set by main() from --vemb-v16-transport via vemb_v16_aeron_set_transport().
+ * Default = "aeron" preserves existing loopback behavior. */
+static std::string g_aeron_transport_mode = "aeron";
+static std::string g_aeron_remote_endpoint;  /* "host:port" for cross-node */
+
+void vemb_v16_aeron_set_transport(const std::string &mode,
+                                  const std::string &endpoint) {
+    g_aeron_transport_mode = mode;
+    g_aeron_remote_endpoint = endpoint;
+}
+
 extern "C" {
 /* SDK ships the aeron (UDS + SHM SPSC ring) transport as opaque handles.
  * No C11 <stdatomic.h> dependency leaks into this C++ translation unit. */
@@ -472,7 +484,7 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         benchmark_error_log("[aeron] --vemb-v16-dim required\n");
         exit(1);
     }
-    if (cfg->vemb_v16_endpoints) {
+    if (cfg->vemb_v16_endpoints && g_aeron_transport_mode != "aeron-cross-node") {
         benchmark_error_log("[aeron] --vemb-v16-endpoints not supported in aeron mode (single-node UDS only)\n");
         exit(1);
     }
@@ -492,16 +504,42 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         uds_path = cfg->unix_socket;
     }
 
-    /* Best-effort cleanup of any stale channels from a previous crashed run. */
-    vemb_v16_aeron_close_all(uds_path);
+    /* Best-effort cleanup of any stale channels from a previous crashed run.
+     * Cross-node mode bypasses UDS entirely (TCP ATTACH + shmdev mmap). */
+    bool cross_node = (g_aeron_transport_mode == "aeron-cross-node");
+    std::string cn_host;
+    uint16_t    cn_port = 0;
+    if (cross_node) {
+        auto colon = g_aeron_remote_endpoint.find(':');
+        if (colon == std::string::npos) {
+            benchmark_error_log("[aeron] cross-node endpoint must be HOST:PORT, got '%s'\n",
+                                g_aeron_remote_endpoint.c_str());
+            exit(1);
+        }
+        cn_host = g_aeron_remote_endpoint.substr(0, colon);
+        cn_port = (uint16_t)atoi(g_aeron_remote_endpoint.c_str() + colon + 1);
+        if (cn_host.empty() || cn_port == 0) {
+            benchmark_error_log("[aeron] cross-node endpoint parse failed\n");
+            exit(1);
+        }
+        fprintf(stderr, "[aeron] cross-node mode: %s:%u\n", cn_host.c_str(), cn_port);
+    } else {
+        vemb_v16_aeron_close_all(uds_path);
+        fprintf(stderr, "[aeron] local mode: uds=%s\n", uds_path);
+    }
 
     /* Allocate channels up-front (main thread). Each worker will own
      * cfg->clients of them. */
-    fprintf(stderr, "[aeron] allocating %u channels on %s\n",
-            total_channels, uds_path);
+    fprintf(stderr, "[aeron] allocating %u channels%s\n",
+            total_channels, cross_node ? " (cross-node)" : "");
     std::vector<vemb_v16_aeron_channel_t *> all_channels(total_channels, nullptr);
     for (uint32_t i = 0; i < total_channels; i++) {
-        all_channels[i] = vemb_v16_aeron_open(uds_path, cfg->vemb_v16_dim);
+        if (cross_node) {
+            all_channels[i] = vemb_v16_aeron_open_remote(cn_host.c_str(), cn_port,
+                                                         cfg->vemb_v16_dim);
+        } else {
+            all_channels[i] = vemb_v16_aeron_open(uds_path, cfg->vemb_v16_dim);
+        }
         if (!all_channels[i]) {
             benchmark_error_log("[aeron] open channel %u failed: %s\n",
                                 i, strerror(errno));
@@ -514,7 +552,11 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         /* Map the warm region so worker_main can dereference VEMB_HANDLE
          * offsets and read the actual vector bytes — without this the test
          * would only validate that the server returns a handle, not that
-         * the handle points to real data. */
+         * the handle points to real data.
+         *
+         * Cross-node ATTACH resp advertises warm region paths via the
+         * client_path field in the manifest; SDK parses them into
+         * ch->desc.warm_regions[] which this call consumes. */
         if (vemb_v16_aeron_open_warm_region(all_channels[i]) != 0) {
             benchmark_error_log("[aeron] open warm region %u failed: %s\n",
                                 i, strerror(errno));
@@ -525,8 +567,8 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
             exit(1);
         }
     }
-    fprintf(stderr, "[aeron] all %u channels ready (warm region mapped)\n",
-            total_channels);
+    fprintf(stderr, "[aeron] all %u channels ready%s\n",
+            total_channels, cross_node ? " (cross-node, no warm region)" : " (warm region mapped)");
 
     /* Setup workers */
     std::vector<worker_arg> workers(cfg->threads);
