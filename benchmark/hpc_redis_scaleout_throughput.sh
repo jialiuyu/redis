@@ -19,7 +19,7 @@ NODE0_HOST="${NODE0_HOST:-192.168.90.111}"
 NODE1_HOST="${NODE1_HOST:-192.168.90.112}"
 SSH_USER="${SSH_USER:-root}"
 REMOTE_DIR="${REMOTE_DIR:-/root/szz/codespace/hpc-redis}"
-MEMTIER="${MEMTIER:-/root/gqs/codespace/UnifiedBus/memtier_benchmark/memtier_benchmark}"
+MEMTIER="${MEMTIER:-$REMOTE_DIR/memtier_benchmark/memtier_benchmark}"
 
 PAYLOAD_LOCAL_PATH="${PAYLOAD_LOCAL_PATH:-/dev/obmm_shmdev1}"
 PAYLOAD_PEER_PATH="${PAYLOAD_PEER_PATH:-/dev/obmm_shmdev5}"
