@@ -17,7 +17,9 @@
 #   DIM           vector 维度            (默认 300)
 #   SERVER_MASK   server taskset         (默认 "0-47")
 #   CLIENT_MASK   client taskset         (默认 "96-191")
+#   SERVER_HOST   client 连接的 server IP (默认 127.0.0.1)
 #   PORT          server 端口            (默认 6395)
+#   ROLE          both|server|client     (默认 both)
 
 set -uo pipefail
 
@@ -27,6 +29,8 @@ MEMTIER=$HPC/memtier_benchmark/memtier_benchmark
 MANIFEST=$HPC/examples/vemb_v16_warm_regions_111.yaml
 
 PORT=${PORT:-6395}
+SERVER_HOST=${SERVER_HOST:-127.0.0.1}
+ROLE=${ROLE:-both}
 DIM=${DIM:-300}
 NUM_KEYS=${NUM_KEYS:-10000}
 MAX_VECTORS=${MAX_VECTORS:-131072}
@@ -67,6 +71,7 @@ get_cpu_jiffies() {
 
 # ── cleanup ──
 cleanup() {
+    [ "$ROLE" = "client" ] && return
     if [ -f "$PIDFILE" ]; then
         local p=$(cat "$PIDFILE" 2>/dev/null)
         [ -n "$p" ] && { kill "$p" 2>/dev/null; sleep 0.5; kill -9 "$p" 2>/dev/null; }
@@ -80,42 +85,55 @@ cleanup
 sleep 0.5
 
 # ── 启动 server ──
-echo "=== start server: mask=$SERVER_MASK pio=21 snw=21 ==="
-taskset -c "$SERVER_MASK" $REDIS \
-    --port $PORT --bind 0.0.0.0 --protected-mode no \
-    --vemb-v16-enabled yes --vemb-v16-dim $DIM \
-    --vemb-v16-max-vectors $MAX_VECTORS \
-    --vemb-v16-warm-regions-manifest "$MANIFEST" \
-    --vemb-v16-reset-warm-regions yes \
-    --vemb-v16-proxy-io-threads 21 \
-    --vemb-v16-supernode-workers 21 \
-    --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
-    >/dev/null 2>&1
+if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
+    echo "=== start server: mask=$SERVER_MASK pio=21 snw=21 ==="
+    taskset -c "$SERVER_MASK" $REDIS \
+        --port $PORT --bind 0.0.0.0 --protected-mode no \
+        --vemb-v16-enabled yes --vemb-v16-dim $DIM \
+        --vemb-v16-max-vectors $MAX_VECTORS \
+        --vemb-v16-warm-regions-manifest "$MANIFEST" \
+        --vemb-v16-reset-warm-regions yes \
+        --vemb-v16-proxy-io-threads 21 \
+        --vemb-v16-supernode-workers 21 \
+        --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
+        >/dev/null 2>&1
 
-# ── 等 UDS listener 就绪 ──
-for _ in $(seq 1 50); do
-    [ -S "$SOCKET" ] && break
-    sleep 0.2
-done
-if [ ! -S "$SOCKET" ]; then
-    echo "FAIL: UDS socket $SOCKET not ready"
-    echo "--- server log tail ---"
-    tail -30 "$SERVER_LOG" 2>/dev/null
-    exit 1
+    # ── 等 UDS listener 就绪 ──
+    for _ in $(seq 1 50); do
+        [ -S "$SOCKET" ] && break
+        sleep 0.2
+    done
+    if [ ! -S "$SOCKET" ]; then
+        echo "FAIL: UDS socket $SOCKET not ready"
+        echo "--- server log tail ---"
+        tail -30 "$SERVER_LOG" 2>/dev/null
+        exit 1
+    fi
+    # 同时确认 TCP 端口监听
+    for _ in $(seq 1 50); do
+        ss -tln | grep -q ":$PORT " && break
+        sleep 0.2
+    done
+    echo "server up: pid=$(cat $PIDFILE) socket=$SOCKET tcp=$SERVER_HOST:$PORT"
+    sleep 1
 fi
-# 同时确认 TCP 端口监听
-for _ in $(seq 1 50); do
-    ss -tln | grep -q ":$PORT " && break
-    sleep 0.2
-done
-echo "server up: pid=$(cat $PIDFILE) socket=$SOCKET"
-sleep 1
+
+if [ "$ROLE" = "server" ]; then
+    echo "server-only mode: leaving server running at $SERVER_HOST:$PORT"
+    trap - EXIT
+    exit 0
+fi
+
+if [ "$ROLE" != "both" ] && [ "$ROLE" != "client" ]; then
+    echo "ERROR: ROLE must be both, server, or client (got $ROLE)"
+    exit 2
+fi
 
 # ── prefill 10K keys (S:S 顺序写入) ──
 echo ""
-echo "=== prefill: $NUM_KEYS keys, dim=$DIM ==="
+echo "=== prefill: $NUM_KEYS keys, dim=$DIM server=$SERVER_HOST:$PORT ==="
 taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport=aeron \
-    --vemb-v16-dim $DIM -s 127.0.0.1 -p $PORT \
+    --vemb-v16-dim $DIM -s $SERVER_HOST -p $PORT \
     -t 1 -c 1 -n $NUM_KEYS --pipeline=32 \
     --ratio=1:0 --key-pattern=S:S \
     --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
@@ -123,19 +141,21 @@ taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport=aero
 
 # ── bench ──
 echo ""
-echo "=== bench: mask=$CLIENT_MASK t=$T c=$C pipeline=$PIPELINE test-time=$TEST_TIME ==="
+echo "=== bench: mask=$CLIENT_MASK t=$T c=$C pipeline=$PIPELINE test-time=$TEST_TIME server=$SERVER_HOST:$PORT ==="
 SRV_PID=$(cat $PIDFILE 2>/dev/null)
-J0=$(get_cpu_jiffies "$SRV_PID")
+J0=0
+[ -n "$SRV_PID" ] && J0=$(get_cpu_jiffies "$SRV_PID")
 
 taskset -c "$CLIENT_MASK" $MEMTIER --protocol vemb_v16 --vemb-v16-transport=aeron \
-    --vemb-v16-dim $DIM -s 127.0.0.1 -p $PORT \
+    --vemb-v16-dim $DIM -s $SERVER_HOST -p $PORT \
     -t $T -c $C --pipeline=$PIPELINE \
     --ratio=0:1 --key-pattern=R:R \
     --key-prefix=$KEY_PREFIX --key-minimum=1 --key-maximum=$NUM_KEYS \
     --test-time=$TEST_TIME \
     >$BENCH_OUT 2>$BENCH_ERR
 
-J1=$(get_cpu_jiffies "$SRV_PID")
+J1=0
+[ -n "$SRV_PID" ] && J1=$(get_cpu_jiffies "$SRV_PID")
 
 # ── 汇总 ──
 echo ""
@@ -150,7 +170,7 @@ P99=$(echo "$BENCH_TOTALS" | awk '{print $8}')
 KBSEC=$(echo "$BENCH_TOTALS" | awk '{print $9}')
 
 # CPU 核数 = jiffies 差 / 100 / duration
-CPU_CORES=$(awk -v d=$((J1 - J0)) -v t=$TEST_TIME 'BEGIN{ if(d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
+CPU_CORES=$(awk -v d=$((J1 - J0)) -v t=$TEST_TIME -v pid="$SRV_PID" 'BEGIN{ if(pid==""||d<0||t<=0) print "NA"; else printf "%.2f", d/100.0/t }')
 OPS_PER_CORE=$(awk -v o="$OPS_SEC" -v c="$CPU_CORES" 'BEGIN{ if(c=="NA"||c==0) print "NA"; else printf "%.0f", o/c }')
 GBSEC=$(awk -v k="$KBSEC" 'BEGIN{ printf "%.2f", k/1024/1024 }')
 

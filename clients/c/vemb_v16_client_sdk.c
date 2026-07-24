@@ -2361,7 +2361,7 @@ struct vemb_v16_aeron_channel {
     vemb_v16_channel_desc_t    desc;
     vemb_v16_client_ring_t    *req_ring;
     vemb_v16_client_ring_t    *resp_ring;
-    char                       uds_path[108];  /* sockaddr_un::sun_path cap */
+    char                       control_endpoint[256];
     /* warm regions (lazy; opened by vemb_v16_aeron_open_warm_region) */
     struct {
         void          *mapping_addr;
@@ -2394,6 +2394,44 @@ static int vemb_v16_aeron_uds_connect(const char *uds_path) {
     return fd;
 }
 
+static int vemb_v16_aeron_parse_tcp_endpoint(const char *endpoint,
+                                             char *host,
+                                             size_t host_cap,
+                                             uint16_t *port) {
+    if (!endpoint || !host || host_cap == 0 || !port)
+        return -1;
+    const char *p = endpoint;
+    if (!strncmp(p, "tcp://", 6))
+        p += 6;
+    else if (p[0] == '/')
+        return -1;
+    const char *colon = strrchr(p, ':');
+    if (!colon || colon == p || !colon[1])
+        return -1;
+    size_t host_len = (size_t)(colon - p);
+    if (host_len >= host_cap)
+        return -1;
+    char *endptr = NULL;
+    unsigned long parsed = strtoul(colon + 1, &endptr, 10);
+    if (!endptr || *endptr != '\0' || parsed == 0 || parsed > 65535)
+        return -1;
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+    *port = (uint16_t)parsed;
+    return 0;
+}
+
+static int vemb_v16_aeron_control_connect(const char *endpoint, int *is_tcp) {
+    char host[128];
+    uint16_t port = 0;
+    if (vemb_v16_aeron_parse_tcp_endpoint(endpoint, host, sizeof(host), &port) == 0) {
+        if (is_tcp) *is_tcp = 1;
+        return vemb_v16_net_connect(host, port, VEMB_V16_AERON_UDS_TIMEOUT_MS);
+    }
+    if (is_tcp) *is_tcp = 0;
+    return vemb_v16_aeron_uds_connect(endpoint);
+}
+
 /* UDS control op: alloc a channel for the requested dim. Fills desc. */
 static int vemb_v16_aeron_uds_alloc(int fd, uint32_t dim,
                                     vemb_v16_channel_desc_t *desc) {
@@ -2409,6 +2447,42 @@ static int vemb_v16_aeron_uds_alloc(int fd, uint32_t dim,
     if (status != VEMB_V16_STATUS_OK)                                 return -1;
     if (vemb_v16_net_read_full (fd, desc,   sizeof(*desc))   != 0)    return -1;
     return 0;
+}
+
+static int vemb_v16_aeron_tcp_alloc(int fd, uint32_t dim,
+                                    vemb_v16_channel_desc_t *desc) {
+    vemb_v16_alloc_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.vector_dim = dim;
+    uint8_t payload[8];
+    size_t payload_len = 0;
+    memset(desc, 0, sizeof(*desc));
+    if (vemb_v16_alloc_req_encode(payload,
+                                  sizeof(payload),
+                                  &req,
+                                  &payload_len) != 0)
+        return -1;
+    if (vemb_v16_net_write_frame(fd,
+                                 VEMB_V16_NET_ALLOC_AERON_CHANNEL,
+                                 0,
+                                 0,
+                                 0,
+                                 payload,
+                                 (uint32_t)payload_len) != 0)
+        return -1;
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_WELCOME ||
+        hdr.flags != 0 ||
+        hdr.payload_len == 0)
+        return -1;
+    uint8_t *desc_buf = malloc(hdr.payload_len);
+    if (!desc_buf)
+        return -1;
+    int rc = vemb_v16_net_read_full(fd, desc_buf, hdr.payload_len) == 0 &&
+        vemb_v16_channel_desc_decode(desc, desc_buf, hdr.payload_len) == 0 ? 0 : -1;
+    free(desc_buf);
+    return rc;
 }
 
 /* UDS control op: close a specific channel by id. */
@@ -2435,6 +2509,33 @@ static int vemb_v16_aeron_uds_close_all(int fd, uint64_t *closed) {
     return 0;
 }
 
+static int vemb_v16_aeron_tcp_status_control(int fd,
+                                             uint16_t type,
+                                             uint64_t channel_id,
+                                             uint64_t *value) {
+    if (vemb_v16_net_write_frame(fd,
+                                 type,
+                                 0,
+                                 channel_id,
+                                 0,
+                                 NULL,
+                                 0) != 0)
+        return -1;
+    vemb_v16_net_hdr_t hdr;
+    if (vemb_v16_net_read_header(fd, &hdr) != 0 ||
+        hdr.type != VEMB_V16_NET_CONTROL_STATUS ||
+        hdr.payload_len != vemb_v16_net_status_encoded_len())
+        return -1;
+    uint8_t payload[VEMB_V16_NET_STATUS_ENCODED_LEN];
+    vemb_v16_net_status_t st;
+    if (vemb_v16_net_read_full(fd, payload, sizeof(payload)) != 0 ||
+        vemb_v16_net_status_decode(&st, payload, sizeof(payload)) != 0 ||
+        st.status != VEMB_V16_STATUS_OK)
+        return -1;
+    if (value) *value = st.value;
+    return 0;
+}
+
 /* Open a POSIX SHM ring by name + slot_size. */
 static int vemb_v16_aeron_ring_open(const char *name,
                                     uint32_t slot_size,
@@ -2458,12 +2559,19 @@ static void vemb_v16_aeron_ring_close(vemb_v16_client_ring_t *r,
 
 /* Best-effort server-side close notification. Errors are swallowed
  * because the rings are already unmapped locally by the caller. */
-static void vemb_v16_aeron_notify_close(const char *uds_path,
+static void vemb_v16_aeron_notify_close(const char *endpoint,
                                         uint64_t channel_id) {
-    if (!uds_path || !uds_path[0]) return;
-    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    if (!endpoint || !endpoint[0]) return;
+    int is_tcp = 0;
+    int fd = vemb_v16_aeron_control_connect(endpoint, &is_tcp);
     if (fd < 0) return;
-    vemb_v16_aeron_uds_close(fd, channel_id);
+    if (is_tcp)
+        vemb_v16_aeron_tcp_status_control(fd,
+                                          VEMB_V16_NET_CLOSE_CHANNEL,
+                                          channel_id,
+                                          NULL);
+    else
+        vemb_v16_aeron_uds_close(fd, channel_id);
     close(fd);
 }
 
@@ -2473,11 +2581,14 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
 
     vemb_v16_aeron_channel_t *ch = calloc(1, sizeof(*ch));
     if (!ch) return NULL;
-    strncpy(ch->uds_path, uds_path, sizeof(ch->uds_path) - 1);
+    strncpy(ch->control_endpoint, uds_path, sizeof(ch->control_endpoint) - 1);
 
-    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    int is_tcp = 0;
+    int fd = vemb_v16_aeron_control_connect(uds_path, &is_tcp);
     if (fd < 0) { free(ch); return NULL; }
-    int rc = vemb_v16_aeron_uds_alloc(fd, dim, &ch->desc);
+    int rc = is_tcp ?
+        vemb_v16_aeron_tcp_alloc(fd, dim, &ch->desc) :
+        vemb_v16_aeron_uds_alloc(fd, dim, &ch->desc);
     close(fd);
     if (rc != 0) {
         free(ch);
@@ -2514,16 +2625,22 @@ void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch) {
     ch->warm_count = 0;
     vemb_v16_aeron_ring_close(ch->req_ring,  ch->desc.request_ring_slot_size);
     vemb_v16_aeron_ring_close(ch->resp_ring, ch->desc.response_ring_slot_size);
-    vemb_v16_aeron_notify_close(ch->uds_path, ch->desc.channel_id);
+    vemb_v16_aeron_notify_close(ch->control_endpoint, ch->desc.channel_id);
     free(ch);
 }
 
 int vemb_v16_aeron_close_all(const char *uds_path) {
     if (!uds_path || !uds_path[0]) return -1;
-    int fd = vemb_v16_aeron_uds_connect(uds_path);
+    int is_tcp = 0;
+    int fd = vemb_v16_aeron_control_connect(uds_path, &is_tcp);
     if (fd < 0) return -1;
     uint64_t closed = 0;
-    int rc = vemb_v16_aeron_uds_close_all(fd, &closed);
+    int rc = is_tcp ?
+        vemb_v16_aeron_tcp_status_control(fd,
+                                          VEMB_V16_NET_CLOSE_ALL_CHANNELS,
+                                          0,
+                                          &closed) :
+        vemb_v16_aeron_uds_close_all(fd, &closed);
     close(fd);
     if (rc != 0) return -1;
     return (int)(closed > INT_MAX ? INT_MAX : closed);

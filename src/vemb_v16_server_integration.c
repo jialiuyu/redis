@@ -147,7 +147,7 @@ int vemb_v16_server_integration_init(void) {
         serverLog(LL_NOTICE, "VEMB V16 sniff enabled on Redis listening ports (transport=%s)",
                   vemb_transport);
     } else {
-        serverLog(LL_NOTICE, "VEMB V16 transport=aeron: sniff disabled, clients must use UDS+SHM");
+        serverLog(LL_NOTICE, "VEMB V16 transport=aeron: TCP sniff accepts control frames; data clients use UDS/UB rings");
     }
 
     if (pthread_create(&server.vemb_v16_proxy_thread, NULL,
@@ -215,6 +215,13 @@ static void vemb_async_peek_handler(connection *conn) {
     /* VEMB frame: read type at byte offset 6 (after magic[4] + version[2]). */
     uint16_t ftype;
     memcpy(&ftype, buf + 6, sizeof(ftype));
+    if (ftype == VEMB_V16_NET_HELLO &&
+        server.vemb_v16_transport &&
+        !strcmp(server.vemb_v16_transport, "aeron")) {
+        connSetReadHandler(conn, NULL);
+        acceptCommonFinalize(conn, 0);
+        return;
+    }
 
     /* Steal the fd from conn so cleanup won't close it. */
     connSetReadHandler(conn, NULL);
@@ -271,11 +278,6 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
     /* Fast path: proxy not running (VEMB V16 disabled) */
     if (!server.vemb_v16_proxy)
         return 0;
-    /* Pure aeron mode: no sniff/inject path. Clients must connect to the
-     * UDS socket directly; anything arriving on Redis ports is RESP. */
-    if (server.vemb_v16_transport &&
-        !strcmp(server.vemb_v16_transport, "aeron"))
-        return 0;
     /* Cannot sniff through TLS */
     if (connIsTLS(conn))
         return 0;
@@ -297,10 +299,12 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
         uint16_t ftype;
         memcpy(&ftype, buf + 6, sizeof(ftype));
 
-        /* Steal the fd so connClose won't close it. */
-        conn->fd = -1;
-
         if (ftype == VEMB_V16_NET_HELLO) {
+            if (server.vemb_v16_transport &&
+                !strcmp(server.vemb_v16_transport, "aeron"))
+                return 0;
+            /* Steal the fd so connClose won't close it. */
+            conn->fd = -1;
             serverLog(LL_VERBOSE,
                       "VEMB V16 HELLO on fd %d (fast), injecting data plane", fd);
             if (vemb_v16_proxy_inject_fd(server.vemb_v16_proxy, fd) != 0) {
@@ -309,6 +313,8 @@ int vemb_v16_sniff_and_handoff(connection *conn) {
                 close(fd);
             }
         } else {
+            /* Steal the fd so connClose won't close it. */
+            conn->fd = -1;
             serverLog(LL_NOTICE,
                       "VEMB V16 control frame type=0x%02x on fd %d (fast), "
                       "dispatching to tcp_handle_fd", ftype, fd);

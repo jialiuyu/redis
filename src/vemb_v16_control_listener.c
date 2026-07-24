@@ -42,10 +42,15 @@ static void stub_close_frame_response(int fd, uint64_t closed_count) {
     memset(&st, 0, sizeof(st));
     st.status = VEMB_V16_STATUS_OK;
     st.value = closed_count;
+    uint8_t payload[16];
+    size_t payload_len = 0;
+    if (vemb_v16_net_status_encode(payload, sizeof(payload), &st,
+                                   &payload_len) != 0)
+        return;
     vemb_v16_net_write_frame(fd,
                              VEMB_V16_NET_CONTROL_STATUS,
                              0, 0, 0,
-                             &st, sizeof(st));
+                             payload, (uint32_t)payload_len);
 }
 
 static void *control_fd_worker(void *arg) {
