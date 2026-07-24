@@ -616,6 +616,18 @@ hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容�
 
 该路径只在跨 owner、迁移修复或新旧 epoch 不一致时进入；普通本地 key 仍走本地 location cache。remote meta publish 在单 owner 快路径跳过，多 owner 时只向需要的目标 view 异步发布，避免把扩容控制面开销带入所有读写请求。
 
+#### 扩容吞吐验证
+
+2026-07-24 在双机环境执行 `benchmark/hpc_redis_scaleout_throughput.sh`，验证 0->1 横向扩容过程中的读吞吐与切换耗时。测试机器为 `node0=192.168.90.111`、`node1=192.168.90.112`，向量维度 `DIM=300`，预填充 `10000` 个 key，读压测使用 `64` threads、每线程 `4` connections、pipeline `32`。本轮将 WARM region 扩大到 `4GiB`，remote meta mmap offset 后移到 `5GiB`，以排除小 region 配置对扩容读性能的影响。
+
+| 阶段 | 拓扑/路径 | Ops/sec | Hits/sec | p50 latency (ms) | Wall (s) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| baseline | `active={0}` | 11,610,975.06 | 11,610,975.06 | 0.743 | 31 |
+| during scaleout | `active={0}->{0,1}`，client topology retry | 12,264,037.11 | 12,263,820.09 | 0.591 | 4 |
+| after scaleout | `active={0,1}`，client topology 按 active ring 分流 | 12,242,474.81 | 12,242,474.81 | 0.711 | 34 |
+
+实验结果显示，扩容窗口内 coordinator 在约 `4s` 完成 source done 收敛和 full-active topology 发布，读吞吐未出现下降；切换后 full-active 稳态吞吐保持在 `12.2M ops/sec` 以上。将 WARM region 调整为 `4GiB` 后，baseline、during 和 after 的吞吐形态与小 region 配置下基本一致，说明该场景下吞吐瓶颈不来自 warm payload region 容量不足。
+
 ### 5.7 故障处理与观测
 
 迁移任务需要暴露 range/shard 级进度、snapshot 数量、delta 数量、stale/retry/redirect 计数、source fence 命中、target apply 失败和 SOURCE_GC 完成状态。扩容压测应同时观察 proxy backlog、job shard queue、completion ring、region full/fallback、bitmap lock/unlock 时间和 remote lookup 延迟，确认瓶颈来自迁移控制面还是常规数据面。

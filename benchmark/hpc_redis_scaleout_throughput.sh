@@ -39,6 +39,8 @@ MAX_VECTORS="${MAX_VECTORS:-65536}"
 PIO="${PIO:-21}"
 SNW="${SNW:-21}"
 UB_RPC_TIMEOUT_MS="${UB_RPC_TIMEOUT_MS:-2000}"
+WARM_REGION_BYTES="${WARM_REGION_BYTES:-4294967296}"
+REMOTE_META_MMAP_OFFSET="${REMOTE_META_MMAP_OFFSET:-$((WARM_REGION_BYTES + 1073741824))}"
 
 # ============================================================================
 # 测试参数
@@ -109,7 +111,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: $PAYLOAD_LOCAL_PATH
-remote_meta_mmap_offset: 268435456
+remote_meta_mmap_offset: $REMOTE_META_MMAP_OFFSET
 remote_meta_entries: $MAX_VECTORS
 remote_meta_buckets: $((MAX_VECTORS * 2))
 ub_rpc_timeout_ms: $UB_RPC_TIMEOUT_MS
@@ -119,7 +121,7 @@ warm_regions:
     provider: ub
     path: $PAYLOAD_LOCAL_PATH
     mmap_offset: 0
-    bytes: 67108864
+    bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
     home_ub_node_id: 0
     weight: 1
@@ -131,7 +133,7 @@ local_region_weight: 4
 
 remote_meta_provider: ub
 remote_meta_path: $PAYLOAD_LOCAL_PATH
-remote_meta_mmap_offset: 268435456
+remote_meta_mmap_offset: $REMOTE_META_MMAP_OFFSET
 remote_meta_entries: $MAX_VECTORS
 remote_meta_buckets: $((MAX_VECTORS * 2))
 ub_rpc_timeout_ms: $UB_RPC_TIMEOUT_MS
@@ -141,7 +143,7 @@ warm_regions:
     provider: ub
     path: $PAYLOAD_LOCAL_PATH
     mmap_offset: 0
-    bytes: 67108864
+    bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
     home_ub_node_id: 1
     weight: 1
@@ -149,7 +151,7 @@ warm_regions:
     provider: ub
     path: $PAYLOAD_PEER_PATH
     mmap_offset: 0
-    bytes: 67108864
+    bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
     home_ub_node_id: 0
     weight: 1
@@ -158,7 +160,7 @@ remote_meta_views:
   - owner_id: 0
     provider: ub
     path: $PAYLOAD_PEER_PATH
-    mmap_offset: 268435456
+    mmap_offset: $REMOTE_META_MMAP_OFFSET
     entries: $MAX_VECTORS
     buckets: $((MAX_VECTORS * 2))
 
@@ -185,7 +187,7 @@ warm_regions:
     provider: ub
     path: $PAYLOAD_PEER_PATH
     mmap_offset: 0
-    bytes: 67108864
+    bytes: $WARM_REGION_BYTES
     value_size: $VECTOR_BYTES
     home_ub_node_id: 1
     weight: 1
@@ -194,7 +196,7 @@ remote_meta_views:
   - owner_id: 1
     provider: ub
     path: $PAYLOAD_PEER_PATH
-    mmap_offset: 268435456
+    mmap_offset: $REMOTE_META_MMAP_OFFSET
     entries: $MAX_VECTORS
     buckets: $((MAX_VECTORS * 2))
 
@@ -281,8 +283,29 @@ run_memtier() {
     local ops hits p50 p99
     ops=$(echo "$tot" | awk '{print $2}')
     hits=$(echo "$tot" | awk '{print $3}')
-    p50=$(echo "$tot" | awk '{print $6}')
-    p99=$(echo "$tot" | awk '{print $7}')
+    p50=$(echo "$tot" | awk '{print $(NF-3)}')
+    p99=$(echo "$tot" | awk '{print $(NF-2)}')
+    [ -z "$ops" ] && ops=0
+    echo "$ops $hits $p50 $p99"
+}
+
+# 前台跑 memtier：exec_host 上执行，直连 target_host:PORT
+run_memtier_target() {
+    local exec_host=$1 target_host=$2 tt=$3 outfile=$4 extra=$5
+    local key_min=${6:-1}
+    local key_max=${7:-$PREFILL_KEYS}
+    ssh_run "$exec_host" "numactl --membind=1 taskset -c 96-191 \
+        $MEMTIER --protocol vemb_v16 --vemb-v16-dim $DIM \
+        -s $target_host -p $PORT -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE \
+        --ratio=0:1 --key-pattern=R:R --key-prefix=item: \
+        --key-minimum=$key_min --key-maximum=$key_max \
+        --test-time=$tt $extra >$outfile 2>&1" || true
+    local tot; tot=$(ssh_run "$exec_host" "grep '^Totals' $outfile 2>/dev/null | tail -1")
+    local ops hits p50 p99
+    ops=$(echo "$tot" | awk '{print $2}')
+    hits=$(echo "$tot" | awk '{print $3}')
+    p50=$(echo "$tot" | awk '{print $(NF-3)}')
+    p99=$(echo "$tot" | awk '{print $(NF-2)}')
     [ -z "$ops" ] && ops=0
     echo "$ops $hits $p50 $p99"
 }
@@ -325,8 +348,8 @@ parse_bg_out() {
     fi
     ops=$(echo "$tot" | awk '{print $2}')
     hits=$(echo "$tot" | awk '{print $3}')
-    p50=$(echo "$tot" | awk '{print $6}')
-    p99=$(echo "$tot" | awk '{print $7}')
+    p50=$(echo "$tot" | awk '{print $(NF-3)}')
+    p99=$(echo "$tot" | awk '{print $(NF-2)}')
     [ -z "$ops" ] && ops=0
     echo "$ops $hits $p50 $p99"
 }
@@ -465,8 +488,35 @@ record_phase "during_scaleout" "$ops" "$hits" "${p50:-NA}" "${p99:-NA}" "$SCALEO
 
 ssh_run "$NODE0_HOST" "cat $COORD_OUT; echo '---'; cat $COORD_ERR 2>/dev/null" || true
 
-# 段3: after scaleout (active={0,1})
-log "段3: after scaleout VEMB read (${TEST_TIME}s)"
+# 段3a: after scaleout, direct node0 read original keyspace
+log "段3a: after scaleout direct node0 old-key VEMB read (${TEST_TIME}s)"
+T0=$(date +%s)
+result=$(run_memtier_target "$NODE0_HOST" "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_direct_node0_old_keys.txt" \
+    "" 1 "$PREFILL_KEYS")
+T1=$(date +%s)
+read ops hits p50 p99 <<< "$result"
+record_phase "scaleout_after_direct_node0_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, direct=$NODE0_HOST:$PORT, old_keys=1-$PREFILL_KEYS"
+
+# 段3b: after scaleout, direct node1 read original keyspace from node0 client
+log "段3b: after scaleout direct node1 old-key VEMB read (${TEST_TIME}s)"
+T0=$(date +%s)
+result=$(run_memtier_target "$NODE0_HOST" "$NODE1_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_direct_node1_old_keys.txt" \
+    "" 1 "$PREFILL_KEYS")
+T1=$(date +%s)
+read ops hits p50 p99 <<< "$result"
+record_phase "scaleout_after_direct_node1_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, direct=$NODE1_HOST:$PORT from node0, old_keys=1-$PREFILL_KEYS"
+
+# 段3c: after scaleout, client-topology read original migrated keyspace
+log "段3c: after scaleout client-topology old-key VEMB read (${TEST_TIME}s)"
+T0=$(date +%s)
+result=$(run_memtier "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after_old_keys.txt" \
+    "--vemb-v16-client-topology" "$FINAL_ENDPOINTS" 1 "$PREFILL_KEYS")
+T1=$(date +%s)
+read ops hits p50 p99 <<< "$result"
+record_phase "scaleout_after_old_keys" "$ops" "$hits" "$p50" "$p99" "$((T1-T0))" "active={0,1}, memtier-client-topology, old_keys=1-$PREFILL_KEYS, endpoints=$FINAL_ENDPOINTS"
+
+# 段3d: after scaleout, write/read new steady keyspace (active={0,1})
+log "段3d: after scaleout new-key VEMB read (${TEST_TIME}s)"
 T0=$(date +%s)
 prefill_steady_data "$FINAL_ENDPOINTS" "$STEADY_KEY_MIN" "$STEADY_KEY_MAX" "$RAW_DIR/scaleout_after_prefill.txt"
 result=$(run_memtier "$NODE0_HOST" "$TEST_TIME" "$RAW_DIR/scaleout_after.txt" \
