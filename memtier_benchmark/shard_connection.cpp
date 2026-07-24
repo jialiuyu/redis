@@ -94,6 +94,45 @@ arbitrary_request::arbitrary_request(size_t request_index, request_type type,
         index(request_index) {
 }
 
+vemb_v16_request::vemb_v16_request(request_type type,
+                                   unsigned int size,
+                                   struct timeval* sent_time,
+                                   unsigned int keys,
+                                   const char *key,
+                                   unsigned int key_len,
+                                   const char *value,
+                                   unsigned int value_len,
+                                   int expiry,
+                                   unsigned int offset,
+                                   unsigned int retry_count) :
+        request(type, size, sent_time, keys),
+        m_key(NULL), m_key_len(0), m_value(NULL), m_value_len(0),
+        m_expiry(expiry), m_offset(offset), m_retry_count(retry_count)
+{
+    m_key_len = key_len;
+    if (key_len > 0) {
+        m_key = (char *)malloc(key_len);
+        memcpy(m_key, key, key_len);
+    }
+    m_value_len = value_len;
+    if (value && value_len > 0) {
+        m_value = (char *)malloc(value_len);
+        memcpy(m_value, value, value_len);
+    }
+}
+
+vemb_v16_request::~vemb_v16_request(void)
+{
+    if (m_key) {
+        free(m_key);
+        m_key = NULL;
+    }
+    if (m_value) {
+        free(m_value);
+        m_value = NULL;
+    }
+}
+
 verify_request::verify_request(request_type type,
                                unsigned int size,
                                struct timeval* sent_time,
@@ -656,7 +695,13 @@ void shard_connection::send_set_command(struct timeval* sent_time, const char *k
     cmd_size = m_protocol->write_command_set(key, key_len, value, value_len,
                                              expiry, offset);
 
-    push_req(new request(rt_set, cmd_size, sent_time, 1));
+    if (m_config->protocol == PROTOCOL_VEMB_V16) {
+        push_req(new vemb_v16_request(rt_set, cmd_size, sent_time, 1,
+                                      key, key_len, value, value_len,
+                                      expiry, offset, 0));
+    } else {
+        push_req(new request(rt_set, cmd_size, sent_time, 1));
+    }
 }
 
 
@@ -667,7 +712,47 @@ void shard_connection::send_get_command(struct timeval* sent_time,
     benchmark_debug_log("server %s: GET key=[%.*s]\n", get_readable_id(), key_len, key);
     cmd_size = m_protocol->write_command_get(key, key_len, offset);
 
-    push_req(new request(rt_get, cmd_size, sent_time, 1));
+    if (m_config->protocol == PROTOCOL_VEMB_V16) {
+        push_req(new vemb_v16_request(rt_get, cmd_size, sent_time, 1,
+                                      key, key_len, NULL, 0, 0, offset, 0));
+    } else {
+        push_req(new request(rt_get, cmd_size, sent_time, 1));
+    }
+}
+
+void shard_connection::send_vemb_v16_retry_command(
+        struct timeval* sent_time,
+        const vemb_v16_request *request,
+        unsigned int retry_count,
+        uint8_t request_flags)
+{
+    assert(m_config->protocol == PROTOCOL_VEMB_V16);
+    assert(request != NULL);
+
+    vemb_v16_protocol *vp = (vemb_v16_protocol *)m_protocol;
+    vp->set_next_request_flags(request_flags);
+
+    int cmd_size = 0;
+    if (request->m_type == rt_get) {
+        cmd_size = m_protocol->write_command_get(request->m_key,
+                                                request->m_key_len,
+                                                request->m_offset);
+    } else if (request->m_type == rt_set) {
+        cmd_size = m_protocol->write_command_set(request->m_key,
+                                                request->m_key_len,
+                                                request->m_value,
+                                                request->m_value_len,
+                                                request->m_expiry,
+                                                request->m_offset);
+    } else {
+        assert(0);
+    }
+
+    push_req(new vemb_v16_request(request->m_type, cmd_size, sent_time,
+                                  request->m_keys, request->m_key,
+                                  request->m_key_len, request->m_value,
+                                  request->m_value_len, request->m_expiry,
+                                  request->m_offset, retry_count));
 }
 
 void shard_connection::send_mget_command(struct timeval* sent_time, const keylist* key_list) {

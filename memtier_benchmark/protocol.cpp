@@ -88,7 +88,9 @@ void abstract_protocol::set_keep_value(bool flag)
 /////////////////////////////////////////////////////////////////////////
 
 protocol_response::protocol_response()
-    : m_status(NULL), m_mbulk_value(NULL), m_value(NULL), m_value_len(0), m_hits(0), m_error(false)
+    : m_status(NULL), m_mbulk_value(NULL), m_value(NULL), m_value_len(0),
+      m_total_len(0), m_hits(0), m_error(false), m_vemb_v16_status(0),
+      m_vemb_v16_redirect_owner(UINT32_MAX)
 {
 }
 
@@ -105,6 +107,23 @@ void protocol_response::set_error()
 bool protocol_response::is_error(void)
 {
     return m_error;
+}
+
+void protocol_response::set_vemb_v16_status(uint8_t status,
+                                            uint32_t redirect_owner)
+{
+    m_vemb_v16_status = status;
+    m_vemb_v16_redirect_owner = redirect_owner;
+}
+
+uint8_t protocol_response::get_vemb_v16_status(void) const
+{
+    return m_vemb_v16_status;
+}
+
+uint32_t protocol_response::get_vemb_v16_redirect_owner(void) const
+{
+    return m_vemb_v16_redirect_owner;
 }
 
 void protocol_response::set_status(const char* status)
@@ -174,6 +193,8 @@ void protocol_response::clear(void)
     m_total_len = 0;
     m_hits = 0;
     m_error = 0;
+    m_vemb_v16_status = 0;
+    m_vemb_v16_redirect_owner = UINT32_MAX;
 }
 
 void protocol_response::set_mbulk_value(mbulk_size_el* element) {
@@ -1291,7 +1312,7 @@ vemb_v16_protocol::vemb_v16_protocol(uint32_t dim, uint32_t max_vectors)
       m_warm_mapped_addr(NULL), m_warm_region_bytes(0),
       m_vsim_mode(false), m_vsim_query_vector(NULL),
       m_vsim_req_template(NULL), m_vsim_req_template_size(0),
-      m_vrem_mode(false)
+      m_vrem_mode(false), m_topology_epoch(0), m_next_request_flags(0)
 {
 }
 
@@ -1371,6 +1392,19 @@ void vemb_v16_protocol::set_handle_mode(bool enable)
     m_handle_mode = enable;
 }
 
+void vemb_v16_protocol::set_topology_epoch(uint64_t topology_epoch)
+{
+    m_topology_epoch = topology_epoch;
+    if (m_vsim_req_template) {
+        build_vsim_template();
+    }
+}
+
+void vemb_v16_protocol::set_next_request_flags(uint8_t flags)
+{
+    m_next_request_flags = flags;
+}
+
 void vemb_v16_protocol::set_dim(uint32_t dim)
 {
     if (dim == m_dim || dim == 0) return;
@@ -1401,6 +1435,7 @@ abstract_protocol* vemb_v16_protocol::clone(void)
     p->set_handle_mode(m_handle_mode);
     p->set_vsim_mode(m_vsim_mode);
     p->set_vrem_mode(m_vrem_mode);
+    p->set_topology_epoch(m_topology_epoch);
     return p;
 }
 
@@ -1531,8 +1566,11 @@ int vemb_v16_protocol::build_aeron_set_request(const char *key, int key_len,
 
     memset(req, 0, sizeof(*req));
     req->op = m_vrem_mode ? VEMB_V16_OP_VREM : VEMB_V16_OP_VADD;
+    req->flags = m_next_request_flags;
+    m_next_request_flags = 0;
     req->req_id = m_req_id++;
     req->channel_id = m_channel_id;
+    req->topology_epoch = m_topology_epoch;
     req->key_len = actual_key_len;
     memcpy(req->key, key, actual_key_len);
     req->key_hash = vemb_v16_xxh3_64_str(req->key, req->key_len);
@@ -1564,8 +1602,11 @@ int vemb_v16_protocol::build_aeron_get_request(const char *key, int key_len,
 
     memset(req, 0, sizeof(*req));
     req->op = m_handle_mode ? VEMB_V16_OP_VEMB_HANDLE : VEMB_V16_OP_VEMB_INLINE;
+    req->flags = m_next_request_flags;
+    m_next_request_flags = 0;
     req->req_id = m_req_id++;
     req->channel_id = m_channel_id;
+    req->topology_epoch = m_topology_epoch;
     req->key_len = actual_key_len;
     req->dim = m_dim;
     req->vector_bytes = m_dim * sizeof(float);
@@ -1597,13 +1638,34 @@ int vemb_v16_protocol::write_command_set(const char *key, int key_len,
         if (evbuffer_reserve_space(m_write_buf, total, vec, 1) < 1)
             return -1;
 
-        ssize_t len = vemb_v16_serialize_vrem(vec[0].iov_base, vec[0].iov_len,
-                                              m_channel_id, m_req_id++,
-                                              key, actual_key_len);
-        if (len < 0)
+        vemb_v16_req_t req = {0};
+        req.op = VEMB_V16_OP_VREM;
+        req.flags = m_next_request_flags;
+        m_next_request_flags = 0;
+        req.req_id = m_req_id++;
+        req.channel_id = m_channel_id;
+        req.topology_epoch = m_topology_epoch;
+        req.key_len = actual_key_len;
+        memcpy(req.key, key, actual_key_len);
+        req.key_hash = vemb_v16_xxh3_64_str(req.key, req.key_len);
+
+        size_t payload_len_actual = 0;
+        if (vemb_v16_req_encode((uint8_t *)vec[0].iov_base + sizeof(vemb_v16_net_hdr_t),
+                                vec[0].iov_len - sizeof(vemb_v16_net_hdr_t),
+                                &req, &payload_len_actual) != 0)
             return -1;
 
-        vec[0].iov_len = (size_t)len;
+        vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)vec[0].iov_base;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->magic = VEMB_V16_MAGIC;
+        hdr->version = VEMB_V16_VERSION;
+        hdr->type = VEMB_V16_NET_REQUEST;
+        hdr->payload_len = (uint32_t)payload_len_actual;
+        hdr->channel_id = m_channel_id;
+        hdr->req_id = req.req_id;
+
+        size_t len = sizeof(*hdr) + payload_len_actual;
+        vec[0].iov_len = len;
         evbuffer_commit_space(m_write_buf, vec, 1);
         return (int)len;
     }
@@ -1619,14 +1681,37 @@ int vemb_v16_protocol::write_command_set(const char *key, int key_len,
     if (evbuffer_reserve_space(m_write_buf, total, vec, 1) < 1)
         return -1;
 
-    ssize_t len = vemb_v16_serialize_vadd(vec[0].iov_base, vec[0].iov_len,
-                                          m_channel_id, m_req_id++,
-                                          key, actual_key_len,
-                                          (const float *)value, m_dim);
-    if (len < 0)
+    vemb_v16_req_t req = {0};
+    req.op = VEMB_V16_OP_VADD;
+    req.flags = m_next_request_flags;
+    m_next_request_flags = 0;
+    req.req_id = m_req_id++;
+    req.channel_id = m_channel_id;
+    req.topology_epoch = m_topology_epoch;
+    req.key_len = actual_key_len;
+    req.dim = m_dim;
+    req.vector_bytes = vector_bytes;
+    memcpy(req.key, key, actual_key_len);
+    req.key_hash = vemb_v16_xxh3_64_str(req.key, req.key_len);
+    memcpy(req.vector, value, vector_bytes);
+
+    size_t payload_len_actual = 0;
+    if (vemb_v16_req_encode((uint8_t *)vec[0].iov_base + sizeof(vemb_v16_net_hdr_t),
+                            vec[0].iov_len - sizeof(vemb_v16_net_hdr_t),
+                            &req, &payload_len_actual) != 0)
         return -1;
 
-    vec[0].iov_len = (size_t)len;
+    vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)vec[0].iov_base;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = VEMB_V16_MAGIC;
+    hdr->version = VEMB_V16_VERSION;
+    hdr->type = VEMB_V16_NET_REQUEST;
+    hdr->payload_len = (uint32_t)payload_len_actual;
+    hdr->channel_id = m_channel_id;
+    hdr->req_id = req.req_id;
+
+    size_t len = sizeof(*hdr) + payload_len_actual;
+    vec[0].iov_len = len;
     evbuffer_commit_space(m_write_buf, vec, 1);
     return (int)len;
 }
@@ -1654,10 +1739,13 @@ int vemb_v16_protocol::write_command_get(const char *key, int key_len,
         hdr->req_id = m_req_id++;
 
         vemb_v16_req_t *req = (vemb_v16_req_t *)(p + sizeof(*hdr));
+        req->flags = m_next_request_flags;
+        m_next_request_flags = 0;
         req->req_id = hdr->req_id;
+        req->topology_epoch = m_topology_epoch;
         req->key_len = actual_key_len;
         memcpy(req->key, key, actual_key_len);
-        req->key_hash = vemb_v16_murmur3(req->key, actual_key_len);
+        req->key_hash = vemb_v16_xxh3_64_str(req->key, actual_key_len);
 
         vec[0].iov_len = m_vsim_req_template_size;
         evbuffer_commit_space(m_write_buf, vec, 1);
@@ -1674,20 +1762,36 @@ int vemb_v16_protocol::write_command_get(const char *key, int key_len,
     if (evbuffer_reserve_space(m_write_buf, total, vec, 1) < 1)
         return -1;
 
-    ssize_t len;
-    if (m_handle_mode) {
-        len = vemb_v16_serialize_vemb(vec[0].iov_base, vec[0].iov_len,
-                                      m_channel_id, m_req_id++,
-                                      key, actual_key_len, m_dim);
-    } else {
-        len = vemb_v16_serialize_vemb_inline(vec[0].iov_base, vec[0].iov_len,
-                                             m_channel_id, m_req_id++,
-                                             key, actual_key_len, m_dim);
-    }
-    if (len < 0)
+    vemb_v16_req_t req = {0};
+    req.op = m_handle_mode ? VEMB_V16_OP_VEMB_HANDLE : VEMB_V16_OP_VEMB_INLINE;
+    req.flags = m_next_request_flags;
+    m_next_request_flags = 0;
+    req.req_id = m_req_id++;
+    req.channel_id = m_channel_id;
+    req.topology_epoch = m_topology_epoch;
+    req.key_len = actual_key_len;
+    req.dim = m_dim;
+    req.vector_bytes = m_dim * sizeof(float);
+    memcpy(req.key, key, actual_key_len);
+    req.key_hash = vemb_v16_xxh3_64_str(req.key, req.key_len);
+
+    size_t payload_len_actual = 0;
+    if (vemb_v16_req_encode((uint8_t *)vec[0].iov_base + sizeof(vemb_v16_net_hdr_t),
+                            vec[0].iov_len - sizeof(vemb_v16_net_hdr_t),
+                            &req, &payload_len_actual) != 0)
         return -1;
 
-    vec[0].iov_len = (size_t)len;
+    vemb_v16_net_hdr_t *hdr = (vemb_v16_net_hdr_t *)vec[0].iov_base;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = VEMB_V16_MAGIC;
+    hdr->version = VEMB_V16_VERSION;
+    hdr->type = VEMB_V16_NET_REQUEST;
+    hdr->payload_len = (uint32_t)payload_len_actual;
+    hdr->channel_id = m_channel_id;
+    hdr->req_id = req.req_id;
+
+    size_t len = sizeof(*hdr) + payload_len_actual;
+    vec[0].iov_len = len;
     evbuffer_commit_space(m_write_buf, vec, 1);
     return (int)len;
 }
@@ -1728,12 +1832,24 @@ int vemb_v16_protocol::parse_response()
         return -1;
 
     if (resp.status == VEMB_V16_STATUS_OK) {
+        m_last_response.set_status(strdup("OK"));
         m_last_response.incr_hits();
     } else if (resp.status == VEMB_V16_STATUS_NOT_FOUND) {
+        m_last_response.set_status(strdup("NOT_FOUND"));
         // miss: no hit count
     } else {
+        const char *status = "ERR";
+        if (resp.status == VEMB_V16_STATUS_STALE_TOPOLOGY) {
+            status = "STALE_TOPOLOGY";
+        } else if (resp.status == VEMB_V16_STATUS_MOVED) {
+            status = "MOVED";
+        } else if (resp.status == VEMB_V16_STATUS_ASK) {
+            status = "ASK";
+        }
+        m_last_response.set_status(strdup(status));
         m_last_response.set_error();
     }
+    m_last_response.set_vemb_v16_status(resp.status, resp.redirect_owner);
 
     if (m_keep_value && resp.status == VEMB_V16_STATUS_OK &&
         (resp.op == VEMB_V16_OP_VEMB_HANDLE || resp.op == VEMB_V16_OP_VEMB_INLINE) &&
@@ -1775,10 +1891,23 @@ int vemb_v16_protocol::parse_aeron_response(const vemb_v16_resp_t *resp,
     m_last_response.clear();
 
     if (resp->status == VEMB_V16_STATUS_OK) {
+        m_last_response.set_status(strdup("OK"));
         m_last_response.incr_hits();
-    } else if (resp->status != VEMB_V16_STATUS_NOT_FOUND) {
+    } else if (resp->status == VEMB_V16_STATUS_NOT_FOUND) {
+        m_last_response.set_status(strdup("NOT_FOUND"));
+    } else {
+        const char *status = "ERR";
+        if (resp->status == VEMB_V16_STATUS_STALE_TOPOLOGY) {
+            status = "STALE_TOPOLOGY";
+        } else if (resp->status == VEMB_V16_STATUS_MOVED) {
+            status = "MOVED";
+        } else if (resp->status == VEMB_V16_STATUS_ASK) {
+            status = "ASK";
+        }
+        m_last_response.set_status(strdup(status));
         m_last_response.set_error();
     }
+    m_last_response.set_vemb_v16_status(resp->status, resp->redirect_owner);
 
     if (m_keep_value && resp->status == VEMB_V16_STATUS_OK &&
         (resp->op == VEMB_V16_OP_VEMB_HANDLE || resp->op == VEMB_V16_OP_VEMB_INLINE) &&

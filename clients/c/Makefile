@@ -65,7 +65,8 @@ PUBLIC_HEADERS := \
 	$(INC_DIR)/vemb_v16_net.h \
 	$(INC_DIR)/vemb_v16_client_topology.h \
 	$(INC_DIR)/vemb_v16_topology.h \
-	$(INC_DIR)/vemb_v16_hash.h
+	$(INC_DIR)/vemb_v16_hash.h \
+	$(INC_DIR)/vemb_v16_peer_view_map.h
 
 # ---- compile flags shared across all .c ----
 ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(PIC_FLAGS) $(WARN_FLAGS) $(INCLUDES)
@@ -137,6 +138,10 @@ $(INC_DIR)/vemb_v16_topology.h: $(SRC_DIR)/vemb_v16_topology.h
 	cp $< $@
 
 $(INC_DIR)/vemb_v16_hash.h: $(SRC_DIR)/vemb_v16_hash.h
+	@mkdir -p $(INC_DIR)
+	cp $< $@
+
+$(INC_DIR)/vemb_v16_peer_view_map.h: $(SRC_DIR)/vemb_v16_peer_view_map.h
 	@mkdir -p $(INC_DIR)
 	cp $< $@
 

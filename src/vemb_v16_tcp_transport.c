@@ -260,10 +260,10 @@ static uint8_t *encode_tcp_response_batch(vemb_v16_channel_t *ch,
                                           uint32_t *published,
                                           size_t *out_len) {
     uint32_t net_flags = 0;
-    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-    const uint8_t *vectors[VEMB_V16_PROXY_BATCH];
-    uint32_t vector_bytes[VEMB_V16_PROXY_BATCH];
-    vemb_v16_net_hdr_t headers[VEMB_V16_PROXY_BATCH];
+    vemb_v16_resp_t responses[PROXY_RESPONSE_BATCH];
+    const uint8_t *vectors[PROXY_RESPONSE_BATCH];
+    uint32_t vector_bytes[PROXY_RESPONSE_BATCH];
+    vemb_v16_net_hdr_t headers[PROXY_RESPONSE_BATCH];
     uint32_t out = 0;
     size_t total_bytes = 0;
 
@@ -421,9 +421,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
                                         uint32_t *published) {
     if (!vemb_v16_channel_tcp_backpressure_enabled(ch)) {
         uint32_t net_flags = 0;
-        vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-        uint8_t frame_prefixes[VEMB_V16_PROXY_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
-        struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
+        vemb_v16_resp_t responses[PROXY_RESPONSE_BATCH];
+        uint8_t frame_prefixes[PROXY_RESPONSE_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
+        struct iovec iov[PROXY_RESPONSE_BATCH * 3u];
         int iovcnt = 0;
         uint32_t out = 0;
 
@@ -479,9 +479,9 @@ int vemb_v16_tcp_publish_response_batch(vemb_v16_channel_t *ch,
 
 #ifdef __linux__
     uint32_t net_flags = 0;
-    vemb_v16_resp_t responses[VEMB_V16_PROXY_BATCH];
-    uint8_t frame_prefixes[VEMB_V16_PROXY_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
-    struct iovec iov[VEMB_V16_PROXY_BATCH * 3u];
+    vemb_v16_resp_t responses[PROXY_RESPONSE_BATCH];
+    uint8_t frame_prefixes[PROXY_RESPONSE_BATCH][VEMB_V16_TCP_RESPONSE_PREFIX_CAP];
+    struct iovec iov[PROXY_RESPONSE_BATCH * 3u];
     int iovcnt = 0;
     uint32_t out = 0;
     size_t total_bytes = 0;
@@ -681,8 +681,7 @@ static int decode_tcp_key_only_request(vemb_v16_req_t *req,
 
 /// TCP transport: decode one buffered request frame into a request slot.
 static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
-                                               vemb_v16_req_t *req,
-                                               int *req_len) {
+                                               vemb_v16_req_t *req) {
     size_t pending = vemb_v16_tcp_input_pending_bytes(ch);
     if (pending < sizeof(vemb_v16_net_hdr_t))
         return 0;
@@ -706,7 +705,6 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
     if (pending < frame_len)
         return 0;
 
-    *req_len = 0;
     int decode_rc = decode_tcp_key_only_request(req,
                                                 frame + sizeof(hdr),
                                                 hdr.payload_len);
@@ -721,7 +719,6 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
     }
     if (req->channel_id == 0)
         req->channel_id = vemb_v16_channel_id(ch);
-    *req_len = (int)hdr.payload_len;
     vemb_v16_tcp_input_consume(ch, frame_len);
     return 1;
 }
@@ -729,29 +726,29 @@ static int channel_read_tcp_request_from_input(vemb_v16_channel_t *ch,
 /// TCP transport: read a bounded batch of already-ready request frames.
 int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
                                     uint32_t proxy_io_worker_id) {
-    vemb_v16_req_t reqs[VEMB_V16_PROXY_BATCH];
-    int req_lens[VEMB_V16_PROXY_BATCH];
+    vemb_v16_req_t reqs[PROXY_REQUEST_BATCH];
+    const vemb_v16_req_t *req_ptrs[PROXY_REQUEST_BATCH];
     uint32_t count = 0;
-    while (count < VEMB_V16_PROXY_BATCH) {
+    while (count < PROXY_REQUEST_BATCH) {
         int rc = channel_read_tcp_request_from_input(ch,
-                                                     &reqs[count],
-                                                     &req_lens[count]);
+                                                     &reqs[count]);
         if (rc < 0)
             return -1;
         if (rc == 0)
             break;
+        req_ptrs[count] = &reqs[count];
         count++;
     }
     if (count > 0) {
-        vemb_v16_proxy_handle_request_batch(ch,
-                                            reqs,
-                                            req_lens,
-                                            count,
-                                            proxy_io_worker_id);
+        vemb_v16_proxy_handle_request_ptr_batch(ch,
+                                                req_ptrs,
+                                                sizeof(vemb_v16_req_t),
+                                                count,
+                                                proxy_io_worker_id);
         if (vemb_v16_channel_net_fd(ch) < 0)
             return -1;
     }
-    if (count >= VEMB_V16_PROXY_BATCH)
+    if (count >= PROXY_REQUEST_BATCH)
         return (int)count;
 
     int fill_rc = fill_tcp_input_buffer(ch);
@@ -760,23 +757,23 @@ int vemb_v16_tcp_read_ready_requests(vemb_v16_channel_t *ch,
 
     uint32_t total = count;
     count = 0;
-    while (count < VEMB_V16_PROXY_BATCH) {
+    while (count < PROXY_REQUEST_BATCH) {
         int rc = channel_read_tcp_request_from_input(ch,
-                                                     &reqs[count],
-                                                     &req_lens[count]);
+                                                     &reqs[count]);
         if (rc < 0)
             return -1;
         if (rc == 0)
             break;
+        req_ptrs[count] = &reqs[count];
         count++;
     }
 
     if (count > 0) {
-        vemb_v16_proxy_handle_request_batch(ch,
-                                            reqs,
-                                            req_lens,
-                                            count,
-                                            proxy_io_worker_id);
+        vemb_v16_proxy_handle_request_ptr_batch(ch,
+                                                req_ptrs,
+                                                sizeof(vemb_v16_req_t),
+                                                count,
+                                                proxy_io_worker_id);
         if (vemb_v16_channel_net_fd(ch) < 0)
             return -1;
     }

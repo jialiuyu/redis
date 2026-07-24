@@ -13,7 +13,7 @@ static float sve_cosine_similarity_f32_sve_impl(const float *a,
 
     size_t i = 0;
     while (i < dim) {
-        svbool_t pg = svwhilelt_b32(i, dim);
+        svbool_t pg = svwhilelt_b32((uint64_t)i, (uint64_t)dim);
         svfloat32_t va = svld1_f32(pg, &a[i]);
         svfloat32_t vb = svld1_f32(pg, &b[i]);
 

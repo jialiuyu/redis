@@ -34,6 +34,7 @@
 #include "ub_metadata.h"
 #include "proxy_aggregator.h"
 #include "sve_config.h"
+#include "sve_similarity.h"
 #include "supernode_worker.h"
 #include "zmalloc.h"
 #include "server.h"

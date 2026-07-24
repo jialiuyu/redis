@@ -107,12 +107,12 @@ static int write_full(int fd, const void *buf, size_t n) {
 int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id) {
     vemb_v16_client_ring_t *request_ring = vemb_v16_channel_request_ring(ch);
-    const void *slots[VEMB_V16_PROXY_BATCH];
-    const vemb_v16_req_t *reqs[VEMB_V16_PROXY_BATCH];
+    const void *slots[PROXY_REQUEST_BATCH];
+    const vemb_v16_req_t *reqs[PROXY_REQUEST_BATCH];
 
     uint32_t req_count = vemb_v16_client_peek_batch(request_ring,
                                                     slots,
-                                                    VEMB_V16_PROXY_BATCH);
+                                                    PROXY_REQUEST_BATCH);
     if (req_count == 0)
         return 0;
 

@@ -128,6 +128,59 @@ Observation: `20:20` meets the CPU target, but throughput is about
 `1.7-2.4%` below the repeated `21:21` runs. `16:16` and `18:18` do not meet the
 combined CPU and throughput target.
 
+## 2026-07-22 TCP Request Bypass Follow-Up
+
+Change summary:
+
+- Split the old unified `VEMB_V16_PROXY_BATCH` into independently tunable
+  `PROXY_REQUEST_BATCH`, `PROXY_RESPONSE_BATCH`, and `PROXY_QUEUE_BATCH`.
+- Exposed those values through `make`, for example:
+  `make -C src vemb_v16_server PROXY_REQUEST_BATCH=16 PROXY_RESPONSE_BATCH=24 PROXY_QUEUE_BATCH=8`.
+- Removed the TCP-only `vemb_v16_proxy_handle_request_batch()` wrapper.
+  TCP now builds a request pointer batch and calls
+  `vemb_v16_proxy_handle_request_ptr_batch()` directly, matching the Aeron
+  request scheduling entry point.
+
+Validation:
+
+```bash
+make -C src redis-server USE_UB=yes
+NUM_KEYS=100000 WORKERS='21:21' TS='64' CS='4' TEST_TIME=30 bash hpc_redis_max_tput.sh
+```
+
+Result:
+
+| Build / path | ops/sec | p50 ms | p99 ms | cores | ops/core/sec | Artifact |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Pre-bypass TCP inline reference, 2026-07-22 earlier run | 11585807.09 | 0.711 | NA | 20.92 | ~553814 | recorded in `docs/VEMB_V16_AERON_BEST_FLAMEGRAPH_20260722.md` |
+| TCP ptr-batch bypass, 2026-07-22 | 11771274.05 | 0.703 | 0.863 | 21.10 | ~557880 | `perf/server_flamegraph_host_mt_read_21_21_t64_c4_20260722_153218.svg` |
+
+The post-change flamegraph was captured with the same `21:21 t64 c4` host-mt
+shape while running a 30s memtier read workload. The remote source artifact was:
+
+```text
+/tmp/host_mt_read_21_21_t64_c4_20260722_153218/server_flamegraph_host_mt_read_21_21_t64_c4_20260722_153218.svg
+```
+
+Local copy:
+
+```text
+perf/server_flamegraph_host_mt_read_21_21_t64_c4_20260722_153218.svg
+```
+
+Interpretation:
+
+- Throughput improved by about `1.6%` versus the earlier same-day TCP inline
+  reference (`11.586M -> 11.771M ops/sec`).
+- CPU usage stayed essentially flat (`20.92 -> 21.10` cores), so per-core
+  throughput improved slightly (`~553.8k -> ~557.9k ops/core/sec`).
+- Latency did not regress; p50 moved from `0.711ms` to `0.703ms`, and the
+  post-change p99 was `0.863ms`.
+- The change is primarily a cleanup and dispatch-path simplification for TCP:
+  it removes one request batch wrapping layer and makes TCP/Aeron feed the same
+  pointer-batch scheduler. The measured gain is modest but positive on the
+  target host-mt workload.
+
 ## Conclusion
 
 `WORKERS='21:21'` meets the target:

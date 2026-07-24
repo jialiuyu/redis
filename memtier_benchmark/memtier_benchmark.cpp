@@ -317,6 +317,10 @@ static void config_init_defaults(struct benchmark_config *cfg)
         cfg->hdr_prefix = "";
     if (!cfg->print_percentiles.is_defined())
         cfg->print_percentiles = config_quantiles("50,99,99.9");
+    if (!cfg->vemb_v16_topology_refresh_ms)
+        cfg->vemb_v16_topology_refresh_ms = 500;
+    if (!cfg->vemb_v16_topology_retry_limit)
+        cfg->vemb_v16_topology_retry_limit = 8;
 #ifdef USE_TLS
     if (!cfg->tls_protocols)
         cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
@@ -429,6 +433,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_vemb_v16_vsim,
         o_vemb_v16_vrem,
         o_vemb_v16_endpoints,
+        o_vemb_v16_client_topology,
+        o_vemb_v16_topology_refresh_ms,
+        o_vemb_v16_topology_retry_limit,
         o_vemb_v16_transport,
         o_tls,
         o_tls_cert,
@@ -513,6 +520,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "vemb-v16-vsim",              0, 0, o_vemb_v16_vsim },
         { "vemb-v16-vrem",              0, 0, o_vemb_v16_vrem },
         { "vemb-v16-endpoints",         1, 0, o_vemb_v16_endpoints },
+        { "vemb-v16-client-topology",   0, 0, o_vemb_v16_client_topology },
+        { "vemb-v16-topology-refresh-ms", 1, 0, o_vemb_v16_topology_refresh_ms },
+        { "vemb-v16-topology-retry-limit", 1, 0, o_vemb_v16_topology_retry_limit },
         { "vemb-v16-transport",         1, 0, o_vemb_v16_transport },
         { "rate-limiting",              1, 0, o_rate_limiting },
         { NULL,                         0, 0, 0 }
@@ -903,6 +913,15 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 case o_vemb_v16_endpoints:
                     cfg->vemb_v16_endpoints = optarg;
                     break;
+                case o_vemb_v16_client_topology:
+                    cfg->vemb_v16_client_topology = true;
+                    break;
+                case o_vemb_v16_topology_refresh_ms:
+                    cfg->vemb_v16_topology_refresh_ms = (unsigned int)atoi(optarg);
+                    break;
+                case o_vemb_v16_topology_retry_limit:
+                    cfg->vemb_v16_topology_retry_limit = (unsigned int)atoi(optarg);
+                    break;
                 case o_vemb_v16_transport:
                     if (strcmp(optarg, "tcp") != 0 &&
                         strcmp(optarg, "aeron") != 0 &&
@@ -1111,6 +1130,9 @@ void usage() {
             "      --vemb-v16-vrem            Use VREM instead of VADD for vemb_v16 writes (SET path)\n"
             "      --vemb-v16-handle          Force VEMB_HANDLE read mode (default; flag for script compat)\n"
             "      --vemb-v16-endpoints=LIST  Comma-separated host:port list for multi-endpoint VEMB routing\n"
+            "      --vemb-v16-client-topology  Fetch server topology and route by active owner ring\n"
+            "      --vemb-v16-topology-refresh-ms=N  Refresh VEMB topology every N ms (default 500)\n"
+            "      --vemb-v16-topology-retry-limit=N  Retry VEMB topology transitions up to N times (default 8)\n"
             "      --vemb-v16-transport=tcp|aeron|aeron-cross-node  Transport for VEMB V16 (default tcp uses libevent RESP/sniff path;\n"
             "                               aeron uses UDS + SHM SPSC ring, bypassing libevent for max throughput;\n"
             "                               aeron-cross-node uses TCP ATTACH + UB shmdev mmap for cross-node deploy)\n"

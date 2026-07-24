@@ -19,7 +19,13 @@
 #include <unistd.h>
 #endif
 
+#ifndef VEMB_V16_SUPERNODE_BATCH
+#ifdef PROXY_QUEUE_BATCH
+#define VEMB_V16_SUPERNODE_BATCH PROXY_QUEUE_BATCH
+#else
 #define VEMB_V16_SUPERNODE_BATCH 32u
+#endif
+#endif
 
 typedef struct vemb_v16_inline_snapshot {
     uint32_t payload_bytes;
@@ -234,6 +240,11 @@ void vemb_v16_supernode_handle_vemb_job(vemb_v16_supernode_ctx_t *ctx,
         err_reason = "shape_mismatch";
         goto finish_vemb_job;
     }
+    if (migration_active &&
+        vemb_v16_storage_write_epoch_is_stale(storage, job->topology_epoch)) {
+        completion.status = VEMB_V16_STATUS_STALE_TOPOLOGY;
+        goto finish_vemb_job;
+    }
 
     if (needs_payload_snapshot &&
         vemb_v16_tlc_get_cached_handle(tlc,
@@ -360,6 +371,11 @@ void vemb_v16_supernode_handle_vsim_key_key_job(
 
     if (!job_shape_matches_tlc(vsim_job->dim, vsim_job->vector_bytes, tlc)) {
         completion.status = VEMB_V16_STATUS_ERR;
+        goto finish_vsim_job;
+    }
+    if (migration_active &&
+        vemb_v16_storage_write_epoch_is_stale(storage, job->topology_epoch)) {
+        completion.status = VEMB_V16_STATUS_STALE_TOPOLOGY;
         goto finish_vsim_job;
     }
 
