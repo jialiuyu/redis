@@ -111,6 +111,9 @@ struct benchmark_config {
     bool     vemb_v16_vsim;
     bool     vemb_v16_vrem;
     const char *vemb_v16_endpoints;
+    bool     vemb_v16_client_topology;
+    unsigned int vemb_v16_topology_refresh_ms;
+    unsigned int vemb_v16_topology_retry_limit;
     /* transport: "tcp" (default, libevent RESP/sniff) or "aeron"
      * (UDS + POSIX SHM SPSC ring, side-channel runner bypassing libevent). */
     const char *vemb_v16_transport;

@@ -50,6 +50,29 @@ struct request {
     virtual ~request(void) {}
 };
 
+struct vemb_v16_request : public request {
+    char *m_key;
+    unsigned int m_key_len;
+    char *m_value;
+    unsigned int m_value_len;
+    int m_expiry;
+    unsigned int m_offset;
+    unsigned int m_retry_count;
+
+    vemb_v16_request(request_type type,
+                     unsigned int size,
+                     struct timeval* sent_time,
+                     unsigned int keys,
+                     const char *key,
+                     unsigned int key_len,
+                     const char *value,
+                     unsigned int value_len,
+                     int expiry,
+                     unsigned int offset,
+                     unsigned int retry_count);
+    virtual ~vemb_v16_request(void);
+};
+
 struct arbitrary_request : public request {
     size_t index;
 
@@ -97,6 +120,10 @@ public:
                           const char *value, int value_len, int expiry, unsigned int offset);
     void send_get_command(struct timeval* sent_time,
                           const char *key, int key_len, unsigned int offset);
+    void send_vemb_v16_retry_command(struct timeval* sent_time,
+                                     const vemb_v16_request *request,
+                                     unsigned int retry_count,
+                                     uint8_t request_flags);
     void send_mget_command(struct timeval* sent_time, const keylist* key_list);
     void send_verify_get_command(struct timeval* sent_time, const char *key, int key_len,
                                  const char *value, int value_len, unsigned int offset);

@@ -34,6 +34,8 @@
 #define VEMB_V16_SDK_ENC_BUF_LEN  (24u + 4u + VEMB_V16_MAX_KEY_LEN + \
                                    VEMB_V16_MAX_DIM * sizeof(float) + 64u)
 
+void sve_streaming_load_f32(const void *src, void *dst, size_t size);
+
 /* Encode req using the compact wire format and write it as a VEMB_V16_NET_REQUEST
  * frame. Returns 0 on success, -1 on error. */
 static int sdk_write_request(int fd,

@@ -210,7 +210,9 @@ bool client::finished(void)
 {
     if (m_config->requests > 0 && m_reqs_processed >= m_config->requests)
         return true;
-    if (m_config->test_time > 0 && m_stats.get_duration() >= m_config->test_time)
+    if (m_config->test_time > 0 &&
+        m_stats.get_duration_usec() >=
+            (unsigned long int)m_config->test_time * 1000000)
         return true;
     return false;
 }

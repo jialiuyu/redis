@@ -619,9 +619,24 @@ static void topology_resp_upsert_endpoint(
     resp->endpoints[resp->endpoint_count++] = *endpoint;
 }
 
+static int topology_resp_has_endpoint_for_owner(
+        const vemb_v16_topology_control_resp_t *resp,
+        uint32_t owner_id) {
+    for (uint32_t i = 0; i < resp->endpoint_count; i++) {
+        if (resp->endpoints[i].owner_id == owner_id)
+            return 1;
+    }
+    return 0;
+}
+
 static void topology_resp_add_local_endpoint(
         vemb_v16_proxy_t *proxy,
         vemb_v16_topology_control_resp_t *resp) {
+    if (topology_resp_has_endpoint_for_owner(
+            resp, proxy_storage(proxy)->local_owner_id)) {
+        return;
+    }
+
     vemb_v16_topology_endpoint_t endpoint = {
         .owner_id = proxy_storage(proxy)->local_owner_id,
     };

@@ -117,6 +117,8 @@ protected:
     unsigned int m_total_len;
     unsigned int m_hits;
     bool m_error;
+    uint8_t m_vemb_v16_status;
+    uint32_t m_vemb_v16_redirect_owner;
 
 public:
     protocol_response();
@@ -127,6 +129,10 @@ public:
 
     void set_error();
     bool is_error(void);
+
+    void set_vemb_v16_status(uint8_t status, uint32_t redirect_owner);
+    uint8_t get_vemb_v16_status(void) const;
+    uint32_t get_vemb_v16_redirect_owner(void) const;
 
     void set_value(const char *value, unsigned int value_len);
     const char *get_value(unsigned int *value_len);
@@ -223,6 +229,8 @@ protected:
 
     /* VREM mode: when true, SET sends VREM instead of VADD (delete by key) */
     bool m_vrem_mode;
+    uint64_t m_topology_epoch;
+    uint8_t m_next_request_flags;
 
 public:
     vemb_v16_protocol(uint32_t dim = VEMB_V16_DEFAULT_DIM,
@@ -233,6 +241,8 @@ public:
     void set_vsim_mode(bool enable);
     void set_vrem_mode(bool enable);
     void set_handle_mode(bool enable);
+    void set_topology_epoch(uint64_t topology_epoch);
+    void set_next_request_flags(uint8_t flags);
     void set_dim(uint32_t dim);
     uint32_t get_dim(void) const { return m_dim; }
     void build_vsim_template(void);
