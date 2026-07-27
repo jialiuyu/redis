@@ -39,7 +39,7 @@ mkdir -p "$RAWDIR"
 TSV=$OUTDIR/summary.tsv
 PIDFILE=/tmp/redis_vadd_baseline.pid
 
-printf 'N\tt\tc\ttxc\tops_sec\thits\tp50_ms\tp99_ms\tcpu_cores\trun_ops\tmem_base_mb\tmem_peak_mb\tmem_avg_mb\n' > "$TSV"
+printf 'N\tt\tc\ttxc\tops_sec\tavg_ms\tp50_ms\tp99_ms\tp999_ms\twire_KB_sec\tcpu_cores\trun_ops\tmem_base_mb\tmem_peak_mb\tmem_avg_mb\n' > "$TSV"
 declare -A OPS
 BEST_OPS=0; BEST_KEY=""
 
@@ -122,24 +122,29 @@ run_client() {
     rm -f "$mem_samples_file"
     cores=$(awk -v d=$(( j1 - j0 )) -v tt=$TEST_TIME 'BEGIN{ if(d<0) print "NA"; else printf "%.2f", d/100.0/tt }')
     local tot; tot=$(grep '^Totals' "$raw" | tail -1)
-    local ops hits p50 p99
-    ops=$(echo "$tot" | awk '{print $2}')
-    hits=$(echo "$tot" | awk '{print $3}')
-    p50=$(echo "$tot" | awk '{print $6}')
-    p99=$(echo "$tot" | awk '{print $7}')
+    # memtier --command 模式 Totals 行是 7 列（无 hits/misses）：
+    #   Type Ops/sec Avg Latency p50 p99 p99.9 KB/sec
+    local ops avg p50 p99 p999 wire
+    ops=$(echo "$tot"     | awk '{print $2}')
+    avg=$(echo "$tot"     | awk '{print $3}')
+    p50=$(echo "$tot"     | awk '{print $4}')
+    p99=$(echo "$tot"     | awk '{print $5}')
+    p999=$(echo "$tot"    | awk '{print $6}')
+    wire=$(echo "$tot"    | awk '{print $7}')
     local runops; runops=$(grep 'RUN #1 100%' "$raw" | grep -oE 'avg: *[0-9.,]+' | head -1 | grep -oE '[0-9.,]+')
     [ -z "$ops" ] && ops=0; [ -z "$runops" ] && runops=0
+    [ -z "$avg" ] && avg=0; [ -z "$p50" ] && p50=0; [ -z "$p99" ] && p99=0; [ -z "$p999" ] && p999=0; [ -z "$wire" ] && wire=0
     [ -z "$mem_base_mb" ] && mem_base_mb=0; [ -z "$mem_peak_mb" ] && mem_peak_mb=0; [ -z "$mem_avg_mb" ] && mem_avg_mb=0
     local eff=$ops
     awk "BEGIN{exit !($ops < 1)}" && [ "$runops" != 0 ] && eff=$runops
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$n" "$t" "$c" "$((t*c))" "$ops" "$hits" "$p50" "$p99" "$cores" "$runops" \
-        "$mem_base_mb" "$mem_peak_mb" "$mem_avg_mb" >> "$TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$n" "$t" "$c" "$((t*c))" "$ops" "$avg" "$p50" "$p99" "$p999" "$wire" \
+        "$cores" "$runops" "$mem_base_mb" "$mem_peak_mb" "$mem_avg_mb" >> "$TSV"
     local k="N${n}|t${t}|c${c}"
     OPS[$k]=$eff
     awk "BEGIN{exit !($eff > $BEST_OPS)}" && { BEST_OPS=$eff; BEST_KEY="$k"; }
-    printf '   N=%-2s t%-2s c%-2s  ops=%-12s hits=%-12s p50=%-8s cores=%-5s  mem=%s/%sMB\n' \
-        "$n" "$t" "$c" "$eff" "$hits" "$p50" "$cores" "$mem_base_mb" "$mem_peak_mb"
+    printf '   N=%-2s t%-2s c%-2s  ops=%-12s avg=%-9s p50=%-9s p99=%-9s p999=%-9s wire=%-10s cores=%-5s  mem=%s/%sMB\n' \
+        "$n" "$t" "$c" "$eff" "$avg" "$p50" "$p99" "$p999" "$wire" "$cores" "$mem_base_mb" "$mem_peak_mb"
 }
 
 log "vanilla redis VADD max-tput sweep — ${#NS[@]} N × ${#TS[@]} memtier pts = $(( ${#NS[@]}*${#TS[@]} )) runs (无 prefill, 固定 vector)"
