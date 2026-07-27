@@ -312,6 +312,7 @@ run_one_config() {
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" >> "$TSV"
     log "    => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores"
+    rm -f "$raw"  # TSV 已经记录, raw log 可删
 }
 
 # ============================================================================

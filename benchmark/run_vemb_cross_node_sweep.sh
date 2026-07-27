@@ -337,6 +337,8 @@ run_one_config() {
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$OP_TYPE" "$server_type" "$t" "$c" "$p" "$ops" "$avg" "$p50" "$p99" "$kb" "$cores" "$nic_util" >> "$TSV"
     log "    => ops/s=$ops  avg=${avg}ms  p50=${p50}ms  p99=${p99}ms  cores=$cores  ${NIC_IFACE}_util=${nic_util}%"
+    rm -f "$raw_local"
+    ssh "$CLIENT" "rm -f $raw_remote" 2>/dev/null
 }
 
 # ============================================================================
