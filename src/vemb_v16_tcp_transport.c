@@ -1063,6 +1063,48 @@ static void tcp_handle_peer_view_topology_control(vemb_v16_proxy_t *proxy,
     close(fd);
 }
 
+static void tcp_handle_aeron_alloc_channel(vemb_v16_proxy_t *proxy,
+                                           int fd,
+                                           uint32_t payload_len) {
+    vemb_v16_alloc_req_t req;
+    memset(&req, 0, sizeof(req));
+    uint8_t payload[8];
+    if (payload_len != vemb_v16_alloc_req_encoded_len() ||
+        vemb_v16_net_read_full(fd, payload, sizeof(payload)) != 0 ||
+        vemb_v16_alloc_req_decode(&req, payload, sizeof(payload)) != 0) {
+        close(fd);
+        return;
+    }
+
+    vemb_v16_channel_desc_t desc;
+    if (vemb_v16_proxy_alloc_shm_channel(proxy, &desc) != 0) {
+        tcp_write_status(fd, VEMB_V16_STATUS_ERR, 0);
+        close(fd);
+        return;
+    }
+
+    size_t desc_len = vemb_v16_channel_desc_encoded_len(&desc);
+    uint8_t *desc_buf = zmalloc(desc_len);
+    int write_rc = -1;
+    if (desc_buf &&
+        vemb_v16_channel_desc_encode(desc_buf,
+                                     desc_len,
+                                     &desc,
+                                     &desc_len) == 0) {
+        write_rc = vemb_v16_net_write_frame(fd,
+                                            VEMB_V16_NET_WELCOME,
+                                            0,
+                                            desc.channel_id,
+                                            0,
+                                            desc_buf,
+                                            (uint32_t)desc_len);
+    }
+    zfree(desc_buf);
+    if (write_rc != 0)
+        vemb_v16_proxy_close_channel_by_id(proxy, desc.channel_id);
+    close(fd);
+}
+
 /// TCP control plane: process one accepted TCP control or channel setup socket.
 void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     assert(proxy != NULL);
@@ -1163,6 +1205,10 @@ void vemb_v16_tcp_handle_fd(vemb_v16_proxy_t *proxy, int fd) {
     }
     if (hdr.type == VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET) {
         tcp_handle_peer_view_topology_control(proxy, fd, hdr.payload_len);
+        return;
+    }
+    if (hdr.type == VEMB_V16_NET_ALLOC_AERON_CHANNEL) {
+        tcp_handle_aeron_alloc_channel(proxy, fd, hdr.payload_len);
         return;
     }
 

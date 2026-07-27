@@ -391,11 +391,12 @@ void vemb_v16_close_warm_region(void *mapping_addr, size_t mapping_bytes);
 
 typedef struct vemb_v16_aeron_channel vemb_v16_aeron_channel_t;
 
-/* Allocate and map one channel via the UDS control plane.
- *   uds_path  — typically VEMB_V16_UDS_PATH ("/tmp/vemb_v16.sock")
+/* Allocate and map one channel via the control plane.
+ *   uds_path  — VEMB_V16_UDS_PATH ("/tmp/vemb_v16.sock") or
+ *               "tcp://host:port" for remote control-plane allocation
  *   dim       — vector dimension; server uses it to size ring slots
- * Returns NULL on any failure (UDS missing, alloc rejected, SHM open
- * error). Caller owns the returned handle and must release it with
+ * Returns NULL on any failure (control endpoint missing, alloc rejected,
+ * ring open error). Caller owns the returned handle and must release it with
  * vemb_v16_aeron_close(). */
 vemb_v16_aeron_channel_t *vemb_v16_aeron_open(const char *uds_path,
                                               uint32_t dim);
@@ -418,7 +419,7 @@ vemb_v16_aeron_channel_t *vemb_v16_aeron_open_remote(const char *host,
  * swallowed — the rings are still unmapped locally. */
 void vemb_v16_aeron_close(vemb_v16_aeron_channel_t *ch);
 
-/* Close every channel currently registered on the given UDS endpoint.
+/* Close every channel currently registered on the given control endpoint.
  * Returns the server-reported count closed (>= 0) or -1 on protocol
  * error. Intended for best-effort stale-state cleanup before a run. */
 int vemb_v16_aeron_close_all(const char *uds_path);

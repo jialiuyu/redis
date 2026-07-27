@@ -19,4 +19,5 @@ $ run
 ```
 - 先编译 client sdk : cd clients/c/ && make -j
 - 再编译 memtier_benchmark:  autoreconf -ivf && ./configure && make -j
+make -C clients/c -j && make -C memtier_benchmark -j
 ```

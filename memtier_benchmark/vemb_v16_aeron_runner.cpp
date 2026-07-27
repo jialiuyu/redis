@@ -499,9 +499,17 @@ run_stats vemb_v16_aeron_run(benchmark_config* cfg, object_generator* obj_gen) {
         exit(1);
     }
 
+    char control_endpoint[320];
     const char *uds_path = VEMB_V16_UDS_PATH;
     if (cfg->unix_socket && cfg->unix_socket[0]) {
         uds_path = cfg->unix_socket;
+    } else if (cfg->server && cfg->server[0] && cfg->port != 0) {
+        snprintf(control_endpoint,
+                 sizeof(control_endpoint),
+                 "tcp://%s:%u",
+                 cfg->server,
+                 (unsigned)cfg->port);
+        uds_path = control_endpoint;
     }
 
     /* Best-effort cleanup of any stale channels from a previous crashed run.

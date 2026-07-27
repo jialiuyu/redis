@@ -55,6 +55,7 @@ BG_TIME_SCALEOUT="${BG_TIME_SCALEOUT:-60}"
 PIPELINE="${PIPELINE:-32}"
 MEMTIER_T="${MEMTIER_T:-64}"
 MEMTIER_C="${MEMTIER_C:-4}"
+VNODE_COUNT="${VNODE_COUNT:-10}"
 
 # ============================================================================
 # Epoch（用时间戳避免与历史测试冲突）
@@ -416,6 +417,7 @@ ssh_run "$NODE1_HOST" "grep -E 'remote meta ready|registered.*remote meta|ub rpc
 log "Phase 3: Initial topology (active={0}, epoch=$INIT_EPOCH) + prefill"
 ssh_run "$NODE0_HOST" "cd $REMOTE_DIR && ./benchmark/vemb_v16_topology_ctl --set --transport tcp \
     --host $NODE0_HOST --port $PORT --epoch $INIT_EPOCH --min-write-epoch $INIT_EPOCH \
+    --vnode-count $VNODE_COUNT \
     --active 0 --standby 0 \
     --owner-endpoints 0=$NODE0_HOST:$PORT \
     --timeout-ms $CONTROL_TIMEOUT" || { echo "FAIL: initial topology"; exit 1; }
@@ -446,6 +448,7 @@ T0=$(date +%s)
 # 启动 coordinator（在 node0 上 setsid -f 后台跑）
 ssh_run "$NODE0_HOST" "cd $REMOTE_DIR && setsid -f ./benchmark/vemb_v16_topology_ctl \
     --coordinator-listen --transport tcp --host $NODE0_HOST --port $COORD_PORT \
+    --vnode-count $VNODE_COUNT \
     --expected-sources 0 --migration-epoch $MIGRATION_EPOCH --cutover-epoch $CUTOVER_EPOCH \
     --standby 0,1 --owner-endpoints 0=$NODE0_HOST:$PORT,1=$NODE1_HOST:$PORT \
     --wait-ms 60000 --timeout-ms $CONTROL_TIMEOUT >$COORD_OUT 2>$COORD_ERR </dev/null"
@@ -454,6 +457,7 @@ sleep 1
 # 发布候选拓扑到 node1
 ssh_run "$NODE1_HOST" "cd $REMOTE_DIR && ./benchmark/vemb_v16_topology_ctl --set --transport tcp \
     --host $NODE1_HOST --port $PORT --epoch $MIGRATION_EPOCH --min-write-epoch $MIGRATION_EPOCH \
+    --vnode-count $VNODE_COUNT \
     --active 0 --standby 0,1 --dual-write --auto-scaleout --coordinated-scaleout \
     --owner-endpoints 0=$NODE0_HOST:$PORT,1=$NODE1_HOST:$PORT \
     --coordinator-endpoint $NODE0_HOST:$COORD_PORT --timeout-ms $CONTROL_TIMEOUT"
@@ -462,6 +466,7 @@ ssh_run "$NODE1_HOST" "cd $REMOTE_DIR && ./benchmark/vemb_v16_topology_ctl --set
 ssh_run "$NODE0_HOST" "cd $REMOTE_DIR && ./benchmark/vemb_v16_topology_ctl \
     --set-with-peer-view-map $NODE0_PEER_MAP --transport tcp \
     --host $NODE0_HOST --port $PORT --epoch $MIGRATION_EPOCH --min-write-epoch $MIGRATION_EPOCH \
+    --vnode-count $VNODE_COUNT \
     --active 0 --standby 0,1 --dual-write --auto-scaleout --coordinated-scaleout \
     --owner-endpoints 0=$NODE0_HOST:$PORT,1=$NODE1_HOST:$PORT \
     --coordinator-endpoint $NODE0_HOST:$COORD_PORT --timeout-ms $COMBINED_TIMEOUT"
