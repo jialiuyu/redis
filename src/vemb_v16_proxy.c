@@ -1664,7 +1664,28 @@ static void proxy_io_channel_deactivate(vemb_v16_channel_t *ch) {
         shutdown(ch->net_fd, SHUT_RDWR);
 }
 
+#define VEMB_V16_PROXY_AFFINITY_INTERLEAVED 0
+#define VEMB_V16_PROXY_AFFINITY_GROUPED 1
+
+#ifndef VEMB_V16_PROXY_AFFINITY_MODE
+#define VEMB_V16_PROXY_AFFINITY_MODE VEMB_V16_PROXY_AFFINITY_INTERLEAVED
+#endif
+
+#if VEMB_V16_PROXY_AFFINITY_MODE != VEMB_V16_PROXY_AFFINITY_INTERLEAVED && \
+    VEMB_V16_PROXY_AFFINITY_MODE != VEMB_V16_PROXY_AFFINITY_GROUPED
+#error "VEMB_V16_PROXY_AFFINITY_MODE must be 0 (interleaved) or 1 (grouped)"
+#endif
+
+static const char *proxy_worker_affinity_mode_name(void) {
+#if VEMB_V16_PROXY_AFFINITY_MODE == VEMB_V16_PROXY_AFFINITY_GROUPED
+    return "grouped";
+#else
+    return "interleaved";
+#endif
+}
+
 #ifdef __linux__
+
 static uint32_t proxy_get_available_cpus(int *cpus, uint32_t cap) {
     if (cap == 0)
         return 0;
@@ -1691,18 +1712,29 @@ static uint32_t proxy_available_cpu_count(void) {
     return online > 0 ? (uint32_t)online : 1u;
 }
 
-static void proxy_set_interleaved_worker_affinity(vemb_v16_proxy_t *proxy,
-                                                  uint32_t worker_id,
-                                                  uint32_t lane) {
+static void proxy_set_worker_affinity(vemb_v16_proxy_t *proxy,
+                                      uint32_t worker_id,
+                                      uint32_t lane) {
     int cpus[CPU_SETSIZE];
     uint32_t cpu_count = proxy_get_available_cpus(cpus, CPU_SETSIZE);
-    uint32_t required = 2u * proxy->proxy_io_worker_count;
+    uint32_t required;
+#if VEMB_V16_PROXY_AFFINITY_MODE == VEMB_V16_PROXY_AFFINITY_GROUPED
+    required = proxy->proxy_io_worker_count + proxy->supernode_worker_count;
+#else
+    required = 2u * proxy->proxy_io_worker_count;
     if (proxy->supernode_worker_count > proxy->proxy_io_worker_count)
         required = 2u * proxy->supernode_worker_count;
+#endif
     if (cpu_count == 0 || required > cpu_count)
         return;
 
+#if VEMB_V16_PROXY_AFFINITY_MODE == VEMB_V16_PROXY_AFFINITY_GROUPED
+    uint32_t cpu_index = lane == 0
+        ? worker_id
+        : proxy->proxy_io_worker_count + worker_id;
+#else
     uint32_t cpu_index = worker_id * 2u + lane;
+#endif
     if (cpu_index >= cpu_count)
         return;
 
@@ -1711,11 +1743,12 @@ static void proxy_set_interleaved_worker_affinity(vemb_v16_proxy_t *proxy,
     CPU_SET(cpus[cpu_index], &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 }
+
 #endif
 
 static void proxy_io_set_affinity(vemb_v16_proxy_t *proxy, uint32_t worker_id) {
 #ifdef __linux__
-    proxy_set_interleaved_worker_affinity(proxy, worker_id, 0);
+    proxy_set_worker_affinity(proxy, worker_id, 0);
 #else
     (void)proxy;
     (void)worker_id;
@@ -1725,7 +1758,7 @@ static void proxy_io_set_affinity(vemb_v16_proxy_t *proxy, uint32_t worker_id) {
 static void supernode_worker_set_affinity(vemb_v16_proxy_t *proxy,
                                           uint32_t worker_id) {
 #ifdef __linux__
-    proxy_set_interleaved_worker_affinity(proxy, worker_id, 1);
+    proxy_set_worker_affinity(proxy, worker_id, 1);
 #else
     (void)proxy;
     (void)worker_id;
@@ -3077,7 +3110,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
         goto cleanup;
     }
 
-    serverLog(LL_NOTICE, "vemb_v16 server ready: uds_enabled=%s uds=%s tcp_enabled=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s",
+    serverLog(LL_NOTICE, "vemb_v16 server ready: uds_enabled=%s uds=%s tcp_enabled=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u affinity=%s dim=%u max_vectors=%u vector_region=%s",
               proxy->uds_enabled ? "yes" : "no",
               proxy->uds_path,
               proxy->tcp_enabled ? "yes" : "no",
@@ -3085,6 +3118,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
               proxy->tcp_port,
               proxy->proxy_io_worker_count,
               proxy->supernode_worker_count,
+              proxy_worker_affinity_mode_name(),
               proxy->vector_dim,
               proxy->max_vectors,
               vemb_v16_storage_vector_region_name(proxy_storage(proxy)));

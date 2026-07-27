@@ -4,53 +4,66 @@
 
 ### 2.1 目的
 
-本文档用于概述 hpc-redis 在推荐特征向量场景下的架构设计。文档重点说明 hpc-redis 如何从原生 Redis 通用命令路径，演进为面向固定向量读写和相似度计算的 VEMB V16 专用数据面，并梳理系统分层、模块分解、关键时序、设计约束、关键优化设计与性能收益。
+本文档用于概述 HPC-Redis Server 在推荐特征向量场景下的架构设计。文档重点说明 HPC-Redis Server 如何从原生 Redis 通用命令路径，演进为面向固定向量读写和相似度计算的专用数据面，并梳理系统分层、模块分解、关键时序、设计约束、关键优化设计与性能收益。
 
 ### 2.2 背景
-原生 Redis 的优势是通用命令语义、对象模型和主线程串行一致性；但在固定形态向量负载下，RESP 解析、Redis command dispatch、module callback、blocked-client/unblock、对象封装和主线程执行面会共同限制吞吐。hpc-redis 因此把向量热路径拆出，形成：
+推荐特征服务的主要数据是固定维度的向量，访问模式表现为“读多写少”：系统需要持续读取向量用于召回、排序和相似度计算，同时接收少量更新以保持特征新鲜。与通用键值数据相比，这类负载的数据形态和操作类型相对固定，性能关键不在于支持更多数据类型，而在于以更低的固定开销完成向量的定位、搬运和计算。
 
-hpc-redis 面向高并发推荐特征访问场景. 读侧通过 `VEMB` 获取向量 handle 或 inline payload，写侧通过 `VADD` 更新已有向量。该比例用于模拟推荐特征服务中“高频召回/查询 + 持续特征更新”的主路径：大部分请求读取 embedding 参与召回、排序或相似度计算，少量请求写入或覆盖最新特征，要求读路径保持低延迟，同时写路径不能破坏已有 handle、slot generation 和迁移一致性。
+原生 Redis 以通用性为优先，单次请求通常要经过文本协议解析、命令分派、对象封装以及主线程执行等环节。这些环节保证了广泛的命令语义和一致性，但会把与向量无关的处理成本重复带入每一次访问，并使并发请求在共享执行面上相互影响。因此，直接沿用通用 Redis 路径难以同时满足推荐场景对高吞吐、低延迟和持续更新的要求。
 
-client/bench 根据 `vector_key` 构建 consistent hash ring 并选择 endpoint；server 侧保持无拓扑、无二次 hash。该模型降低 proxy 复杂度，代价是 CLI/bench/未来 client 必须共享同一 ring 规则。
+hpc-redis 的核心思想是将固定向量访问从通用命令路径中分离出来，构建面向向量的专用数据面：客户端先依据键确定负责该数据的节点，请求经 TCP 或 Aeron 传输通道到达 proxy；proxy 完成协议解析和请求汇聚后，以轻量请求引用批量提交给 SuperNode，SuperNode 再批量获取请求，由多个工作线程调用 TLC 访问向量元数据和一致性状态，并通过 UB storage 读取或写入向量内容，完成读、写和相似度计算；执行结果写入 completion queue 后，由 proxy 批量取回并通过原传输通道返回客户端。向量内容按固定长度连续存放，键的版本、位置和有效性等少量信息留在节点本地内存中。这样，常态请求只需完成一次路由、一次本地定位和必要的数据访问，避免在主线程中反复进行通用对象处理。
 
-```text
-clienC
-  -> Consistent Hash(key)
-  -> TCP or Aeron channel
-  -> proxy I/O worker pool
-  -> SuperNode worker pool
-  -> TLC local storage / UB warm payload / remote meta
-  -> completion / response
-
-server:
-  Proxy 0 <-> SuperNode 0
-  Proxy 1 <-> SuperNode 1
-  ...
-  Proxy N <-> SuperNode N
-```
+读请求根据运行环境采用两种交付方式：跨机器访问直接返回完整向量，同机共享内存访问只返回向量位置，由客户端直接读取数据。两者都表达同一个语义，即返回当前有效版本的向量。写入和节点扩展则通过版本推进与访问切换控制，确保数据迁移期间不会返回旧向量，也不会因并行读写丢失更新。由此，hpc-redis 在保持 Redis 易用访问方式的同时，把通用性让位于固定向量场景所需要的并行执行、低数据搬运开销和可扩展性。
 
 ## 3 设计约束
 
 ### 3.1 遵循标准/协议
 
-- VEMB V16 自定义二进制协议：`VEMB_V16_MAGIC`、`VEMB_V16_VERSION`、固定 frame type 与 data op，定义在 `src/vemb_v16_protocol.h`。
+- HPC-Redis Server 自定义二进制协议：`VEMB_V16_MAGIC`、`VEMB_V16_VERSION`、固定 frame type 与 data op，定义在 `src/vemb_v16_protocol.h`。
 - TCP transport 第一阶段使用 persistent connection + binary frame，支持 `HELLO/WELCOME/REQUEST/RESPONSE/STATS/CLOSE` 等 frame。
 - Aeron 路径保留 handle/mmap 语义，TCP 路径下完整向量读取使用 `VEMB_V16_OP_VEMB_INLINE`。
 - 多 endpoint 路由使用 client-side consistent hash，virtual node hash 使用 `vemb_v16_murmur3()`。
 - 默认向量维度为 300，协议上限为 `VEMB_V16_MAX_DIM`。
 
-### 3.2 约束/限制
+### 3.2 限制与约束
 
-- proxy 不持有全局拓扑，不读写 WARM/COLD，不执行向量计算。
-- SuperNode owns execution；当前部分初始化路径仍在 proxy 创建阶段承载 storage/TLC，但语义目标是 SuperNode owns storage。
-- `region_id` 是外部稳定 warm region 身份，`region_index` 是 server 本地数组下标，不能混用。
-- WARM handle 永远指向 WARM data region，不直接暴露 COLD handle；COLD read-through 需要先 promote 到 WARM。
-- TCP 下 `VEMB_HANDLE` 不作为跨主机读完整 vector 的语义；完整 payload 返回由 inline response 承担。
-- Aeron 模式需要运行在满足 UB 直连或本机共享内存直连条件的环境中，client 必须能够 attach/mmap 对应 WARM data region；不满足该条件时应使用 TCP inline payload 语义。
-- 迁移、tombstone、source fence、owner generation 必须共同防止 cutover/source-gc 期间读到旧位置。
+本系统将“请求如何到达 Server”和“向量内容如何交付给 CLI”分开约束。所有 HPC-Redis 使用的 UB Region 都是共享数据区域，不是每个进程各自维护的本地副本；参与同一数据面的 Server 组件必须映射相同的 UB Region，并使用一致的 region layout、向量维度和访问参数。TCP 可以跨机器传输完整向量；Aeron 只传递请求和 handle，向量仍保留在 Server 与 CLI 都能访问的共享 UB.MEM 中。因此，Aeron 的低复制能力以共享映射、客户端实现和版本校验共同满足为前提，不能把它当作普通 TCP 连接使用。
+
+**通用架构边界**
+
+- Client / CLI 负责根据 key 选择 owner，并遵循统一的路由规则；Proxy 不维护全局拓扑，不进行二次 hash 或跨节点 fan-out。
+- Proxy 只负责连接、协议解析、任务提交和结果返回，不负责 key 版本判断、向量计算或 WARM/COLD 数据访问；这些工作由 SuperNode 和 TLC 完成。
+- `location cache` 只缓存 key 到向量位置的小型元数据，不能作为永久有效的 handle。缓存命中后仍必须校验 key 版本、slot 状态、`write_seq` 和 `owner_generation`。
+- WARM handle 只能指向 WARM data region。COLD/overflow 中的数据必须先提升到 WARM 并发布为稳定 slot，才能向客户端返回 handle。
+- `region_id` 是对外稳定的 WARM region 身份，`region_index` 只是 Server 进程内的数组下标；CLI、协议和迁移信息中不能混用二者。
+
+**Aeron 模式的使用前提**
+
+- CLI 与 HPC-Redis Server 必须处于同机或具备 UB 直连能力的环境，并且双方都能映射同一份 UB WARM region；CLI 不能映射自己的副本，也不能只映射 Aeron ring 而不映射向量所在的 Region。不具备共享映射条件时，必须使用 TCP `VEMB_INLINE`。
+- CLI 必须使用 Server 发布的 region 描述建立 Aeron request/response ring 和 WARM region 映射，不能自行猜测 region 路径、映射偏移、容量或向量长度。请求和响应协议版本、向量维度、`value_size` 也必须一致。
+- Server 返回的 `VEMB_HANDLE` 是带版本的位置描述，不是永久指针，也不代表 CLI 获得了该 slot 的所有权。CLI 只能按 `region_id`、`local_slot`、`offset` 和 `bytes` 在已映射区域内读取，不能写入、释放或复用 Server 管理的 slot。
+- CLI 必须检查 handle 的边界和长度，确认 `offset + bytes` 位于对应 WARM region 内，且 `bytes` 与约定的向量维度一致。`region_id`、`local_slot` 或 `owner_generation` 不匹配时，不能继续解引用。
+- CLI 不得长期保存并重复使用旧 handle。Server 重启、region 重新创建、数据删除、覆盖写或迁移后，旧 handle 都可能失效，CLI 必须重新发起 `VEMB_HANDLE` 获取新的位置描述。
+
+**并发访问与结果一致性**
+
+一致性保证建立在“先发布稳定状态，再允许读取”的规则上。Server 写入 payload 时先将 slot 置为写入状态，并将 `write_seq` 变为奇数；向量 bytes 和 slot 元数据全部写完后，再以发布语义将 `write_seq` 更新为偶数并将 slot 置为 `READY`。Server worker、Aeron CLI 和其他共享映射读者都必须在读取前后检查 `write_seq`，只有两次读取相同且均为偶数时才接受结果。
+
+| 场景 | Server 侧处理 | CLI/请求侧行为 | 一致性结果 |
+| --- | --- | --- | --- |
+| 并发覆盖写 | `write_seq` 进入写入状态，完成后发布新稳定版本 | 读取前后版本不一致时丢弃本次读取并重试 | 不返回半写或混合版本的向量 |
+| `location cache` 过期 | 通过 key 版本、slot 状态和 owner 版本拒绝旧位置，并重新定位 | 不把 cache 命中直接当作成功结果 | 不返回已经失效的缓存位置 |
+| `VREM` 删除 | 推进 key 版本、写入 tombstone，并使旧 slot/旧位置不可见 | 收到 miss 或重试结果后重新获取状态 | 删除完成后旧 handle 不能继续读出向量 |
+| owner 迁移或拓扑切换 | 使用 topology epoch、source fence 和 `owner_generation` 控制旧 owner 与新 owner 的可见范围 | 遇到 redirect、retry 或版本不一致时重新路由并获取 handle | 不在 cutover 或 source 回收期间返回旧 owner 数据 |
+| Aeron region 重建 | 使旧 region 身份或 generation 失效，重新发布可用 region 描述 | 重新映射 region 并重新获取 handle | 不解引用已被重建或复用的共享区域 |
+
+因此，TCP `VEMB_INLINE` 的成功结果表示 Server 已复制出一个稳定的完整向量快照；Aeron `VEMB_HANDLE` 的成功结果表示 Server 已发布一个经过校验的稳定位置，CLI 还必须按同一套 slot 状态、`write_seq` 和 `owner_generation` 规则完成实际读取。Aeron handle 描述的是可校验的位置和版本，不是获取时刻的不可变数据副本：如果 CLI 获取 handle 后、真正读取前发生了同一 slot 的覆盖写，CLI 在重新校验通过后会读取该 slot 的最新稳定 payload；如果数据因删除或迁移而转移到新位置，旧 handle 会因版本或 owner 校验失败，CLI 必须重新获取 handle。由此，Aeron CLI 最终接受的是读取校验时的最新有效版本，而不是旧 handle 对应的过期版本。并发更新、删除或迁移发生时，系统通过放弃当前结果并重试来保证不返回错误版本，而不是阻塞所有读写请求。
 
 ## 3 第一层设计描述
+本章在总体架构的基础上，进一步说明 hpc-redis 单个服务器内部的组件级组织方式。组件图按请求处理方向展开：Transport Layer 提供两种传输模式，一种是基于 TCP 协议的通用路径，另一种是面向高性能场景、基于 UB 的 Aeron 路径；Proxy Layer 负责连接管理、I/O 和请求分派，Queue Layer 通过 `Job Queue` 与 `Completion Queue` 解耦接入和执行，SuperNode worker pool 批量消费请求并调用 TLC/TLC Core 访问键元数据、位置缓存和 UB.MEM 中的向量内容。请求沿队列向下执行，结果经完成队列向上返回 proxy，形成从协议接入、批量调度到存储访问和结果回传的完整闭环。
+
 ### 3.1 架构图
+![arch_1](docs/svg/supernode_arch_2.drawio.svg)
 ```mermaid
 flowchart TB
     subgraph L0[Client / Route Layer]
@@ -80,10 +93,10 @@ flowchart TB
         CORE[tlc_core]
         LC[location cache]
         KM[key meta shards]
-        WM[warm slot metadata]
     end
 
     subgraph L5[Payload Layer]
+        WM[warm slot metadata]
         UB[UB packed vector regions]
         COLD[optional COLD / overflow layer]
     end
@@ -113,64 +126,161 @@ flowchart TB
 
 ### 3.2 总体结构解释
 
+本节从一次请求的完整生命周期说明各层之间的职责边界。系统将“请求接入、任务调度、向量定位、数据访问和结果返回”拆分为相互协作但相对独立的组件：客户端负责确定数据归属，Transport/Proxy 负责可靠接入，队列负责批量转交，SuperNode 负责执行操作，TLC 负责存储访问与一致性判断，UB.MEM 负责承载固定长度的向量内容。控制信息与向量 payload 分离，跨组件传递轻量引用而不是反复复制完整向量，从而同时缩短常态读路径并保留并行扩展空间。
+
+该结构的基本数据流为：客户端按键选择目标节点，经 TCP 或基于 UB 的 Aeron 通道发送请求；proxy 完成协议解析和轻量校验后，将请求引用批量写入 `Job Queue`；SuperNode worker 批量取出请求，调用 TLC 定位并校验向量，再从 UB.MEM 读取或写入 payload，必要时执行相似度计算；执行结果写入 `Completion Queue`，由 proxy 批量取回并经原 Transport 返回客户端。请求队列承载执行方向的数据流，完成队列承载返回方向的数据流，二者共同隔离网络抖动与存储计算，避免任一层承担不属于自身的职责。
+
 #### 3.2.1 Client / Route
 
-`CLI` 负责生成 `VADD/VEMB/VREM/VSIM` 请求，并在多 endpoint 场景下根据 `client-side consistent_hash(key)` 选择目标 endpoint。
+`CLI`、benchmark 和未来 client 负责生成 `VADD/VEMB/VREM/VSIM` 请求，并根据 key 选择负责该数据的 endpoint。单 endpoint 时，客户端直接发送请求；多 endpoint 时，客户端使用一致性哈希将 key 映射到节点，使同一 key 的读写和计算尽量落在同一 owner 上。
 
-多 SuperNode 场景采用 client-side consistent hash，server 内 proxy 不做二次 hash、不维护全局拓扑、不执行 fan-out。每个 endpoint 只处理自己负责的 key 范围，跨 owner 操作通过 remote meta、UB lookup 和迁移控制面解决。
+路由由客户端完成，server 内 proxy 不进行二次 hash、不维护全局拓扑，也不执行 fan-out。每个 endpoint 只处理自身负责的 key 范围；跨 owner 的查询、相似度计算和迁移修复通过 remote meta、UB lookup 与迁移控制面完成。这样可以把拓扑判断从每个请求的服务端热路径移除，使 SuperNode 专注于本地执行。
 
-该设计把横向扩展的复杂度前移到 client/bench/CLI 的 route 规则中，换取 server 数据面更短的热路径。proxy 不需要在每个请求上做拓扑判断，SuperNode 也可以围绕本地 owner 状态优化 cache 和锁粒度。扩容时，source fence、owner generation、tombstone、epoch/barrier 共同保证 cutover/source-gc 期间不会从旧源位置返回 stale payload。
+该设计的代价是所有客户端必须遵循同一套路由规则，扩容时还需要同步更新路由 epoch。迁移期间，source fence、owner generation、tombstone 和版本信息共同约束旧 owner 与新 owner 的可见范围，宁可触发重试或重路由，也不能返回已经失效的 payload。后续优化重点是降低路由更新和重试的控制面开销，并保持正常请求不进入拓扑判断路径。
 
-#### 3.2.2 Protocol / Transport
-协议层由 VEMB V16 request/response 语义与 transport 共同组成，当前主要包括 TCP 和 Aeron 两类路径。两种 transport 都使用统一的 request/response encode、decode 逻辑，只是在承载介质和 payload 返回方式上不同。
-- TCP 模式: 通信协议走 TCP 协议栈；在 vemb 读取数据时 `VEMB_INLINE` 成功响应返回 response metadata 并携带完整 300 维 FP32 向量数据
-- Aeron 模式: 通信协议走 UB 通信协议, 基于 ub 实现的 ring 交换 request/response。`VEMB_HANDLE` 返回 `{region_id, offset, bytes}`，client mmap warm region 后本地读取 payload。完整 vector 不随 response ring 返回，而是留在 UB payload region 中，因此更适合本机高吞吐。
+#### 3.2.2 Protocol / Operation Semantics
+协议层定义 HPC-Redis Server 数据面的四类基本操作。它们描述“对向量做什么”，与 TCP 或 Aeron 所描述的“如何传输”相互独立：客户端先生成一种操作请求，随后由 Transport 承载、Proxy 分派、SuperNode 执行，最后通过 completion 返回状态或结果。
 
-#### 3.2.3 Proxy
+| 指令 | 作用 | 请求内容 | 成功结果 |
+| --- | --- | --- | --- |
+| `VADD` | 新增或覆盖一个 key 对应的向量 | key + 固定维度 vector payload | status，以及新向量的 handle 元数据 |
+| `VEMB` | 按 key 读取向量 | key；返回方式由 transport 决定 | `VEMB_INLINE` 返回完整 vector，或 `VEMB_HANDLE` 返回位置描述 |
+| `VREM` | 删除一个 key 对应的向量 | key 和版本/拓扑信息，不携带 vector payload | status，以及删除后的版本或控制信息 |
+| `VSIM` | 读取向量并计算相似度 | `VSIM_INLINE` 携带 query vector 和目标 key；`VSIM_KEY_KEY` 携带两个 key | similarity score，以及必要的 status 或 redirect 元数据 |
 
-proxy 负责接入、channel 生命周期、frame parse、job dispatch、completion drain 和 response write。
+四类操作分别覆盖推荐特征服务的写入、读取、删除和相似度计算主路径。`VADD` 负责建立或更新 key 到向量位置的映射，`VEMB` 负责向客户端交付向量，`VREM` 负责删除数据并阻断旧位置继续被读取，`VSIM` 将向量读取和计算合并在 SuperNode 内完成，避免客户端先取向量再发起第二次计算请求。
 
-```text
-vemb_v16_proxy
-  proxy I/O worker pool
-  per-channel lifecycle / backlog / completion boundary
+其中，`VEMB_INLINE` 和 `VEMB_HANDLE` 是 `VEMB` 的两种返回语义，而不是两种独立的业务操作：TCP 模式使用 `VEMB_INLINE`，成功响应携带完整的 300 维 FP32 vector；Aeron 模式使用 `VEMB_HANDLE`，响应只携带 `{region_id, offset, bytes, owner_generation}` 等位置和版本信息，由客户端映射 UB.MEM 后读取 payload。类似地，`VSIM_INLINE` 与 `VSIM_KEY_KEY` 表示两种输入形式，前者由请求直接携带 query vector，后者由 SuperNode 根据两个 key 定位向量，必要时通过 remote meta 和 UB lookup 获取远端数据。
+
+所有操作都遵循统一的请求和响应边界：请求首先经过协议字段、长度、操作类型和向量维度校验；执行阶段由 SuperNode 调用 TLC 完成位置定位、版本判断和数据访问；响应通过 `Completion Queue` 返回 status、handle、payload snapshot 或 similarity score。这样，协议操作语义保持稳定，TCP/Aeron 只改变承载方式和 payload 的交付方式。
+
+#### 3.2.3 Protocol / Transport
+在操作语义确定后，Transport 负责选择请求和响应的具体承载方式，不改变 `VADD/VEMB/VREM/VSIM` 的业务含义，只改变请求的传输介质和 payload 的交付路径。
+
+TCP 模式面向通用的跨机器访问。客户端通过 TCP 持久连接发送 `VEMB` 请求，proxy 解析后交给 SuperNode；SuperNode 经 TLC 定位并校验向量，从 UB.MEM warm region 读取完整 payload，最后通过 completion queue 返回 proxy。读取成功时使用 `VEMB_INLINE`，TCP response 同时携带响应状态、必要的 metadata 和完整的 300 维 FP32 向量，客户端收到 response 即获得可直接使用的全量数据。由于 TCP 对端通常不能直接访问服务端的 UB.MEM 地址，因此 TCP 的完整向量读取不能用只返回位置的 handle 代替。
+
+Aeron 模式面向同机或具备 UB 直连条件的高性能场景。客户端通过基于 UB 的 Aeron ring 发送请求，proxy 和 SuperNode 的执行过程与 TCP 模式保持一致，但 SuperNode 完成读取后使用 `VEMB_HANDLE` 返回 `{region_id, offset, bytes, owner_generation}` 等位置和版本信息，不将完整向量复制到 response ring。客户端根据 handle 映射对应的 UB.MEM warm region，再按 offset 直接读取 payload；因此，response 只传递小型控制信息，向量内容留在共享的 UB.MEM 区域中，适合追求高吞吐和低数据搬运开销的场景。
+
+两种模式的共同点是：请求都经过统一的 HPC-Redis Server 编解码、proxy 分派、SuperNode 执行和 completion 返回流程，TLC 都负责向量位置和版本有效性判断。区别在于数据交付边界：TCP 的 `VEMB_INLINE` 将全量 payload 交付给客户端，适合跨机器访问；Aeron 的 `VEMB_HANDLE` 只交付可校验的位置，客户端通过 UB.MEM 共享映射取得 payload，适合高性能本机访问。Transport 还负责连接或 ring 的建立、背压、批量读写和异常关闭，不能把这些状态管理下沉到 SuperNode。
+
+| 对比项 | TCP 模式 | Aeron 模式 |
+| --- | --- | --- |
+| 主要场景 | 通用跨机器访问 | 同机或 UB 直连的高性能访问 |
+| VEMB 返回模式 | `VEMB_INLINE` | `VEMB_HANDLE` |
+| response 内容 | 状态、metadata 和完整 300 维向量 | 状态、`region_id/offset/bytes/owner_generation` 等 handle |
+| payload 获取 | 客户端从 TCP response 直接获得 | 客户端 mmap UB.MEM warm region 后按 handle 读取 |
+| 主要代价 | 网络回传和约 `1200B` payload 拷贝 | 需要共享映射和 handle 有效性校验 |
+
+后续优化将围绕 TCP 的持久连接、批量 encode/decode、pipeline，以及 Aeron 的 ring poll、批量发布和 handle 读取展开；性能评估时必须分别注明两种返回语义，不能将 TCP 全量向量交付能力与 Aeron handle 吞吐直接视为同一指标。
+
+#### 3.2.4 Proxy
+
+Proxy 位于 Transport 与 SuperNode 之间，是外部通信状态与内部执行状态的边界层。它不决定 key 的 owner，也不参与向量存储和计算，只负责把 TCP/Aeron 上的协议请求转换为可调度的内部任务，并把 SuperNode 产生的完成结果转换回对应 Transport 的响应。这样，连接数量、网络事件和慢客户端不会直接进入向量执行和 TLC 控制面。
+
+请求进入时，proxy I/O worker 从 TCP socket 或 Aeron ring 批量读取 frame，完成 magic、version、长度、操作类型和基本请求形状等协议级校验，维护 channel 生命周期，并将完整请求写入 job pool slot。随后，proxy 只向对应的 `Job Queue` 发布轻量 `job_ref`，不在 I/O 线程中调用 TLC、不读取 UB.MEM，也不执行 `VADD/VEMB/VSIM` 的实际操作。请求的版本裁决、slot 状态检查和完整操作语义由 SuperNode/TLC 负责。
+
+结果返回时，proxy 从 `Completion Queue` 批量取出执行结果，根据 `req_id` 和 channel 关联原请求，按 Transport 选择响应格式：TCP `VEMB_INLINE` 需要写回完整 payload snapshot，Aeron `VEMB_HANDLE` 只需写回位置和版本描述。proxy 负责 response encode、批量发布和 socket/ring 写回；对于暂时不可写的 channel，结果保存在对应 backlog 中，并通过回压限制继续接收的请求，避免慢客户端耗尽全局执行资源。
+
+Proxy 的职责边界可以概括为“搬运和调度，不做数据裁决”：它拥有 channel、I/O worker、job 发布、completion 回收和 response backlog；SuperNode 拥有任务执行，TLC 拥有向量定位与一致性，UB.MEM 拥有 payload 存储。后续优化主要包括 I/O worker 与 SuperNode worker 的池化解耦、epoll/ring poll 批量事件处理、request/job/completion/response 的端到端 batch、per-channel 回压，以及减少 inline snapshot 在 backlog 和 response 路径上的重复复制。
+
+#### 3.2.5 Job Queue
+
+`Job Queue` 是 Proxy 到 SuperNode 的请求调度边界，负责把已经完成协议解析的请求交给合适的 SuperNode worker。队列按 `proxy_worker x supernode_worker` 划分 shard，使不同 worker 之间可以并行消费，同时避免所有请求争用一条全局队列。它只负责传递可调度的请求引用，不负责向量定位、payload 存储或业务语义判断。
+
+Proxy 收到请求后，将完整内容写入预分配的 `job pool` slot。slot 保存操作类型、key、hash、flags、topology epoch、req_id 以及必要的 vector payload；队列中只发布轻量 `job_ref`，由 proxy worker、pool type、slot id、generation、req_id 和 op 等字段组成。SuperNode worker 批量取得 `job_ref` 后，根据 slot id 和 generation 找回完整请求，再调用 TLC 执行。这样，约 `1200B` 的 vector payload 不需要在多个 worker 队列之间重复复制，slot generation 也能防止请求完成后旧引用访问已经复用的 slot。
+
+`Job Queue` 的处理方向是 `Proxy -> SuperNode`：Proxy 批量发布请求引用，SuperNode 批量取出并执行。批量化将每条请求的队列发布和消费固定成本摊薄，同时使 worker 可以连续处理同一批请求，减少线程切换和跨核同步。队列容量耗尽时，Proxy 需要根据队列状态暂停或放慢请求接收，避免无界积压扩大内存和延迟。
+
+后续优化将集中在 request/job_ref 的 batch poll/publish、job pool 复用、queue shard 的负载均衡、slot generation 生命周期管理，以及进一步减少大对象跨线程复制。
+
+#### 3.2.6 Completion Queue
+
+`Completion Queue` 是 SuperNode 到 Proxy 的结果回传边界，与 `Job Queue` 方向相反。SuperNode worker 完成 TLC 访问或相似度计算后，将执行结果写入对应的 completion；completion 至少包含 status、req_id 和操作结果，并可按操作携带 handle、完整 payload snapshot、similarity score、redirect 或 retry 信息。队列本身不负责生成客户端 response，只负责安全、有序地把执行结果交给 Proxy。
+
+Completion 通过 `req_id` 关联原始请求，通过 channel 信息确定返回连接。Proxy 批量取出 completion 后，按照 Transport 选择最终格式：TCP `VEMB_INLINE` 将完整 payload snapshot 编码到 response，Aeron `VEMB_HANDLE` 只编码位置和版本信息；随后 Proxy 再按 channel 写回客户端。对于暂时不可写的 channel，completion 或已编码 response 保存在对应 backlog 中，并通过回压限制新的请求进入，避免慢客户端阻塞其他 channel 和 SuperNode worker。
+
+`Completion Queue` 的处理方向是 `SuperNode -> Proxy`：SuperNode 只发布已经完成的结果，Proxy 负责关联请求、编码响应和传输回写。它把执行线程与网络回写解耦，使 SuperNode 不需要等待 socket 可写，也使同一批完成结果可以被 Proxy 一次性处理。后续优化重点是 completion 的批量发布与批量取回、不同响应类型的内存复用、TCP inline snapshot 的复制次数、Aeron handle 的轻量化，以及 queue 满载时的回压和丢弃策略。
+
+#### 3.2.7 Worker / SuperNode
+
+Worker / SuperNode 是 HPC-Redis Server 的实际执行层，负责把 `Job Queue` 中的请求转换为向量存储操作或相似度结果。worker pool 按 queue shard 批量取出 `job_ref`，恢复 job pool 中的完整请求后，先完成操作类型、key、向量维度和 payload 大小等必要校验，再按照操作类型调用 TLC。执行完成后，worker 将 status、handle、payload snapshot 或 similarity score 写入 `Completion Queue`，不直接操作客户端连接。
+
+四类操作在该层的执行职责不同：
+
+- `VADD`：将输入的固定维度向量交给 TLC，由 TLC 完成版本判断、slot 选择或复用、metadata 更新以及向 UB.MEM 写入 payload。
+- `VREM`：按 key 删除向量，推进版本和 tombstone 状态，阻断旧 location 继续被读出；该操作不携带 vector payload。
+- `VEMB`：按 key 获取稳定的向量位置。TCP `VEMB_INLINE` 需要从 UB.MEM 复制完整 payload snapshot，Aeron `VEMB_HANDLE` 只返回经过校验的 handle。
+- `VSIM`：在 SuperNode 内完成向量读取和相似度计算。`VSIM_INLINE` 使用请求携带的 query vector，`VSIM_KEY_KEY` 根据两个 key 定位向量，必要时通过 TLC 获取远端 handle 或 snapshot。
+
+一次任务的执行顺序可以概括为“批量取任务、校验请求、调用 TLC、访问 payload、执行计算、发布 completion”。TLC 负责位置解析、版本有效性和读写一致性，UB.MEM 负责固定长度 vector bytes，SuperNode worker 负责操作编排和 SVE 向量计算。SuperNode 不负责客户端连接、Transport 状态或全局拓扑选择，因此网络回压和路由切换不会改变本地执行语义。
+
+该层的后续优化主要包括 worker 数量与 queue shard 的匹配、任务和 completion 的批量执行、worker 与数据分片的局部性、固定维度下的 SVE load/copy/cosine，以及将 payload 搬运、slot 校验和相似度计算安排在同一执行批次中，减少线程回流、重复定位和中间数据复制。
+
+#### 3.2.8 Storage Access / TLC
+
+TLC（Storage Access Layer）是 SuperNode 的统一向量访问入口和一致性协调层，不只是负责数据淘汰的传统缓存。它向上为 `VADD/VREM/VEMB/VSIM` 提供统一接口，向下连接本地 metadata、key meta shard、location cache、UB.MEM payload、远端 metadata view、UB lookup RPC 和迁移控制面。SuperNode 只描述要执行的操作，TLC 负责回答“向量在哪里、当前版本是否有效、是否可以读写以及是否需要访问远端”。
+
+对本地 key，TLC 首先通过 location cache 快速找到向量位置，再校验 warm slot 是否为 `READY`、`write_seq` 是否稳定以及 `owner_generation` 是否匹配。校验通过后，TLC 可以返回一个小型 handle，或复制出稳定的 payload snapshot；校验失败时才进入对应的 key meta shard 重新裁决。key meta shard 按 key hash 将控制信息分片，同一 shard 内的写入、删除、版本推进、tombstone、迁移 fence 和 location cache 更新按顺序完成，不同 shard 之间则可以并行执行。这样，读请求的大多数 cache 命中路径不需要获取 shard 锁，只有 cache miss 或一致性状态不明确时才进入控制面。
+
+写入和删除由 TLC 先根据 key hash 定位到 key meta shard，在 shard 的细粒度控制边界内完成版本判断、slot 选择或复用及删除状态更新，再协调 warm slot 的 payload 写入和最终版本发布。
+
+handle 只描述向量的位置和版本，不包含完整 Redis object 或 vector bytes。其主要字段为 `region_id/local_slot/offset/bytes/owner_generation`：`region_id` 表示稳定的 warm region 身份，`local_slot` 表示该区域中的槽位，`offset/bytes` 描述 payload 的位置和长度，`owner_generation` 用于判断该位置是否仍属于当前 owner。`region_id` 与本地运行时数组中的 `region_index` 是不同概念，不能混用。若向量只存在于 COLD/overflow 层，TLC 需要先将其提升到 WARM，再向上层返回 WARM handle。
+
+`VSIM_KEY_KEY` 表示根据两个 key 找到对应向量并计算相似度。当两个 key 由不同的 SuperNode 负责时，TLC 先确认第二个 key 当前由哪个节点负责，以及该节点上的向量位置和版本是否仍然有效；这一步只读取少量的位置和版本信息，代码中称为 `remote meta`。确认远端数据有效后，系统才通过 `UB lookup` 获取向量位置或稳定的数据快照，交给 SuperNode 完成计算。若发现数据正在迁移或版本已经变化（例如 `key_version`、`owner_generation` 或 `topology_epoch` 与请求或远端记录不一致），系统返回重试或重路由结果，而不是继续使用旧向量。普通的本地读写不经过这条远程路径，因此不会承担额外的远程访问开销。
+
+TLC 的职责边界是“定位、校验和协调”，SuperNode 负责操作编排与计算，UB.MEM 负责保存固定长度的 payload，Proxy 负责协议和网络返回。后续优化主要包括 location cache 的本地命中、metadata 与 payload 分离、key meta 分片锁、slot bitmap/seqlock、单 owner 快路径跳过 remote-meta publish，以及多 owner 场景按目标 view 异步发布，从而把远程控制和迁移开销限制在必要请求上。
+
+#### 3.2.9 UB Storage
+
+UB Storage 位于 TLC Core 之下，是向量 payload 的共享存储后端，不负责 key 查找、版本裁决或迁移决策。TLC Core 保存 key meta shard、location cache 和 warm region runtime，并向 UB Storage 提供 `region_id`、`local_slot` 和 `offset`；UB Storage 根据这些位置描述访问对应的共享 WARM region。两层的边界是：TLC Core 决定“访问哪个 slot、这个 slot 是否有效”，UB Storage 负责“保存 slot 状态和向量 bytes，并提供可并发访问的内存布局”。
+
+每个共享 WARM region 按固定布局组织为 `[region header][slot metadata array][packed vector arena]`。region header 描述 `region_id`、容量和向量长度；slot metadata 保存 `state`、`write_seq`、`owner_generation`、`bytes` 等与该 slot 对应的状态；packed vector arena 只保存固定长度的 FP32 vector bytes。默认每条向量为 `300 * 4 = 1200B`，`local_slot * value_size` 可以直接计算 payload 偏移，避免 Redis object 和变长对象的寻址开销。COLD/overflow 是可选的上层容量补充，不改变 WARM region 的基本布局。
+
+UB Storage 的逻辑布局如下：
+
+```mermaid
+flowchart LR
+    CORE[TLC Core<br/>key meta/cache/region runtime]
+
+    subgraph UB[UB Storage: shared UB.MEM]
+        H[region header<br/>region_id/capacity/value_size]
+        SM[warm slot metadata<br/>state/write_seq/generation]
+        W0[WARM region 0<br/>packed vector arena]
+        WREST[WARM region 1..N<br/>same layout]
+        COLD[COLD / overflow<br/>optional]
+    end
+
+    CORE -->|region_id| H
+    H --> SM
+    CORE -->|location: local_slot + offset| W0
+    CORE -->|region_id| WREST
+    CORE -->|fallback| COLD
+    SM -. guards .-> W0
 ```
 
-`proxy I/O worker pool` 负责解析 TCP/Aeron frame，管理 fd/ring poll、channel 生命周期、job dispatch 和 completion drain。proxy 只搬运协议 frame、key、inline payload 或 completion snapshot，不访问 TLC metadata，也不做向量计算。
+图中仅展开 `WARM region 0` 的一条完整路径，`WARM region 1..N` 复用相同布局。图中的 `TLC Core -> UB Storage` 是位置访问关系，不是网络或 RPC 通道：TLC Core 先根据 key 找到 `region_id` 和 `local_slot`，再计算该向量在 WARM region 中的字节位置 `offset = local_slot * value_size`，将这些位置描述交给 UB Storage。UB Storage 通过共享 slot metadata 校验状态，并按 `offset` 访问 vector bytes。key version、tombstone、迁移 fence 和 location cache 不属于 UB Storage，而由 TLC Core 在私有内存中维护。
 
-`channel lifecycle / backlog` 维护 channel id、连接关闭、慢客户端回压和待写 response。per-channel completion/backlog 保存 response frame；在 TCP inline 模式下，backlog 可能暂存约 `1200B` 的 payload snapshot。
+#### UB region 的粒度、分桶与冲突处理
 
-#### 3.2.4 job_worker_queue
+UB region 是向量存储的基本分配单位，但 key 不会直接把 hash 转换成一个唯一的字节地址。系统先按固定向量大小计算一个 region 能容纳的 slot 数：`capacity_slots = region_bytes / value_size`。以 300 维 FP32 为例，每个 slot 固定保存 `1200B` payload；一个 `1GiB` 的 payload 区域约可容纳 `1GiB / 1200B` 个 slot，slot metadata 与 payload 一一对应。因此，region 的粒度是“若干个固定大小 slot 的共享区域”，而不是一个 key 一个独立内存块。
 
-`job_worker_queue` 是 proxy I/O worker 与 SuperNode worker 之间的调度层，对应 `proxy_worker x supernode_worker` job shard queues。proxy 完成 request decode 和轻量校验后，将请求落到 job pool slot，并向 `job_worker_queue` 发布轻量 `job_ref`；SuperNode worker 从该队列批量 poll `job_ref`，再回到 job pool 找到完整 job 执行。
+key 到 region 的选择分为两步。第一步，TLC 将每个 region 按配置的容量权重放置多个虚拟位置；本地 region 会获得额外权重，通常优先承载本地数据。key hash 在这些虚拟位置上找到一个起点，系统从该起点依次尝试候选 region。这样，增加或减少 region 时只会影响部分 key，且容量较大的 region 可以通过更高权重获得更多 key，而不需要维护一张逐 key 的固定映射表。
 
-这个层次的核心目标是把 `socket -> request -> job` 压缩成 `socket -> jobs`，同时避免跨 worker 队列搬运完整 1200B vector payload。后续“数据流 batch 化与 job_ref 轻量调度”会展开 `job pool + job_ref` 的具体优化方式。
+第二步，key 进入某个 region 后，系统不会扫描整个 region，而是将 slot 按每组最多 8 个 slot 划分为多个小集合。经过混合的 key hash 计算出集合编号：
 
-#### 3.2.5 Worker / SuperNode
+```text
+set_count = ceil(capacity_slots / 8)
+set_id    = mix(key_hash) % set_count
+候选 slot  = set_id 对应的最多 8 个 slot
+```
 
-执行层由 SuperNode worker pool 和 `VADD/VREM/VEMB/VSIM` handlers 组成。
+因此，一个 key 的正常访问范围只是一个小集合，而不是整个 region。这个“小集合”就是这里所说的桶；`region` 是共享内存的大容器，`bucket/set` 是容器中的候选 slot 集合，`local_slot` 才是最终存放向量的具体位置。读请求按同样的规则找到候选集合，再在集合内确认具体 slot。
 
-`SuperNode worker pool` 执行 `VADD/VREM/VEMB/VSIM`，调用 TLC，生成 completion。每次 `VADD/VSIM_INLINE` 消费约 `1200B` 请求 vector；`VEMB_INLINE` 生成约 `1200B` response snapshot；handle 响应只返回 location 元数据。
+Hash 只用于缩小搜索范围，不能被当作唯一身份。写入或读取每个候选 slot 时，系统同时检查 `key_hash` 和 key fingerprint，并结合 slot 状态确认是否是同一个 key；因此，即使两个不同 key 被映射到同一个 hash 或同一个桶，也不会把一个 key 的向量误认为另一个 key。相同 key 的覆盖写直接复用原 slot，并通过 `write_seq` 保证读者不会看到半写内容。
 
-#### 3.2.6 Storage Access / TLC
+当一个桶中的 8 个 slot 都被其他 key 占用时，系统不会覆盖其中任何一个 slot，而是继续尝试 hash 环上后续的候选 region；如果候选 region 都没有可用 slot，再由 TLC 按配置进入 COLD/overflow 等后备路径或报告容量不足。这个处理方式把“hash 冲突”和“region 容量耗尽”区分开：前者通过桶内多 slot、key 身份校验和后续 region 解决，后者通过 region fallback 或上层容量策略解决。整个过程只由 TLC 决定位置，UB Storage 负责按最终 `region_id + local_slot` 保存和并发读写 payload。
 
-存储访问层由 `vemb_v16_tlc facade`、remote meta view、UB lookup RPC 和 migration API 组成。
-
-`vemb_v16_tlc facade` 将本地 core location 转为 vector handle，并处理 remote meta、UB lookup RPC 和迁移控制。handle 由 `region_id/local_slot/offset/bytes/owner_generation` 等元数据组成，不承载完整 Redis object。
-
-`remote meta / UB lookup / migration RPC` 支撑跨 owner key-key VSIM、remote handle repair、scale-out 和迁移。该路径主要传 key、owner、epoch、handle、snapshot/delta 元数据，尽量避免默认跨节点搬完整 vector。
-
-#### 3.2.7 Local Core Storage
-
-本地核心存储层由 `tlc_core`、location cache、key meta shards、warm region runtime 和 warm slot metadata 组成。
-
-`tlc_core` 是本地向量存储核心，维护 location cache、key meta shard、warm slot metadata 和一致性。metadata 常驻 SuperNode 私有内存；每个 key 关联一个 warm location；payload 位于 UB region。
-
-#### 3.2.8 Payload Region
-
-`UB packed vector regions` 承载真正的 embedding bytes。默认每条向量 `300 * 4 = 1200B`；容量约为 `max_vectors * 1200B`，默认 `131072` 条约 `150MiB` payload。
-
-VEMB V16 的基本对象不是 Redis object，而是固定 stride 的 embedding payload：
+HPC-Redis Server 的基本存储对象不是 Redis object，而是由控制区 metadata 指向的固定长度 payload：
 
 ```text
 key_hash = murmur3(vector_key)
@@ -178,22 +288,47 @@ location = {region_id, region_index, local_slot, offset, bytes, owner_generation
 payload = mapped_addr + offset
 ```
 
-读路径优先使用 cached handle。cache hit 之后仍要验证 warm slot 是否处于 READY、`write_seq` 是否为偶数且 copy 前后不变、`owner_generation` 是否匹配，从而避免 stale handle 和半写 payload。
+Handle 的寻址基准是“对应 WARM region 的逻辑 payload 映射基址”，不是某个进程的绝对虚拟地址，也不是 UB 设备或文件的绝对地址。Server 和 CLI 虽然可能被操作系统映射到不同的虚拟地址，但它们都使用同一个 `region_id` 找到同一份共享 region，再用 handle 中的相对 `offset` 找到 payload：
 
-写路径先按 key hash 进入 key meta shard，更新 key version、tombstone/fence 状态和 location cache；payload 写入 warm slot 时通过 `write_seq` 从偶数切到奇数再发布回偶数。
+```text
+Server:  payload_ptr = server_region.mapped_addr + handle.offset
+CLI:     payload_ptr = cli_region.mapped_addr    + handle.offset
+```
 
-VSIM 分为两类：
+这里的 `mapped_addr` 是逻辑 payload 区域的起始地址。对于 UB WARM region，物理布局仍是 `[region header][slot metadata][payload arena]`；Server 和 CLI 建立映射时，映射描述中的 `mmap_offset` 已经指向这份 region 的逻辑起点，代码再通过页对齐和内部布局调整得到 `mapped_addr`。因此，handle 的 `offset` 不需要包含 header 或 slot metadata 的长度，也不能直接加到原始 `mmap()` 返回的未调整地址上。
 
-- `VSIM_INLINE`：request 携带 query vector，SuperNode 读取目标 key payload 后计算 cosine。
-- `VSIM_KEY_KEY`：SuperNode 查 key1/key2 的 handle；跨 owner 场景后续通过 remote meta / UB lookup RPC 解析远端 handle 或 snapshot。
+`region_id` 用来选择哪一个已映射 region，`local_slot` 用来定位并校验该 region 中的 slot metadata，`offset` 用来定位 payload，`bytes` 用来做边界检查，`owner_generation` 用来确认该 slot 仍属于有效版本。TLC Core 会校验 `local_slot < capacity_slots`、`offset == local_slot * value_size` 和 `bytes == value_size`；校验通过后，Server 才读取或写入 `mapped_addr + offset`。Aeron CLI 收到 handle 后执行同样的 region 查找、边界检查和 slot 版本校验，随后从自己的 `mapped_addr + offset` 读取同一份共享 payload。`mmap_offset` 只参与“把哪一段 UB 区域映射进进程”，`offset` 才是 handle 相对于逻辑 payload 基址的字节偏移。
 
-计算层以 FP32 向量为主，使用 SVE 路径做 load/cosine；固定 300 维让内存布局、batch 和 prefetch 策略可以高度专用化。
+读路径和写路径的 key 级裁决由 TLC Core 完成；进入 UB Storage 后，TCP `VEMB_INLINE` 读取稳定的 payload snapshot，Aeron `VEMB_HANDLE` 返回已经校验过的 slot 位置。UB Storage 不修改 key version、tombstone 或 location cache，只按 TLC Core 提供的位置读写共享 region。
+
+UB Storage 的并发安全只覆盖共享 region 内的 slot 和 payload。slot metadata 中的 `state`、`write_seq` 和 `owner_generation` 使用共享原子字段：写线程先通过 CAS 取得 slot，将 `write_seq` 从偶数切换为奇数表示正在写入，完成 vector bytes 和其他 metadata 更新后，再以发布语义写回新的偶数稳定版本并将 slot 设为 `READY`；读线程以获取语义读取 slot 状态，在复制 payload 前后各读取一次 `write_seq`，只有两次值相同且均为偶数、slot 为 `READY` 时才接受结果，否则重试。这样，多个 worker 或进程可以安全访问同一映射区域，读者不会看到半写 payload。key 级写入顺序、迁移 fence 和 owner 版本由 TLC Core 保证。后续 UB Storage 优化主要包括共享 region 的固定布局、slot metadata 的原子访问、payload 批量访问、固定 stride、prefetch、region 容量和 fallback；cache、分片锁和迁移控制属于 TLC Core 的优化范围。
+
+在 Aeron 模式下，CLI 读取 `VEMB_HANDLE` 指向的数据也遵循同一并发安全规则。CLI 收到 `region_id`、`local_slot`、`offset`、`bytes` 和 `owner_generation` 后，先在已映射的 UB.MEM WARM region 中定位对应 slot，再读取共享 slot metadata 并在 payload 读取前后校验 `state`、偶数且未变化的 `write_seq` 以及匹配的 `owner_generation`。只有校验通过，CLI 才接受本次向量读取；如果发现 slot 正在写入、版本发生变化或位置已失效，则丢弃当前结果并重新获取 handle。由此，Aeron 的低复制读取并不牺牲并发一致性，服务端 worker、SuperNode 与 CLI 共享同一套发布、校验和重试机制，避免 CLI 读到半写或已失效的向量。
+
+#### 3.2.10 组件职责与后续优化重点
+
+本节从评审视角概括各组件的边界以及后续优化的目标。系统并不是把所有工作集中到一个执行线程，而是将一次向量请求拆成四类职责：客户端确定请求应到达的节点；Transport 和 Proxy 负责接入与返回；队列负责把接入和执行解耦；SuperNode、TLC 和 UB Storage 负责执行操作、判断数据是否有效以及访问向量内容。这样的划分使网络波动不会直接阻塞向量执行，也使大尺寸向量不必在每个组件之间重复复制。
+
+| 层次/组件 | 主要职责 | 这样划分解决的问题 | 后续优化重点 |
+| --- | --- | --- | --- |
+| Client / Route | 根据 key 选择负责该数据的节点，并生成 `VADD/VEMB/VREM/VSIM` 请求。 | 让同一 key 的读写尽量到达同一个负责节点，Proxy 不需要再次判断拓扑或向多个节点转发。 | 优化路由表更新、扩容期间的重试和重路由，降低迁移对正常请求的影响。 |
+| Transport | 通过 TCP 或基于 UB 的 Aeron 传递请求和响应。TCP 返回完整向量，Aeron 返回 handle，由客户端从共享区域读取向量。 | 统一业务操作的含义，同时根据跨机器和高性能本机场景选择不同的数据交付方式。 | 优化持久连接、批量收发、流水线和回压；分别评估 TCP 的完整向量吞吐与 Aeron 的 handle 读取吞吐。 |
+| Proxy | 读取协议请求、完成基本校验、建立任务、管理连接，并把执行结果写回原连接或 ring。 | 将连接数量、协议解析、慢客户端和网络事件隔离在接入层，避免它们进入 TLC 和向量计算路径。 | 优化 I/O worker 数量、请求解析和响应写回，减少数据复制，并通过批量处理和回压避免队列堆积。 |
+| Job Queue | 以轻量请求引用把 Proxy 接收的任务交给 SuperNode worker；完整任务内容保存在可复用的任务存储区。 | 使 Proxy 不必等待任务执行，也避免把约 `1200B` 的向量在跨线程队列中反复搬运。 | 优化任务存储区复用、引用生命周期校验、队列分片和批量提交/获取，减少分配、释放和线程唤醒。 |
+| SuperNode Worker | 批量执行四类向量操作，调用 TLC 定位和校验数据，并完成向量读写或相似度计算。 | 将真正消耗 CPU 和内存带宽的工作集中到可并行扩展的执行线程，而不是 Redis 通用主线程。 | 优化 Proxy/worker 配比、批量执行、任务亲和性，以及 SVE 向量计算与数据读取的协同。 |
+| Completion Queue | 保存 SuperNode 的状态、handle、向量快照或相似度结果，供 Proxy 批量取回。 | 将执行完成与网络返回再次解耦，SuperNode 不需要直接处理连接和发送阻塞。 | 优化完成项复用、批量取回与响应聚合、异常结果处理和回压，减少完成结果跨层传递的固定成本。 |
+| TLC（含 TLC Core） | 根据 key 找到向量位置，维护 key 的版本、删除状态和迁移状态，并确认返回的位置仍然有效；跨节点时才访问远端控制信息。 | 将“这个 key 当前对应哪个有效版本”与“向量内容存放在哪里”统一裁决，避免返回已删除、正在迁移或已过期的数据。 | 优化位置缓存命中、按 key 分片的控制锁、读侧版本校验，以及把远端查询限制在跨节点和迁移场景。 |
+| UB Storage | 在共享 WARM region 中保存 slot 状态和固定长度向量 payload，并用原子状态和 `write_seq` 协调并发读写。 | 让服务端 worker 和 Aeron CLI 可以访问同一份向量内容，同时避免读者看到写入中的半个向量。 | 优化固定布局、slot 原子操作、批量读取、预取、区域容量管理和 COLD/overflow fallback；不把 key 版本和迁移控制下沉到这一层。 |
+
+后续优化按以下顺序推进。第一，先降低每个请求必经的固定成本：通过请求和完成结果的批量处理、任务存储区复用以及轻量引用传递，减少对象分配、跨线程复制和频繁唤醒。第二，缩短读多写少场景的热路径：优先使用位置缓存，使用共享 slot 状态和 `write_seq` 判断数据是否稳定，仅在缓存失效、版本不一致或迁移期间进入更重的控制路径；TCP 复制完整向量，Aeron 直接读取共享向量。第三，提升并发和扩展能力：增加 key 元数据分片、调整 worker 与队列的对应关系，并将远端元数据查询和迁移处理限制在确有需要的请求上。
+
+这些优化存在明确的依赖关系：只有接入层能够形成足够大的批次，执行层才有稳定的并行度；只有任务通过轻量引用传递，批量化才不会被大向量复制抵消；只有 TLC 的控制信息与 UB Storage 的 payload 分离，位置缓存、细粒度锁和 `write_seq` 才能分别服务于不同的并发路径。因此，第 4 章将分别验证各项优化对端到端吞吐、尾延迟、单位 CPU 吞吐、队列积压、缓存命中率、读侧重试次数和数据一致性的影响，其中一致性校验必须保证不存在半写向量和失效 handle。
 
 ### 3.3 基本策略
 
-1. 热路径专用化：固定向量 workload 走 VEMB V16 request/response 语义，避免 Redis 通用命令框架。
+1. 热路径专用化：固定向量 workload 走 HPC-Redis Server request/response 语义，避免 Redis 通用命令框架。
 2. 接入与执行分离：proxy I/O worker 处理网络/环队列，SuperNode worker 处理存储和计算。
-3. metadata 与 payload 分离：SuperNode 私有 metadata 保持 cache-friendly，UB 只存 packed vector bytes。
+3. metadata 与 payload 分离：key 级 metadata 保留在 SuperNode 私有内存，UB WARM region 共享 slot metadata 与 packed vector bytes。
 4. 读路径无锁化：location cache + warm slot state/write_seq/owner_generation 组合校验。
 5. 写路径细粒度串行：key meta shard lock 串行化同 shard 控制面，slot CAS/seqlock 保护 payload。
 6. 返回语义分流：Aeron 返回 handle，TCP inline 返回 payload snapshot。
@@ -201,211 +336,202 @@ VSIM 分为两类：
 
 ### 3.4 业务链路
 
-`VADD` 写入链路：
-
-`VADD` 是写侧主路径。Client / Route 根据 key 选择 endpoint 后，将 key 和完整 vector payload 通过 TCP 或 Aeron transport 送到 proxy；proxy 只做 encode/decode 边界处理、channel 校验和 job 发布，把 op、key、key_hash、topology_epoch 和 1200B payload 封装成 job 交给 SuperNode shard queue。SuperNode worker 消费 job 后进入 TLC，TLC 在 key meta shard 中串行化同 shard 控制面，选择或复用 warm slot，并通过 warm slot metadata 把 `write_seq` 从可读态切到写入态。真正的向量数据写入 UB Payload Region；写完后 slot metadata 发布 READY，location cache 更新为新的 `{region_id, local_slot, offset, bytes, owner_generation}`。最后 SuperNode 生成 completion，completion ring 将 status 和 handle metadata 送回 proxy，proxy 再通过原 transport 返回 client；完整 vector 不在响应中回传。
+本节只描述请求和数据的主要流向。所有操作都遵循同一条执行路径：客户端根据 key 选择节点，经 TCP 或 Aeron 将请求交给 Proxy；Proxy 完成协议校验后批量提交任务引用，SuperNode worker 批量取出任务并调用 TLC；TLC 先查询 `location cache` 快速获得候选位置，再判断 key 的有效版本和向量位置，UB Storage 负责读写向量内容；执行结果进入 Completion Queue，再由 Proxy 批量取回并通过原 Transport 返回客户端。
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client / Bench
-    participant P as Proxy I/O Worker
-    participant SN as SuperNode Worker
-    participant TLC as vemb_v16_tlc
-    participant KM as Key Meta Shard
-    participant WM as Warm Slot Meta
-    participant UB as UB Payload Region
-    participant CP as Completion
-
-    C->>P: VADD request<br/>key + 1200B vector payload
-    P->>SN: publish VADD job
-    SN->>SN: validate op / dim / vector_bytes
-    SN->>TLC: put_with_epoch(key, vector)
-    TLC->>KM: lock shard and update key metadata
-    TLC->>WM: claim slot / write_seq even -> odd
-    TLC->>UB: write packed vector payload
-    TLC->>WM: publish READY / write_seq odd -> even
-    TLC->>KM: update location cache and key version
-    TLC-->>SN: vector handle / status
-    SN->>CP: publish completion
-    CP-->>P: status + handle metadata
-    P-->>C: response
+flowchart LR
+    C[Client / Route] --> T[TCP or Aeron]
+    T --> P[Proxy]
+    P -->|batch job refs| J[Job Queue]
+    J --> W[SuperNode Worker]
+    W --> TLC[TLC: locate and validate]
+    TLC --> UB[UB Storage: vector payload]
+    W --> CQ[Completion Queue]
+    CQ --> P
+    P --> T
+    T --> C
 ```
 
-`VEMB inline` 读取链路：
+这条路径有四个共同设计：请求在队列之间传递轻量引用，避免完整向量重复复制；请求和完成结果都按批处理，摊薄调度和唤醒开销；`location cache` 只保存 key 到 `{region_id, local_slot, offset, bytes, owner_generation}` 的位置元数据，不保存完整向量；key 的版本与位置由 TLC 判断，向量 payload 由 UB Storage 保存，网络层不参与存储一致性裁决。缓存命中只表示“可以快速尝试这个位置”，仍需校验 slot 状态、`write_seq` 和 owner 版本；缓存未命中或校验失败时，再进入 TLC 的完整控制路径。
 
-`VEMB_INLINE` 是 TCP 完整读语义。Client / Route 发送 key 到 TCP endpoint，proxy 通过 TCP 协议栈读取 request，decode 后把 key、key_hash、dim 和 req_id 放入 SuperNode job queue。SuperNode 先通过 TLC/tlc_core 找到 stable handle，再沿着 handle 定位 UB Payload Region 中的实际 vector bytes。为了避免读到正在覆盖写入的数据，core 在复制前读取 warm slot `write_seq`，复制 1200B payload 后再次校验 `write_seq`；只有前后都是同一个可读版本，payload snapshot 才会进入 completion。completion 从 SuperNode 回到 proxy 后，proxy 将 response metadata 和 inline vector snapshot 一起写回 TCP 连接，client 收到的就是完整 300 维 FP32 向量。
+#### 3.4.1 `VADD` 写入
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as TCP Client / Bench
-    participant P as Proxy I/O Worker
-    participant SN as SuperNode Worker
-    participant TLC as vemb_v16_tlc
-    participant CORE as tlc_core
-    participant WM as Warm Slot Meta
-    participant UB as UB Payload Region
-    participant CP as Completion
+客户端发送 key 和完整向量。Proxy 将请求放入任务池并批量提交引用；SuperNode 交给 TLC 处理 key 版本、slot 选择和写入顺序。UB Storage 先将 slot 标记为写入中，再写入向量，完成后发布为可读版本；TLC 随后更新 key 的位置和版本信息，并写入或更新 `location cache`。Completion 只返回状态和新 handle，不回传完整向量。
 
-    C->>P: VEMB_INLINE request<br/>key only
-    P->>SN: publish VEMB job
-    SN->>TLC: get stable handle
-    TLC->>CORE: locate warm payload
-    CORE->>WM: validate seq before copy
-    CORE->>UB: SVE copy 1200B vector
-    CORE->>WM: validate seq after copy
-    TLC-->>SN: payload snapshot
-    SN->>CP: publish completion<br/>status + inline vector snapshot
-    CP-->>P: completion
-    P-->>C: TCP response frame + 1200B vector payload
-```
+核心设计是将“key 是否更新成功”和“向量 bytes 是否写完整”分开保护：TLC 负责 key 级顺序，UB Storage 通过 slot 状态和 `write_seq` 保护 payload，只有两者都完成后新位置才对读请求可见。
 
-`VEMB handle` 读取链路：
+#### 3.4.2 `VEMB` 完整读取
 
-注：`VEMB_HANDLE` 不读取 vector payload，只返回 vector handle。
+TCP 使用 `VEMB_INLINE`。客户端只发送 key，SuperNode 通过 TLC 先查询 `location cache`，命中后直接获得候选位置；缓存未命中或候选位置失效时，再从 key 元数据中重新定位。确认稳定位置后，UB Storage 读取向量。读取前后检查 slot 的 `write_seq`，确认期间没有写入后，将完整向量放入 Completion Queue；Proxy 再通过 TCP 返回给客户端。
 
-`VEMB_HANDLE` 是 Aeron 高吞吐读取路径。Client / Route 只发送 key，transport ring 把 encoded request 交给 proxy；proxy decode 后生成轻量 job，不携带 vector payload。SuperNode worker 调 TLC，TLC 进入 tlc_core 查 location cache，把 key_hash 映射到 warm location；随后读取 warm slot metadata，校验 READY、generation 和 `write_seq`，确认该 handle 指向的是稳定 payload。校验通过后，数据面只把 handle metadata 写入 completion：`region_id/offset/bytes/local_slot/owner_generation` 从 TLC 回到 SuperNode，再经 completion ring 回到 proxy 和 client。该链路到此结束，不从 UB Payload Region 读取 1200B 向量数据；后续是否按 handle 读取 payload 由 client 侧决定。
+核心设计是返回稳定的 payload snapshot：TCP 客户端收到响应时已经拿到完整向量，不需要理解服务端内存布局；并发写入发生时，本次读取重试，不返回半写数据。
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client / Bench
-    participant P as Proxy I/O Worker
-    participant SN as SuperNode Worker
-    participant TLC as vemb_v16_tlc
-    participant CORE as tlc_core
-    participant LC as Location Cache
-    participant WM as Warm Slot Meta
-    participant CP as Completion
+#### 3.4.3 `VEMB` handle 读取
 
-    C->>P: VEMB_HANDLE request<br/>key only
-    P->>SN: publish VEMB job
-    SN->>TLC: get_cached_handle(key)
-    TLC->>CORE: get_cached_warm_location()
-    CORE->>LC: lookup key -> location
-    CORE->>WM: validate READY / generation / write_seq
-    TLC-->>SN: handle metadata
-    SN->>CP: publish completion<br/>region_id + offset + bytes
-    CP-->>P: handle response
-    P-->>C: response
-```
+Aeron 使用 `VEMB_HANDLE`。客户端只发送 key，SuperNode 通过 TLC 查询并校验 `location cache` 中的候选位置；缓存未命中、版本不一致或正在迁移时，TLC 回到 key 元数据控制路径重新判断。校验通过后，Completion 只返回 `region_id`、`local_slot`、`offset`、`bytes` 和 `owner_generation` 等小型 handle。客户端根据 handle 映射 UB.MEM 并读取向量，读取过程继续使用 slot 状态、`write_seq` 和 owner 版本进行校验。
 
-`VSIM` 相似度计算链路：
+核心设计是控制信息与向量内容分离：handle 通过 Aeron ring 传递，向量仍留在共享 UB Storage 中，避免约 `1200B` 的 payload 在响应路径中重复搬运；并发安全由服务端和客户端共同遵循同一套发布、校验和重试规则保证。
 
-`VSIM` 将读取和计算合并在 SuperNode worker 内完成。Client / Route 发送 `VSIM_INLINE` 时，request 中携带 query vector 和目标 key；发送 `VSIM_KEY_KEY` 时，request 中携带两个 key。proxy decode 后只负责把计算请求发布到 SuperNode job queue。SuperNode 通过 TLC/tlc_core 将 key 解析为 local handle，并从 UB Payload Region 读取 stored vector；如果 `VSIM_KEY_KEY` 的第二个 key 属于远端 owner，TLC 先通过 remote meta view 判断远端位置，再通过 UB lookup RPC 获取 remote handle 或 snapshot。待参与计算的两个 vector 都准备好后，SuperNode 在本地 SVE 路径中计算 cosine score。最后 completion 只携带 score、status 和必要 handle/redirect 元数据返回 proxy，再由 proxy 写回 client；中间不需要 client 先读取 vector 再发起第二次计算请求。
+#### 3.4.4 `VREM` 删除
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client / Bench
-    participant P as Proxy I/O Worker
-    participant SN as SuperNode Worker
-    participant TLC as vemb_v16_tlc
-    participant CORE as tlc_core
-    participant UB as UB Payload Region
-    participant RM as Remote Meta / UB RPC
-    participant CP as Completion
+客户端发送 key。SuperNode 通过 TLC 在对应 key 控制范围内推进版本并写入删除标记，同时删除或标记失效的 `location cache` 条目和旧位置；后续读请求即使命中旧缓存，也必须经过版本、slot 状态和 owner 校验，不能继续返回旧向量。删除完成后，Completion 返回状态，旧 slot 由存储层在确认不再被引用后回收或复用。
 
-    C->>P: VSIM request<br/>query vector or key1 + key2
-    P->>SN: publish VSIM job
-    alt VSIM_INLINE
-        SN->>TLC: get handle for target key
-        TLC->>CORE: load stored vector
-        CORE->>UB: copy stored 1200B vector
-        SN->>SN: SVE cosine(query_vector, stored_vector)
-    else VSIM_KEY_KEY
-        SN->>TLC: get handle for key1
-        SN->>TLC: get handle for key2
-        opt key2 belongs to remote owner
-            TLC->>RM: remote meta / UB lookup RPC
-            RM-->>TLC: remote handle or snapshot
-        end
-        TLC->>CORE: load local vector(s)
-        CORE->>UB: copy payload snapshot
-        SN->>SN: SVE cosine(vector1, vector2)
-    end
-    SN->>CP: publish completion<br/>score + status
-    CP-->>P: score response
-    P-->>C: response
-```
+核心设计是先阻断旧位置的可见性，再回收向量空间。删除不会直接依赖物理清零 payload，而是依靠 key 版本、删除标记和 slot 有效性共同保证语义正确。
+
+#### 3.4.5 `VSIM` 相似度计算
+
+`VSIM_INLINE` 请求携带 query vector 和目标 key；`VSIM_KEY_KEY` 请求携带两个 key。Proxy 将请求批量交给 SuperNode，SuperNode 通过 TLC 查询目标 key 的 `location cache`，必要时回到 key 元数据路径确认位置和版本，再从 UB Storage 读取稳定 payload，并在本地完成相似度计算，Completion 只返回 score 和状态。
+
+当 `VSIM_KEY_KEY` 的两个 key 属于不同节点时，TLC 先确认远端 key 的 owner、版本和位置，再通过远端查询获得 handle 或稳定数据快照。若发现迁移或版本变化，当前计算结果作废并重试或重路由，不使用旧向量。
+
+核心设计是把“向量读取 + 相似度计算”合并在 SuperNode 内，避免客户端先取回向量、再发起第二次计算请求；跨 owner 只增加必要的控制信息查询，普通本地请求仍走本地快速路径。
 
 ## 4 优化设计
 
 hpc-redis 的优化目标不是在 Redis 原有命令路径上做局部加速，而是围绕推荐特征向量的固定访问形态重构数据面。读写对象、协议、线程模型、存储布局和返回语义都服务于同一个目标：让 CPU 时间尽量用于 key 定位、payload 搬运和向量计算，避免消耗在通用对象模型、通用命令调度和跨线程唤醒上。
 
-### 4.1 基础设计: VEMB V16 独立数据面
+### 4.1 基础设计: HPC-Redis Server 独立数据面
 
-VEMB V16 独立数据面不把“二进制返回”本身作为优化点。Redis 自身也可以通过 raw/bulk string 返回二进制 payload，因此这里的关键差异不是 payload 是否为二进制，而是固定向量 workload 不再经过 Redis 通用命令执行链路。`VADD/VEMB/VREM/VSIM` 使用统一的 request/response encode、decode 语义进入专用 proxy、SuperNode worker 和 completion ring，形成独立的接入、调度、执行与返回路径。
+HPC-Redis Server 独立数据面的目标，是为固定维度向量建立一条专用的请求、执行和返回路径。它的核心差异不在于“返回二进制数据”，而在于向量请求不再经过 Redis 通用命令路径中的文本解析、命令查找、通用对象创建和主线程执行。`VADD/VEMB/VREM/VSIM` 直接使用固定格式的二进制请求和响应，进入 Proxy、Job Queue、SuperNode、TLC 和 UB Storage 组成的专用数据面。
 
-该设计的价值主要来自三方面：
+一次请求的基本流向如下：
 
-1. 请求进入系统后直接形成 VEMB request struct 和 job，不再构造 Redis object，也不进入 Redis command table。
-2. 执行面从 Redis 主线程串行模型转换为 SuperNode worker pool，向量读写和 VSIM 计算可以按 shard 并行展开。
-3. 返回路径从 completion ring 直接回到 proxy，由 proxy 根据 TCP 或 Aeron transport 写回 response，不再依赖 Redis module callback 或 blocked-client/unblock 流程。
+```text
+Client / CLI
+    -> TCP or Aeron
+    -> Proxy: 协议校验与请求接入
+    -> Job Queue: 批量传递轻量任务引用
+    -> SuperNode Worker: 执行向量操作
+    -> TLC: 定位并校验 key 的有效版本
+    -> UB Storage: 读取或写入固定长度向量
+    -> Completion Queue
+    -> Proxy
+    -> TCP response or Aeron handle
+```
 
-因此，独立数据面是后续线程模型、payload/metadata 分离、Aeron handle 返回和 inline snapshot 返回的基础设计。
+该数据面包含四个相互配合的基本设计。
 
-当前实现上，独立数据面由以下几个明确边界组成：
+1. **操作路径专用化。** 请求只携带固定向量操作所需的字段，Proxy 完成格式和长度校验后直接创建可调度任务，不创建 Redis 通用对象，也不进入通用命令表。这样，CPU 时间更多用于 key 定位、payload 访问和相似度计算。
+2. **接入与执行分离。** Proxy 只处理 socket/ring、连接状态、任务提交和结果返回；SuperNode worker 只处理向量读写、删除和相似度计算。网络抖动、慢客户端和连接数量不会直接阻塞存储与计算。
+3. **控制信息与向量内容分离。** TLC 保存 key 的版本、删除和迁移状态，并通过 `location cache` 快速定位向量；UB Storage 保存共享 WARM region 中的 slot metadata 和固定长度 payload。队列之间优先传递轻量引用，避免约 `1200B` 向量被重复复制。
+4. **返回方式按传输环境区分。** TCP `VEMB_INLINE` 在响应中返回稳定的完整向量，适用于跨机器访问；Aeron `VEMB_HANDLE` 只返回带位置和版本信息的 handle，由 CLI 映射相同的 UB Region 后读取 payload。两种方式的业务语义相同，差别只在向量内容的交付位置。
+
+独立数据面因此同时解决三个问题：绕开通用 Redis 路径带来的固定处理开销；通过 Job Queue、Completion Queue 和 worker pool 形成可批量、可并行的执行链路；通过 TLC 的版本判断与 UB Storage 的 slot 并发控制，保证向量在读写、删除和迁移期间不会以半写或失效版本对外可见。后续 `4.2` 至 `4.10` 的优化，分别围绕接入与执行解耦、批量调度、位置缓存、细粒度并发控制、SVE 计算和 TCP/Aeron 返回语义展开，而不是改变这条基础数据流。
 
 ### 4.2 优化：proxy I/O 与 SuperNode 执行解耦
 
-系统把网络接入和向量执行拆成两组 worker：proxy I/O worker 只负责 socket/ring poll、frame parse、job publish、completion drain 和 response backlog；SuperNode worker 负责 TLC lookup、payload snapshot、写入、删除和 VSIM 计算。
+本节优化的是请求接入和向量执行之间的边界。系统使用两类线程：Proxy I/O worker 负责读取 TCP/Aeron、解析请求、提交任务、批量取回执行结果和处理响应积压；SuperNode worker 负责调用 TLC、访问 UB Storage、执行写入/删除和相似度计算。Proxy 不直接访问向量，也不等待某个请求执行完成。
 
-这个拆分避免了网络慢客户端、连接生命周期和内核 I/O 抖动直接阻塞向量执行线程。请求进入 `proxy_worker x supernode_worker` shard queue 后，执行侧可以稳定批量消费；completion 回到 proxy 后再按 channel 写回。相比 per-channel thread 或在 I/O 线程中执行存储逻辑，该模型能控制线程数量、降低高连接数调度成本，并让 CPU cache 更集中地服务于各自职责。
+一次请求在两类线程之间按以下方式流动：
 
-线程模型从早期 per-channel thread 收敛为 pooled-only：per-channel 边界只保留在 completion ring、response backlog 和 channel lifecycle 上，请求分发统一进入 `proxy_worker x supernode_worker` job shard queue。Linux 下 proxy I/O 使用 epoll 聚合连接事件，非 Linux 环境退化为 poll，从而在保持可移植性的同时，让高连接数场景不再按连接数膨胀执行线程。
+```text
+Proxy I/O worker
+    -> 解析并校验请求
+    -> 写入可复用的任务槽位
+    -> Job Queue 发布轻量任务引用
+    -> SuperNode worker 批量取出并执行
+    -> Completion Queue 返回状态或结果
+    -> Proxy I/O worker 关联 channel 并写回响应
+```
+
+该边界带来三项直接收益。第一，慢客户端、连接数量和网络事件不会阻塞向量读写与计算。第二，SuperNode worker 可以连续批量消费任务，不必为每个 socket 单独创建执行线程。第三，响应暂时不可写时，结果只在对应 channel 的 backlog 中等待，并通过回压限制继续接收请求，避免一个慢连接拖垮整个执行面。
+
+线程模型采用线程池，而不是“一条连接对应一个执行线程”。Proxy I/O worker 只维护连接状态和 I/O 事件；SuperNode worker 按任务队列分片并行执行。Linux 使用 `epoll` 聚合多个连接的事件，其他环境使用 `poll`，从而使线程数量主要由 CPU 和目标吞吐决定，而不是由连接数量决定。
+
+该设计的代价是增加了队列、任务引用和完成结果的管理开销，并要求合理配置 Proxy 与 SuperNode worker 的数量。如果接入线程不足，请求无法及时进入执行面；如果执行线程不足，Job Queue 会积压；如果回写能力不足，Completion Queue 和 channel backlog 会增长。因此，worker 配比和队列积压需要与吞吐、尾延迟一起评估，不能只观察单侧 CPU 利用率。
 
 #### 实验
 
-远端主机实测也验证了这一点。基于 `NUM_KEYS=100000`、`TS=64`、`CS=4`、`TEST_TIME=30` 的 TCP `mixed-80r20w` 负载，三组代表性 worker 配比结果如下：
+在远端主机上使用 TCP `mixed-80r20w` 负载进行验证，固定条件为 `NUM_KEYS=100000`、`TS=64`、`CS=4`、`TEST_TIME=30`。表中的配比为 `Proxy I/O worker : SuperNode worker`：
 
 | 配比 | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `1:1` | 1,021,403.10 | 7.807 | 7.967 | 1.66 | 单线程基线 |
-| `1:20` | 236,231.32 | 35.071 | 36.607 | 0.61 | 单 proxy 成为明显瓶颈 |
-| `20:20` | 11,711,294.81 | 0.703 | 0.703 | 20.65 | 接近当前主峰 |
+| `1:1` | 1,021,403.10 | 7.807 | 7.967 | 1.66 | 接入和执行都只有一个并行单元 |
+| `1:20` | 236,231.32 | 35.071 | 36.607 | 0.61 | SuperNode 有空闲能力，但单个 Proxy 限制了入口和结果回写 |
+| `20:20` | 11,711,294.81 | 0.703 | 0.703 | 20.65 | 两侧并行度匹配，达到当前测试配置的高位 |
+| `21:21` | 11,771,274.05 | 0.703 | 0.863 | 21.10 | 吞吐略高于 `20:20`，继续增加线程的收益已明显变小 |
 
-这组数据说明，proxy I/O 与 SuperNode 执行解耦后，单侧 worker 过少会迅速限制吞吐；当两侧配比接近且并行度足够时，端到端吞吐可提升到千万级 QPS，延迟也同步降到亚毫秒级。
+结果表明，单侧 worker 过少会成为端到端瓶颈：`1:20` 并没有因为执行线程更多而获得收益，反而受限于单个 Proxy 的请求接入、完成结果回收和响应写回；当两侧并行度匹配时，吞吐达到约 `11.7M QPS`，p50/p99 延迟约为亚毫秒级。相较于 `1:1`，`20:20` 的吞吐提升约 `11.5` 倍，p50 延迟下降约 `91.0%`，p99 延迟下降约 `91.2%`，说明多线程并行执行和接入/执行解耦共同扩大了系统处理能力。由此可见，解耦的价值不是简单增加线程，而是让接入、执行和回写可以分别扩展并保持流水化。
 
-对应的 21:21 host-mt flamegraph 也支持这个判断，见 `perf/server_flamegraph_host_mt_read_21_21_t64_c4_20260722_153218.svg`。图上最重的路径集中在 `drain_completions.lto_priv.0` 和 `vemb_v16_tcp_publish_response_batch`，而 `vemb_v16_proxy_handle_request_ptr_batch_internal.constprop.0`、`tlc_core_get_warm_location_raw.lto_priv.0` 只占较小比例，说明在高配比下请求调度和 TLC 查找已不是主要瓶颈，更多 CPU 时间消耗在 completion drain、response publish 和网络侧 `epoll` / `napi_poll` 处理上。
+对 21:21 配置的性能采样表明，热点主要集中在“批量取回完成结果”和“批量写回 TCP 响应”，而请求分派和 TLC 定位占比较小。这说明当接入和执行能力达到平衡后，瓶颈会从线程调度和数据定位转移到结果回写、网络栈和 payload 发送；后续优化应继续减少完成结果处理和响应发送的固定成本。
 
-这也解释了 `20:20` 和 `21:21` 为什么几乎持平：worker 再加 1 组后，执行侧并没有出现新的结构性收益，系统已经进入“响应回写与网络栈更显眼”的阶段；而 `1:20` 则相反，单 proxy I/O worker 把 request ingress、completion drain 和 response write 全串起来，吞吐因此被压到明显更低。
+`20:20` 与 `21:21` 接近，说明继续增加执行线程已经不能带来同等收益，系统进入响应回写和网络处理主导的阶段。后续应结合 `4.3` 的批量调度、响应聚合和回压设计继续优化，而不是继续无条件增加 worker 数量。
+
+#### CPU 亲和性实验
+
+在 worker 数量固定为 `21:21` 后，进一步比较两种线程到 CPU 的绑定方式。默认的 `interleaved` 模式将 Proxy 和 SuperNode 交叉绑定到可用 CPU：Proxy worker 0、SuperNode worker 0、Proxy worker 1、SuperNode worker 1 依次占用 CPU。新增的 `grouped` 模式按功能分组，前 `N` 个 CPU 分配给 `N` 个 Proxy worker，后 `M` 个 CPU 分配给 `M` 个 SuperNode worker。两种模式均由编译宏 `VEMB_V16_PROXY_AFFINITY_MODE` 控制，`0` 表示交叉模式，`1` 表示分组模式。
+
+该实验固定使用 TCP `mixed-80r20w`、`NUM_KEYS=100000`、`WORKERS='21:21'`、`TS=64`、`CS=4` 和 `TEST_TIME=30`，只改变线程亲和性布局。比较吞吐、p50/p99 尾延迟和 CPU 使用率，用于判断线程相互穿插或按功能分组是否更适合当前请求接入、任务执行与响应回写的流水线。
+
+构建时分别使用 `make -C src redis-server USE_UB=yes VEMB_V16_PROXY_AFFINITY_MODE=0` 和 `VEMB_V16_PROXY_AFFINITY_MODE=1`；Server 启动日志会打印实际的 `affinity=interleaved` 或 `affinity=grouped`，用于确认实验配置没有混淆。
+
+| affinity 模式 | CPU 分配 | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `interleaved` | Proxy/SuperNode 交叉占用 | 11,137,993.25 | 0.743 | 0.943 | 20.53 | 当前配置下吞吐和尾延迟较优 |
+| `grouped` | 前 `N` 个 CPU 给 Proxy，后 `M` 个 CPU 给 SuperNode | 10,723,054.62 | 0.775 | 1.215 | 25.83 | CPU 消耗更高，吞吐下降 |
+
+在本次配置下，分组模式吞吐较交叉模式下降约 `3.7%`，p99 延迟上升约 `28.8%`，CPU 使用量上升约 `25.8%`。这表明当前请求链路中，Proxy 接入、SuperNode 执行和 Completion Queue 回收之间存在较强的流水协同，交叉布局更有利于保持整体处理平衡；分组布局虽然更容易从拓扑上区分两类线程，但没有因此获得性能收益。该结论只适用于当前 CPU 集合、`21:21` worker 配比和 TCP workload，NUMA、核间距离或 worker 配比变化后仍需重新评估。
+
+该实验只评价 CPU 调度布局，不改变 Job Queue、Completion Queue、TLC 或 UB Storage 的数据语义；因此结果应与前述 `21:21` worker 配比基线结合分析，不能仅依据单侧 CPU 利用率判断优劣。
 
 ### 4.3 优化：数据流 batch 化与 job_ref 轻量调度
 
-独立数据面内部的数据流按 `socket/ring -> job -> worker -> completion -> response` 串起来，并在每个跨组件边界尽量 batch 化。proxy I/O worker 从 socket 或 Aeron ring 批量读取 request，decode 后不是逐条同步调用 SuperNode，而是把请求写入 job pool slot，再批量发布 `vemb_v16_job_ref_t` 到 `proxy_worker x supernode_worker` shard queue。SuperNode worker 侧批量 poll job refs，按 ref 找回 job pool 中的实际请求内容，执行完成后再批量写入 completion ring；proxy drain completion 时同样按 batch 聚合，再按 TCP 或 Aeron transport 批量发布 response。
+Batch 化解决的是每条请求都会重复发生的固定成本，包括一次队列发布、一次线程唤醒、一次完成结果回收和一次响应发送。系统在请求和结果的每个跨组件边界都尽量一次处理多个元素：Proxy 批量读取 request，批量提交任务；SuperNode worker 批量获取任务并执行；执行结果批量写入 Completion Queue，Proxy 再批量取回并发送 response。
 
-proxy 侧还把 `socket -> request -> job` 简化为 `socket -> jobs`：request decode 只是 socket/ring 输入到 job pool slot 的转换步骤，不形成独立的中间排队层。这样网络输入一旦完成基本校验，就直接成为可调度 job，减少一次对象生命周期管理和一次队列边界。
+请求路径可以概括为：
 
-`job pool + job_ref` 是这条链路的关键结构。job pool 保存完整 job，包括 op、key、hash、flags、topology_epoch、inline vector 或必要 payload snapshot；shard queue 中只传轻量 `job_ref`，包含 proxy worker id、pool type、slot id、generation、req_id 和 op。这样跨 worker 队列不需要反复搬运 1200B vector，也不需要动态分配大 job 对象；SuperNode 通过 ref 定位 job pool slot，并用 generation 校验 slot 生命周期，完成后再通过 return/completion 路径释放或复用 slot。
+```text
+socket / Aeron ring
+    -> batch decode
+    -> job pool slot
+    -> batch publish job references
+    -> SuperNode batch execute
+    -> batch publish completions
+    -> batch encode and response write
+```
 
-该设计把固定开销从“每请求一次跨线程同步”摊薄为“批量 poll/publish + slot 引用传递”。收益体现在三点：一是 socket/ring 到 worker 的排队成本下降，二是大 payload 留在 job pool 和 UB region 中，跨队列只传小 ref，三是 completion 可以批量回流，避免 SuperNode worker 在单条 response 上频繁唤醒 proxy。
+其中，`job pool` 是可复用的任务存储区，保存完整请求内容；`job_ref` 是指向任务槽位的轻量引用，只包含 worker、槽位、代数、请求编号和操作类型等信息。Proxy 将请求内容写入槽位后，只把 `job_ref` 放入 Job Queue，SuperNode 根据引用取回完整任务。这样，固定约 `1200B` 的向量不会在队列之间重复复制，也不需要为每条请求单独分配和释放大对象。
 
-client pipeline window 保持多个 outstanding request，用于覆盖 request/response 等待开销并支撑 proxy/SuperNode 两侧批量 drain。现有压测显示 `pipeline=16` 已基本覆盖等待开销，继续增加到 `pipeline=32` 收益很小；mixed 80R/20W 模式把读写放在同一 worker、channel 和 pipeline 中，避免人为拆分读写路径造成吞吐口径偏差。
+任务槽位使用 `generation` 标记生命周期。任务完成并回收后，槽位可能被下一条请求复用；SuperNode 取出引用时必须同时检查槽位编号和 generation，避免旧请求引用访问已经复用的内容。这个检查保证了 batch 化不会以牺牲任务生命周期安全为代价。
+
+Client pipeline 与 server batch 解决的是不同问题。Server batch 决定一次 poll/publish/execute 处理多少请求，降低系统内部的单位请求成本；client pipeline 决定同时保持多少个未完成请求，用于持续填充 server batch 并覆盖请求往返等待时间。只有两者同时达到合适规模，Proxy 和 SuperNode 才能持续获得足够任务；pipeline 过小无法形成批次，pipeline 过大则会增加排队和尾延迟。
+
+该设计的核心收益是：用一次批量操作摊薄跨线程固定成本，用轻量引用避免大 payload 跨队列复制，用可复用槽位减少动态内存管理，并通过 Completion Queue 将执行和网络回写继续隔离。后续优化重点是根据负载动态选择 batch 大小、限制 batch 等待时间、在队列接近满载时及时回压，并分别观察吞吐和尾延迟，而不是只追求更大的 batch。
 
 #### 实验
 
-这轮 batch 消融在远端主机上通过编译期开关切换 server 侧 `PROXY_REQUEST_BATCH` / `PROXY_RESPONSE_BATCH` / `PROXY_QUEUE_BATCH`，client 侧只修改脚本中的 `PIPELINE`。固定条件为 TCP `mixed-80r20w`、`NUM_KEYS=100000`、`WORKERS='21:21'`、`TS=64`、`CS=4`、`TEST_TIME=30`。
+实验通过配置分别调整 server 侧请求、队列和响应的 batch 大小，client 侧只调整 `PIPELINE`。固定条件为 TCP `mixed-80r20w`、`NUM_KEYS=100000`、`WORKERS='21:21'`、`TS=64`、`CS=4`、`TEST_TIME=30`。
 
 | server batch | client PIPELINE | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `1` | `1` | 1,739,809.48 | 0.127 | 0.279 | 12.80 | 低 batch 下吞吐偏低 |
-| `1` | `16` | 2,111,807.30 | 1.911 | 2.367 | 14.17 | pipeline 增大只带来小幅提升 |
-| `1` | `32` | 2,123,582.55 | 3.807 | 4.447 | 13.96 | 接近该档上限 |
-| `16` | `16` | 10,423,223.31 | 0.399 | 0.607 | 20.20 | batch 开始放大出明显收益 |
-| `16` | `32` | 10,828,725.89 | 0.735 | 1.327 | 22.08 | 继续增大 pipeline 略有收益 |
-| `32` | `1` | 1,870,143.12 | 0.119 | 0.255 | 13.06 | 单靠 server batch 不能放大到高峰 |
-| `32` | `16` | 10,148,982.41 | 0.407 | 0.631 | 19.94 | 已进入千万级区间 |
-| `32` | `32` | 11,753,098.30 | 0.703 | 0.871 | 21.12 | 当前已测最佳点 |
+| `1` | `1` | 1,739,809.48 | 0.127 | 0.279 | 12.80 | 内部按单条请求处理，吞吐受固定开销限制 |
+| `1` | `16` | 2,111,807.30 | 1.911 | 2.367 | 14.17 | pipeline 只能部分覆盖等待，无法形成 server batch |
+| `1` | `32` | 2,123,582.55 | 3.807 | 4.447 | 13.96 | pipeline 继续增大后吞吐接近该档上限 |
+| `16` | `16` | 10,423,223.31 | 0.399 | 0.607 | 20.20 | server batch 带来主要吞吐提升 |
+| `16` | `32` | 10,828,725.89 | 0.735 | 1.327 | 22.08 | 更大的 pipeline 继续填充执行面 |
+| `32` | `1` | 1,870,143.12 | 0.119 | 0.255 | 13.06 | 没有足够 outstanding request，batch 无法填满 |
+| `32` | `16` | 10,148,982.41 | 0.407 | 0.631 | 19.94 | batch 和 pipeline 配合后进入千万级 |
+| `32` | `32` | 11,753,098.30 | 0.703 | 0.871 | 21.12 | 当前测试点中的最高吞吐 |
 
-这组数据说明，server batch 从 `1` 提升到 `16/32` 后，吞吐从 2M 级跃升到 10M+，batch 化确实是主因；client pipeline 只有在 server batch 足够大时才更容易转化为吞吐，否则更多是在抬高等待时间。当前已测点里，`server batch=32 + PIPELINE=32` 最强，`server batch=16` 也已经能把系统推到千万级。
+这组数据验证了两者的互补关系。固定 pipeline 时，server batch 从 `1` 提升到 `16/32`，吞吐从约 `2M` 提升到 `10M+`，说明批量处理是主要收益来源；固定 server batch 时，pipeline 从 `16` 增加到 `32` 只有在 server batch 已经足够大时才有明显收益。反过来，`server batch=32 + PIPELINE=1` 只有约 `1.87M QPS`，说明仅扩大服务端批量而没有足够的未完成请求，执行面仍无法被填满。当前测试点中，`server batch=32 + PIPELINE=32` 达到约 `11.75M QPS`，但其 p99 已高于较小 pipeline，说明后续需要在吞吐和尾延迟之间选择合适的窗口。
 
-job pool 消融的口径与此类似，但关闭方式不是“提前分配一批对象再循环使用”，而是每条请求进入时都走一次 `zmalloc`，完成后立刻 `zfree`，不保留可复用的 job slot 生命期。这样对比出来的收益才是 `job pool` 本身减少对象分配/释放与生命周期管理的净收益。
+job pool 的独立消融也必须保持一致口径：关闭复用时，应让每条请求都执行一次分配和释放，而不是继续预分配并循环使用槽位。这样对比得到的才是任务槽位复用减少对象分配、释放和生命周期管理成本的实际收益。
 
-### 4.5 优化：metadata/payload 分离与 cache 优化
+### 4.4 优化：metadata 与 payload 分离
 
-推荐特征向量的 payload 固定为 packed FP32 bytes，默认 300 维约 `1200B`。hpc-redis 将大 payload 和 warm slot metadata 放入 UB warm region，将 key meta、location cache、migration fence 等控制面 metadata 保留在 SuperNode 私有内存中。WARM data region 采用 slot metadata array + packed vector arena 的布局，`local_slot` 同时索引 slot metadata 和 `local_slot * value_size` 对应的 vector bytes；多 warm region 通过 region hash ring、local weight、fallback/full stats 组织，为真实 UB 大容量、跨 region 放置和满载 fallback 预留空间。
+推荐特征向量的 payload 固定为 packed FP32 bytes，默认 300 维约 `1200B`。系统将“判断 key 对应哪个有效向量”的控制信息，与“保存向量 bytes”的数据区域分开：key version、tombstone、迁移 fence、location cache 和 warm region runtime 由 SuperNode/TLC 管理；共享 UB WARM region 保存 region header、slot metadata 和 packed vector payload。所有参与同一数据面的进程都映射同一份 UB Region，CLI 在 Aeron 模式下也必须映射该 Region。
+
+这种分离避免用 Redis 通用对象表示固定长度向量，也避免把完整 payload 放入 key 元数据和队列。控制面只处理小对象，数据面按固定长度和固定偏移访问向量；两者通过 `region_id`、`local_slot`、`offset`、`bytes` 和 `owner_generation` 关联。
+
+WARM region 的逻辑布局为：
+
+```text
+[region header][slot metadata array][packed vector arena]
+       |                 |                    |
+   region 身份       slot 状态与版本       固定长度 vector bytes
+```
+
+其中，`local_slot` 同时标识 slot metadata 和 payload 位置，向量地址可以按 `local_slot * value_size` 计算。多份 WARM region 使用各自稳定的 `region_id`，由 SuperNode 的运行时信息管理；COLD/overflow 只作为容量补充，不能直接向客户端返回 COLD handle。
 
 ```mermaid
 flowchart LR
@@ -417,12 +543,7 @@ flowchart LR
 
     subgraph UB[UB warm payload region]
         direction TB
-        subgraph META[slot metadata array]
-            M0[meta 0<br/>state/write_seq/key_hash/generation]
-            M1[meta 1]
-            M2[meta 2]
-            MN[meta N]
-        end
+        SM[slot metadata array<br/>state/write_seq/key_hash/generation]
         subgraph PAYLOAD[packed vector arena]
             S0[slot 0<br/>300 x FP32]
             S1[slot 1<br/>300 x FP32]
@@ -433,27 +554,31 @@ flowchart LR
 
     KM --> LC
     LC --> RT
-    RT -->|local_slot| META
+    RT -->|region_id| SM
     RT -->|local_slot * value_size| PAYLOAD
-    M0 -. guards .-> S0
-    M1 -. guards .-> S1
-    M2 -. guards .-> S2
-    MN -. guards .-> SNn
+    SM -. guards .-> S0
+    SM -. guards .-> S1
+    SM -. guards .-> S2
+    SM -. guards .-> SNn
 ```
 
-这个布局是 cache 优化的前提：读路径先查小 metadata，再按 handle 定位大 payload；写路径在小 metadata 上完成串行控制，在大 payload region 上顺序写入。高频 key lookup 因此可以从完整 metadata 路径压缩到 location cache + warm slot metadata 的短路径。SuperNode 在 `VEMB_HANDLE`、`VEMB_INLINE`、`VSIM` 等读侧请求中，优先通过 key_hash 命中 location cache，直接拿到 `{region_id, region_index, local_slot, offset, bytes, owner_generation}`，再用 warm slot state、`write_seq` 和 generation 做有效性确认。这样读路径大多数情况下不需要进入 key meta shard lock，也不需要遍历完整 key metadata。
+该布局使控制面和数据面各自承担明确职责：TLC 在 key meta shard 中完成版本、删除和迁移判断，UB Storage 只依据位置描述访问共享 slot 和 payload；写入时，TLC 先确定 key 的新版本和 slot，UB Storage 再使用 slot 状态和 `write_seq` 写入，完成后才发布为可读。读取时，SuperNode 或 Aeron CLI 先确认 slot 稳定，再读取 payload，避免把并发控制下沉为对整个向量的互斥锁。
 
-收益体现在几个方面：
+metadata/payload 分离带来的收益包括：
 
-- metadata 更 cache-friendly，热路径不需要反复触碰 Redis object、SDS、robj 等通用结构。
-- payload region 可以按 `local_slot * value_size` 做固定 offset 计算，省去对象寻址和变长布局开销。
-- same-key overwrite 优先复用原 slot，减少 warm bucket 扫描和 cache 中 handle 的抖动。
-- remote meta publish 在单 owner 快路径跳过，多 owner 时只对目标 view 异步发布，避免无意义控制面写入。
-- Aeron 模式可以直接返回 `{region_id, offset, bytes}`，client mmap 后本地读取向量，避免完整 payload 在 response ring 中往返拷贝。
+- key 元数据规模小且访问集中，读路径不必反复触碰 Redis object、SDS、robj 等通用结构。
+- payload 采用固定长度和固定偏移，省去变长对象寻址和对象生命周期管理。
+- same-key overwrite 可以复用原 slot，减少重新分配和位置变化。
+- Aeron 只需返回 `{region_id, local_slot, offset, bytes, owner_generation}`，CLI 从同一共享 Region 读取 payload。
+- 迁移、删除和版本控制留在 TLC，UB Storage 不承担 key 语义，边界更容易验证和扩展。
 
-写侧会同步维护 cache 的有效性。`VADD` 成功写入 UB payload 后，TLC 更新 key version 和 location cache，让后续读请求可以直接命中新 location；same-key overwrite 优先复用原 slot，减少 cache 中 handle 的抖动。`VREM`、tombstone、source fence 和迁移状态会在同一一致性路径上阻断旧 cache 位置，避免删除或迁移后继续返回 stale handle。
+### 4.5 优化：location cache 快速定位
 
-cache 本身只缓存小 metadata，不缓存完整 1200B vector payload。payload 仍保留在 UB Payload Region 中，cache 命中后只负责快速定位 payload 或生成 vector handle。这个设计让热 key 读侧主要消耗在 cache lookup、slot 校验和必要的 payload snapshot 上，而不是 Redis object 查找、完整 metadata 锁竞争或大对象搬运。
+`4.4` 将控制信息与向量 payload 分开后，读请求仍不应每次都扫描完整 key 元数据。`location cache` 为高频 key 保存最近一次有效的位置描述，包括 `{region_id, region_index, local_slot, offset, bytes, owner_generation}` 等小型元数据，不保存完整向量。TLC 先查询 cache，命中后直接检查共享 slot 的状态、`write_seq` 和 owner 版本；只有 cache 未命中或位置校验失败时，才进入 key meta shard 的完整控制路径。
+
+cache 只负责缩短“key -> location”的路径，不负责决定数据是否有效。`VADD` 发布新 slot 后，TLC 在完成 key 版本更新的同时更新 cache；same-key overwrite 优先复用原 slot，减少位置变化。`VREM`、tombstone、source fence、迁移和 `owner_generation` 更新会使旧 cache 位置失效。即使命中旧 cache，读请求也必须重新检查版本和 slot，不能把 cache 命中直接当作成功结果。
+
+因此，cache 的收益是减少 key 定位和控制面访问，而不是减少向量 payload 的存储。热 key 的常态读路径变为“小 metadata lookup + slot 校验 + 必要的 payload snapshot”；cache miss、写入、删除和迁移则统一回到 `4.6` 的 key meta shard 控制路径。
 
 #### 实验
 
@@ -464,18 +589,20 @@ cache 本身只缓存小 metadata，不缓存完整 1200B vector payload。paylo
 | enable cache | 11,728,756.31 | 11,728,756.31 | 0.703 | - | 21.05 | 306/402MB | QPS 维持在当前 21:21 主峰附近 |
 | cache off | 11,563,497.76 | 11,563,497.76 | 0.719 | 0.983 | 24.95 | 306/400MB | QPS 基本不降，但 TLC lookup 成本转移到 CPU 热点中 |
 
-cache off 的 flamegraph 见 `perf/redis-server-cache-off-20260723_193646.svg`。采样显示整体热点仍主要集中在 TCP 收发、response publish 和 inline payload copy，例如 `writev/recv`、内核 TCP path、`vemb_v16_tcp_publish_response_batch` 和 `sve_streaming_load_f32()`。这解释了为什么关掉 cache 后 QPS 没有明显下降：当前配置下系统吞吐上限更多受网络回写、completion drain、payload snapshot 和 worker 并行调度影响，cache miss 增加的成本被更多 CPU 时间吸收，没有立刻成为端到端吞吐瓶颈。
+cache off 的性能采样显示，整体热点仍主要集中在 TCP 收发、response publish 和 inline payload copy，例如 `writev/recv`、内核 TCP path、`vemb_v16_tcp_publish_response_batch` 和 `sve_streaming_load_f32()`。因此，关闭 cache 后 QPS 没有明显下降，并不表示 cache 没有价值，而是说明当前满载配置的首要上限仍在网络回写、Completion Queue、payload snapshot 和 worker 并行调度；cache miss 的额外成本首先表现为 CPU 消耗增加。
 
-但 cache off 后 `warm_lookup_region` 已经成为显著 TLC 热点，`vemb_v16_tlc_get_handle -> tlc_core_get_warm_location_raw -> warm_lookup_region` 在 perf 中约占 `6.08%` self overhead。另一个值得注意的信号是，在当前关闭方式下读路径仍能看到 `location_cache_put/location_cache_store_entry` 栈，说明实现上如果只让 cache read 直接 miss，而不关闭 cache write，系统会在每次 `warm_lookup` 后继续写入一个不会被命中的 cache entry。这部分不会降低 QPS 的表象，但会增加每请求 CPU 成本；因此 cache 优化的收益应更多用 `ops/core/sec`、TLC lookup 热点和火焰图占比来观察，而不只看满载 QPS。
+cache off 后，完整的 warm lookup 路径成为明显的 TLC 成本；在只关闭 cache read、仍保留 cache write 的测试方式下，每次 lookup 还会继续写入一个不会被命中的 cache entry，进一步增加请求 CPU 开销。因此，cache 优化应主要用 `ops/core/sec`、TLC lookup 成本和关键路径占比衡量，而不能只看满载 QPS。这个结果也引出下一节：当 cache miss 或请求需要修改 key 状态时，必须依靠分片控制边界避免所有请求争用一把全局锁。
 
 
 ### 4.6 优化：key meta shard lock
 
-key meta shard lock 是 TLC 控制面的细粒度串行边界。key_hash 先映射到 key meta shard，同一个 shard 内的 `VADD`、`VREM`、迁移 fence、tombstone、version 更新和 location cache 发布在锁内按顺序完成；不同 shard 之间可以由多个 SuperNode worker 并行推进，避免退化为 Redis 主线程式全局串行。
+`key meta shard lock` 是 cache miss、写入和控制状态变化时使用的细粒度串行边界。系统先根据 `key_hash` 将 key 映射到一个 shard；同一 shard 内的 `VADD`、`VREM`、迁移 fence、tombstone、版本推进和 `location cache` 更新按顺序完成，不同 shard 可以由多个 SuperNode worker 并行处理。它保护的是小规模 key 控制信息，不是整个向量存储，也不是所有请求共享的一把全局锁。
 
-该锁主要保护小 metadata，而不是保护 1200B payload 搬运。写路径在锁内完成 key 语义裁决、slot 选择/复用、版本推进和 cache 更新，真正的 vector bytes 写入通过 warm slot state、bitmap/CAS 和 `write_seq` 与读路径协调。读路径默认不进入 key meta shard lock，只有遇到 source fence、tombstone、migration state、cache miss 或 owner_generation 不匹配等需要控制面判断的情况，才回到锁内确认。
+写请求的顺序是：先进入对应 shard，判断 key 的当前版本和删除/迁移状态；再选择或复用 slot，推进新版本并确定 cache 更新边界；随后由 UB Storage 使用 slot 状态和 `write_seq` 写入向量；payload 发布为稳定状态后，TLC 才发布新的位置和 cache。删除和迁移也遵循同一控制顺序，先使旧位置不可见，再允许 slot 回收或复用。
 
-这种边界让写侧保持同 key/同 shard 的确定性，同时把 80R/20W workload 中占主导的读请求留在 location cache + slot seqlock 快路径上。锁粒度按 shard 拆分后，扩容 key meta shard 数量或重新映射 worker 到 shard 可以作为纵向扩容手段，但需要观察 shard 热点、锁等待和 cache miss 比例，避免热点 key range 集中到少数 shard。
+读请求通常不获取 shard lock：先走 `location cache + slot 校验` 快路径。只有 cache miss、slot 版本不一致、source fence、tombstone、迁移状态或 owner generation 不匹配时，才进入 shard 控制路径重新裁决。这样，4.5 的 cache 命中减少锁访问，4.6 的分片锁则保证必须进入控制面的请求仍然可以并行推进。
+
+这种边界同时保证了两点：同一 key 的更新具有确定顺序，不同 key 或不同 shard 可以并行执行；大向量的写入和读取不需要持有 key shard 锁，而由 UB slot 的原子状态和 `write_seq` 保证并发安全。后续可以增加 shard 数量或调整 worker 到 shard 的映射，但必须同时观察热点 key、锁等待、cache miss 和队列积压，避免把热点集中到少数 shard。
 
 #### 实验
 
@@ -487,6 +614,8 @@ key meta shard lock 是 TLC 控制面的细粒度串行边界。key_hash 先映�
 | `1` | `read_write` | 804,690.23 | 402,340.85 | 50.0% | 9.599 | 23.295 | 41.50 | 289/385 MB |
 
 这组数据中，`256` shards 相对 `1` shard 吞吐提升约 `14.45x`；退化为单 shard 后 QPS 下降约 `93.08%`，p50 延迟放大约 `14.14x`，p99 延迟放大约 `16.28x`。两组内存占用基本一致，说明差异主要来自 key meta 控制面锁竞争，而不是容量或 payload 存储成本。
+
+该实验与 `4.5` 的 cache 实验共同说明：cache 负责减少进入控制面的读请求数量，shard lock 负责降低不可避免的写入、失效和迁移请求的竞争。二者不能互相替代；只有“cache 命中走快路径、控制请求按 shard 并行”的组合，才能同时满足读多写少场景下的吞吐和一致性要求。
 
 ### 4.7 优化：bitmap 优化
 
@@ -553,7 +682,7 @@ TLC 里 seqlock 主要落在两个地方。
 
 ### 4.10 优化：返回语义按 transport 分流
 
-TCP 和 Aeron 的成本模型不同，因此 VEMB V16 不强行使用单一返回语义：
+TCP 和 Aeron 的成本模型不同，因此 HPC-Redis Server 不强行使用单一返回语义：
 
 - TCP 跨主机路径使用 `VEMB_INLINE` 返回完整 vector payload，确保“读成功”等价于 client 已拿到 300 维向量。
 - Aeron 本机路径使用 handle/mmap 语义，response 只返回 region/offset/bytes，payload 保留在 UB warm region 中。
@@ -562,7 +691,7 @@ TCP 和 Aeron 的成本模型不同，因此 VEMB V16 不强行使用单一返�
 
 benchmark 因此限制 TCP read mode 只走 inline vector 或 mixed inline，避免把 TCP handle-only 路径的结果误读为跨主机完整 payload 交付能力。
 
-当前实现的 enable-cache TCP inline 结果作为后续消融和优化测试的 baseline。除非修改了协议、线程模型、cache 读写语义或 payload copy 路径，否则后续实验不需要反复重测同一组基线；新的结果应优先和该行对比 `ops/sec`、`cpu_cores`、`ops/core/sec` 和 flamegraph 热点迁移。
+当前实现的 enable-cache TCP inline 结果作为后续消融和优化测试的 baseline。除非修改了协议、线程模型、cache 读写语义或 payload copy 路径，否则后续实验不需要反复重测同一组基线；新的结果应优先和该行对比 `ops/sec`、`cpu_cores`、`ops/core/sec` 和关键路径热点迁移。
 
 | 模式 | 返回语义 | 代表参数 | ops/sec | hits/sec | p50_ms | p99_ms | cpu_cores | ops/core/sec | 说明 |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -573,11 +702,20 @@ benchmark 因此限制 TCP read mode 只走 inline vector 或 mixed inline，避
 
 ## 5 扩容设计
 
-hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容通过增加 SuperNode endpoint、调整 client-side consistent hash ring 和执行 TLC 迁移，把部分 key range 从 source owner 平滑迁移到 target owner；纵向扩容则在单个 SuperNode 内增加 worker、队列、WARM region、cache/shard 容量和 UB 数据面资源，提升单节点承载能力。两类扩容都要求保持 proxy 热路径简单、读请求不返回 stale payload、写请求不丢失更新。
+hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容通过增加 SuperNode endpoint、调整用户侧 consistent hash ring 和执行 TLC 迁移，把部分 key range 从 source owner 平滑迁移到 target owner；纵向扩容则在单个 SuperNode 内增加 worker、队列、WARM region、cache/shard 容量和 UB 数据面资源，提升单节点承载能力。两类扩容都要求保持 proxy 热路径简单、读请求不返回 stale payload、写请求不丢失更新。
+
+本章明确区分两个名称相近但职责不同的客户端：
+
+| 组件 | 所属平面 | 主要职责 | 不负责的工作 |
+| --- | --- | --- | --- |
+| `topo_ctl CLI` | 扩容控制面 | 由运维或控制器调用，用于新增/下线 endpoint、创建迁移任务、推进 `PREPARE/SNAPSHOT/DELTA/CUTOVER/SOURCE_GC`，并请求发布新的拓扑 epoch 和路由表。 | 不发送用户的 `VADD/VEMB/VREM/VSIM` 业务请求，不读取向量 payload，也不负责 Aeron handle 解引用。 |
+| 用户 SDK / 用户 CLI | 业务数据面 | 发送用户的 `VADD/VEMB/VREM/VSIM` 请求，根据已发布的 consistent hash ring 选择 endpoint，遇到拓扑变化时刷新路由并执行 retry/redirect；Aeron 模式下还负责映射 UB Region 并读取 handle 指向的 payload。 | 不创建 HPC-Redis 节点，不创建迁移任务，不推进 source/target 状态机，不直接修改全局拓扑。 |
+
+下文出现“控制面客户端”时均指 `topo_ctl CLI`，出现“用户客户端”时均指用户 SDK、用户 CLI 或 benchmark。二者可以通过控制接口交换拓扑版本，但不共享同一条请求职责链：`topo_ctl CLI -> control listener / migration API -> source/target SuperNode` 负责扩容控制，`用户 SDK/CLI -> Proxy -> SuperNode` 负责业务数据访问。
 
 ### 5.1 横向扩容
 
-横向扩容面向“增加节点数”的场景，核心动作是新增 SuperNode endpoint 并重新划分 key owner。client/bench/未来 client 根据新的 consistent hash ring 将部分 key route 到 target owner；source owner 通过 migration API 输出 snapshot/delta，target owner 接收并发布新的 local metadata。proxy 仍只处理本 endpoint 的请求，不维护全局拓扑，也不在请求热路径上做二次 hash 或 fan-out。
+横向扩容面向“增加节点数”的场景，并按“先创建节点、后触发迁移”的顺序执行。首先由部署系统或运维人员创建并启动新的 target HPC-Redis Server，完成其 SuperNode、UB Region、TLC Core、key meta shard 和 location cache 的初始化，确认 target endpoint 已具备接收迁移数据的条件。随后，`topo_ctl CLI` 指定 source owner、target owner、迁移的 key range/shard 和目标拓扑 epoch，通过 control listener / migration API 触发扩容任务；source owner 输出 snapshot/delta，target owner 接收并发布新的 local metadata。待迁移和校验完成后，`topo_ctl CLI` 再请求发布新的拓扑 epoch 和 consistent hash ring，用户 SDK/CLI 刷新路由并将相关 key route 到 target owner。Proxy 仍只处理本 endpoint 的请求，不维护全局拓扑，也不在请求热路径上做二次 hash 或 fan-out。
 
 横向扩容的收益是把 key space、读写请求、VSIM 计算和 UB payload 容量分摊到更多 SuperNode 上。它适合单节点 CPU、内存带宽、UB region 容量、completion ring 或网络入口已经接近上限的场景。代价是需要处理 route epoch、source fence、owner_generation、remote meta 和迁移状态机，控制面复杂度高于纵向扩容。
 
@@ -585,30 +723,49 @@ hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容�
 
 纵向扩容面向“增强单节点”的场景，不改变 key owner 归属，也不触发跨 owner 数据迁移。典型手段包括增加 proxy I/O worker、SuperNode worker、job shard queue、completion ring 容量、WARM region 数量、region local weight、key meta shard 数量、location cache 容量和 bitmap/slot 管理能力。
 
-纵向扩容优先保持拓扑 epoch 不变，因此不会引入 client route 切换和 source/target owner 迁移窗口。它适合单节点还有 CPU 核、内存带宽或 UB 资源可用，但现有 worker、队列、region 或 cache 配置偏小的场景。扩容时需要关注 NUMA/UB locality、worker 到 shard 的映射、bitmap word 争抢、completion backlog 和 slow client backpressure，避免只是增加线程数却放大同步成本。
+纵向扩容优先保持拓扑 epoch 不变，因此不会引入用户 SDK/CLI 的 route 切换和 source/target owner 迁移窗口。它适合单节点还有 CPU 核、内存带宽或 UB 资源可用，但现有 worker、队列、region 或 cache 配置偏小的场景。扩容时需要关注 NUMA/UB locality、worker 到 shard 的映射、bitmap word 争抢、completion backlog 和 slow client backpressure，避免只是增加线程数却放大同步成本。
 
 ### 5.3 拓扑与路由切换
 
-扩容前后存在两个拓扑 epoch：旧 epoch 中 key 仍由 source owner 服务，新 epoch 中部分 key range 归属 target owner。client/bench/未来 client 负责根据 consistent hash ring 选择 endpoint，请求 frame 携带 `topology_epoch`，server 侧不做全局二次 hash，也不在 proxy 中执行 fan-out。
+扩容前后存在两个拓扑 epoch：旧 epoch 中 key 仍由 source owner 服务，新 epoch 中部分 key range 归属 target owner。新节点创建并完成初始化后，`topo_ctl CLI` 负责推动迁移阶段、epoch 准备和最终发布；用户 SDK/CLI 负责获取新 ring，并根据 consistent hash ring 选择 endpoint，请求 frame 携带 `topology_epoch`。server 侧不做全局二次 hash，也不在 proxy 中执行 fan-out。
 
-拓扑发布采用“先准备 target，再切换 client route”的顺序。target SuperNode 先创建对应 WARM region、key meta shard、location cache 和 remote meta view；source SuperNode 保留旧 owner 状态并暴露迁移 API。待 target 能接收 migrated key 后，控制面发布新 ring，client 逐步按新 epoch 把相关 key 路由到 target endpoint。
+拓扑发布采用“先创建并准备 target，再迁移，最后切换用户 route”的顺序。target SuperNode 在节点创建阶段完成 WARM region、key meta shard、location cache 和 remote meta view 初始化；source SuperNode 保留旧 owner 状态并暴露迁移 API。`topo_ctl CLI` 触发并推进迁移，待 target 能接收 migrated key 且版本校验完成后，再请求发布新 ring。用户 SDK/CLI 刷新本地拓扑并按新 epoch 把相关 key 路由到 target endpoint。`topo_ctl CLI` 不参与每一条用户请求的路由。
+
+用户 SDK 对拓扑变化的感知和更新分为两个步骤。SDK 在多 endpoint 模式下首次请求前通过 seed endpoint 获取完整拓扑，并保存当前 `topology_epoch`、active ring、standby ring 和 endpoint 列表；之后每个请求都携带本地 epoch，并依据 active ring 和 key 的哈希结果选择目标 owner。当服务端发现请求使用的 epoch 已过期，或目标 owner 已发生变化时，返回 `STALE_TOPOLOGY` 或 `MOVED`。SDK 收到这两类结果后将本地拓扑标记为过期，再通过 seed connection 重新获取完整 topology response，而不是只修改单个 owner。新拓扑会先校验 epoch、active/standby owner 关系和 endpoint 信息，校验通过后整体替换本地拓扑；尚未完成的请求再依据新的 active ring 重新选择 owner 并重试，重试次数受限于 retry budget。`ASK` 只表示当前请求临时发送到指定 owner，不触发完整拓扑刷新；单 endpoint 模式没有 ring，也不执行上述刷新流程。由此，`topo_ctl CLI` 负责发布拓扑，用户 SDK 负责在业务请求中感知变化并更新本地路由，二者职责清晰分离。
 
 ### 5.4 迁移阶段
-迁移按 key range 或 shard 分批推进，避免一次性搬迁造成 source/target 抖动。每个迁移单元包含以下阶段：
+迁移按 key range 或 shard 分批推进，避免一次性搬迁造成 source 和 target 同时承受大规模扫描、写入及路由切换压力。每个迁移单元都可以理解为一条独立的小状态机：它只负责一个明确的数据范围，完成后再进入下一个范围。整个过程遵循“先建立目标状态，再同步变化，最后切换 owner”的顺序。
 
-1. `PREPARE`：target 初始化迁移上下文，source 记录迁移计划和目标 owner generation。
-2. `SNAPSHOT`：source 扫描迁移范围内的 key meta，读取 stable handle 或 inline snapshot，将 key、version、owner_generation、handle/payload 元数据发送到 target。
-3. `DELTA`：迁移过程中发生的 `VADD/VREM` 通过 migration delta 发送到 target，保证 snapshot 之后的更新不会丢失。
-4. `CUTOVER`：source 对迁移 key range 打开 source fence，阻断旧位置继续被读出；target 完成版本校验后发布 READY metadata。
-5. `SOURCE_GC`：确认 client route 已切到新 epoch 且 target 可服务后，source 清理旧 key meta、location cache 和 warm slot 引用。
+1. `PREPARE`：target 建立该迁移单元的上下文，预先准备 WARM region、location cache、key meta 和 remote meta view；source 记录迁移范围、目标 owner 以及目标 `owner_generation`。此时用户请求仍按旧拓扑访问 source。
+2. `SNAPSHOT`：source 扫描范围内的 key meta，生成该时刻的 baseline descriptor，并向 target 发送 key、`key_version`、tombstone、`owner_generation` 以及 handle/payload 元数据。`SNAPSHOT` 完成只表示 target 已经看到这一时刻的数据，不表示 target 已经可以成为新的 owner。
+3. `DELTA`：snapshot 期间发生的 `VADD` 和 `VREM` 仍先在 source 本地提交，同时写入 migration outbox 并发送给 target。增量记录必须携带 key、版本、删除标记和 owner 信息，使 target 能够按版本顺序应用 snapshot 之后的变化，避免更新丢失或删除被旧 snapshot 覆盖。
+4. `BARRIER`：source 为该 range 记录 checkpoint，不冻结正常写入，只要求 migration outbox 追平到指定序号。source 在这一阶段不再扩大当前迁移范围，target 通过 keyed barrier 校验 `key_version`、tombstone 和 owner 视图是否一致；outbox 中剩余的增量应能在短窗口内完成追平。`BARRIER` 表示“可以开始收口”，但尚未发生 owner 切换。
+5. `CUTOVER`：当 target 的 baseline 和全部必要 delta 已到位后，target 执行 `LEASE_COMMIT`，并确认该 range 的 key 已进入 `READY` 状态。随后 source 进入最终收口窗口（`FENCE_BARRIER`）：source 打开 final fence，不再接受该迁移范围的新增量，等待 `acked_seq >= final_barrier_seq`，确认没有悬挂的迁移记录后标记 `CUTOVER`，关闭旧 owner 语义。此后 target 才按新 owner 和新 epoch 对外提供服务。
+6. `SOURCE_GC`：确认 `topo_ctl CLI` 已发布新 epoch、用户 SDK/CLI 已能够切换到新 route，且 target 已稳定服务后，source 才清理旧 key meta、location cache 和 warm slot 引用。清理动作不得早于路由切换和 target 可服务确认。
+
+因此，“snapshot 完成”和“可以切主”必须分开判断。只有 target 的 baseline、增量数据和 lease 都已到位，并且最终屏障确认 outbox 已追平，才允许进入 `CUTOVER`。如果增量追平失败，迁移单元回到 `DELTA`，继续应用 migration outbox；追平到新的 checkpoint 后再次进入 `BARRIER`。如果 target 的版本校验或 lease 提交失败，则保持 source 的旧 owner 语义，修正 target 状态后重新执行 `DELTA -> BARRIER` 的收敛循环。只有这些条件全部满足，才能进入 `CUTOVER`；在此期间可以返回 `ASK`、`MOVED` 或要求请求重试，但不能提前让 source 退出服务。
+
+扩容完成也分为两个层次。`LOCAL_DONE` 表示某个 source 的迁移范围内已经没有未完成的 `MIGRATING` key，baseline 重试和 migration outbox 都已收敛。`GLOBAL_DONE` 则要求所有 source 都达到 `LOCAL_DONE`，`topo_ctl CLI` 已发布包含 target 的 full active topology，并且 source 侧 `SOURCE_GC` 已完成。单个 range 完成 `CUTOVER` 不等于整次扩容完成；只有新 epoch 已对外生效、旧 epoch 已退出服务边界，扩容任务才算真正结束。
+
+`BARRIER` 和其中的 `FENCE_BARRIER` 是迁移性能的关键。正常迁移期间，系统只记录 checkpoint 并异步追平增量，绝大多数读请求仍由 source 的本地 `location cache + warm slot` 快路径完成，不需要等待整个 range 搬迁完成。只有在最终收口时，系统才对当前小范围打开短时 final fence，完成最后增量对齐和 owner 切换；这将长时间的全局停写转化为局部、短时且可控的切换窗口。
+
+迁移期间，用户 SDK/CLI 的行为保持简单：普通读写仍只访问本地 active owner，不执行双写，也不主动 fan-out。请求命中旧 epoch 时，服务端返回 `STALE_TOPOLOGY`、`MOVED` 或临时 `ASK`，SDK 按 5.3 的规则刷新 topology 并重试；`ASK` 只允许一次定向重试，且只有在 target 已完成 gate 检查并可以服务时才会成功，否则回到完整 topology refresh。由于 source 在切主前仍是读权威，读请求通常不需要等待数据搬迁或反复在 source 与 target 间切换；只有 epoch、fence、tombstone 或版本校验失败时才进入控制面裁决。因此，扩容对读路径的可见影响主要是少量拓扑刷新、偶发重定向和 cutover 窗口内的短暂重试，不会形成长期的路由抖动。
 
 ### 5.5 读写一致性
 
-扩容期间的核心约束是“宁可返回 miss/redirect/retry，也不能返回旧 payload”。source fence、tombstone、owner_generation、key version 和 topology epoch 共同组成一致性边界：source 在 `CUTOVER` 后不再从旧 warm slot 返回 cached handle；target 只有在 snapshot/delta 已应用且 slot metadata READY 后，才允许读侧命中 location cache。
+扩容期间的核心约束是：宁可返回 miss、redirect 或 retry，也不能返回旧 payload。该约束由 `topology_epoch`、`owner_generation`、`key_version`、tombstone 和 source fence 共同建立一致性边界。它们分别解决不同层次的问题：
 
-读路径仍优先走 location cache + warm slot seqlock 的无锁快路径，但遇到 source fence、tombstone、owner_generation 不匹配或 epoch 落后时，必须回到 TLC 控制面裁决。inline payload copy 继续通过 `write_seq` 前后双检查保证 snapshot 稳定；handle 返回必须携带新的 owner_generation，避免 client mmap 旧 region 后继续复用 stale handle。
+1. `topology_epoch` 解决“请求应该发给谁”。客户端依据本地 epoch 选择 active owner；服务端发现 epoch 已过期时拒绝继续按旧路由执行，使请求进入拓扑刷新或重定向流程。
+2. `owner_generation` 解决“这个 owner 和 handle 是否仍然有效”。节点接管、迁移或 region 重建后 generation 会变化，旧 owner、旧 region 和旧 warm slot 即使仍然能够被定位，也不能继续被当作当前 owner 使用。
+3. `key_version` 解决“同一个 key 哪个状态更新”。snapshot、delta、写入和删除都必须按版本单调推进，低版本数据不能覆盖高版本数据。
+4. tombstone 表示 key 已被删除。它是带版本的状态，不能只当作一次 miss 处理，否则旧 snapshot 或延迟到达的 delta 可能把已删除的数据重新创建出来。
+5. source fence 表示 source 已经停止为迁移范围提供旧 owner 语义。`CUTOVER` 后，source 不再从旧 warm slot 返回 cached handle；target 只有在 baseline 和 delta 全部应用、版本校验完成且 slot metadata 为 `READY` 后，才允许通过 location cache 对外提供读取。
 
-写路径以 key meta shard lock 串行化同 key 更新。迁移窗口内，source 收到旧 epoch 写请求时将其记录为 delta 或返回需要重试/重路由的状态；target 收到新 epoch 写请求时，在本地 key meta 中建立新版本并更新 location cache。`VREM` 与 tombstone 必须和 `VADD` 走同一迁移版本路径，避免删除被旧 snapshot 重新复活。
+这五类状态形成一条闭环：先用 `topology_epoch` 拦截过期路由，再用 `owner_generation` 拦截失效的 owner 和 handle，最后用 `key_version`、tombstone 和 source fence 裁决同一 owner 内的并发更新、迁移数据和删除状态。任何 epoch 落后、generation 不匹配、版本倒退、tombstone 命中或 fence 已生效的请求，都必须回到 TLC 控制面裁决，不能依赖客户端或本地缓存猜测结果。这样，即使客户端在切换窗口内仍持有旧拓扑，或者 target 尚未完成 baseline/delta 追平，系统也只会返回 miss、redirect 或 retry，不会重新暴露旧值。
+
+读路径仍优先使用 `location cache + warm slot` 的 seqlock 快路径，但需要在读取前后分别进行保护。读取前检查路由、epoch、source fence 和 key meta 中的当前版本，避免把已经 cutover 或已被更高版本覆盖的位置当成有效位置；读取 payload 后再次核对 `write_seq`、`owner_generation`、`key_version` 和 tombstone，只有前后状态一致时才接受结果。inline payload copy 通过 `write_seq` 前后双检查保证复制期间数据稳定；返回 handle 时必须同时携带对应的 `owner_generation` 和 `key_version`。因此，即使用户 SDK/CLI 已经映射旧 region，也会在后续校验中识别出旧 handle，不能继续把它当作新 owner 的有效数据复用。
+
+写路径以 key meta shard lock 串行化同一 key 的更新。迁移窗口内，source 收到旧 epoch 的写请求时，要么在本地提交并写入 migration outbox 作为 delta，要么返回需要重试或重路由的状态；target 收到新 epoch 的写请求时，在本地 key meta 中建立更高版本并更新 location cache。`VREM` 及其 tombstone 必须与 `VADD` 经过同一套版本和迁移路径，防止删除操作被旧 snapshot 或延迟 delta 重新覆盖。对于 `ASK` redirect，用户 SDK/CLI 只执行一次定向重试；如果 target gate 尚未 ready，则回退到完整 topology refresh，避免在旧路由上无限重试。
 
 ### 5.6 Remote Meta 与 UB Lookup
 
@@ -623,13 +780,13 @@ hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容�
 | 阶段 | 拓扑/路径 | Ops/sec | Hits/sec | p50 latency (ms) | Wall (s) |
 | --- | --- | ---: | ---: | ---: | ---: |
 | baseline | `active={0}` | 11,610,975.06 | 11,610,975.06 | 0.743 | 31 |
-| during scaleout | `active={0}->{0,1}`，client topology retry | 12,264,037.11 | 12,263,820.09 | 0.591 | 4 |
-| after scaleout | `active={0,1}`，client topology 按 active ring 分流 | 12,242,474.81 | 12,242,474.81 | 0.711 | 34 |
+| during scaleout | `active={0}->{0,1}`，用户 SDK/benchmark topology retry | 12,264,037.11 | 12,263,820.09 | 0.591 | 4 |
+| after scaleout | `active={0,1}`，用户 SDK/benchmark 按 active ring 分流 | 12,242,474.81 | 12,242,474.81 | 0.711 | 34 |
 
-实验结果显示，扩容窗口内 coordinator 在约 `4s` 完成 source done 收敛和 full-active topology 发布，读吞吐未出现下降；切换后 full-active 稳态吞吐保持在 `12.2M ops/sec` 以上。将 WARM region 调整为 `4GiB` 后，baseline、during 和 after 的吞吐形态与小 region 配置下基本一致，说明该场景下吞吐瓶颈不来自 warm payload region 容量不足。
+实验结果显示，扩容窗口内由 `topo_ctl CLI` 触发的迁移控制流程在约 `4s` 完成 source done 收敛和 full-active topology 发布，读吞吐未出现下降；切换后 full-active 稳态吞吐保持在 `12.2M ops/sec` 以上。将 WARM region 调整为 `4GiB` 后，baseline、during 和 after 的吞吐形态与小 region 配置下基本一致，说明该场景下吞吐瓶颈不来自 warm payload region 容量不足。
 
 ### 5.7 故障处理与观测
 
 迁移任务需要暴露 range/shard 级进度、snapshot 数量、delta 数量、stale/retry/redirect 计数、source fence 命中、target apply 失败和 SOURCE_GC 完成状态。扩容压测应同时观察 proxy backlog、job shard queue、completion ring、region full/fallback、bitmap lock/unlock 时间和 remote lookup 延迟，确认瓶颈来自迁移控制面还是常规数据面。
 
-如果 target apply 失败或新 epoch 无法稳定服务，可以停止发布新的 route epoch，并让旧 epoch client 继续访问 source；已经进入 `CUTOVER` 的 range 需要按迁移状态机恢复 source 可读状态或完成 target 接管。回滚/恢复流程必须以 owner_generation 和 key version 为准，不能只依赖 client 侧路由配置。
+如果 target apply 失败或新 epoch 无法稳定服务，`topo_ctl CLI` 可以停止发布新的 route epoch，并让旧 epoch 的用户 SDK/CLI 继续访问 source；已经进入 `CUTOVER` 的 range 需要按迁移状态机恢复 source 可读状态或完成 target 接管。回滚/恢复流程必须以 owner_generation 和 key version 为准，不能只依赖用户 SDK/CLI 的本地路由配置。

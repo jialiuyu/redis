@@ -336,6 +336,21 @@ endif
 
 .PHONY: sve_f32_load_ut
 
+# Region-backed f32 streaming load micro benchmark
+# 编译: make sve_streaming_load_f32_ut USE_SVE=yes|no
+SVE_STREAMING_LOAD_F32_UT_CFLAGS = -O3 -Wall -Wextra -march=native -pthread -std=gnu11 \
+	-I../src -DSVE_OP_STANDALONE
+
+ifeq ($(USE_SVE),yes)
+    SVE_STREAMING_LOAD_F32_UT_CFLAGS += -DUSE_SVE -march=armv8.2-a+sve
+endif
+
+sve_streaming_load_f32_ut: sve_streaming_load_f32_ut.c ../src/sve_operation.c ../src/sve_operation.h ../src/sve_config.h ../src/monotonic.c ../src/redisassert.c
+	$(CC) $(SVE_STREAMING_LOAD_F32_UT_CFLAGS) -o $@ sve_streaming_load_f32_ut.c ../src/sve_operation.c ../src/monotonic.c ../src/redisassert.c -lm -lpthread
+	@echo "✅ Built: $@"
+
+.PHONY: sve_streaming_load_f32_ut
+
 # UB client 跨节点验证工具
 # 编译: make ub_client_ut
 # 可选: make ub_client_ut USE_CC_MODE=yes USE_SVE=yes

@@ -5,7 +5,7 @@
 #
 # 使用方法（所有参数都有默认值，按需覆盖）：
 #   bash run_aeron_best.sh
-#   TEST_TIME=60 T=64 C=4 PIPELINE=32 bash run_aeron_best.sh
+#   TEST_TIME=60 T=64 C=4 PIPELINE=32 PIO=21 SNW=21 bash run_aeron_best.sh
 #   ssh HW01 'TEST_TIME=60 bash /root/gqs/codespace/UnifiedBus/test_hpc/run_aeron_best.sh'
 #
 # 可调参数（环境变量）：
@@ -16,6 +16,8 @@
 #   MAX_VECTORS   server vector 容量上限 (默认 131072=128K；NUM_KEYS 不能超过这个)
 #   DIM           vector 维度            (默认 300)
 #   SERVER_MASK   server taskset         (默认 "0-47")
+#   PIO           vemb-v16 proxy IO 线程数 (默认 21)
+#   SNW           vemb-v16 supernode worker 数 (默认 21)
 #   CLIENT_MASK   client taskset         (默认 "96-191")
 #   SERVER_HOST   client 连接的 server IP (默认 127.0.0.1)
 #   PORT          server 端口            (默认 6395)
@@ -37,6 +39,8 @@ MAX_VECTORS=${MAX_VECTORS:-131072}
 PIPELINE=${PIPELINE:-32}
 TEST_TIME=${TEST_TIME:-60}
 KEY_PREFIX=${KEY_PREFIX:-"item:"}
+PIO=${PIO:-21}
+SNW=${SNW:-21}
 
 # Sanity: NUM_KEYS 不能超过 MAX_VECTORS（server 软上限），也不能超过物理 warm region 容量（~894K）
 if [ "$NUM_KEYS" -gt "$MAX_VECTORS" ]; then
@@ -86,15 +90,15 @@ sleep 0.5
 
 # ── 启动 server ──
 if [ "$ROLE" = "both" ] || [ "$ROLE" = "server" ]; then
-    echo "=== start server: mask=$SERVER_MASK pio=21 snw=21 ==="
+    echo "=== start server: mask=$SERVER_MASK pio=$PIO snw=$SNW ==="
     taskset -c "$SERVER_MASK" $REDIS \
         --port $PORT --bind 0.0.0.0 --protected-mode no \
         --vemb-v16-enabled yes --vemb-v16-dim $DIM \
         --vemb-v16-max-vectors $MAX_VECTORS \
         --vemb-v16-warm-regions-manifest "$MANIFEST" \
         --vemb-v16-reset-warm-regions yes \
-        --vemb-v16-proxy-io-threads 21 \
-        --vemb-v16-supernode-workers 21 \
+        --vemb-v16-proxy-io-threads $PIO \
+        --vemb-v16-supernode-workers $SNW \
         --daemonize yes --pidfile $PIDFILE --logfile "$SERVER_LOG" --loglevel notice \
         >/dev/null 2>&1
 
