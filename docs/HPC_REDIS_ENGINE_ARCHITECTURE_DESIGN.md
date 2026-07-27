@@ -500,22 +500,27 @@ Client pipeline 与 server batch 解决的是不同问题。Server batch 决定�
 
 #### 实验
 
-实验通过配置分别调整 server 侧请求、队列和响应的 batch 大小，client 侧只调整 `PIPELINE`。固定条件为 TCP `mixed-80r20w`、`NUM_KEYS=100000`、`WORKERS='21:21'`、`TS=64`、`CS=4`、`TEST_TIME=30`。
+本实验固定 server batch 和 client pipeline 均为 `32`，不把批量大小作为变量，只观察 `job pool + job_ref` 对任务入口的影响。按照 `scripts/test_host_mt.md` 执行：
 
-| server batch | client PIPELINE | ops/sec | p50_ms | p99_ms | cpu_cores | 观察 |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `1` | `1` | 1,739,809.48 | 0.127 | 0.279 | 12.80 | 内部按单条请求处理，吞吐受固定开销限制 |
-| `1` | `16` | 2,111,807.30 | 1.911 | 2.367 | 14.17 | pipeline 只能部分覆盖等待，无法形成 server batch |
-| `1` | `32` | 2,123,582.55 | 3.807 | 4.447 | 13.96 | pipeline 继续增大后吞吐接近该档上限 |
-| `16` | `16` | 10,423,223.31 | 0.399 | 0.607 | 20.20 | server batch 带来主要吞吐提升 |
-| `16` | `32` | 10,828,725.89 | 0.735 | 1.327 | 22.08 | 更大的 pipeline 继续填充执行面 |
-| `32` | `1` | 1,870,143.12 | 0.119 | 0.255 | 13.06 | 没有足够 outstanding request，batch 无法填满 |
-| `32` | `16` | 10,148,982.41 | 0.407 | 0.631 | 19.94 | batch 和 pipeline 配合后进入千万级 |
-| `32` | `32` | 11,753,098.30 | 0.703 | 0.871 | 21.12 | 当前测试点中的最高吞吐 |
+```bash
+NUM_KEYS=100000 WORKERS='21:21' TS='64' CS='4' TEST_TIME=30 bash hpc_redis_max_tput.sh
+```
 
-这组数据验证了两者的互补关系。固定 pipeline 时，server batch 从 `1` 提升到 `16/32`，吞吐从约 `2M` 提升到 `10M+`，说明批量处理是主要收益来源；固定 server batch 时，pipeline 从 `16` 增加到 `32` 只有在 server batch 已经足够大时才有明显收益。反过来，`server batch=32 + PIPELINE=1` 只有约 `1.87M QPS`，说明仅扩大服务端批量而没有足够的未完成请求，执行面仍无法被填满。当前测试点中，`server batch=32 + PIPELINE=32` 达到约 `11.75M QPS`，但其 p99 已高于较小 pipeline，说明后续需要在吞吐和尾延迟之间选择合适的窗口。
+该命令使用当前 server 的 `job pool + job_ref` 实现，job pool 采用进程内 heap 预分配，日志中的 `job_pool_slots=(heap)` 表示这一点；当前脚本默认 `PIPELINE=32`、`OP_MODE=vemb`，因此本次复测是纯 VEMB read，不是 mixed-80r20w。
 
-job pool 的独立消融也必须保持一致口径：关闭复用时，应让每条请求都执行一次分配和释放，而不是继续预分配并循环使用槽位。这样对比得到的才是任务槽位复用减少对象分配、释放和生命周期管理成本的实际收益。
+| 实现 | workload | server batch | client pipeline | ops/sec | hits/sec | p50_ms | p99_ms | cpu_cores |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `job pool + job_ref` | `vemb` | `32` | `32` | 11,129,431.00 | 11,129,431.00 | 0.727 | 0.935 | 20.82 |
+
+该结果是当前实现的固定配置复测基线，说明在 batch/pipeline 均为 `32` 时，任务引用和预分配 slot 路径能够稳定运行；它不能单独证明相对旧实现的收益。要隔离 `job pool + job_ref` 的收益，必须保持同一 workload 对比旧的“完整 job 入队”和中间的“job pointer descriptor”版本。已有同一演进线的 TCP `mixed-80r20w` 记录如下：
+
+| 实现阶段 | 平均 QPS | 相对前一阶段 | 说明 |
+| --- | ---: | ---: | --- |
+| 原始 pooled：完整 job 进入 Job Queue | 2,843,824.98 | - | 队列仍搬运较大的 job 数据 |
+| `job_ptr descriptor` | 2,944,068.16 | +3.52% | 队列只传指针描述，但每条请求仍分配和释放 job |
+| `job pool + job_ref` | 3,472,419.33 | +17.95% | 队列只传轻量引用，完整 job 复用 per-worker slot |
+
+相对于原始 pooled 版本，`job pool + job_ref` 累计提升约 `22.10%`；相对于 `job_ptr descriptor`，提升约 `17.95%`。收益来自两个固定成本的连续消除：先减少大 job 在队列中的复制，再用 per-worker slot 复用替代每请求的分配和释放。上述 mixed 记录与本次 exact command 的纯读复测属于不同 workload，不能直接用 QPS 互相换算；后续若需要新的严格收益对照，应在同一远端、同一 workload 下分别运行旧版本和当前版本。
 
 ### 4.4 优化：metadata 与 payload 分离
 
@@ -775,15 +780,17 @@ hpc-redis 的扩容设计分为横向扩容和纵向扩容两类。横向扩容�
 
 #### 扩容吞吐验证
 
-2026-07-24 在双机环境执行 `benchmark/hpc_redis_scaleout_throughput.sh`，验证 0->1 横向扩容过程中的读吞吐与切换耗时。测试机器为 `node0=192.168.90.111`、`node1=192.168.90.112`，向量维度 `DIM=300`，预填充 `10000` 个 key，读压测使用 `64` threads、每线程 `4` connections、pipeline `32`。本轮将 WARM region 扩大到 `4GiB`，remote meta mmap offset 后移到 `5GiB`，以排除小 region 配置对扩容读性能的影响。
+2026-07-27 在双机环境执行 `benchmark/hpc_redis_scaleout_throughput.sh`，验证 0->1 横向扩容过程中的读吞吐、切换耗时和 owner 分布。测试机器为 `node0=192.168.90.111`、`node1=192.168.90.112`，向量维度 `DIM=300`，预填充 `10000` 个 key，读压测使用 `64` threads、每线程 `4` connections、pipeline `32`，`VNODE_COUNT=100`。本轮将 WARM region 扩大到 `4GiB`，remote meta mmap offset 后移到 `5GiB`，以排除小 region 配置对扩容读性能的影响。
 
-| 阶段 | 拓扑/路径 | Ops/sec | Hits/sec | p50 latency (ms) | Wall (s) |
-| --- | --- | ---: | ---: | ---: | ---: |
-| baseline | `active={0}` | 11,610,975.06 | 11,610,975.06 | 0.743 | 31 |
-| during scaleout | `active={0}->{0,1}`，用户 SDK/benchmark topology retry | 12,264,037.11 | 12,263,820.09 | 0.591 | 4 |
-| after scaleout | `active={0,1}`，用户 SDK/benchmark 按 active ring 分流 | 12,242,474.81 | 12,242,474.81 | 0.711 | 34 |
+| 阶段 | 拓扑/路径 | Ops/sec | Hits/sec | p50 latency (ms) | p99 latency (ms) | Wall (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | `active={0}` | 11,679,034.75 | 11,679,034.75 | 0.615 | 0.943 | 32 |
+| during scaleout | `active={0}->{0,1}`，用户 SDK/benchmark topology retry | 12,047,874.17 | 12,047,446.23 | 0.599 | 0.927 | 4 |
+| after scaleout | `active={0,1}`，用户 SDK/benchmark 按 active ring 分流 | 12,171,483.56 | 12,171,483.56 | 0.711 | 9.407 | 34 |
 
-实验结果显示，扩容窗口内由 `topo_ctl CLI` 触发的迁移控制流程在约 `4s` 完成 source done 收敛和 full-active topology 发布，读吞吐未出现下降；切换后 full-active 稳态吞吐保持在 `12.2M ops/sec` 以上。将 WARM region 调整为 `4GiB` 后，baseline、during 和 after 的吞吐形态与小 region 配置下基本一致，说明该场景下吞吐瓶颈不来自 warm payload region 容量不足。
+实验结果显示，扩容窗口内由 `topo_ctl CLI` 触发的迁移控制流程在约 `4s` 完成 source done 收敛和 full-active topology 发布，`during` 阶段吞吐没有下降；切换后 full-active 稳态吞吐达到 `12.17M ops/sec`，较 baseline 的 `11.68M ops/sec` 高约 `4.2%`。本轮 coordinator 记录 `scaleout_all_sources_done=1`、`scaleout_full_active_published=2 errors=0`，node0 的迁移计划记录 `marked=4726 skipped=5274 baseline_sent=4726 errors=0`，对应旧 key 约 `47.26%` 迁移到 node1、`52.74%` 保留在 node0，较默认 `10` 个 vnode 下的 `21.58%/78.42%` 分布明显均衡。
+
+`after` 的 p99 从 baseline 的 `0.943ms` 上升到 `9.407ms`，但 p50 仍为 `0.711ms`，且 hits 与 ops 完全相等。这不是迁移失败，而是双节点 active ring 分流后，部分请求从 node0 client 经 TCP 访问 node1；同一轮的 direct-node1 读测 p50 为 `9.151ms`，说明跨节点路径形成了 after 阶段的尾延迟。`after` 阶段的 wall 时间还包含 steady keyspace 的 prefill，不能将 `34s` 单独解释为纯读压测时长。将 WARM region 调整为 `4GiB` 后，吞吐仍保持在 `12M ops/sec` 级别，说明该场景的主要性能差异来自跨节点访问尾延迟，而不是 warm payload region 容量不足。
 
 ### 5.7 故障处理与观测
 
