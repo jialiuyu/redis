@@ -102,6 +102,108 @@ PREFILL_OPS=$(echo "$PREFILL_OUT" | grep "^Totals" | tail -1 | awk '{print $2}')
 echo "    prefill done: ops=$PREFILL_OPS"
 sleep 1
 
+# ── 验证 warm region 分布：扫描每个 region 的 slot state 统计 READY 数量 ──
+echo ">>> verifying warm region distribution..."
+python3 - "$MANIFEST" <<'PYEOF'
+import sys, os, mmap, struct, re
+
+manifest = sys.argv[1]
+try:
+    with open(manifest) as f:
+        text = f.read()
+except OSError as e:
+    print(f"  WARN: cannot read manifest {manifest}: {e}")
+    sys.exit(0)
+
+# 简易 yaml 解析（不依赖 PyYAML）
+regions = []
+cur = {}
+for line in text.splitlines():
+    if line.strip().startswith('- region_id:'):
+        if cur: regions.append(cur)
+        cur = {'region_id': int(line.split(':',1)[1].strip())}
+    else:
+        m = re.match(r'\s+(\w+):\s*(.+?)\s*$', line)
+        if m and cur is not None:
+            k, v = m.group(1), m.group(2)
+            if k in ('path','mmap_offset','bytes','value_size','home_ub_node_id','weight'):
+                cur[k] = int(v) if k != 'path' else v
+if cur: regions.append(cur)
+
+if not regions:
+    print("  WARN: no warm_regions found in manifest")
+    sys.exit(0)
+
+HEADER_FMT = struct.Struct('<IIIII4xQ32s')   # magic, version, region_id, capacity_slots, value_size, region_bytes, reserved
+SLOT_FMT   = struct.Struct('<IIIIQQQQQII')   # state, region_id, local_slot, bytes, owner_gen, write_seq, key_hash, key_fp, last_access_ns, clock_bit, cold_state
+HEADER_SZ  = 64
+SLOT_SZ    = 64
+SLOT_READY = 2
+
+total_ready = 0
+region_stats = []
+for r in regions:
+    path   = r.get('path')
+    offset = r.get('mmap_offset', 0)
+    rbytes = r.get('bytes', 0)
+    rid    = r.get('region_id')
+    if not path or not rbytes:
+        print(f"  region_id={rid}: skip (missing path/bytes)"); continue
+
+    # 本地物理 shmdev (1-4) 要 O_RDWR；远端 UB view (5-8) 要 O_RDWR|O_SYNC。
+    # 先试 O_RDWR，mmap EPERM 则 fallback 到 O_SYNC。
+    m = None
+    for flags_open in (os.O_RDWR, os.O_RDWR | os.O_SYNC):
+        try:
+            fd = os.open(path, flags_open)
+            try:
+                m = mmap.mmap(fd, rbytes, mmap.MAP_SHARED, mmap.PROT_READ, offset=offset)
+            finally:
+                os.close(fd)
+            break
+        except PermissionError:
+            m = None
+            continue
+        except OSError as e:
+            m = None
+            last_err = e
+            continue
+    if m is None:
+        print(f"  region_id={rid} path={path}: mmap failed (tried O_RDWR and O_RDWR|O_SYNC), skipping")
+        continue
+
+    # 读 header
+    magic, version, h_rid, cap, vsize, rg_bytes, _ = HEADER_FMT.unpack_from(m, 0)
+    if magic not in (0x5631414c, 0x56314149):   # V1AL / V1AI
+        print(f"  region_id={rid} path={path}: bad magic=0x{magic:x}, skipping")
+        m.close(); continue
+
+    # 统计 slot states
+    counts = {0:0, 1:0, 2:0, 3:0}
+    for i in range(cap):
+        off = HEADER_SZ + i * SLOT_SZ
+        if off + SLOT_SZ > rbytes: break
+        state = SLOT_FMT.unpack_from(m, off)[0]
+        counts[state] = counts.get(state, 0) + 1
+    m.close()
+
+    ready = counts.get(SLOT_READY, 0)
+    total_ready += ready
+    region_stats.append((rid, path, ready, cap, rbytes))
+
+    state_str = '/'.join(f"{s}:{counts.get(s,0)}" for s in sorted(counts))
+    print(f"  region_id={rid} path={path:24s} READY={ready:6d}/{cap:<6d} bytes={rbytes:>12d} states[{state_str}]")
+
+if total_ready > 0:
+    print("  ── distribution ──")
+    for rid, path, ready, cap, rbytes in region_stats:
+        pct = 100.0 * ready / total_ready
+        bar = '#' * int(round(pct/2))
+        print(f"    region_id={rid}: {ready:6d} ({pct:5.1f}%) {bar}")
+else:
+    print("  WARN: no READY slots found in any region")
+PYEOF
+
 # ── bench ──
 echo ">>> bench: ${TRANSPORT} READ t=$T c=$C pipeline=$PIPELINE ${TEST_TIME}s..."
 SRV_PID=$(cat $PIDFILE 2>/dev/null)

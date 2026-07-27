@@ -3,474 +3,370 @@
 # 一档失败会触发 cleanup 杀全部 server。用 || true 兜底。
 #
 # ============================================================================
-# Multi-Instance Redis 8.6.3 Baseline (核数拉平 hpc-redis)
+# Multi-Instance Redis 8.6.3 Baseline (核数拉平 hpc-redis) - 17 档 sweep 版
 #
-#   N 个 Redis 实例，各绑 IO_THREADS 核，总核数 ≈ hpc-redis 的 46 核
-#   数据分片：每实例持有不交叠的 key 范围
-#   N 个 memtier 并行打，各连各的端口，汇总吞吐
+# 在 SERVER (HW01) 本地直接执行；跨节点时 ssh CLIENT 启 memtier。
 #
-# 拓扑（同 run_cross_node_redis_baseline.sh）：
-#   JUMP=HW01 / SERVER=HW01 / CLIENT=HW02(192.168.90.112) / data=192.168.1.111
+# N 个 Redis 实例，各绑 IO_THREADS 核，总核数 ≈ hpc-redis 的 48 核
+# 数据分片：每实例持有不交叠的 key 范围
+# N 个 memtier 并行打，各连各的端口，汇总吞吐
 #
-# 用法:
-#   NUM_INSTANCES=12 IO_THREADS=4 bash run_multi_instance_redis_baseline.sh
+# 跟 run_vemb_{local_loopback,cross_node}_sweep.sh 对齐:
+#   - 17 档 (t,c,pipeline) 配置矩阵（TS/CS/PS 数组）
+#   - server 启动参数对齐（--bind 0.0.0.0 / --tcp-backlog 16384 / --appendonly no / --save ''）
+#   - 输出 TSV 列对齐 sweep 脚本（op/server_type/t/c/pipeline/ops_sec/avg/p50/p99/kb_sec/cores/nic_util）
+#
+# 用法 (在 HW01 上执行):
+#   bash run_multi_instance_redis_baseline.sh                                 # 默认 17 档, 跨节点
+#   TS="64" CS="4" PS="32" bash ...                                          # 单档调试
+#   LOCAL_BENCH=1 RAW=1 DIM=300 bash ...                                     # 本地回环 + RAW
+#   DIM=8 NIC_IFACE=eth4 bash ...                                            # 跨节点 DIM=8
 # ============================================================================
+set -uo pipefail
 
-JUMP="${JUMP:-HW01}"
-SERVER="${SERVER:-HW01}"
-CLIENT="${CLIENT:-192.168.90.112}"
-SERVER_HOST="${SERVER_HOST:-192.168.1.111}"
+# === 拓扑 ===
+CLIENT=${CLIENT:-HW02}
+SERVER_HOST=${SERVER_HOST:-192.168.1.111}
 BASE_PORT=${BASE_PORT:-7001}
-CODE_DIR="${CODE_DIR:-/root/gqs/codespace/redis-8.6.3}"
-MEMTIER_DIR="${MEMTIER_DIR:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin}"
+CODE_DIR=${CODE_DIR:-/root/gqs/codespace/redis-8.6.3}
+MEMTIER_DIR=${MEMTIER_DIR:-/root/gqs/codespace/UnifiedBus/memtier_benchmark_origin}
 
-# ───────── 实验参数 ─────────
-# LOCAL_BENCH=1: 跑本地回环（server+client 都在 HW01，memtier 连 127.0.0.1）
+# === 实验参数 ===
 LOCAL_BENCH=${LOCAL_BENCH:-0}
 NUM_INSTANCES=${NUM_INSTANCES:-12}
 IO_THREADS=${IO_THREADS:-4}
 DIM=${DIM:-300}
 NUM_KEYS=${NUM_KEYS:-100000}
-PIPELINE=${PIPELINE:-16}
 TEST_TIME=${TEST_TIME:-30}
-# RAW=1 走 VEMB raw 二进制路径（INT8 量化字节直传，server 跳过反量化+DIM 次 sprintf）
 RAW=${RAW:-0}
 RAW_SUFFIX=""
 [ "$RAW" = "1" ] && RAW_SUFFIX=" raw"
-# 100G NIC 统计：sar -n DEV 1 监听 server 端网卡。本地回环不需要。
 NIC_IFACE=${NIC_IFACE:-eth4}
-# 每实例 memtier 的 -t 和 -c
-MEMTIER_T=${MEMTIER_T:-16}
-MEMTIER_C=${MEMTIER_C:-4}
 
-# 客户端核范围（local: HW01 NUMA1; cross-node: HW02 NUMA1）
+# === 17 档配置矩阵（跟 run_vemb_*_sweep.sh 完全一致）===
+TS_DEFAULT=(1 1 1 1  1  2  4  8  16 32 64 64 64 64 64 64 64)
+CS_DEFAULT=(1 1 1 1  1  1  1  1  1  1  1  2  4  8  16 32 64)
+PS_DEFAULT=(1 4 8 16 32 32 32 32 32 32 32 32 32 32 32 32 32)
+TS=( ${TS:-${TS_DEFAULT[*]}} )
+CS=( ${CS:-${CS_DEFAULT[*]}} )
+PS=( ${PS:-${PS_DEFAULT[*]}} )
+if [ ${#TS[@]} -ne ${#CS[@]} ] || [ ${#TS[@]} -ne ${#PS[@]} ]; then
+    echo "ERROR: TS/CS/PS length mismatch (TS=${#TS[@]} CS=${#CS[@]} PS=${#PS[@]})"
+    exit 2
+fi
+NCONFIGS=${#TS[@]}
+
+# === 客户端核 ===
 CLIENT_CPU_START=${CLIENT_CPU_START:-97}
 CLIENT_CPU_END=${CLIENT_CPU_END:-191}
-# CLIENT_CPUSET: 任意 taskset 范围字符串（如 HW06 NUMA1 "24-47,72-95"）。
-# 如果设置，覆盖 CLIENT_CPU_START-END。
 CLIENT_CPUSET=${CLIENT_CPUSET:-}
-# 派生：脚本里绑核用 CLIENT_CPU_SPEC
-if [ -n "$CLIENT_CPUSET" ]; then
-    CLIENT_CPU_SPEC="$CLIENT_CPUSET"
-else
-    CLIENT_CPU_SPEC="$CLIENT_CPU_START-$CLIENT_CPU_END"
-fi
+[ -n "$CLIENT_CPUSET" ] && CLIENT_CPU_SPEC="$CLIENT_CPUSET" || CLIENT_CPU_SPEC="$CLIENT_CPU_START-$CLIENT_CPU_END"
 
-# 派生值
 CORES_PER_INSTANCE=$IO_THREADS
-# 每实例 memtier 独占核组大小（保证调度公平，避免 12 进程争抢 95 核造成实例间不均衡）
-TOTAL_CLIENT_CORES=$((CLIENT_CPU_END - CLIENT_CPU_START + 1))
-CORES_PER_MEMTIER=$(( TOTAL_CLIENT_CORES / NUM_INSTANCES ))
 
-LOCAL_RESULT_DIR="benchmark/results/vemb_multi_instance_baseline"
+# === 输出 ===
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULT_PREFIX="multi_inst_${TIMESTAMP}"
+OUTDIR=${OUTDIR:-benchmark/results/vemb_multi_instance_baseline/${TIMESTAMP}}
+RAWDIR="$OUTDIR/raw"
+TSV="$OUTDIR/summary.tsv"
 
-mkdir -p "$LOCAL_RESULT_DIR"
+ulimit -n 200000
+mkdir -p "$RAWDIR"
 
-log() {
-    echo "[$(date '+%H:%M:%S')] $*"
-}
-
-get_ts() {
-    python3 -c 'import time; print("%.9f" % time.time())' 2>/dev/null || date +%s
-}
-
-# 环境变量前缀：传给 HW01 上的 orchestrator
-ORCH_ENV="NUM_INSTANCES=$NUM_INSTANCES IO_THREADS=$IO_THREADS CORES_PER=$CORES_PER_INSTANCE DIM=$DIM NUM_KEYS=$NUM_KEYS BASE_PORT=$BASE_PORT CODE_DIR=$CODE_DIR"
+log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ============================================================================
-# Step 0: Upload helpers to HW01
+# jiffies (本机直接读 /proc)
 # ============================================================================
-log "=== Step 0: Upload helpers ==="
+get_jiffies() {
+    local pid=$1 s=0
+    for f in /proc/$pid/task/*/stat; do
+        [ -r "$f" ] || continue
+        local r=$(sed 's/.*)//' "$f")
+        set -- $r
+        s=$((s + ${12:-0} + ${13:-0}))
+    done
+    echo $s
+}
 
-# jiffies helper
-ssh "$JUMP" "cat > /tmp/get_jiffies.sh" <<'JIFFIES_EOF'
-#!/bin/bash
-pid=$1
-s=0
-for f in /proc/$pid/task/*/stat; do
-    [ -r "$f" ] || continue
-    r=$(sed 's/.*)//' "$f")
-    set -- $r
-    s=$((s + ${12:-0} + ${13:-0}))
-done
-echo $s
-JIFFIES_EOF
+# ----------------------------------------------------------------------------
+# 单实例操作（直接本地执行）
+# ----------------------------------------------------------------------------
+INST_PORT=0 INST_CORE_START=0 INST_CORE_END=0 INST_KEY_MIN=0 INST_KEY_MAX=0
+INST_DATA_DIR="" INST_LOG=""
 
-# multi-instance orchestrator on HW01（读 env var，由 ORCH_ENV 传入）
-ssh "$JUMP" "cat > /tmp/multi_instance_server.sh" <<'ORCH_EOF'
-#!/bin/bash
-# 用法: multi_instance_server.sh <cmd> <iid>
-# env: NUM_INSTANCES IO_THREADS CORES_PER DIM NUM_KEYS BASE_PORT CODE_DIR
-cmd=$1
-iid=$2
+inst_var() {
+    local iid=$1
+    local keys_per=$(( (NUM_KEYS + NUM_INSTANCES - 1) / NUM_INSTANCES ))
+    INST_PORT=$((BASE_PORT + iid))
+    INST_CORE_START=$((iid * CORES_PER_INSTANCE))
+    INST_CORE_END=$((INST_CORE_START + CORES_PER_INSTANCE - 1))
+    INST_KEY_MIN=$((iid * keys_per + 1))
+    INST_KEY_MAX=$(( (iid + 1) * keys_per ))
+    [ $INST_KEY_MAX -gt $NUM_KEYS ] && INST_KEY_MAX=$NUM_KEYS
+    INST_DATA_DIR="/tmp/redis_multi_inst_${iid}"
+    INST_LOG="${INST_DATA_DIR}/redis.log"
+}
 
-PORT=$((BASE_PORT + iid))
-CORE_START=$((iid * CORES_PER))
-CORE_END=$((CORE_START + CORES_PER - 1))
-KEYS_PER=$(( (NUM_KEYS + NUM_INSTANCES - 1) / NUM_INSTANCES ))
-KEY_MIN=$((iid * KEYS_PER + 1))
-KEY_MAX=$(( (iid + 1) * KEYS_PER ))
-[ $KEY_MAX -gt $NUM_KEYS ] && KEY_MAX=$NUM_KEYS
-DATA_DIR="/tmp/redis_multi_inst_${iid}"
-SERVER_LOG="${DATA_DIR}/redis.log"
+start_instance() {
+    local iid=$1; inst_var $iid
+    rm -rf "$INST_DATA_DIR" && mkdir -p "$INST_DATA_DIR"
+    numactl --membind=0 taskset -c $INST_CORE_START-$INST_CORE_END \
+        $CODE_DIR/src/redis-server \
+            --port $INST_PORT --bind 0.0.0.0 --protected-mode no \
+            --tcp-backlog 16384 --tcp-keepalive 1800 --timeout 0 \
+            --io-threads $IO_THREADS --io-threads-do-reads yes \
+            --appendonly no --save '' \
+            --dir "$INST_DATA_DIR" --logfile "$INST_LOG" \
+            --daemonize yes --pidfile "${INST_DATA_DIR}/redis.pid"
+}
 
-case "$cmd" in
-start)
-    cd "$CODE_DIR"
-    rm -rf "$DATA_DIR" && mkdir -p "$DATA_DIR"
-    numactl --membind=0 taskset -c $CORE_START-$CORE_END ./src/redis-server \
-        --port $PORT --protected-mode no \
-        --dir "$DATA_DIR" \
-        --tcp-keepalive 1800 --timeout 0 \
-        --io-threads $IO_THREADS --io-threads-do-reads yes \
-        --daemonize yes --logfile "$SERVER_LOG" \
-        --pidfile "${DATA_DIR}/redis.pid"
-    ;;
-stop)
-    redis-cli -p $PORT --timeout 2 SHUTDOWN NOSAVE 2>/dev/null || true
-    # 双重 kill：pkill 模式 + ss 精确找 PID（pkill "redis-server.*:PORT" 末尾带或不带空格都匹配）
-    pkill -9 -f "redis-server.*:$PORT" 2>/dev/null || true
-    # 兜底：ss 找端口对应 PID（处理 pkill 未匹配的残留）
-    for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do
+stop_instance() {
+    local iid=$1; inst_var $iid
+    $CODE_DIR/src/redis-cli -p $INST_PORT --timeout 2 SHUTDOWN NOSAVE 2>/dev/null || true
+    pkill -9 -f "redis-server.*:$INST_PORT" 2>/dev/null || true
+    for pid in $(ss -tlnp 2>/dev/null | grep ":$INST_PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do
         kill -9 "$pid" 2>/dev/null || true
     done
-    ;;
-prefill)
-    cd "$CODE_DIR"
-    VEC300=$(seq -s " " 1 $DIM | sed "s/[0-9]*/0.1/g")
-    expected=$((KEY_MAX - KEY_MIN + 1))
-    # 单 redis-cli --pipe + VCARD 验证 + VEMB probe（不只查数量，验证 key 真的在）+ 失败重试
+}
+
+prefill_instance() {
+    local iid=$1; inst_var $iid
+    local vec300=$(seq -s " " 1 $DIM | sed "s/[0-9]*/0.1/g")
+    local expected=$((INST_KEY_MAX - INST_KEY_MIN + 1))
     for attempt in 1 2 3 4 5; do
-        # 先 DEL 旧 vset 避免脏数据（VCARD 可能来自上次残留）
-        ./src/redis-cli -p $PORT DEL myvectors >/dev/null 2>&1
+        $CODE_DIR/src/redis-cli -p $INST_PORT DEL myvectors >/dev/null 2>&1
         sleep 0.2
         {
-            for i in $(seq $KEY_MIN $KEY_MAX); do
-                echo "VADD myvectors VALUES $DIM $VEC300 item:$i"
+            for i in $(seq $INST_KEY_MIN $INST_KEY_MAX); do
+                echo "VADD myvectors VALUES $DIM $vec300 item:$i"
             done
-        } | ./src/redis-cli -p $PORT --pipe >/dev/null 2>&1
-        # VCARD 验证
-        card=$(./src/redis-cli -p $PORT VCARD myvectors 2>/dev/null)
+        } | $CODE_DIR/src/redis-cli -p $INST_PORT --pipe >/dev/null 2>&1
+        local card=$($CODE_DIR/src/redis-cli -p $INST_PORT VCARD myvectors 2>/dev/null)
         [ -z "$card" ] && card=0
-        # VEMB probe：查一个应该存在的 key，验证响应非空
-        probe=$(./src/redis-cli -p $PORT VEMB myvectors item:$KEY_MIN 2>/dev/null | wc -c)
+        local probe=$($CODE_DIR/src/redis-cli -p $INST_PORT VEMB myvectors item:$INST_KEY_MIN 2>/dev/null | wc -c)
         if [ "$card" -ge "$expected" ] && [ "$probe" -gt 100 ]; then
-            echo "instance $iid: prefill OK card=$card expected=$expected probe_bytes=$probe (attempt $attempt)"
-            break
+            log "    inst $iid: prefill OK card=$card (attempt $attempt)"
+            return 0
         fi
-        echo "instance $iid: prefill attempt $attempt card=$card expected=$expected probe_bytes=$probe, retrying..."
         sleep 2
     done
-    ;;
-pid)
-    ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1
-    ;;
-keyrange)
-    echo "$KEY_MIN $KEY_MAX"
-    ;;
-esac
-ORCH_EOF
+    log "    inst $iid: prefill FAIL"
+    return 1
+}
 
-# Cleanup any lingering instances
-log "Cleaning up any lingering instances..."
-for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh stop $i" 2>/dev/null &
-done
-wait
+get_pid() {
+    local iid=$1; inst_var $iid
+    ss -tlnp 2>/dev/null | grep ":$INST_PORT " | grep -oP 'pid=\K[0-9]+' | head -1
+}
 
-# ============================================================================
-# Step 1: Start N Redis instances
-# ============================================================================
-log "=== Step 1: Start $NUM_INSTANCES Redis instances (io-threads=$IO_THREADS, ${CORES_PER_INSTANCE} cores each) ==="
-
-for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    PORT=$((BASE_PORT + i))
-    CORE_START=$((i * CORES_PER_INSTANCE))
-    CORE_END=$((CORE_START + CORES_PER_INSTANCE - 1))
-    log "  instance $i: port=$PORT cores=$CORE_START-$CORE_END"
-    ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh start $i" 2>/dev/null || true
-done
-
-# Wait for all to listen — single SSH poll loop on HW01
-log "Waiting for all instances to listen..."
-ALL_OK=1
-for attempt in $(seq 1 60); do
-    result=$(ssh "$JUMP" "$ORCH_ENV bash -c '
+# ----------------------------------------------------------------------------
+# 全部实例启停 / prefill (并行)
+# ----------------------------------------------------------------------------
+start_all_instances() {
+    log "  Starting $NUM_INSTANCES instances (io-threads=$IO_THREADS, ${CORES_PER_INSTANCE} cores each)..."
+    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+        start_instance $i
+    done
+    local up
+    for attempt in $(seq 1 60); do
         up=0
-        for i in \$(seq 0 \$((NUM_INSTANCES - 1))); do
-            p=\$((BASE_PORT + i))
-            ss -tln | grep -q \":\$p \" && up=\$((up + 1))
+        for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+            inst_var $i
+            ss -tln | grep -q ":$INST_PORT " && up=$((up + 1))
         done
-        echo \$up
-    '" 2>/dev/null)
-    if [ "$result" = "$NUM_INSTANCES" ]; then
-        log "All $NUM_INSTANCES instances are listening."
-        ALL_OK=1
-        break
-    fi
-    ALL_OK=0
-    sleep 1
-done
-if [ "$ALL_OK" -ne 1 ]; then
-    log "ABORT: not all instances started (only ${result:-0}/$NUM_INSTANCES listening)"
-    exit 1
-fi
+        [ "$up" = "$NUM_INSTANCES" ] && return 0
+        sleep 1
+    done
+    log "ABORT: only ${up:-0}/$NUM_INSTANCES listening"
+    return 1
+}
 
-# Connectivity check
-if [ "$LOCAL_BENCH" = "1" ]; then
-    log "Local mode: skipping cross-node connectivity check"
-else
-    log "Checking $CLIENT -> $SERVER_HOST connectivity..."
-    if ! ssh "$JUMP" "ssh $CLIENT \"timeout 3 bash -c ': <>/dev/tcp/$SERVER_HOST/$BASE_PORT'\"" 2>/dev/null; then
-        log "ERROR: $CLIENT cannot reach $SERVER_HOST:$BASE_PORT"
-        exit 1
-    fi
-fi
-log "Connectivity OK"
+prefill_all_instances() {
+    log "  Prefilling $NUM_KEYS vectors across $NUM_INSTANCES instances (parallel)..."
+    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+        prefill_instance $i &
+    done
+    wait
+}
 
-# ============================================================================
-# Step 2: Prefill (parallel across instances)
-# ============================================================================
-log "=== Step 2: Prefill $NUM_KEYS vectors across $NUM_INSTANCES instances ==="
+stop_all_instances() {
+    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+        stop_instance $i &
+    done
+    wait
+}
 
-for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    log "  prefill instance $i..."
-    ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh prefill $i"
-done
-log "Prefill done."
+# ----------------------------------------------------------------------------
+# 一档 sweep
+# ----------------------------------------------------------------------------
+run_one_config() {
+    local idx=$1
+    local t=${TS[$idx]} c=${CS[$idx]} p=${PS[$idx]}
+    log "--- config $((idx+1))/${NCONFIGS}: t=$t c=$c pipeline=$p ---"
 
-# ============================================================================
-# Step 3: Upload bench script to HW01 (scp to CLIENT each iteration)
-# ============================================================================
-log "=== Step 3: Deploy bench script ==="
+    start_all_instances || { log "FAIL: start_all_instances"; return 1; }
+    prefill_all_instances
 
-BENCH_SCRIPT_NAME="multi_inst_bench.sh"
-ssh "$JUMP" "cat > /tmp/$BENCH_SCRIPT_NAME" <<'BENCH_SCRIPT'
-#!/bin/bash
-# 不用 set -e：vanilla redis VEMB 偶发 connection reset 是正常的
-threads=$1
-clients=$2
-test_time=$3
-host=$4
-port=$5
-memtier_dir=$6
-key_min=$7
-key_max=$8
-pipeline=$9
-out_file=${10}
-raw_suffix=${11:-}
-
-cd "$memtier_dir"
-./memtier_benchmark \
-    -h "$host" -p "$port" \
-    --hide-histogram --test-time="$test_time" --select-db=0 \
-    -c "$clients" -t "$threads" --pipeline="$pipeline" \
-    --command="VEMB myvectors __key__${raw_suffix}" \
-    --command-key-pattern=R \
-    --key-prefix=item: \
-    --key-minimum="$key_min" --key-maximum="$key_max" \
-    > "$out_file" 2>&1 || true
-BENCH_SCRIPT
-
-# ============================================================================
-# Step 4: Run parallel benchmarks
-# ============================================================================
-log "=== Step 4: Run $NUM_INSTANCES parallel memtier benchmarks ==="
-log "  per-instance: -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE → $((MEMTIER_T * MEMTIER_C)) conn/inst"
-log "  total connections: $((NUM_INSTANCES * MEMTIER_T * MEMTIER_C))"
-
-# scp bench script to CLIENT once (skip in local mode — already on HW01)
-if [ "$LOCAL_BENCH" != "1" ]; then
-    ssh "$JUMP" "scp /tmp/$BENCH_SCRIPT_NAME $CLIENT:/tmp/$BENCH_SCRIPT_NAME" 2>/dev/null
-fi
-
-# Determine target host for memtier
-if [ "$LOCAL_BENCH" = "1" ]; then
-    BENCH_HOST="127.0.0.1"
-else
-    BENCH_HOST="$SERVER_HOST"
-fi
-
-# Get PIDs + J0 for all instances
-declare -a INSTANCE_PIDS J0_VALUES
-TOTAL_J0=0
-for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    INSTANCE_PIDS[$i]=$(ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh pid $i" 2>/dev/null)
-    pid="${INSTANCE_PIDS[$i]}"
-    if [ -n "$pid" ]; then
-        J0_VALUES[$i]=$(ssh "$JUMP" "bash /tmp/get_jiffies.sh $pid" 2>/dev/null)
-    else
-        J0_VALUES[$i]=0
-        log "  WARN: no PID for instance $i"
-    fi
-done
-
-RUN_START=$(get_ts)
-
-# === 100G NIC 利用率采集（仅跨节点场景；本地回环走 lo，跳过）===
-SAR_LOG=""
-if [ "$LOCAL_BENCH" != "1" ]; then
-    SAR_LOG="/tmp/sar_nic_${RESULT_PREFIX}.log"
-    ssh "$JUMP" "rm -f $SAR_LOG; nohup sar -n DEV 1 $((TEST_TIME + 5)) > $SAR_LOG 2>&1 &" 2>/dev/null
-    log "  sar -n DEV 1 started on $JUMP (iface=$NIC_IFACE, sampling ${TEST_TIME}s)"
-fi
-
-# Launch all memtier in parallel
-# SHARED_CLIENT_CPU=1（默认）: 所有 memtier 共享 CLIENT_CPU_START-END（跟历史一致，可能不均但峰值高）
-# SHARED_CLIENT_CPU=0: 每实例独立绑核组（稳定可复现，但单实例上限略低）
-SHARED_CLIENT_CPU=${SHARED_CLIENT_CPU:-1}
-PIDS=""
-for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    PORT=$((BASE_PORT + i))
-    read KEY_MIN_I KEY_MAX_I <<< $(ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh keyrange $i" 2>/dev/null)
-    remote_out="/tmp/${RESULT_PREFIX}_inst${i}.log"
-
-    if [ "$SHARED_CLIENT_CPU" = "1" ]; then
-        # 共享绑核：所有 memtier 共享 CLIENT_CPU_SPEC（支持离散范围如 HW06 NUMA1 "24-47,72-95"）
-        if [ "$LOCAL_BENCH" = "1" ]; then
-            ssh "$JUMP" "numactl --membind=1 taskset -c $CLIENT_CPU_SPEC bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'" 2>/dev/null &
+    # PIDs + J0
+    declare -a INSTANCE_PIDS J0_VALUES
+    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+        INSTANCE_PIDS[$i]=$(get_pid $i)
+        if [ -n "${INSTANCE_PIDS[$i]}" ]; then
+            J0_VALUES[$i]=$(get_jiffies ${INSTANCE_PIDS[$i]})
         else
-            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CLIENT_CPU_SPEC bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'\"" 2>/dev/null &
+            J0_VALUES[$i]=0
+            log "  WARN: no PID for inst $i"
         fi
-    else
-        # 独立绑核：每实例独占核组（仅支持 CLIENT_CPU_START-END 连续范围）
-        CPM=$CORES_PER_MEMTIER
-        CSTART=$((CLIENT_CPU_START + i * CPM))
-        CEND=$((CSTART + CPM - 1))
+    done
+
+    # sar NIC 监控（仅跨节点；本地回环走 lo 跳过）
+    local sar_log="$RAWDIR/sar_t${t}_c${c}_p${p}.log"
+    rm -f "$sar_log"
+    [ "$LOCAL_BENCH" != "1" ] && nohup sar -n DEV 1 $((TEST_TIME + 5)) > "$sar_log" 2>&1 &
+
+    # bench host
+    local bench_host
+    [ "$LOCAL_BENCH" = "1" ] && bench_host="127.0.0.1" || bench_host="$SERVER_HOST"
+
+    # Parallel memtier (每实例用同样的 t/c/p)
+    log "  launching $NUM_INSTANCES parallel memtier (per-inst: -t $t -c $c --pipeline=$p)"
+    declare -a REMOTE_OUTS
+    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+        inst_var $i
+        local remote_out="/tmp/multi_inst_${TIMESTAMP}_t${t}_c${c}_p${p}_inst${i}.log"
+        REMOTE_OUTS[$i]=$remote_out
         if [ "$LOCAL_BENCH" = "1" ]; then
-            ssh "$JUMP" "numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'" 2>/dev/null &
+            taskset -c $CLIENT_CPU_SPEC \
+                $MEMTIER_DIR/memtier_benchmark \
+                    -h "$bench_host" -p "$INST_PORT" \
+                    --hide-histogram --test-time="$TEST_TIME" --select-db=0 \
+                    -c "$c" -t "$t" --pipeline="$p" \
+                    --command="VEMB myvectors __key__${RAW_SUFFIX}" \
+                    --command-key-pattern=R \
+                    --key-prefix=item: \
+                    --key-minimum="$INST_KEY_MIN" --key-maximum="$INST_KEY_MAX" \
+                    > "$remote_out" 2>&1 &
         else
-            ssh "$JUMP" "ssh $CLIENT \"numactl --membind=1 taskset -c $CSTART-$CEND bash /tmp/$BENCH_SCRIPT_NAME $MEMTIER_T $MEMTIER_C $TEST_TIME $BENCH_HOST $PORT $MEMTIER_DIR $KEY_MIN_I $KEY_MAX_I $PIPELINE $remote_out '$RAW_SUFFIX'\"" 2>/dev/null &
+            ssh "$CLIENT" "taskset -c $CLIENT_CPU_SPEC \
+                $MEMTIER_DIR/memtier_benchmark \
+                    -h '$bench_host' -p '$INST_PORT' \
+                    --hide-histogram --test-time='$TEST_TIME' --select-db=0 \
+                    -c '$c' -t '$t' --pipeline='$p' \
+                    --command='VEMB myvectors __key__${RAW_SUFFIX}' \
+                    --command-key-pattern=R \
+                    --key-prefix='item:' \
+                    --key-minimum='$INST_KEY_MIN' --key-maximum='$INST_KEY_MAX' \
+                    > '$remote_out' 2>&1" &
         fi
-    fi
-    PIDS="$PIDS $!"
-done
+    done
+    wait
 
-log "  All $NUM_INSTANCES benchmarks launched, waiting..."
-wait $PIDS
-RUN_END=$(get_ts)
+    # Collect per-instance + aggregate
+    local TOTAL_OPS=0 TOTAL_KB_SEC=0 AVG_LAT_SUM=0 P50_SUM=0 P99_SUM=0 VALID=0 TOTAL_CORES=0
+    for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+        local local_out="$RAWDIR/inst${i}_t${t}_c${c}_p${p}.log"
+        local remote_out="${REMOTE_OUTS[$i]}"
+        if [ "$LOCAL_BENCH" = "1" ]; then
+            cp "$remote_out" "$local_out" 2>/dev/null || true
+        else
+            ssh "$CLIENT" "cat $remote_out" > "$local_out" 2>/dev/null || true
+        fi
 
-# ============================================================================
-# Step 5: Collect + aggregate results
-# ============================================================================
-log "=== Step 5: Collecting results ==="
+        # Totals 行字段位置 (跟 sweep 脚本同一套解析)
+        #   NF>=9: 带 Hits/Misses, ops=$2 avg=$5 p50=$6 p99=$7 kb=$9
+        #   NF>=7: 普通,        ops=$2 avg=$3 p50=$4 p99=$5 kb=$7
+        local totals=$(grep "^Totals" "$local_out" 2>/dev/null | tail -1)
+        local nfields=$(echo "$totals" | awk '{print NF}')
+        local ops=0 avg=0 p50=0 p99=0 kb=0
+        if [ -n "$totals" ] && [ "$(echo "$totals" | awk '{print $2}')" != "0.00" ]; then
+            if [ "$nfields" -ge 9 ]; then
+                ops=$(echo "$totals" | awk '{print $2}')
+                avg=$(echo "$totals" | awk '{print $5}')
+                p50=$(echo "$totals" | awk '{print $6}')
+                p99=$(echo "$totals" | awk '{print $7}')
+                kb=$(echo "$totals" | awk '{print $9}')
+            elif [ "$nfields" -ge 7 ]; then
+                ops=$(echo "$totals" | awk '{print $2}')
+                avg=$(echo "$totals" | awk '{print $3}')
+                p50=$(echo "$totals" | awk '{print $4}')
+                p99=$(echo "$totals" | awk '{print $5}')
+                kb=$(echo "$totals" | awk '{print $7}')
+            fi
+        else
+            log "  WARN: inst $i no Totals"
+        fi
 
-TOTAL_OPS=0
-TOTAL_KB_SEC=0
-AVG_LAT_SUM=0
-P99_SUM=0
-VALID_INSTANCES=0
-TOTAL_CORES=0
-
-for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    remote_out="/tmp/${RESULT_PREFIX}_inst${i}.log"
-    local_out="$LOCAL_RESULT_DIR/${RESULT_PREFIX}_inst${i}.log"
-    if [ "$LOCAL_BENCH" = "1" ]; then
-        ssh "$JUMP" "cat $remote_out" > "$local_out" 2>/dev/null || true
-    else
-        ssh "$JUMP" "ssh $CLIENT \"cat $remote_out\"" > "$local_out" 2>/dev/null || true
-    fi
-
-    totals=$(grep "^Totals" "$local_out" 2>/dev/null | tail -1)
-    last_progress=$(tr '\r' '\n' < "$local_out" 2>/dev/null | \
-        grep -E "^\[RUN #[0-9]+ +[0-9]+%," | tail -1)
-
-    if [ -n "$totals" ] && [ "$(echo "$totals" | awk '{print $2}')" != "0.00" ]; then
-        ops=$(echo "$totals" | awk '{print $2}')
-        avg=$(echo "$totals" | awk '{print $3}')
-        p99=$(echo "$totals" | awk '{print $5}')
-        kb=$(echo "$totals" | awk '{print $7}')
-    elif [ -n "$last_progress" ]; then
-        ops=$(echo "$last_progress" | sed -n 's/.*(avg: *\([0-9][0-9]*\)) ops\/sec.*/\1/p')
-        avg=$(echo "$last_progress" | sed -n 's/.*(avg: *\([0-9.][0-9.]*\)) msec latency.*/\1/p')
-        kb=$(echo "$last_progress" | sed -n 's/.*(avg: *\([0-9.][0-9.]*\)\([MK]\)B\/sec).*/\1\2B\/sec/p')
-        p99="N/A"
-    else
-        ops=0; avg=0; p99=0; kb=0
-        log "  WARN: instance $i no data"
-    fi
-
-    # Per-instance cores via jiffies
-    pid="${INSTANCE_PIDS[$i]}"
-    inst_cores="NA"
-    if [ -n "$pid" ]; then
-        j1_i=$(ssh "$JUMP" "bash /tmp/get_jiffies.sh $pid" 2>/dev/null || echo 0)
-        inst_cores=$(awk "BEGIN{ printf \"%.2f\", ($j1_i - ${J0_VALUES[$i]:-0}) / 100.0 / $TEST_TIME }")
+        # cores via jiffies
+        local pid="${INSTANCE_PIDS[$i]}"
+        local inst_cores=0
+        if [ -n "$pid" ]; then
+            local j1=$(get_jiffies $pid)
+            inst_cores=$(awk "BEGIN{ printf \"%.2f\", ($j1 - ${J0_VALUES[$i]:-0}) / 100.0 / $TEST_TIME }")
+        fi
         TOTAL_CORES=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_CORES + $inst_cores }")
+
+        TOTAL_OPS=$((TOTAL_OPS + $(echo "$ops" | awk '{printf "%.0f", $1}')))
+        TOTAL_KB_SEC=$((TOTAL_KB_SEC + $(echo "$kb" | awk '{printf "%.0f", $1}')))
+        AVG_LAT_SUM=$(awk "BEGIN{printf \"%.4f\", $AVG_LAT_SUM + ${avg:-0}}")
+        P50_SUM=$(awk "BEGIN{printf \"%.4f\", $P50_SUM + ${p50:-0}}")
+        P99_SUM=$(awk "BEGIN{printf \"%.4f\", $P99_SUM + ${p99:-0}}")
+        VALID=$((VALID + 1))
+    done
+
+    local AVG_LAT=$(awk "BEGIN{ if($VALID>0) printf \"%.3f\", $AVG_LAT_SUM/$VALID; else print \"NA\" }")
+    local AVG_P50=$(awk "BEGIN{ if($VALID>0) printf \"%.3f\", $P50_SUM/$VALID; else print \"NA\" }")
+    local AVG_P99=$(awk "BEGIN{ if($VALID>0) printf \"%.3f\", $P99_SUM/$VALID; else print \"NA\" }")
+
+    local NIC_UTIL="N/A"
+    if [ "$LOCAL_BENCH" != "1" ]; then
+        sleep 2  # 等 sar flush 最后样本
+        NIC_UTIL=$(awk -v iface="$NIC_IFACE" '$2==iface && NF>=9 {sum+=$NF; n++} END {if(n>0) printf "%.1f", sum/n; else print "N/A"}' "$sar_log" 2>/dev/null)
+        [ -z "$NIC_UTIL" ] && NIC_UTIL="N/A"
     fi
 
-    # Sum ops
-    ops_int=$(echo "$ops" | awk '{printf "%.0f", $1}')
-    TOTAL_OPS=$((TOTAL_OPS + ops_int))
+    printf "VEMB\tbaseline_multi_inst\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$t" "$c" "$p" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P50" "$AVG_P99" "$TOTAL_KB_SEC" "$TOTAL_CORES" "$NIC_UTIL" >> "$TSV"
+    log "  => ops/s=$TOTAL_OPS  avg=${AVG_LAT}ms  p50=${AVG_P50}ms  p99=${AVG_P99}ms  cores=$TOTAL_CORES  ${NIC_IFACE}_util=${NIC_UTIL}%"
 
-    # Sum KB/sec (normalize to KB/sec numeric)
-    # Totals line field 7 is plain KB/sec number; progress fallback has "NNNKB/sec" or "NNNMB/sec"
-    if echo "$kb" | grep -q "MB"; then
-        kb_sec=$(echo "$kb" | sed 's/[^0-9.]//g' | awk '{printf "%.0f", $1 * 1024}')
-    elif echo "$kb" | grep -q "KB"; then
-        kb_sec=$(echo "$kb" | sed 's/[^0-9.]//g' | awk '{printf "%.0f", $1}')
-    else
-        # Totals line: plain number already in KB/sec
-        kb_sec=$(echo "$kb" | awk '{printf "%.0f", $1}')
-    fi
-    TOTAL_KB_SEC=$((TOTAL_KB_SEC + kb_sec))
-
-    AVG_LAT_SUM=$(awk "BEGIN{printf \"%.4f\", $AVG_LAT_SUM + ${avg:-0}}")
-    if [ "$p99" != "N/A" ]; then
-        P99_SUM=$(awk "BEGIN{printf \"%.4f\", $P99_SUM + $p99}")
-    fi
-    VALID_INSTANCES=$((VALID_INSTANCES + 1))
-
-    log "  inst $i: ops/sec=$ops lat=${avg}ms cores=$inst_cores"
-done
-
-# Aggregate
-AVG_LAT=$(awk "BEGIN{ if($VALID_INSTANCES>0) printf \"%.3f\", $AVG_LAT_SUM / $VALID_INSTANCES; else print \"N/A\" }")
-AVG_P99=$(awk "BEGIN{ if($VALID_INSTANCES>0) printf \"%.3f\", $P99_SUM / $VALID_INSTANCES; else print \"N/A\" }")
-TOTAL_GB_SEC=$(awk "BEGIN{ printf \"%.2f\", $TOTAL_KB_SEC / 1024.0 / 1024.0 }")
-
-# === NIC 利用率解析（仅跨节点场景）===
-NIC_UTIL_STR="N/A"
-if [ "$LOCAL_BENCH" != "1" ] && [ -n "$SAR_LOG" ]; then
-    sleep 2  # 等 sar flush 最后样本
-    NIC_UTIL_STR=$(ssh "$JUMP" "awk '\$2==\"$NIC_IFACE\" && NF>=9 {sum+=\$NF; n++} END {if(n>0) printf \"%.1f\", sum/n; else print \"N/A\"}' $SAR_LOG 2>/dev/null" 2>/dev/null)
-    [ -z "$NIC_UTIL_STR" ] && NIC_UTIL_STR="N/A"
-    log "  NIC $NIC_IFACE util: ${NIC_UTIL_STR}%"
-fi
-
-# ops/sec/core 派生
-OPS_PER_CORE="N/A"
-if [ "$TOTAL_CORES" != "0" ] && [ -n "$TOTAL_CORES" ]; then
-    OPS_PER_CORE=$(awk "BEGIN{ c=$TOTAL_CORES+0; if(c>0) printf \"%.0f\", $TOTAL_OPS/c; else print \"N/A\" }")
-fi
-
-echo ""
-log "=== Aggregate Results ==="
-{
-    printf "%-12s %14s %12s %12s %12s %10s %12s %12s\n" \
-        "instances" "total_ops/sec" "avg_lat(ms)" "avg_p99(ms)" "wire_GB/s" "cores" "ops/core/s" "NIC_util%"
-    printf "%-12s %14s %12s %12s %12s %10s %12s %12s\n" \
-        "$NUM_INSTANCES" "$TOTAL_OPS" "$AVG_LAT" "$AVG_P99" "$TOTAL_GB_SEC" "$TOTAL_CORES" "$OPS_PER_CORE" "$NIC_UTIL_STR"
-} | tee "$LOCAL_RESULT_DIR/${RESULT_PREFIX}_summary.txt"
-
-echo ""
-echo "Config: $NUM_INSTANCES × io-threads=$IO_THREADS × ${CORES_PER_INSTANCE}cores = $((NUM_INSTANCES * CORES_PER_INSTANCE)) cores total"
-echo "        per-instance memtier: -t $MEMTIER_T -c $MEMTIER_C --pipeline=$PIPELINE ($((MEMTIER_T * MEMTIER_C)) conn)"
-echo "        total connections: $((NUM_INSTANCES * MEMTIER_T * MEMTIER_C)),  test_time=${TEST_TIME}s"
-echo ""
-echo "Result files:"
-ls -la "$LOCAL_RESULT_DIR/${RESULT_PREFIX}"*
+    stop_all_instances
+}
 
 # ============================================================================
-# Cleanup
+# Cleanup lingering instances
 # ============================================================================
-log "Cleaning up $NUM_INSTANCES instances..."
+log "Cleaning up lingering instances..."
 for i in $(seq 0 $((NUM_INSTANCES - 1))); do
-    ssh "$JUMP" "$ORCH_ENV bash /tmp/multi_instance_server.sh stop $i" 2>/dev/null &
+    stop_instance $i &
 done
 wait
-ssh "$JUMP" "ssh $CLIENT \"rm -f /tmp/${RESULT_PREFIX}_*.log /tmp/$BENCH_SCRIPT_NAME\"" 2>/dev/null || true
 
-log "=== All done ==="
+# ============================================================================
+# Connectivity check (LOCAL_BENCH=1 跳过)
+# ============================================================================
+if [ "$LOCAL_BENCH" != "1" ]; then
+    log "Checking ssh $CLIENT reachable..."
+    ssh "$CLIENT" "true" 2>/dev/null || { log "ERROR: cannot ssh to CLIENT=$CLIENT"; exit 1; }
+    ssh "$CLIENT" "test -x $MEMTIER_DIR/memtier_benchmark" 2>/dev/null \
+        || { log "ERROR: CLIENT memtier missing at $MEMTIER_DIR/memtier_benchmark"; exit 1; }
+    log "  ssh ok, memtier ok"
+fi
+
+# ============================================================================
+# TSV header + main sweep loop
+# ============================================================================
+printf "op\tserver_type\tt\tc\tpipeline\tops_sec\tavg_lat_ms\tp50_ms\tp99_ms\tkb_sec\tcores\tnic_util_pct\n" > "$TSV"
+
+log "=== ${NCONFIGS}-档 sweep × ${NUM_INSTANCES} 实例 × io-threads=${IO_THREADS} (每档 restart) ==="
+log "  LOCAL_BENCH=$LOCAL_BENCH  RAW=$RAW  DIM=$DIM  NUM_KEYS=$NUM_KEYS  TEST_TIME=${TEST_TIME}s"
+log "  client_cpuset=$CLIENT_CPU_SPEC  NIC_IFACE=$NIC_IFACE"
+
+for ((idx=0; idx<NCONFIGS; idx++)); do
+    run_one_config $idx
+done
+
+log "=== DONE ==="
+log "TSV : $TSV"
+log "raw : $RAWDIR/*.log"
+echo "----- summary -----"
+column -t -s $'\t' "$TSV"
