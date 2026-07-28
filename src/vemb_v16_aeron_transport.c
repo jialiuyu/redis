@@ -4,7 +4,6 @@
 #include "vemb_v16_aeron_transport.h"
 #include "vemb_v16_client_ring.h"
 #include "vemb_v16_log.h"
-#include "zmalloc.h"
 #include "macro.h"
 
 #include <stdatomic.h>
@@ -108,27 +107,25 @@ static int write_full(int fd, const void *buf, size_t n) {
 int vemb_v16_aeron_poll_shm_requests(vemb_v16_channel_t *ch,
                                      uint32_t proxy_io_worker_id) {
     vemb_v16_client_ring_t *request_ring = vemb_v16_channel_request_ring(ch);
+    const void *slots[PROXY_REQUEST_BATCH];
+    const vemb_v16_req_t *reqs[PROXY_REQUEST_BATCH];
 
-    vemb_v16_req_t *req_buf =
-        zmalloc(sizeof(*req_buf) * VEMB_V16_PROXY_BATCH);
-    if (!req_buf)
-        return -1;
-
-    uint32_t req_count = vemb_v16_client_poll_batch(request_ring,
-                                                    req_buf,
-                                                    sizeof(req_buf[0]),
-                                                    VEMB_V16_PROXY_BATCH);
-    if (req_count == 0) {
-        zfree(req_buf);
+    uint32_t req_count = vemb_v16_client_peek_batch(request_ring,
+                                                    slots,
+                                                    PROXY_REQUEST_BATCH);
+    if (req_count == 0)
         return 0;
-    }
 
     for (uint32_t i = 0; i < req_count; i++) {
-        vemb_v16_proxy_handle_request(ch, &req_buf[i],
-                       (int)vemb_v16_channel_request_slot_size(ch),
-                       proxy_io_worker_id);
+        reqs[i] = (const vemb_v16_req_t *)slots[i];
     }
-    zfree(req_buf);
+    int req_len = (int)vemb_v16_channel_request_slot_size(ch);
+    vemb_v16_proxy_handle_request_ptr_batch(ch,
+                                            reqs,
+                                            req_len,
+                                            req_count,
+                                            proxy_io_worker_id);
+    vemb_v16_client_consume_batch(request_ring, req_count);
     return (int)req_count;
 }
 
@@ -138,6 +135,21 @@ int vemb_v16_aeron_publish_response(vemb_v16_channel_t *ch,
     while (vemb_v16_client_publish(vemb_v16_channel_response_ring(ch),
                                    resp,
                                    sizeof(*resp)) != 0 &&
+           vemb_v16_channel_proxy_running(ch) &&
+           vemb_v16_channel_active(ch)) {
+        vemb_v16_channel_add_proxy_response_ring_full(ch, 1);
+        cpu_relax();
+    }
+    return vemb_v16_channel_active(ch) ? 0 : -1;
+}
+
+int vemb_v16_aeron_publish_response_batch(vemb_v16_channel_t *ch,
+                                          const vemb_v16_resp_t *resps,
+                                          uint32_t count) {
+    while (vemb_v16_client_publish_batch(vemb_v16_channel_response_ring(ch),
+                                         resps,
+                                         sizeof(resps[0]),
+                                         count) != 0 &&
            vemb_v16_channel_proxy_running(ch) &&
            vemb_v16_channel_active(ch)) {
         vemb_v16_channel_add_proxy_response_ring_full(ch, 1);

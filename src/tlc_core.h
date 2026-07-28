@@ -159,6 +159,11 @@ int tlc_core_get_warm_location(tlc_core_t *core,
                                uint32_t key_len,
                                uint64_t key_hash,
                                tlc_warm_location_t *location);
+int tlc_core_get_warm_location_stable_read(tlc_core_t *core,
+                                           const char *key,
+                                           uint32_t key_len,
+                                           uint64_t key_hash,
+                                           tlc_warm_location_t *location);
 int tlc_core_get_cached_warm_location(tlc_core_t *core,
                                       const char *key,
                                       uint32_t key_len,

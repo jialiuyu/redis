@@ -667,7 +667,7 @@ func main() {
 	}
 	if actualEngine == "ub" {
 		if redisNoquant {
-			fmt.Fprintln(os.Stderr, "-redis-noquant is only valid with vector-engine redis")
+			fmt.Fprintln(os.Stderr, "-redis-noquant is only valid with the Redis HNSW backend")
 			os.Exit(1)
 		}
 		if err := preflight(addr, timeout, dim, prefillCount, ubShmPath); err != nil {

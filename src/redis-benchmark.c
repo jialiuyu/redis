@@ -39,6 +39,7 @@
 #include "hdr_histogram.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
+#include "vemb_v16_client_sdk.h"
 
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
@@ -53,6 +54,16 @@
 
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
+
+/* VEMB V16 client states */
+#define VEMB_STATE_WAIT_WELCOME 0
+#define VEMB_STATE_READY        1
+/* VEMB request op selector (matches CLI flags --vemb-v16-op) */
+#define VEMB_OP_NONE   0
+#define VEMB_OP_VADD   1
+#define VEMB_OP_VEMB   2
+#define VEMB_OP_VSIM   3
+#define VEMB_OP_VREM   4
 
 struct benchmarkThread;
 struct clusterNode;
@@ -105,6 +116,10 @@ static struct config {
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
+    int vemb_v16_enabled;        /* --vemb-v16-enabled */
+    int vemb_v16_dim;            /* --vemb-v16-dim, default 300 */
+    int vemb_v16_op;             /* VEMB_OP_* selector */
+    float *vemb_v16_query_vec;   /* shared VSIM query vector (config.vemb_v16_dim floats) */
 } config;
 
 typedef struct _client {
@@ -127,6 +142,10 @@ typedef struct _client {
     int thread_id;
     struct clusterNode *cluster_node;
     int slots_last_update;
+    /* VEMB V16 per-client state */
+    int vemb_state;             /* VEMB_STATE_* */
+    uint64_t vemb_channel_id;
+    uint32_t vemb_req_id;
 } *client;
 
 /* Threads. */
@@ -438,6 +457,107 @@ static void clientDone(client c) {
     }
 }
 
+/* =====================================================================
+ *  VEMB V16 fast path (HPC-Redis extension)
+ *
+ *  When --vemb-v16-enabled is set, each client speaks the binary VEMB V16
+ *  protocol on the redis-server's port 6379 instead of RESP. We still use
+ *  a hiredis redisContext for the non-blocking socket and its read buffer
+ *  (c->context->reader->buf), but we bypass redisGetReply and parse the
+ *  binary frames ourselves via the client SDK's low-level helpers.
+ *
+ *  Lifecycle per connection:
+ *    WAIT_WELCOME  -- client sent HELLO, waiting for WELCOME frame
+ *    READY         -- WELCOME parsed; alternate op-frame send / response recv
+ * ===================================================================== */
+
+/* Shift consumed bytes out of the hiredis reader buffer. hiredis only does
+ * this automatically inside redisReaderGetReply, which we bypass for VEMB.
+ *
+ * CRITICAL: r->buf is an hi_sds string. We must keep r->len, r->pos AND the
+ * sds header length in sync — redisReaderFeed appends via hi_sdscatlen which
+ * uses hi_sdslen(buf), not r->len. Updating only r->len leaves the sds length
+ * stale, so the next feed writes to the wrong offset and corrupts the buffer. */
+static void vembDrainReader(client c, size_t consumed) {
+    redisReader *r = c->context->reader;
+    if (consumed == 0) return;
+    hi_sdsrange(r->buf, (ssize_t)consumed, -1);
+    r->len = hi_sdslen(r->buf);
+    r->pos = 0;
+}
+
+/* Record one completed op latency into the histograms (mirrors the RESP path). */
+static void vembRecordLatency(client c) {
+    int requests_finished = 0;
+    atomicGetIncr(config.requests_finished, requests_finished, 1);
+    if (requests_finished >= config.requests) return;
+    long long lat = (long)c->latency;
+    if (lat > CONFIG_LATENCY_HISTOGRAM_MAX_VALUE) lat = CONFIG_LATENCY_HISTOGRAM_MAX_VALUE;
+    if (lat > CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE) lat = CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE;
+    if (config.num_threads == 0) {
+        hdr_record_value(config.latency_histogram, lat);
+        hdr_record_value(config.current_sec_latency_histogram, lat);
+    } else {
+        hdr_record_value_atomic(config.latency_histogram, lat);
+        hdr_record_value_atomic(config.current_sec_latency_histogram, lat);
+    }
+}
+
+/* Build one VEMB op frame with a fresh random key into c->obuf. The vector
+ * payload (VADD/VSIM) uses a shared random query vector allocated at startup.
+ * VEMB mode is always pipeline=1 — concurrent load is provided via -c/--threads. */
+static void vembBuildOpFrame(client c) {
+    char key[32];
+    long r = (config.randomkeys_keyspacelen > 0)
+             ? (random() % config.randomkeys_keyspacelen)
+             : 0;
+    int key_len = snprintf(key, sizeof(key), "key:%012ld", r);
+    if (key_len > (int)VEMB_V16_MAX_KEY_LEN - 1)
+        key_len = VEMB_V16_MAX_KEY_LEN - 1;
+
+    /* Worst-case frame size for VSIM_INLINE at dim=4096 is ~16 KB; 32 KB is
+     * ample for any dim up to VEMB_V16_MAX_DIM. Thread-local avoids realloc. */
+    static __thread char frame_buf[32 * 1024];
+    ssize_t n = -1;
+    switch (config.vemb_v16_op) {
+    case VEMB_OP_VADD:
+        n = vemb_v16_serialize_vadd(frame_buf, sizeof(frame_buf),
+                                    c->vemb_channel_id, c->vemb_req_id++,
+                                    key, (uint32_t)key_len,
+                                    config.vemb_v16_query_vec,
+                                    (uint32_t)config.vemb_v16_dim);
+        break;
+    case VEMB_OP_VEMB:
+        n = vemb_v16_serialize_vemb_inline(frame_buf, sizeof(frame_buf),
+                                           c->vemb_channel_id, c->vemb_req_id++,
+                                           key, (uint32_t)key_len,
+                                           (uint32_t)config.vemb_v16_dim);
+        break;
+    case VEMB_OP_VSIM:
+        n = vemb_v16_serialize_vsim_inline(frame_buf, sizeof(frame_buf),
+                                           c->vemb_channel_id, c->vemb_req_id++,
+                                           key, (uint32_t)key_len,
+                                           config.vemb_v16_query_vec,
+                                           (uint32_t)config.vemb_v16_dim);
+        break;
+    case VEMB_OP_VREM:
+        n = vemb_v16_serialize_vrem(frame_buf, sizeof(frame_buf),
+                                    c->vemb_channel_id, c->vemb_req_id++,
+                                    key, (uint32_t)key_len);
+        break;
+    default:
+        fprintf(stderr, "VEMB: no op selected\n");
+        exit(1);
+    }
+    if (n < 0) {
+        fprintf(stderr, "VEMB serialize failed (op=%d dim=%d)\n",
+                config.vemb_v16_op, config.vemb_v16_dim);
+        exit(1);
+    }
+    sdsclear(c->obuf);
+    c->obuf = sdscatlen(c->obuf, frame_buf, (size_t)n);
+}
+
 REDIS_NO_SANITIZE_MSAN("memory")
 static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
@@ -445,6 +565,76 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
+
+    if (config.vemb_v16_enabled) {
+        /* VEMB V16 binary protocol path. */
+        if (c->latency < 0 && c->vemb_state == VEMB_STATE_READY)
+            c->latency = ustime() - (c->start);
+
+        if (redisBufferRead(c->context) != REDIS_OK) {
+            fprintf(stderr, "VEMB read error: %s\n", c->context->errstr);
+            exit(1);
+        }
+
+        redisReader *r = c->context->reader;
+        size_t offset = 0;
+        while (r->len - offset > 0) {
+            size_t avail = r->len - offset;
+            const uint8_t *p = (const uint8_t *)(r->buf + offset);
+
+            if (c->vemb_state == VEMB_STATE_WAIT_WELCOME) {
+                vemb_v16_channel_desc_t desc;
+                ssize_t consumed = vemb_v16_parse_welcome(p, avail, &desc);
+                if (consumed == 0) break;
+                if (consumed < 0) {
+                    fprintf(stderr, "VEMB WELCOME parse failed\n");
+                    exit(1);
+                }
+                offset += (size_t)consumed;
+                c->vemb_channel_id = desc.channel_id;
+                c->vemb_state = VEMB_STATE_READY;
+                c->pending = 0; /* WELCOME consumed; next op frame will set pending=1 */
+                vembDrainReader(c, offset);
+                /* Switch to writable so writeHandler can start pumping op frames. */
+                aeDeleteFileEvent(el, fd, AE_READABLE);
+                aeCreateFileEvent(el, fd, AE_WRITABLE, writeHandler, c);
+                return;
+            }
+
+            /* READY: parse op response */
+            vemb_v16_resp_t resp;
+            size_t inline_bytes = 0;
+            ssize_t consumed = vemb_v16_parse_response(p, avail, &resp, &inline_bytes);
+            if (consumed == 0) break;
+            if (consumed < 0) {
+                fprintf(stderr, "VEMB response parse failed (offset=%zu avail=%zu magic=0x%08x type=%u)\n",
+                        offset, avail,
+                        avail >= 4 ? ((const uint32_t *)p)[0] : 0,
+                        avail >= 8 ? ((const uint16_t *)p)[3] : 0);
+                exit(1);
+            }
+            offset += (size_t)consumed;
+
+            if (resp.status != VEMB_V16_STATUS_OK &&
+                resp.status != VEMB_V16_STATUS_NOT_FOUND) {
+                fprintf(stderr,
+                        "VEMB op returned status=%u (op=%u)\n",
+                        resp.status, resp.op);
+            }
+
+            vembRecordLatency(c);
+            c->pending--;
+            if (c->pending == 0) {
+                vembDrainReader(c, offset);
+                clientDone(c);
+                return;
+            }
+        }
+        /* Partial frame remaining; shift it to the start of the buffer so the
+         * next redisBufferRead appends cleanly. */
+        vembDrainReader(c, offset);
+        return;
+    }
 
     /* Calculate latency only for the first read event. This means that the
      * server already sent the reply and we need to parse it. Parsing overhead
@@ -560,19 +750,34 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     /* Initialize request when nothing was written. */
     if (c->written == 0) {
-        /* Enforce upper bound to number of requests. */
-        int requests_issued = 0;
-        atomicGetIncr(config.requests_issued, requests_issued, config.pipeline);
-        if (requests_issued >= config.requests) {
-            return;
-        }
+        if (config.vemb_v16_enabled) {
+            if (c->vemb_state == VEMB_STATE_WAIT_WELCOME) {
+                /* HELLO already prepared in createClient; just send it. */
+            } else {
+                /* READY: issue one fresh op frame. VEMB mode is pipeline=1. */
+                int requests_issued = 0;
+                atomicGetIncr(config.requests_issued, requests_issued, 1);
+                if (requests_issued >= config.requests) return;
+                vembBuildOpFrame(c);
+                c->pending = 1;
+                c->start = ustime();
+                c->latency = -1;
+            }
+        } else {
+            /* Enforce upper bound to number of requests. */
+            int requests_issued = 0;
+            atomicGetIncr(config.requests_issued, requests_issued, config.pipeline);
+            if (requests_issued >= config.requests) {
+                return;
+            }
 
-        /* Really initialize: randomize keys and set start time. */
-        if (config.randomkeys) randomizeClientKey(c);
-        if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
-        atomicGet(config.slots_last_update, c->slots_last_update);
-        c->start = ustime();
-        c->latency = -1;
+            /* Really initialize: randomize keys and set start time. */
+            if (config.randomkeys) randomizeClientKey(c);
+            if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
+            atomicGet(config.slots_last_update, c->slots_last_update);
+            c->start = ustime();
+            c->latency = -1;
+        }
     }
     const ssize_t buflen = sdslen(c->obuf);
     const ssize_t writeLen = buflen-c->written;
@@ -669,6 +874,38 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     /* Suppress hiredis cleanup of unused buffers for max speed. */
     c->context->reader->maxbuf = 0;
 
+    /* ---- VEMB V16 fast path: build HELLO, skip RESP machinery ---- */
+    if (config.vemb_v16_enabled) {
+        c->obuf = sdsempty();
+        char hello_buf[64];
+        ssize_t hello_len = vemb_v16_serialize_hello(hello_buf, sizeof(hello_buf),
+                                                    (uint32_t)config.vemb_v16_dim, 0);
+        if (hello_len < 0) {
+            fprintf(stderr, "VEMB HELLO serialize failed\n");
+            exit(1);
+        }
+        c->obuf = sdscatlen(c->obuf, hello_buf, (size_t)hello_len);
+        c->vemb_state = VEMB_STATE_WAIT_WELCOME;
+        c->vemb_channel_id = 0;
+        c->vemb_req_id = (uint32_t)(random() & 0xffffffff);
+        c->written = 0;
+        c->pending = 1;     /* waiting for WELCOME */
+        c->prefix_pending = 0;
+        c->prefixlen = 0;
+        c->randptr = NULL;
+        c->randlen = 0;
+        c->stagptr = NULL;
+        c->staglen = 0;
+
+        aeEventLoop *el = (thread_id < 0) ? config.el : config.threads[thread_id]->el;
+        aeCreateFileEvent(el, c->context->fd, AE_WRITABLE, writeHandler, c);
+
+        listAddNodeTail(config.clients, c);
+        atomicIncr(config.liveclients, 1);
+        atomicGet(config.slots_last_update, c->slots_last_update);
+        return c;
+    }
+
     /* Build the request buffer:
      * Queue N requests accordingly to the pipeline size, or simply clone
      * the example client buffer. */
@@ -733,6 +970,9 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     c->randlen = 0;
     c->stagptr = NULL;
     c->staglen = 0;
+    c->vemb_state = VEMB_STATE_READY;   /* unused for RESP path */
+    c->vemb_channel_id = 0;
+    c->vemb_req_id = 0;
 
     /* Find substrings in the output buffer that need to be randomized. */
     if (config.randomkeys) {
@@ -1494,6 +1734,34 @@ int parseOptions(int argc, char **argv) {
             config.cluster_mode = 1;
         } else if (!strcmp(argv[i],"--enable-tracking")) {
             config.enable_tracking = 1;
+        } else if (!strcmp(argv[i],"--vemb-v16-enabled")) {
+            /* Accepts an optional yes/no value to match redis-server's convention
+             * (--vemb-v16-enabled yes). If the next token isn't yes/no, treat as
+             * a bare flag. */
+            if (!lastarg && (!strcmp(argv[i+1],"yes") || !strcmp(argv[i+1],"no"))) {
+                config.vemb_v16_enabled = (argv[++i][0] == 'y');
+            } else {
+                config.vemb_v16_enabled = 1;
+            }
+        } else if (!strcmp(argv[i],"--vemb-v16-dim")) {
+            if (lastarg) goto invalid;
+            config.vemb_v16_dim = atoi(argv[++i]);
+            if (config.vemb_v16_dim <= 0 || config.vemb_v16_dim > (int)VEMB_V16_MAX_DIM) {
+                fprintf(stderr, "Invalid --vemb-v16-dim value: %s\n", argv[i]);
+                exit(1);
+            }
+        } else if (!strcmp(argv[i],"--vemb-v16-op")) {
+            if (lastarg) goto invalid;
+            const char *opstr = argv[++i];
+            if (!strcmp(opstr, "vadd")) config.vemb_v16_op = VEMB_OP_VADD;
+            else if (!strcmp(opstr, "vemb")) config.vemb_v16_op = VEMB_OP_VEMB;
+            else if (!strcmp(opstr, "vsim")) config.vemb_v16_op = VEMB_OP_VSIM;
+            else if (!strcmp(opstr, "vrem")) config.vemb_v16_op = VEMB_OP_VREM;
+            else {
+                fprintf(stderr, "Invalid --vemb-v16-op: %s (expected vadd|vemb|vsim|vrem)\n", opstr);
+                exit(1);
+            }
+            config.vemb_v16_enabled = 1;
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -1612,7 +1880,14 @@ usage:
 "                    on the command line.\n"
 " -I                 Idle mode. Just open N idle connections and wait.\n"
 " -x                 Read last argument from STDIN.\n"
-" --seed <num>       Set the seed for random number generator. Default seed is based on time.\n",
+" --seed <num>       Set the seed for random number generator. Default seed is based on time.\n"
+" --vemb-v16-enabled Speak the binary VEMB V16 protocol (HPC-Redis) instead of RESP.\n"
+"                    Requires --vemb-v16-dim and --vemb-v16-op.\n"
+" --vemb-v16-dim <n> Vector dimension (default 300). Mirrors server --vemb-v16-dim.\n"
+" --vemb-v16-op <s>  Operation: vadd|vemb|vsim|vrem. Implies --vemb-v16-enabled.\n"
+"                    VADD writes a random vector; VEMB reads inline; VSIM computes\n"
+"                    cosine similarity against a shared random query; VREM deletes.\n"
+"                    VEMB mode is always pipeline=1; use -c and --threads for concurrency.\n",
 tls_usage,
 " --help             Output this help and exit.\n"
 " --version          Output version and exit.\n\n"
@@ -1740,6 +2015,10 @@ int main(int argc, char **argv) {
     config.slots_last_update = 0;
     config.enable_tracking = 0;
     config.resp3 = 0;
+    config.vemb_v16_enabled = 0;
+    config.vemb_v16_dim = VEMB_V16_DEFAULT_DIM;
+    config.vemb_v16_op = VEMB_OP_NONE;
+    config.vemb_v16_query_vec = NULL;
 
     i = parseOptions(argc,argv);
     argc -= i;
@@ -1796,10 +2075,15 @@ int main(int argc, char **argv) {
         if (config.num_threads == 0)
             config.num_threads = config.cluster_node_count;
     } else {
-        config.redis_config =
-            getRedisConfig(config.conn_info.hostip, config.conn_info.hostport, config.hostsocket);
-        if (config.redis_config == NULL) {
-            fprintf(stderr, "WARNING: Could not fetch server CONFIG\n");
+        /* VEMB V16 mode does not speak RESP, so getRedisConfig (which issues
+         * a CONFIG GET via RESP) would fail noisily against an hpc-redis
+         * server that has VEMB enabled on the same port. Skip it. */
+        if (!config.vemb_v16_enabled) {
+            config.redis_config =
+                getRedisConfig(config.conn_info.hostip, config.conn_info.hostport, config.hostsocket);
+            if (config.redis_config == NULL) {
+                fprintf(stderr, "WARNING: Could not fetch server CONFIG\n");
+            }
         }
     }
     if (config.num_threads > 0) {
@@ -1834,6 +2118,42 @@ int main(int argc, char **argv) {
     if(config.csv){
         printf("\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n");
     }
+
+    /* ---- VEMB V16 dispatch: single op benchmark, no RESP test suite ---- */
+    if (config.vemb_v16_enabled) {
+        if (config.vemb_v16_op == VEMB_OP_NONE) {
+            fprintf(stderr, "VEMB V16 mode requires --vemb-v16-op {vadd|vemb|vsim|vrem}\n");
+            exit(1);
+        }
+        /* Pre-generate the shared query vector (VSIM) / write payload (VADD).
+         * All requests reuse the same vector, matching memtier's behavior —
+         * the goal is throughput measurement, not vector diversity. */
+        config.vemb_v16_query_vec = zmalloc(sizeof(float) * config.vemb_v16_dim);
+        for (i = 0; i < config.vemb_v16_dim; i++) {
+            /* Uniform [-1, 1] — magnitude irrelevant for cosine sim and write tests. */
+            config.vemb_v16_query_vec[i] =
+                (float)((double)random() / RAND_MAX * 2.0 - 1.0);
+        }
+        /* Adjust datasize so the latency report's "payload" line is meaningful. */
+        config.datasize = config.vemb_v16_dim * (int)sizeof(float);
+
+        const char *op_name = "vemb_v16";
+        switch (config.vemb_v16_op) {
+        case VEMB_OP_VADD: op_name = "VADD_V16"; break;
+        case VEMB_OP_VEMB: op_name = "VEMB_V16"; break;
+        case VEMB_OP_VSIM: op_name = "VSIM_V16"; break;
+        case VEMB_OP_VREM: op_name = "VREM_V16"; break;
+        }
+        do {
+            benchmark(op_name, NULL, 0);
+        } while (config.loop);
+
+        zfree(config.vemb_v16_query_vec);
+        config.vemb_v16_query_vec = NULL;
+        freeCliConnInfo(config.conn_info);
+        return 0;
+    }
+
     /* Run benchmark with command in the remainder of the arguments. */
     if (argc) {
         sds title = sdsnew(argv[0]);

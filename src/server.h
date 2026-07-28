@@ -48,6 +48,7 @@ typedef long long ustime_t; /* microsecond time type. */
 
 /* Vector Engine Types */
 #include "vector_engine_types.h"
+#include "vemb_v16_proxy.h"
 
 #include "ub_client.h"
 
@@ -1943,6 +1944,19 @@ struct redisServer {
     int supernode_workers;       /* SuperNode worker count, 0 means auto-detect */
     proxyConfig proxy;           /* Proxy aggregator configuration */
     ub_mem_config_t ub;          /* UB data-plane configuration */
+    /* VEMB V16 dataplane */
+    int vemb_v16_enabled;
+
+    int vemb_v16_dim;
+    int vemb_v16_max_vectors;
+    char *vemb_v16_warm_regions_manifest;
+    int vemb_v16_reset_warm_regions;
+    int vemb_v16_supernode_workers;
+    int vemb_v16_proxy_io_threads;
+    char *vemb_v16_transport;       /* "sniff" (default) or "aeron" */
+    int vemb_v16_cross_node_aeron_enabled;  /* cross-node ATTACH + ring ABI + backoff */
+    vemb_v16_proxy_t *vemb_v16_proxy;
+    pthread_t vemb_v16_proxy_thread;
     /* Networking */
     int port;                   /* TCP listening port */
     int tls_port;               /* TLS listening port */
@@ -2368,6 +2382,8 @@ struct redisServer {
     mstime_t mstime;            /* 'unixtime' in milliseconds. */
     ustime_t ustime;            /* 'unixtime' in microseconds. */
     mstime_t cmd_time_snapshot; /* Time snapshot of the root execution nesting. */
+    monotime monotonic_us_when_ustime; /* Monotonic timestamp of the last ustime sync. */
+    int accum_call_count_since_ustime; /* Number of calls since last ustime sync. */
     size_t blocking_op_nesting; /* Nesting level of blocking operation, used to reset blocked_last_cron. */
     long long blocked_last_cron; /* Indicate the mstime of the last time we did cron jobs from a blocking operation */
     /* Pubsub */
@@ -3085,6 +3101,7 @@ void setDeferredPushLen(client *c, void *node, long length);
 int isClientReadErrorFatal(client *c);
 int processInputBuffer(client *c);
 void acceptCommonHandler(connection *conn, int flags, char *ip);
+void acceptCommonFinalize(connection *conn, int flags);
 void readQueryFromClient(connection *conn);
 int prepareClientToWrite(client *c);
 void addReplyNull(client *c);

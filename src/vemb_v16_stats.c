@@ -11,79 +11,6 @@ static void stats_set_max(uint64_t *dst, uint64_t value) {
         *dst = value;
 }
 
-static void atomic_update_max_u64(atomic_uint_fast64_t *counter,
-                                  uint64_t value) {
-    uint_fast64_t prev = atomic_load_explicit(counter, memory_order_relaxed);
-    while (prev < value &&
-           !atomic_compare_exchange_weak_explicit(counter,
-                                                  &prev,
-                                                  value,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-    }
-}
-
-void vemb_v16_timing_acc_add(vemb_v16_timing_acc_t *acc, uint64_t ns) {
-    acc->count++;
-    acc->ns += ns;
-    if (acc->max_ns < ns)
-        acc->max_ns = ns;
-}
-
-void vemb_v16_channel_counters_add_timing(vemb_v16_channel_counters_t *stats,
-                                          vemb_v16_timing_stage_t stage,
-                                          const vemb_v16_timing_acc_t *acc) {
-    if (acc->count == 0) {
-        return;
-    }
-
-    atomic_uint_fast64_t *count = NULL;
-    atomic_uint_fast64_t *sum = NULL;
-    atomic_uint_fast64_t *max = NULL;
-    switch (stage) {
-    case VEMB_V16_TIMING_JOB_TOTAL:
-        count = &stats->timing_job_count;
-        sum = &stats->timing_job_total_ns;
-        max = &stats->timing_job_total_max_ns;
-        break;
-    case VEMB_V16_TIMING_PRIMARY_LOOKUP:
-        count = &stats->timing_primary_lookup_count;
-        sum = &stats->timing_primary_lookup_ns;
-        max = &stats->timing_primary_lookup_max_ns;
-        break;
-    case VEMB_V16_TIMING_SECONDARY_LOOKUP:
-        count = &stats->timing_secondary_lookup_count;
-        sum = &stats->timing_secondary_lookup_ns;
-        max = &stats->timing_secondary_lookup_max_ns;
-        break;
-    case VEMB_V16_TIMING_REMOTE_META_LOOKUP:
-        count = &stats->timing_remote_meta_lookup_count;
-        sum = &stats->timing_remote_meta_lookup_ns;
-        max = &stats->timing_remote_meta_lookup_max_ns;
-        break;
-    case VEMB_V16_TIMING_PAYLOAD_LOCAL_SLICE:
-        count = &stats->timing_payload_local_slice_count;
-        sum = &stats->timing_payload_local_slice_ns;
-        max = &stats->timing_payload_local_slice_max_ns;
-        break;
-    case VEMB_V16_TIMING_PAYLOAD_REMOTE_SLICE:
-        count = &stats->timing_payload_remote_slice_count;
-        sum = &stats->timing_payload_remote_slice_ns;
-        max = &stats->timing_payload_remote_slice_max_ns;
-        break;
-    case VEMB_V16_TIMING_COMPUTE:
-        count = &stats->timing_compute_count;
-        sum = &stats->timing_compute_ns;
-        max = &stats->timing_compute_max_ns;
-        break;
-    default:
-        return;
-    }
-    atomic_fetch_add_explicit(count, acc->count, memory_order_relaxed);
-    atomic_fetch_add_explicit(sum, acc->ns, memory_order_relaxed);
-    atomic_update_max_u64(max, acc->max_ns);
-}
-
 void vemb_v16_stats_add_channel_counters(vemb_v16_stats_t *dst,
                                          vemb_v16_channel_counters_t *src) {
     dst->total_requests += counter_load(&src->total_requests);
@@ -98,38 +25,11 @@ void vemb_v16_stats_add_channel_counters(vemb_v16_stats_t *dst,
     dst->proxy_response_ring_full += counter_load(&src->proxy_response_ring_full);
     dst->supernode_completion_publish += counter_load(&src->supernode_completion_publish);
     dst->supernode_completion_ring_full += counter_load(&src->supernode_completion_ring_full);
-    dst->sample_count += counter_load(&src->sample_count);
-    dst->sample_table_lookup_ns += counter_load(&src->sample_table_lookup_ns);
-    dst->sample_bitmap_lock_ns += counter_load(&src->sample_bitmap_lock_ns);
-    dst->sample_bitmap_unlock_ns += counter_load(&src->sample_bitmap_unlock_ns);
-    dst->sample_vector_load_ns += counter_load(&src->sample_vector_load_ns);
-    dst->sample_completion_publish_ns += counter_load(&src->sample_completion_publish_ns);
     dst->moved_count += counter_load(&src->moved_count);
     dst->stale_count += counter_load(&src->stale_count);
     dst->ask_count += counter_load(&src->ask_count);
     dst->forward_count += counter_load(&src->forward_count);
     dst->duplicate_request_count += counter_load(&src->duplicate_request_count);
-    dst->timing_job_count += counter_load(&src->timing_job_count);
-    dst->timing_job_total_ns += counter_load(&src->timing_job_total_ns);
-    stats_set_max(&dst->timing_job_total_max_ns, counter_load(&src->timing_job_total_max_ns));
-    dst->timing_primary_lookup_count += counter_load(&src->timing_primary_lookup_count);
-    dst->timing_primary_lookup_ns += counter_load(&src->timing_primary_lookup_ns);
-    stats_set_max(&dst->timing_primary_lookup_max_ns, counter_load(&src->timing_primary_lookup_max_ns));
-    dst->timing_secondary_lookup_count += counter_load(&src->timing_secondary_lookup_count);
-    dst->timing_secondary_lookup_ns += counter_load(&src->timing_secondary_lookup_ns);
-    stats_set_max(&dst->timing_secondary_lookup_max_ns, counter_load(&src->timing_secondary_lookup_max_ns));
-    dst->timing_remote_meta_lookup_count += counter_load(&src->timing_remote_meta_lookup_count);
-    dst->timing_remote_meta_lookup_ns += counter_load(&src->timing_remote_meta_lookup_ns);
-    stats_set_max(&dst->timing_remote_meta_lookup_max_ns, counter_load(&src->timing_remote_meta_lookup_max_ns));
-    dst->timing_payload_local_slice_count += counter_load(&src->timing_payload_local_slice_count);
-    dst->timing_payload_local_slice_ns += counter_load(&src->timing_payload_local_slice_ns);
-    stats_set_max(&dst->timing_payload_local_slice_max_ns, counter_load(&src->timing_payload_local_slice_max_ns));
-    dst->timing_payload_remote_slice_count += counter_load(&src->timing_payload_remote_slice_count);
-    dst->timing_payload_remote_slice_ns += counter_load(&src->timing_payload_remote_slice_ns);
-    stats_set_max(&dst->timing_payload_remote_slice_max_ns, counter_load(&src->timing_payload_remote_slice_max_ns));
-    dst->timing_compute_count += counter_load(&src->timing_compute_count);
-    dst->timing_compute_ns += counter_load(&src->timing_compute_ns);
-    stats_set_max(&dst->timing_compute_max_ns, counter_load(&src->timing_compute_max_ns));
 }
 
 void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
@@ -153,12 +53,6 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->proxy_response_ring_full += src->proxy_response_ring_full;
     dst->supernode_completion_publish += src->supernode_completion_publish;
     dst->supernode_completion_ring_full += src->supernode_completion_ring_full;
-    dst->sample_count += src->sample_count;
-    dst->sample_table_lookup_ns += src->sample_table_lookup_ns;
-    dst->sample_bitmap_lock_ns += src->sample_bitmap_lock_ns;
-    dst->sample_bitmap_unlock_ns += src->sample_bitmap_unlock_ns;
-    dst->sample_vector_load_ns += src->sample_vector_load_ns;
-    dst->sample_completion_publish_ns += src->sample_completion_publish_ns;
     dst->moved_count += src->moved_count;
     dst->stale_count += src->stale_count;
     dst->ask_count += src->ask_count;
@@ -175,27 +69,6 @@ void vemb_v16_stats_add(vemb_v16_stats_t *dst, const vemb_v16_stats_t *src) {
     dst->migration_baseline_retry_sent += src->migration_baseline_retry_sent;
     dst->migration_baseline_retry_pending +=
         src->migration_baseline_retry_pending;
-    dst->timing_job_count += src->timing_job_count;
-    dst->timing_job_total_ns += src->timing_job_total_ns;
-    stats_set_max(&dst->timing_job_total_max_ns, src->timing_job_total_max_ns);
-    dst->timing_primary_lookup_count += src->timing_primary_lookup_count;
-    dst->timing_primary_lookup_ns += src->timing_primary_lookup_ns;
-    stats_set_max(&dst->timing_primary_lookup_max_ns, src->timing_primary_lookup_max_ns);
-    dst->timing_secondary_lookup_count += src->timing_secondary_lookup_count;
-    dst->timing_secondary_lookup_ns += src->timing_secondary_lookup_ns;
-    stats_set_max(&dst->timing_secondary_lookup_max_ns, src->timing_secondary_lookup_max_ns);
-    dst->timing_remote_meta_lookup_count += src->timing_remote_meta_lookup_count;
-    dst->timing_remote_meta_lookup_ns += src->timing_remote_meta_lookup_ns;
-    stats_set_max(&dst->timing_remote_meta_lookup_max_ns, src->timing_remote_meta_lookup_max_ns);
-    dst->timing_payload_local_slice_count += src->timing_payload_local_slice_count;
-    dst->timing_payload_local_slice_ns += src->timing_payload_local_slice_ns;
-    stats_set_max(&dst->timing_payload_local_slice_max_ns, src->timing_payload_local_slice_max_ns);
-    dst->timing_payload_remote_slice_count += src->timing_payload_remote_slice_count;
-    dst->timing_payload_remote_slice_ns += src->timing_payload_remote_slice_ns;
-    stats_set_max(&dst->timing_payload_remote_slice_max_ns, src->timing_payload_remote_slice_max_ns);
-    dst->timing_compute_count += src->timing_compute_count;
-    dst->timing_compute_ns += src->timing_compute_ns;
-    stats_set_max(&dst->timing_compute_max_ns, src->timing_compute_max_ns);
     dst->warm_eviction_success += src->warm_eviction_success;
     dst->warm_eviction_fail += src->warm_eviction_fail;
     dst->warm_same_key_overwrite += src->warm_same_key_overwrite;

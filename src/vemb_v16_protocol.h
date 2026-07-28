@@ -19,7 +19,7 @@
 #define VEMB_V16_DEFAULT_VECTOR_REGION "/vemb_v16_vectors"
 
 #ifndef VEMB_V16_MAX_CHANNELS
-#define VEMB_V16_MAX_CHANNELS 64
+#define VEMB_V16_MAX_CHANNELS 8192
 #endif
 
 #define VEMB_V16_MAX_KEY_LEN 128
@@ -145,6 +145,7 @@ enum vemb_v16_net_frame_type {
     VEMB_V16_NET_PEER_VIEW_MAP_RESPONSE = 0x1e,
     VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_SET = 0x1f,
     VEMB_V16_NET_PEER_VIEW_MAP_TOPOLOGY_RESPONSE = 0x20,
+    VEMB_V16_NET_ALLOC_AERON_CHANNEL = 0x21,
 };
 
 enum vemb_v16_data_op {
@@ -638,12 +639,6 @@ typedef struct vemb_v16_stats {
     uint64_t proxy_response_ring_full;
     uint64_t supernode_completion_publish;
     uint64_t supernode_completion_ring_full;
-    uint64_t sample_count;
-    uint64_t sample_table_lookup_ns;
-    uint64_t sample_bitmap_lock_ns;
-    uint64_t sample_bitmap_unlock_ns;
-    uint64_t sample_vector_load_ns;
-    uint64_t sample_completion_publish_ns;
     uint64_t bitmap_lock_success;
     uint64_t bitmap_lock_failure;
     uint64_t request_ring_depth;
@@ -703,27 +698,6 @@ typedef struct vemb_v16_stats {
     uint64_t migration_baseline_retry_queued;
     uint64_t migration_baseline_retry_sent;
     uint64_t migration_baseline_retry_pending;
-    uint64_t timing_job_count;
-    uint64_t timing_job_total_ns;
-    uint64_t timing_job_total_max_ns;
-    uint64_t timing_primary_lookup_count;
-    uint64_t timing_primary_lookup_ns;
-    uint64_t timing_primary_lookup_max_ns;
-    uint64_t timing_secondary_lookup_count;
-    uint64_t timing_secondary_lookup_ns;
-    uint64_t timing_secondary_lookup_max_ns;
-    uint64_t timing_remote_meta_lookup_count;
-    uint64_t timing_remote_meta_lookup_ns;
-    uint64_t timing_remote_meta_lookup_max_ns;
-    uint64_t timing_payload_local_slice_count;
-    uint64_t timing_payload_local_slice_ns;
-    uint64_t timing_payload_local_slice_max_ns;
-    uint64_t timing_payload_remote_slice_count;
-    uint64_t timing_payload_remote_slice_ns;
-    uint64_t timing_payload_remote_slice_max_ns;
-    uint64_t timing_compute_count;
-    uint64_t timing_compute_ns;
-    uint64_t timing_compute_max_ns;
 } vemb_v16_stats_t;
 
 static inline size_t vemb_v16_req_handle_len(void) {
@@ -1958,7 +1932,12 @@ static inline int vemb_v16_resp_decode(vemb_v16_resp_t *resp,
     resp->op = (uint8_t)(op_flags & VEMB_V16_TCP_RESP_OP_MASK);
     resp->flags = (uint16_t)((op_flags & VEMB_V16_TCP_RESP_FLAG_MASK) >> 6);
     resp->req_id = vemb_v16_proto_get_u32(&p);
-    RETURN_IF(len != vemb_v16_resp_encoded_len(resp), -1);
+    /* VEMB_INLINE responses append the inline vector payload after the 6B+28B
+     * metadata on the wire. The wire `len` here is the full frame payload
+     * (metadata + inline bytes); vemb_v16_resp_encoded_len() returns only the
+     * metadata portion, so enforce a lower bound — strict equality would reject
+     * every VEMB_INLINE response. */
+    RETURN_IF(len < vemb_v16_resp_encoded_len(resp), -1);
     if (resp->status == VEMB_V16_STATUS_OK) {
         switch (resp->op) {
         case VEMB_V16_OP_VEMB_HANDLE:

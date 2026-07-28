@@ -57,6 +57,10 @@ WARN=-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -W
 OPT=$(OPTIMIZATION)
 
 SKIP_VEC_SETS?=no
+PROXY_REQUEST_BATCH ?=
+PROXY_RESPONSE_BATCH ?=
+PROXY_QUEUE_BATCH ?=
+VEMB_V16_PROXY_AFFINITY_MODE ?= 0
 # Detect if the compiler supports C11 _Atomic.
 # NUMBER_SIGN_CHAR is a workaround to support both GNU Make 4.3 and older versions.
 NUMBER_SIGN_CHAR := \#
@@ -178,6 +182,18 @@ endif
 FINAL_CFLAGS  += $(FEATURE_CFLAGS)
 FINAL_LDFLAGS += $(FEATURE_LDFLAGS)
 FINAL_LIBS    += $(FEATURE_LIBS)
+# Enable ARM SVE intrinsics for vector load/store paths (sve_operation.c, tlc_core.c)
+FINAL_CFLAGS += -DUSE_ARM_SVE -march=armv8.2-a+sve
+ifneq ($(strip $(PROXY_REQUEST_BATCH)),)
+FINAL_CFLAGS += -DPROXY_REQUEST_BATCH=$(PROXY_REQUEST_BATCH)
+endif
+ifneq ($(strip $(PROXY_RESPONSE_BATCH)),)
+FINAL_CFLAGS += -DPROXY_RESPONSE_BATCH=$(PROXY_RESPONSE_BATCH)
+endif
+ifneq ($(strip $(PROXY_QUEUE_BATCH)),)
+FINAL_CFLAGS += -DPROXY_QUEUE_BATCH=$(PROXY_QUEUE_BATCH)
+endif
+FINAL_CFLAGS += -DVEMB_V16_PROXY_AFFINITY_MODE=$(VEMB_V16_PROXY_AFFINITY_MODE)
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -425,12 +441,31 @@ endif
 
 REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
 REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
-REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o vector_engine.o vector_engine_redis_impl.o vector_engine_ub_impl.o ub_client.o ub_metadata.o sve_compute.o sve_similarity.o batch_processor.o vector_proxy_request.o vector_proxy_completion.o batch_latency_trace.o
+REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o vector_engine.o vector_engine_redis_impl.o vector_engine_ub_impl.o ub_client.o ub_metadata.o sve_compute.o sve_similarity.o batch_processor.o vector_proxy_request.o vector_proxy_completion.o batch_latency_trace.o proxy_aggregator.o supernode_worker.o ring_buffer_mgr.o ring_buffer.o sve_operation.o \
+                    vemb_v16_server_integration.o vemb_v16_server_tcp_client.o \
+                    vemb_v16_proxy.o vemb_v16_supernode.o vemb_v16_tlc.o tlc_core.o \
+                    vemb_v16_net.o vemb_v16_storage.o vemb_v16_warm_provider.o vemb_v16_tcp_transport.o \
+                    vemb_v16_aeron_transport.o vemb_v16_aeron_attach.o vemb_v16_stats.o \
+                    vemb_v16_remote_meta.o vemb_v16_ub_rpc.o vemb_v16_topology.o \
+                    vemb_v16_migration_outbox.o \
+                    vemb_v16_shared_allocator.o vemb_v16_mapped_region.o \
+                    vemb_v16_warm_region_layout.o \
+                    vemb_v16_control_listener.o
 REDIS_SERVER_OBJ += $(FEATURE_OBJS)
 REDIS_CLI_NAME=$(OUT_DIR)/redis-cli$(PROG_SUFFIX)
-REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
+REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o vemb_v16_cli_tcp.o vemb_v16_client_sdk.o vemb_v16_net.o vemb_v16_client_topology.o vemb_v16_topology.o
 REDIS_BENCHMARK_NAME=$(OUT_DIR)/redis-benchmark$(PROG_SUFFIX)
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
+# HPC-Redis: link the VEMB V16 client SDK as a static archive (per CLAUDE.md
+# constraint — do NOT copy SDK .c files into src/).
+REDIS_BENCHMARK_VEMB_LIB=../clients/c/build/libvemb_v16_client.a
+REDIS_BENCHMARK_VEMB_INC=-I../clients/c/build/include -I../src
+
+# Auto-build the client SDK static archive (and flat headers) whenever
+# redis-benchmark needs it. The .a lands in clients/c/build/ and the public
+# headers in clients/c/build/include/.
+$(REDIS_BENCHMARK_VEMB_LIB):
+	$(MAKE) -C ../clients/c static install-headers
 REDIS_CHECK_RDB_NAME=$(OUT_DIR)/redis-check-rdb$(PROG_SUFFIX)
 REDIS_CHECK_AOF_NAME=$(OUT_DIR)/redis-check-aof$(PROG_SUFFIX)
 ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
@@ -525,13 +560,30 @@ $(REDIS_CLI_NAME): $(REDIS_CLI_OBJ_OUT)
 	@mkdir -p $(OUT_DIR)
 	$(REDIS_LD) -o $@ $^ $(DEP_LIB_HIREDIS) $(DEP_OBJ_LINENOISE) $(DEP_LIB_HDR) $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
+.PHONY: redis-cli
+redis-cli: $(REDIS_CLI_NAME)
+
 # redis-benchmark
-$(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ_OUT)
+$(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ_OUT) $(REDIS_BENCHMARK_VEMB_LIB)
 	@mkdir -p $(OUT_DIR)
-	$(REDIS_LD) -o $@ $^ $(DEP_LIB_HIREDIS) $(DEP_LIB_HDR) $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
+	$(REDIS_LD) -o $@ $(REDIS_BENCHMARK_OBJ_OUT) $(REDIS_BENCHMARK_VEMB_LIB) $(DEP_LIB_HIREDIS) $(DEP_LIB_HDR) $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
 DEP = $(addprefix $(OUT_DIR)/,$(REDIS_SERVER_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR)/,$(REDIS_VEC_SETS_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR)/,$(REDIS_CLI_OBJ:%.o=%.d)) $(addprefix $(OUT_DIR)/,$(REDIS_BENCHMARK_OBJ:%.o=%.d))
+
+$(OUT_DIR)/vemb_v16_client_sdk.o: ../clients/c/vemb_v16_client_sdk.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
+$(OUT_DIR)/vemb_v16_client_topology.o: vemb_v16_client_topology.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(FINAL_CFLAGS) $(FINAL_LDFLAGS) -MMD -o $@ -c $<
 -include $(DEP)
+
+# redis-benchmark.o needs the SDK headers (clients/c/build/include/) so it can
+# call vemb_v16_serialize_* / vemb_v16_parse_* directly. Other objects in the
+# benchmark build do not.
+$(OUT_DIR)/redis-benchmark.o: redis-benchmark.c .make-prerequisites
+	@mkdir -p $(OUT_DIR)
+	$(REDIS_CC) $(REDIS_BENCHMARK_VEMB_INC) -MMD -MF $(OUT_DIR)/redis-benchmark.d -o $@ -c $<
 
 # Because the jemalloc.h header is generated as a part of the jemalloc build,
 # building it should complete before building any other object. Instead of
@@ -611,11 +663,21 @@ VEMB_V16_CFLAGS = -O3 -Wall -Wextra -pthread -std=gnu11 -I. -DVEMB_V16_MAX_CHANN
 ifeq ($(USE_SVE),yes)
 VEMB_V16_CFLAGS += -DUSE_SVE -DUSE_ARM_SVE -march=armv8.2-a+sve
 endif
+ifneq ($(strip $(PROXY_REQUEST_BATCH)),)
+VEMB_V16_CFLAGS += -DPROXY_REQUEST_BATCH=$(PROXY_REQUEST_BATCH)
+endif
+ifneq ($(strip $(PROXY_RESPONSE_BATCH)),)
+VEMB_V16_CFLAGS += -DPROXY_RESPONSE_BATCH=$(PROXY_RESPONSE_BATCH)
+endif
+ifneq ($(strip $(PROXY_QUEUE_BATCH)),)
+VEMB_V16_CFLAGS += -DPROXY_QUEUE_BATCH=$(PROXY_QUEUE_BATCH)
+endif
+VEMB_V16_CFLAGS += -DVEMB_V16_PROXY_AFFINITY_MODE=$(VEMB_V16_PROXY_AFFINITY_MODE)
 VEMB_V16_CFLAGS += $(VEMB_V16_EXTRA_CFLAGS)
 
-vemb_v16_server: vemb_v16_server.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c vemb_v16_proxy.h vemb_v16_proxy_internal.h vemb_v16_proxy_types.h vemb_v16_tcp_transport.h vemb_v16_aeron_transport.h vemb_v16_storage.h vemb_v16_warm_region_layout.h vemb_v16_mapped_region.h vemb_v16_remote_meta.h vemb_v16_ub_rpc.h vemb_v16_topology.h vemb_v16_migration_outbox.h vemb_v16_protocol.h vemb_v16_net.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_client_ring.h vemb_v16_supernode.h vemb_v16_stats.h vemb_v16_tlc.h tlc_core.h vemb_v16_warm_provider.h vemb_v16_log.h sve_operation.h sve_similarity.h
+vemb_v16_server: vemb_v16_server.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c vemb_v16_proxy.h vemb_v16_proxy_internal.h vemb_v16_proxy_types.h vemb_v16_tcp_transport.h vemb_v16_aeron_transport.h vemb_v16_aeron_attach.h vemb_v16_storage.h vemb_v16_warm_region_layout.h vemb_v16_mapped_region.h vemb_v16_remote_meta.h vemb_v16_ub_rpc.h vemb_v16_topology.h vemb_v16_migration_outbox.h vemb_v16_protocol.h vemb_v16_net.h vemb_v16_dataplane.h vemb_v16_aeron_ring.h vemb_v16_client_ring.h vemb_v16_supernode.h vemb_v16_stats.h vemb_v16_tlc.h tlc_core.h vemb_v16_warm_provider.h vemb_v16_log.h sve_operation.h sve_similarity.h
 	@printf '    %b %b\n' $(LINKCOLOR)BUILD$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR) 1>&2
-	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c -pthread -lm
+	$(CC) $(VEMB_V16_CFLAGS) -o $@ vemb_v16_server.c vemb_v16_proxy.c vemb_v16_tcp_transport.c vemb_v16_aeron_transport.c vemb_v16_aeron_attach.c vemb_v16_storage.c vemb_v16_warm_region_layout.c vemb_v16_mapped_region.c vemb_v16_remote_meta.c vemb_v16_ub_rpc.c vemb_v16_topology.c vemb_v16_migration_outbox.c vemb_v16_net.c vemb_v16_supernode.c vemb_v16_stats.c vemb_v16_tlc.c tlc_core.c vemb_v16_warm_provider.c vemb_v16_log.c sve_operation.c sve_similarity.c localtime.c zmalloc.c monotonic.c redisassert.c strl.c -pthread -lm
 
 ifdef TLC_VERSION
 tlc_single: $(OUT_DIR)/tlc_$(TLC_VERSION)_server

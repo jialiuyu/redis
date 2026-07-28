@@ -4,6 +4,7 @@
 
 #include "cpu_relax.h"
 #include "vemb_v16_aeron_transport.h"
+#include "vemb_v16_server_integration.h"   /* vemb_v16_cross_node_aeron_enabled() */
 #include "vemb_v16_proxy_types.h"
 #include "vemb_v16_tcp_transport.h"
 #include "vemb_v16_log.h"
@@ -11,6 +12,7 @@
 #include "vemb_v16_stats.h"
 #include "macro.h"
 #include "redisassert.h"
+#include "util.h"
 #include "zmalloc.h"
 
 #include <errno.h>
@@ -30,20 +32,16 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define VEMB_V16_JOB_SHARD_RING_SIZE 256u
 #define VEMB_V16_JOB_RETURN_RING_SIZE 256u
 #define VEMB_V16_COMPLETION_RING_SIZE VEMB_V16_AERON_RING_SIZE
-#define VEMB_V16_DIAG_REQ_ID_LIMIT 80u
 #define VEMB_V16_SCALEOUT_NOTIFY_INTERVAL_US 100000u
 #define VEMB_V16_SCALEOUT_NOTIFY_TIMEOUT_MS 1000u
 #define VEMB_V16_READ_JOB_POOL_SLOTS 1024u
 #define VEMB_V16_VSIM_JOB_POOL_SLOTS 256u
 #define VEMB_V16_INLINE_JOB_POOL_SLOTS 512u
-
-static int diag_should_log_req(uint32_t req_id) {
-    return req_id != 0 && req_id <= VEMB_V16_DIAG_REQ_ID_LIMIT;
-}
 
 static void completion_release_payload(vemb_v16_completion_t *completion) {
     vemb_v16_completion_release_inline_snapshot(completion);
@@ -83,27 +81,8 @@ uint32_t vemb_v16_channel_request_slot_size(vemb_v16_channel_t *ch) {
 
 void vemb_v16_channel_add_proxy_response_ring_full(vemb_v16_channel_t *ch,
                                                    uint64_t n) {
-    atomic_fetch_add_explicit(&ch->stats.proxy_response_ring_full, n,
-                              memory_order_relaxed);
-}
-
-static void channel_note_response_status(vemb_v16_channel_t *ch,
-                                         uint8_t status) {
-    atomic_uint_fast64_t *counter = NULL;
-    switch (status) {
-    case VEMB_V16_STATUS_MOVED:
-        counter = &ch->stats.moved_count;
-        break;
-    case VEMB_V16_STATUS_STALE_TOPOLOGY:
-        counter = &ch->stats.stale_count;
-        break;
-    case VEMB_V16_STATUS_ASK:
-        counter = &ch->stats.ask_count;
-        break;
-    default:
-        return;
-    }
-    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+    (void)ch;
+    (void)n;
 }
 
 const char *vemb_v16_proxy_uds_path(vemb_v16_proxy_t *proxy) {
@@ -116,6 +95,59 @@ const char *vemb_v16_proxy_tcp_host(vemb_v16_proxy_t *proxy) {
 
 uint16_t vemb_v16_proxy_tcp_port(vemb_v16_proxy_t *proxy) {
     return proxy->tcp_port;
+}
+
+size_t vemb_v16_tcp_input_pending_bytes(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_len - ch->tcp_input_pos;
+}
+
+size_t vemb_v16_tcp_input_tailroom(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_cap - ch->tcp_input_len;
+}
+
+uint8_t *vemb_v16_tcp_input_buffer(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_buf;
+}
+
+uint8_t *vemb_v16_tcp_input_pending_ptr(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_buf + ch->tcp_input_pos;
+}
+
+uint8_t *vemb_v16_tcp_input_tail_ptr(vemb_v16_channel_t *ch) {
+    return ch->tcp_input_buf + ch->tcp_input_len;
+}
+
+void vemb_v16_tcp_input_set_buffer(vemb_v16_channel_t *ch,
+                                   uint8_t *buf,
+                                   size_t cap) {
+    ch->tcp_input_buf = buf;
+    ch->tcp_input_cap = cap;
+}
+
+void vemb_v16_tcp_input_append_done(vemb_v16_channel_t *ch, size_t len) {
+    ch->tcp_input_len += len;
+}
+
+void vemb_v16_tcp_input_consume(vemb_v16_channel_t *ch, size_t len) {
+    ch->tcp_input_pos += len;
+    if (ch->tcp_input_pos == ch->tcp_input_len)
+        vemb_v16_tcp_input_reset(ch);
+}
+
+void vemb_v16_tcp_input_compact(vemb_v16_channel_t *ch) {
+    size_t pending = vemb_v16_tcp_input_pending_bytes(ch);
+    if (ch->tcp_input_pos != 0 && pending != 0) {
+        memmove(ch->tcp_input_buf,
+                ch->tcp_input_buf + ch->tcp_input_pos,
+                pending);
+    }
+    ch->tcp_input_pos = 0;
+    ch->tcp_input_len = pending;
+}
+
+void vemb_v16_tcp_input_reset(vemb_v16_channel_t *ch) {
+    ch->tcp_input_len = 0;
+    ch->tcp_input_pos = 0;
 }
 
 #ifdef __linux__
@@ -173,8 +205,13 @@ void vemb_v16_tcp_backlog_reset(vemb_v16_channel_t *ch) {
 static void vemb_v16_channel_free_slots(vemb_v16_channel_t *ch) {
     assert(ch != NULL);
     free(ch->completion_slots);
+    zfree(ch->tcp_input_buf);
     zfree(ch->tcp_response_backlog);
     ch->completion_slots = NULL;
+    ch->tcp_input_buf = NULL;
+    ch->tcp_input_cap = 0;
+    ch->tcp_input_len = 0;
+    ch->tcp_input_pos = 0;
     ch->tcp_response_backlog = NULL;
     ch->tcp_response_backlog_cap = 0;
     ch->tcp_response_backlog_len = 0;
@@ -433,6 +470,10 @@ static int init_job_shard_queues(vemb_v16_proxy_t *proxy) {
     return 0;
 }
 
+#ifdef __linux__
+static uint32_t proxy_available_cpu_count(void);
+#endif
+
 static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (proxy->proxy_io_worker_count == 0)
@@ -440,6 +481,46 @@ static int validate_pooled_worker_config(vemb_v16_proxy_t *proxy) {
     if (proxy->supernode_worker_count == 0)
         return -1;
     return 0;
+}
+
+static uint32_t default_balanced_worker_count(void) {
+#ifdef __linux__
+    uint32_t cpus = proxy_available_cpu_count();
+#else
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    uint32_t cpus = online > 0 ? (uint32_t)online : 1u;
+#endif
+    uint32_t target = cpus / 4u;
+    if (target < 1u)
+        target = 1u;
+    if (target > 32u)
+        target = 32u;
+    if (target > VEMB_V16_MAX_CHANNELS)
+        target = VEMB_V16_MAX_CHANNELS;
+    return target;
+}
+
+static void apply_default_worker_counts(vemb_v16_proxy_t *proxy) {
+    assert(proxy != NULL);
+    if (proxy->proxy_io_worker_count != 0 &&
+        proxy->supernode_worker_count != 0)
+        return;
+
+    uint32_t target = default_balanced_worker_count();
+    if (proxy->proxy_io_worker_count == 0)
+        proxy->proxy_io_worker_count = target;
+    if (proxy->supernode_worker_count == 0)
+        proxy->supernode_worker_count = target;
+#ifdef __linux__
+    uint32_t available_cpus = proxy_available_cpu_count();
+#else
+    uint32_t available_cpus = target * 4u;
+#endif
+    serverLog(LL_NOTICE,
+              "vemb_v16 auto worker counts: available_cpus=%u proxy_io_threads=%u supernode_workers=%u",
+              available_cpus,
+              proxy->proxy_io_worker_count,
+              proxy->supernode_worker_count);
 }
 
 static int shard_queue_topology_ready(vemb_v16_proxy_t *proxy) {
@@ -468,6 +549,29 @@ static vemb_v16_storage_ctx_t *proxy_storage(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     assert(proxy->storage != NULL);
     return proxy->storage;
+}
+
+/* Populate cross-node ATTACH resp with the first local warm region that
+ * has a client_path. The client (HW02) mmap's that path to dereference
+ * VEMB_HANDLE offsets without going through TCP. */
+void vemb_v16_proxy_fill_attach_warm_region(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_aeron_attach_resp_t *resp) {
+    if (!proxy || !resp) return;
+    const vemb_v16_manifest_region_t *region =
+        vemb_v16_storage_first_local_region_with_client_path(proxy_storage(proxy));
+    if (!region) {
+        resp->warm_region_count = 0;
+        return;
+    }
+    resp->warm_region_count = 1;
+    resp->warm_region_id    = region->region_id;
+    resp->warm_backend_type = region->backend_type;
+    resp->warm_region_bytes = region->region_bytes;
+    resp->warm_mmap_offset  = region->mmap_offset;
+    resp->warm_path_len     = (uint32_t)strnlen(region->client_path, 255) + 1u;
+    strncpy(resp->warm_path, region->client_path, 255);
+    resp->warm_path[255] = 0;
 }
 
 static int migration_control_req_valid(
@@ -539,9 +643,24 @@ static void topology_resp_upsert_endpoint(
     resp->endpoints[resp->endpoint_count++] = *endpoint;
 }
 
+static int topology_resp_has_endpoint_for_owner(
+        const vemb_v16_topology_control_resp_t *resp,
+        uint32_t owner_id) {
+    for (uint32_t i = 0; i < resp->endpoint_count; i++) {
+        if (resp->endpoints[i].owner_id == owner_id)
+            return 1;
+    }
+    return 0;
+}
+
 static void topology_resp_add_local_endpoint(
         vemb_v16_proxy_t *proxy,
         vemb_v16_topology_control_resp_t *resp) {
+    if (topology_resp_has_endpoint_for_owner(
+            resp, proxy_storage(proxy)->local_owner_id)) {
+        return;
+    }
+
     vemb_v16_topology_endpoint_t endpoint = {
         .owner_id = proxy_storage(proxy)->local_owner_id,
     };
@@ -583,6 +702,10 @@ static void reset_closed_channel(vemb_v16_channel_t *ch) {
     ch->transport_type = 0;
     ch->net_fd = -1;
     ch->tcp_backpressure_enabled = 0;
+    ch->tcp_input_buf = NULL;
+    ch->tcp_input_cap = 0;
+    ch->tcp_input_len = 0;
+    ch->tcp_input_pos = 0;
     ch->tcp_response_backlog = NULL;
     ch->tcp_response_backlog_cap = 0;
     ch->tcp_response_backlog_len = 0;
@@ -760,7 +883,6 @@ static void publish_response(vemb_v16_channel_t *ch,
         if (vemb_v16_aeron_publish_response(ch, &resp) != 0)
             return;
     }
-    channel_note_response_status(ch, completion->status);
 }
 
 static vemb_v16_completion_t make_completion(vemb_v16_channel_t *ch,
@@ -781,6 +903,12 @@ static void publish_status_response(vemb_v16_channel_t *ch,
     vemb_v16_completion_t completion = make_completion(ch, req, status);
     publish_response(ch, &completion);
 }
+
+#ifdef __linux__
+static int flush_tcp_response_backlog(vemb_v16_channel_t *ch) {
+    return vemb_v16_tcp_flush_response_backlog(ch);
+}
+#endif
 
 static int publish_completion_batch(vemb_v16_channel_t *ch,
                                     vemb_v16_completion_t *completions,
@@ -821,16 +949,21 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
             return -1;
         }
         for (uint32_t i = 0; i < ready_count; i++)
-            channel_note_response_status(ch,
-                                         completions[ready_indices[i]].status);
-        for (uint32_t i = 0; i < ready_count; i++)
             completion_release_payload(&completions[ready_indices[i]]);
     } else {
-        for (uint32_t i = 0; i < ready_count; i++) {
-            uint16_t idx = ready_indices[i];
-            publish_response(ch, &completions[idx]);
-            completion_release_payload(&completions[idx]);
+        vemb_v16_resp_t resps[PROXY_RESPONSE_BATCH];
+        for (uint32_t i = 0; i < ready_count; i++)
+            vemb_v16_make_response_from(&resps[i],
+                                        &completions[ready_indices[i]]);
+        if (vemb_v16_aeron_publish_response_batch(ch,
+                                                  resps,
+                                                  ready_count) != 0) {
+            for (uint32_t i = 0; i < ready_count; i++)
+                completion_release_payload(&completions[ready_indices[i]]);
+            return -1;
         }
+        for (uint32_t i = 0; i < ready_count; i++)
+            completion_release_payload(&completions[ready_indices[i]]);
     }
     return 0;
 }
@@ -839,14 +972,12 @@ static int publish_completion_batch(vemb_v16_channel_t *ch,
 static int publish_shard_job(vemb_v16_channel_t *ch,
                              const vemb_v16_job_ref_t *ref,
                              uint32_t proxy_io_worker_id,
-                             vemb_v16_shard_queue_t *queues,
-                             atomic_uint_fast64_t *ring_full_counter) {
+                             vemb_v16_shard_queue_t *queues) {
     assert(ch != NULL);
     assert(ref != NULL);
     vemb_v16_proxy_t *proxy = ch->proxy;
     assert(shard_queue_topology_ready(proxy));
     assert(queues != NULL);
-    assert(ring_full_counter != NULL);
     assert(proxy_io_worker_id < proxy->job_shard_proxy_count);
 
     uint32_t supernode_id = ch->index % proxy->job_shard_supernode_count;
@@ -857,7 +988,11 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
     while (vemb_v16_aeron_publish(ring, ref) != 0 &&
            atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
            atomic_load_explicit(&ch->active, memory_order_acquire)) {
-        atomic_fetch_add_explicit(ring_full_counter, 1, memory_order_relaxed);
+        /* While waiting for a supernode worker to drain this shard queue,
+         * drain our return queue so the supernode worker can publish
+         * completions and make forward progress. Without this, pio and snw
+         * can spin forever with both rings full. */
+        (void)drain_job_return_queues(proxy, proxy_io_worker_id);
         cpu_relax();
     }
 #ifdef __linux__
@@ -868,10 +1003,47 @@ static int publish_shard_job(vemb_v16_channel_t *ch,
                                                 &expected,
                                                 0,
                                                 memory_order_acq_rel,
-                                                memory_order_relaxed) &&
-        worker->notify_fd >= 0) {
-        uint64_t one = 1;
-        (void)write(worker->notify_fd, &one, sizeof(one));
+                                                memory_order_relaxed)) {
+        (void)eventfd_write(worker->job_eventfd, 1);
+    }
+#endif
+    return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
+}
+
+static int publish_shard_job_batch(vemb_v16_channel_t *ch,
+                                   const vemb_v16_job_ref_t *refs,
+                                   uint32_t ref_count,
+                                   uint32_t proxy_io_worker_id,
+                                   vemb_v16_shard_queue_t *queues) {
+    assert(ch != NULL);
+    assert(refs != NULL || ref_count == 0);
+    vemb_v16_proxy_t *proxy = ch->proxy;
+    assert(shard_queue_topology_ready(proxy));
+    assert(queues != NULL);
+    assert(proxy_io_worker_id < proxy->job_shard_proxy_count);
+    RETURN_IF(ref_count == 0, 0);
+
+    uint32_t supernode_id = ch->index % proxy->job_shard_supernode_count;
+    uint32_t queue_index =
+        shard_queue_index(proxy, proxy_io_worker_id, supernode_id);
+    vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
+
+    while (vemb_v16_aeron_publish_batch(ring, refs, ref_count) != 0 &&
+           atomic_load_explicit(&proxy->running, memory_order_relaxed) &&
+           atomic_load_explicit(&ch->active, memory_order_acquire)) {
+        (void)drain_job_return_queues(proxy, proxy_io_worker_id);
+        cpu_relax();
+    }
+#ifdef __linux__
+    vemb_v16_supernode_pool_worker_t *worker =
+        &proxy->supernode_workers[supernode_id];
+    int expected = 1;
+    if (atomic_compare_exchange_strong_explicit(&worker->job_notify_armed,
+                                                &expected,
+                                                0,
+                                                memory_order_acq_rel,
+                                                memory_order_relaxed)) {
+        (void)eventfd_write(worker->job_eventfd, 1);
     }
 #endif
     return atomic_load_explicit(&ch->active, memory_order_acquire) ? 0 : -1;
@@ -1016,10 +1188,17 @@ static int fill_job_slot(vemb_v16_job_pool_t *pool,
     return 0;
 }
 
-static int publish_request_job(vemb_v16_channel_t *ch,
+typedef struct vemb_v16_pending_job_publish {
+    vemb_v16_job_pool_t *pool;
+    uint32_t slot_id;
+    vemb_v16_job_ref_t ref;
+} vemb_v16_pending_job_publish_t;
+
+static int prepare_request_job(vemb_v16_channel_t *ch,
                                const vemb_v16_req_t *req,
                                uint32_t key_len,
-                               uint32_t proxy_io_worker_id) {
+                               uint32_t proxy_io_worker_id,
+                               vemb_v16_pending_job_publish_t *pending) {
     int is_ping = req->op == VEMB_V16_OP_PING;
     int has_inline_vector = 0;
     int is_vemb_like = 0;
@@ -1045,7 +1224,9 @@ static int publish_request_job(vemb_v16_channel_t *ch,
                           &is_vemb_like) != 0, release_slot);
     GOTO_IF(!is_ping && !has_inline_vector && !is_vemb_like, release_slot);
     vemb_v16_job_slot_t *slot = job_pool_slot(pool, slot_id);
-    vemb_v16_job_ref_t ref = {
+    pending->pool = pool;
+    pending->slot_id = slot_id;
+    pending->ref = (vemb_v16_job_ref_t){
         .proxy_worker_id = (uint16_t)proxy_io_worker_id,
         .pool_type = pool_type,
         .slot_id = slot_id,
@@ -1053,40 +1234,31 @@ static int publish_request_job(vemb_v16_channel_t *ch,
         .req_id = req->req_id,
         .op = req->op,
     };
-    atomic_store_explicit(&slot->hdr.state, VEMB_V16_JOB_SLOT_PUBLISHED, memory_order_release);
-    vemb_v16_shard_queue_t *queues = ch->proxy->job_shard_queues;
-    atomic_uint_fast64_t *ring_full_counter = has_inline_vector ?
-        &ch->stats.proxy_vadd_ring_full : &ch->stats.proxy_vemb_ring_full;
-    if (diag_should_log_req(req->req_id)) {
-        uint32_t supernode_id = ch->index % ch->proxy->job_shard_supernode_count;
-        uint32_t queue_index = shard_queue_index(ch->proxy,
-            proxy_io_worker_id, supernode_id);
-        serverLog(LL_DEBUG,
-                  "vemb_v16 diag proxy enqueue: proxy_worker=%u channel_index=%u channel_id=%llu req_id=%u op=%u flags=%u key_hash=%llu key_len=%u queue=%s queue_index=%u supernode_worker=%u vector_bytes=%u",
-                  proxy_io_worker_id,
-                  ch->index,
-                  (unsigned long long)ch->channel_id,
-                  ref.req_id,
-                  ref.op,
-                  req->flags,
-                  (unsigned long long)req->key_hash,
-                  key_len,
-                  "job",
-                  queue_index,
-                  supernode_id,
-                  req->vector_bytes);
-    }
-
-    int rc = publish_shard_job(ch,
-                           &ref,
-                           proxy_io_worker_id,
-                           queues,
-                           ring_full_counter);
-    if (likely(rc == 0)) {
-        return 0;
-    }
+    return 0;
 release_slot:
     job_pool_release_slot(pool, slot_id, 0);
+    return -1;
+}
+
+static int publish_request_job(vemb_v16_channel_t *ch,
+                               const vemb_v16_req_t *req,
+                               uint32_t key_len,
+                               uint32_t proxy_io_worker_id) {
+    vemb_v16_pending_job_publish_t pending;
+    if (prepare_request_job(ch, req, key_len, proxy_io_worker_id, &pending) != 0)
+        return -1;
+
+    vemb_v16_job_slot_t *slot = job_pool_slot(pending.pool, pending.slot_id);
+    atomic_store_explicit(&slot->hdr.state,
+                          VEMB_V16_JOB_SLOT_PUBLISHED,
+                          memory_order_release);
+    if (likely(publish_shard_job(ch,
+                                 &pending.ref,
+                                 proxy_io_worker_id,
+                                 ch->proxy->job_shard_queues) == 0)) {
+        return 0;
+    }
+    job_pool_release_slot(pending.pool, pending.slot_id, 0);
     return -1;
 }
 
@@ -1096,10 +1268,106 @@ static int tcp_vemb_read_requires_inline_op(vemb_v16_channel_t *ch,
         return 0;
     if (req->op != VEMB_V16_OP_VEMB_HANDLE)
         return 0;
-    return -1;
+    return 0;
 }
 
-/// Request scheduling: validate protocol input and enqueue execution jobs.
+static void vemb_v16_proxy_handle_request_ptr_batch_internal(
+    vemb_v16_channel_t *ch,
+    const vemb_v16_req_t *const *reqs,
+    const int *req_lens,
+    int common_req_len,
+    uint32_t req_count,
+    uint32_t proxy_io_worker_id) {
+    vemb_v16_pending_job_publish_t pending[PROXY_REQUEST_BATCH];
+    vemb_v16_job_ref_t refs[PROXY_REQUEST_BATCH];
+    const vemb_v16_req_t *pending_reqs[PROXY_REQUEST_BATCH];
+    uint32_t pending_count = 0;
+
+    assert(req_count <= PROXY_REQUEST_BATCH);
+    for (uint32_t i = 0; i < req_count; i++) {
+        const vemb_v16_req_t *req = reqs[i];
+        int req_len = req_lens ? req_lens[i] : common_req_len;
+
+        if (req->op == VEMB_V16_OP_PING) {
+            if (prepare_request_job(ch, req, 0, proxy_io_worker_id,
+                                    &pending[pending_count]) == 0) {
+                refs[pending_count] = pending[pending_count].ref;
+                pending_reqs[pending_count] = req;
+                pending_count++;
+            } else {
+                publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
+            }
+            continue;
+        }
+
+        uint32_t key_len = req->key_len;
+        if (key_len == 0 || key_len > VEMB_V16_MAX_KEY_LEN ||
+            req->channel_id != ch->channel_id) {
+            publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
+            continue;
+        }
+        if (req->op == VEMB_V16_OP_VSIM_KEY_KEY &&
+            (req->key2_len == 0 || req->key2_len > VEMB_V16_MAX_KEY_LEN)) {
+            publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
+            continue;
+        }
+
+        size_t min_len = vemb_v16_req_encoded_len(req);
+        if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
+            req->vector_bytes > sizeof(req->vector)) {
+            publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
+            continue;
+        }
+        if (prepare_request_job(ch, req, key_len, proxy_io_worker_id,
+                                &pending[pending_count]) == 0) {
+            refs[pending_count] = pending[pending_count].ref;
+            pending_reqs[pending_count] = req;
+            pending_count++;
+        } else {
+            publish_status_response(ch, req, VEMB_V16_STATUS_ERR);
+        }
+    }
+
+    if (pending_count == 0)
+        return;
+
+    for (uint32_t i = 0; i < pending_count; i++) {
+        vemb_v16_job_slot_t *slot =
+            job_pool_slot(pending[i].pool, pending[i].slot_id);
+        atomic_store_explicit(&slot->hdr.state,
+                              VEMB_V16_JOB_SLOT_PUBLISHED,
+                              memory_order_release);
+    }
+    if (likely(publish_shard_job_batch(ch,
+                                       refs,
+                                       pending_count,
+                                       proxy_io_worker_id,
+                                       ch->proxy->job_shard_queues) == 0)) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < pending_count; i++)
+        job_pool_release_slot(pending[i].pool, pending[i].slot_id, 0);
+    for (uint32_t i = 0; i < pending_count; i++)
+        publish_status_response(ch,
+                                pending_reqs[i],
+                                VEMB_V16_STATUS_ERR);
+}
+
+void vemb_v16_proxy_handle_request_ptr_batch(
+    vemb_v16_channel_t *ch,
+    const vemb_v16_req_t *const *reqs,
+    int req_len,
+    uint32_t req_count,
+    uint32_t proxy_io_worker_id) {
+    vemb_v16_proxy_handle_request_ptr_batch_internal(ch,
+                                                     reqs,
+                                                     NULL,
+                                                     req_len,
+                                                     req_count,
+                                                     proxy_io_worker_id);
+}
+
 void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
                     const vemb_v16_req_t *req,
                     int req_len,
@@ -1107,8 +1375,6 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
     if (req->op == VEMB_V16_OP_PING) {
         if (publish_request_job(ch, req, 0, proxy_io_worker_id) != 0)
             goto error_response;
-        atomic_fetch_add_explicit(&ch->stats.total_requests, 1,
-                                  memory_order_relaxed);
         return;
     }
 
@@ -1122,9 +1388,7 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
         goto error_response;
     }
 
-    size_t min_len = (req->op == VEMB_V16_OP_VADD ||
-                      req->op == VEMB_V16_OP_VSIM_INLINE) ?
-        vemb_v16_req_inline_len(req->vector_bytes) : vemb_v16_req_handle_len();
+    size_t min_len = vemb_v16_req_encoded_len(req);
     if ((size_t)req_len < min_len || req->dim > VEMB_V16_MAX_DIM ||
         req->vector_bytes > sizeof(req->vector)) {
         goto error_response;
@@ -1132,9 +1396,6 @@ void vemb_v16_proxy_handle_request(vemb_v16_channel_t *ch,
     if (publish_request_job(ch, req, key_len, proxy_io_worker_id) != 0) {
         goto error_response;
     }
-
-    atomic_fetch_add_explicit(&ch->stats.published_jobs, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&ch->stats.total_requests, 1, memory_order_relaxed);
     return;
 
 error_response:
@@ -1143,32 +1404,16 @@ error_response:
 
 /// Response scheduling: drain SuperNode completions and publish by transport.
 static int drain_completions(vemb_v16_channel_t *ch) {
-    vemb_v16_completion_t completions[VEMB_V16_PROXY_BATCH];
-    uint16_t ready_indices[VEMB_V16_PROXY_BATCH];
+    vemb_v16_completion_t completions[PROXY_RESPONSE_BATCH];
+    uint16_t ready_indices[PROXY_RESPONSE_BATCH];
     uint32_t n;
     uint32_t total = 0;
     while ((n = vemb_v16_aeron_poll_batch(&ch->completion_ring,
                                           completions,
-                                          VEMB_V16_PROXY_BATCH)) != 0) {
+                                          PROXY_RESPONSE_BATCH)) != 0) {
         total += n;
         uint32_t ready_count = 0;
         for (uint32_t i = 0; i < n; i++) {
-            if (diag_should_log_req(completions[i].req_id)) {
-                serverLog(LL_DEBUG,
-                          "vemb_v16 diag proxy completion drain: channel_index=%u channel_id=%llu batch_index=%u batch_count=%u req_id=%u op=%u status=%u flags=%u vector_bytes=%u region_id=%u local_slot=%u owner_generation=%llu",
-                          ch->index,
-                          (unsigned long long)ch->channel_id,
-                          i,
-                          n,
-                          completions[i].req_id,
-                          completions[i].op,
-                          completions[i].status,
-                          completions[i].flags,
-                          completions[i].vector_bytes,
-                          completions[i].region_id,
-                          completions[i].local_slot,
-                          (unsigned long long)completions[i].owner_generation);
-            }
             if (completions[i].channel_id != ch->channel_id ||
                 !atomic_load_explicit(&ch->active, memory_order_acquire)) {
                 completion_release_payload(&completions[i]);
@@ -1352,6 +1597,101 @@ int vemb_v16_proxy_alloc_tcp_channel(vemb_v16_proxy_t *proxy,
                                 desc);
 }
 
+/// Cross-node aeron control plane: adopt pre-built shmdev rings into a
+/// new proxy channel.  Mirrors alloc_channel_common minus the ring
+/// creation step (rings already exist in the shmdev mapping).
+int vemb_v16_proxy_attach_cross_node_channel(vemb_v16_proxy_t *proxy,
+                                             void *req_ring, void *resp_ring,
+                                             uint32_t req_slot, uint32_t resp_slot,
+                                             const char *shmdev_path,
+                                             uint64_t req_off, uint64_t resp_off,
+                                             uint64_t *out_channel_id) {
+    /* Slot hunt - same logic as alloc_channel_common. We can't easily
+     * refactor alloc_channel_common to accept pre-built rings, so
+     * duplicate the slot hunt + channel setup minus the ring creation. */
+    uint32_t idx = VEMB_V16_MAX_CHANNELS;
+    uint32_t start = atomic_fetch_add_explicit(&proxy->next_channel_index, 1,
+                                               memory_order_relaxed);
+    for (uint32_t i = 0; i < VEMB_V16_MAX_CHANNELS; i++) {
+        uint32_t candidate = (start + i) % VEMB_V16_MAX_CHANNELS;
+        if (atomic_load_explicit(&proxy->channels[candidate].slot_channel_id,
+                                 memory_order_acquire) == 0) {
+            idx = candidate; break;
+        }
+    }
+    if (idx >= VEMB_V16_MAX_CHANNELS) return -1;
+
+    vemb_v16_channel_t *ch = &proxy->channels[idx];
+    reset_closed_channel(ch);
+    ch->index = idx;
+    ch->channel_id = atomic_fetch_add_explicit(&proxy->next_channel_id, 1,
+                                               memory_order_relaxed);
+    ch->proxy = proxy;
+    ch->transport_type = VEMB_V16_TRANSPORT_AERON;  /* reuse aeron data path */
+    ch->net_fd = -1;
+    atomic_store_explicit(&ch->active, 0, memory_order_release);
+    atomic_store_explicit(&ch->proxy_io_registered, 0, memory_order_release);
+    atomic_store_explicit(&ch->proxy_io_state, 0, memory_order_release);
+    atomic_store_explicit(&ch->supernode_state, 0, memory_order_release);
+
+    if (posix_memalign(&ch->completion_slots, 64,
+                       sizeof(vemb_v16_completion_t) *
+                       VEMB_V16_COMPLETION_RING_SIZE) != 0) {
+        cleanup_unstarted_channel(ch); return -1;
+    }
+    if (vemb_v16_aeron_ring_init(&ch->completion_ring,
+                                 ch->completion_slots,
+                                 sizeof(vemb_v16_completion_t),
+                                 VEMB_V16_COMPLETION_RING_SIZE) != 0) {
+        cleanup_unstarted_channel(ch); return -1;
+    }
+
+    /* Cross-node path: rings were already created by storage layer.
+     * Adopt the mappings directly. */
+    ch->request_ring       = (vemb_v16_client_ring_t *)req_ring;
+    ch->response_ring      = (vemb_v16_client_ring_t *)resp_ring;
+    ch->request_ring_bytes  = vemb_v16_client_ring_bytes(req_slot);
+    ch->response_ring_bytes = vemb_v16_client_ring_bytes(resp_slot);
+    snprintf(ch->request_ring_name, sizeof(ch->request_ring_name),
+             "%s@off%llu", shmdev_path, (unsigned long long)req_off);
+    snprintf(ch->response_ring_name, sizeof(ch->response_ring_name),
+             "%s@off%llu", shmdev_path, (unsigned long long)resp_off);
+
+    ch->supernode_ctx = (vemb_v16_supernode_ctx_t){
+        .worker_id = ch->index,
+        .channel_active = &ch->active,
+        .running = &proxy->running,
+        .completion_notify_armed = NULL,
+        .completion_notify_fd = NULL,
+        .completion_ring = &ch->completion_ring,
+        .storage = proxy->storage,
+        .stats = &ch->stats,
+    };
+    atomic_store_explicit(&ch->active, 1, memory_order_release);
+
+    int pooled_proxy_io = proxy->proxy_io_worker_count != 0;
+    ch->tcp_backpressure_enabled = 0;  /* not TCP transport */
+    if (pooled_proxy_io) {
+        ch->supernode_ctx.completion_notify_armed = &ch->completion_notify_armed;
+#ifdef __linux__
+        uint32_t worker_id = ch->index % proxy->proxy_io_worker_count;
+        ch->supernode_ctx.completion_notify_fd =
+            &proxy->proxy_io_workers[worker_id].notify_fd;
+#endif
+    }
+    atomic_store_explicit(&ch->slot_channel_id, ch->channel_id,
+                          memory_order_release);
+
+    if (out_channel_id) *out_channel_id = ch->channel_id;
+    serverLog(LL_VERBOSE,
+              "vemb_v16 cross-node channel allocated: idx=%u cid=%llu shmdev=%s "
+              "req_off=%llu resp_off=%llu",
+              ch->index, (unsigned long long)ch->channel_id,
+              shmdev_path, (unsigned long long)req_off,
+              (unsigned long long)resp_off);
+    return 0;
+}
+
 /// Control plane: close a channel and wait for proxy IO/SuperNode users to leave.
 static void close_channel(vemb_v16_channel_t *ch) {
     if (atomic_load_explicit(&ch->slot_channel_id, memory_order_acquire) == 0) {
@@ -1443,13 +1783,103 @@ static void proxy_io_channel_deactivate(vemb_v16_channel_t *ch) {
         shutdown(ch->net_fd, SHUT_RDWR);
 }
 
-static void proxy_io_set_affinity(uint32_t worker_id) {
+#define VEMB_V16_PROXY_AFFINITY_INTERLEAVED 0
+#define VEMB_V16_PROXY_AFFINITY_GROUPED 1
+
+#ifndef VEMB_V16_PROXY_AFFINITY_MODE
+#define VEMB_V16_PROXY_AFFINITY_MODE VEMB_V16_PROXY_AFFINITY_INTERLEAVED
+#endif
+
+#if VEMB_V16_PROXY_AFFINITY_MODE != VEMB_V16_PROXY_AFFINITY_INTERLEAVED && \
+    VEMB_V16_PROXY_AFFINITY_MODE != VEMB_V16_PROXY_AFFINITY_GROUPED
+#error "VEMB_V16_PROXY_AFFINITY_MODE must be 0 (interleaved) or 1 (grouped)"
+#endif
+
+static const char *proxy_worker_affinity_mode_name(void) {
+#if VEMB_V16_PROXY_AFFINITY_MODE == VEMB_V16_PROXY_AFFINITY_GROUPED
+    return "grouped";
+#else
+    return "interleaved";
+#endif
+}
+
 #ifdef __linux__
+
+static uint32_t proxy_get_available_cpus(int *cpus, uint32_t cap) {
+    if (cap == 0)
+        return 0;
+
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+        return 0;
+
+    uint32_t count = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE && count < cap; cpu++) {
+        if (CPU_ISSET(cpu, &allowed))
+            cpus[count++] = cpu;
+    }
+    return count;
+}
+
+static uint32_t proxy_available_cpu_count(void) {
+    int cpus[CPU_SETSIZE];
+    uint32_t count = proxy_get_available_cpus(cpus, CPU_SETSIZE);
+    if (count != 0)
+        return count;
+
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    return online > 0 ? (uint32_t)online : 1u;
+}
+
+static void proxy_set_worker_affinity(vemb_v16_proxy_t *proxy,
+                                      uint32_t worker_id,
+                                      uint32_t lane) {
+    int cpus[CPU_SETSIZE];
+    uint32_t cpu_count = proxy_get_available_cpus(cpus, CPU_SETSIZE);
+    uint32_t required;
+#if VEMB_V16_PROXY_AFFINITY_MODE == VEMB_V16_PROXY_AFFINITY_GROUPED
+    required = proxy->proxy_io_worker_count + proxy->supernode_worker_count;
+#else
+    required = 2u * proxy->proxy_io_worker_count;
+    if (proxy->supernode_worker_count > proxy->proxy_io_worker_count)
+        required = 2u * proxy->supernode_worker_count;
+#endif
+    if (cpu_count == 0 || required > cpu_count)
+        return;
+
+#if VEMB_V16_PROXY_AFFINITY_MODE == VEMB_V16_PROXY_AFFINITY_GROUPED
+    uint32_t cpu_index = lane == 0
+        ? worker_id
+        : proxy->proxy_io_worker_count + worker_id;
+#else
+    uint32_t cpu_index = worker_id * 2u + lane;
+#endif
+    if (cpu_index >= cpu_count)
+        return;
+
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET((int)((worker_id * 2 + 1) % 64), &cpuset);
+    CPU_SET(cpus[cpu_index], &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
+#endif
+
+static void proxy_io_set_affinity(vemb_v16_proxy_t *proxy, uint32_t worker_id) {
+#ifdef __linux__
+    proxy_set_worker_affinity(proxy, worker_id, 0);
 #else
+    (void)proxy;
+    (void)worker_id;
+#endif
+}
+
+static void supernode_worker_set_affinity(vemb_v16_proxy_t *proxy,
+                                          uint32_t worker_id) {
+#ifdef __linux__
+    proxy_set_worker_affinity(proxy, worker_id, 1);
+#else
+    (void)proxy;
     (void)worker_id;
 #endif
 }
@@ -1458,9 +1888,7 @@ static void proxy_io_set_affinity(uint32_t worker_id) {
 static void *proxy_io_poll_thread_main(void *arg) {
     vemb_v16_proxy_io_worker_t *worker = arg;
     vemb_v16_proxy_t *proxy = worker->proxy;
-
-    proxy_io_set_affinity(worker->worker_id);
-
+    proxy_io_set_affinity(proxy, worker->worker_id);
     serverLog(LL_VERBOSE, "vemb_v16 proxy io poll worker started: worker_id=%u",
               worker->worker_id);
     while (atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
@@ -1487,8 +1915,17 @@ static void *proxy_io_poll_thread_main(void *arg) {
                 proxy_io_channel_release(ch);
                 continue;
             }
-            if (n > 0)
+            if (n > 0) {
                 did_work = 1;
+#ifdef __linux__
+                if (ch->transport_type == VEMB_V16_TRANSPORT_TCP &&
+                    flush_tcp_response_backlog(ch) < 0) {
+                    proxy_io_channel_deactivate(ch);
+                    proxy_io_channel_release(ch);
+                    continue;
+                }
+#endif
+            }
 
             if (atomic_load_explicit(&ch->active, memory_order_acquire) &&
                 ch->transport_type == VEMB_V16_TRANSPORT_AERON) {
@@ -1505,9 +1942,25 @@ static void *proxy_io_poll_thread_main(void *arg) {
 
             if (atomic_load_explicit(&ch->active, memory_order_acquire) &&
                 ch->net_fd >= 0) {
+                if (vemb_v16_tcp_has_buffered_requests(ch)) {
+                    int rc = vemb_v16_tcp_read_ready_requests(ch,
+                                                             worker->worker_id);
+                    if (rc < 0) {
+                        proxy_io_channel_deactivate(ch);
+                        did_work = 1;
+                        proxy_io_channel_release(ch);
+                        continue;
+                    }
+                    if (rc > 0)
+                        did_work = 1;
+                }
                 pfds[nfds] = (struct pollfd){
                     .fd = ch->net_fd,
-                    .events = POLLIN,
+                    .events = POLLIN
+#ifdef __linux__
+                        | (vemb_v16_tcp_backlog_pending(ch) ? POLLOUT : 0)
+#endif
+                    ,
                     .revents = 0,
                 };
                 poll_channels[nfds] = ch;
@@ -1538,6 +1991,14 @@ static void *proxy_io_poll_thread_main(void *arg) {
                 } else if (rc > 0) {
                     did_work = 1;
                 }
+#ifdef __linux__
+            } else if (revents & POLLOUT) {
+                if (flush_tcp_response_backlog(ch) < 0) {
+                    proxy_io_channel_deactivate(ch);
+                } else {
+                    did_work = 1;
+                }
+#endif
             } else if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 proxy_io_channel_deactivate(ch);
                 did_work = 1;
@@ -1592,19 +2053,23 @@ static void *proxy_io_epoll_thread_main(void *arg) {
         atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
         return NULL;
     }
-    worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (worker->notify_fd >= 0) {
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data = {.u64 = notify_token},
-        };
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, worker->notify_fd, &ev) != 0) {
-            close(worker->notify_fd);
-            worker->notify_fd = -1;
-        }
+    struct epoll_event notify_ev = {
+        .events = EPOLLIN,
+        .data = {.u64 = notify_token},
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, worker->notify_fd, &notify_ev) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 FATAL: proxy io notify eventfd epoll add failed: worker_id=%u fd=%d errno=%d error=%s",
+                  worker->worker_id,
+                  worker->notify_fd,
+                  errno,
+                  strerror(errno));
+        atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+        close(epfd);
+        return NULL;
     }
 
-    proxy_io_set_affinity(worker->worker_id);
+    proxy_io_set_affinity(proxy, worker->worker_id);
 
     serverLog(LL_VERBOSE, "vemb_v16 proxy io epoll worker started: worker_id=%u",
               worker->worker_id);
@@ -1735,7 +2200,7 @@ static void *proxy_io_epoll_thread_main(void *arg) {
             }
 
             if (vemb_v16_tcp_backlog_pending(ch)) {
-                int flush = vemb_v16_tcp_flush_response_backlog(ch);
+                int flush = flush_tcp_response_backlog(ch);
                 if (flush < 0) {
                     proxy_io_channel_deactivate(ch);
                     did_work = 1;
@@ -1745,19 +2210,40 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                 if (flush == 1)
                     did_work = 1;
             }
+            if (vemb_v16_tcp_has_buffered_requests(ch)) {
+                int rc = vemb_v16_tcp_read_ready_requests(ch,
+                                                         worker->worker_id);
+                if (rc < 0) {
+                    proxy_io_channel_deactivate(ch);
+                    did_work = 1;
+                    proxy_io_channel_release(ch);
+                    continue;
+                }
+                if (rc > 0)
+                    did_work = 1;
+            }
             int n = drain_completions(ch);
             if (n < 0) {
                 proxy_io_channel_deactivate(ch);
                 did_work = 1;
             } else if (n > 0) {
                 did_work = 1;
+                if (flush_tcp_response_backlog(ch) < 0) {
+                    proxy_io_channel_deactivate(ch);
+                    proxy_io_channel_release(ch);
+                    continue;
+                }
             } else if (proxy_io_channel_arm_completion_notify(ch) < 0) {
                 did_work = 1;
             }
             proxy_io_channel_release(ch);
         }
 
-        int timeout_ms = did_work ? 0 : 10;
+        /* Idle epoll timeout. 1ms when cross-node aeron is enabled
+         * (avoids the fixed 10ms RTT for aeron channels with no fd
+         * wakeup). 10ms otherwise (pre-cross-node behavior). */
+        int timeout_ms = did_work ? 0 :
+            (vemb_v16_cross_node_aeron_enabled() ? 1 : 10);
         int nready = epoll_wait(epfd,
                                 events,
                                 VEMB_V16_MAX_CHANNELS,
@@ -1770,9 +2256,10 @@ static void *proxy_io_epoll_thread_main(void *arg) {
 
         for (int i = 0; i < nready; i++) {
             if (events[i].data.u64 == notify_token) {
-                uint64_t value = 0;
-                if (worker->notify_fd >= 0)
-                    (void)read(worker->notify_fd, &value, sizeof(value));
+                eventfd_t value = 0;
+                while (eventfd_read(worker->notify_fd, &value) != 0 &&
+                       errno == EINTR) {
+                }
                 did_work = 1;
                 continue;
             }
@@ -1798,10 +2285,12 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                                                          worker->worker_id);
                 if (rc < 0) {
                     proxy_io_channel_deactivate(ch);
+                } else if (rc > 0) {
+                    did_work = 1;
                 }
             }
             if ((revents & EPOLLOUT) && atomic_load_explicit(&ch->active, memory_order_acquire)) {
-                if (vemb_v16_tcp_flush_response_backlog(ch) < 0)
+                if (flush_tcp_response_backlog(ch) < 0)
                     proxy_io_channel_deactivate(ch);
             }
             if (revents & (EPOLLERR | EPOLLHUP)) {
@@ -1821,10 +2310,6 @@ static void *proxy_io_epoll_thread_main(void *arg) {
                                   registered_events,
                                   i);
     }
-    if (worker->notify_fd >= 0) {
-        close(worker->notify_fd);
-        worker->notify_fd = -1;
-    }
     close(epfd);
     serverLog(LL_VERBOSE, "vemb_v16 proxy io epoll worker stopped: worker_id=%u",
               worker->worker_id);
@@ -1840,6 +2325,28 @@ static void *proxy_io_pool_thread_main(void *arg) {
 #endif
 }
 
+#ifdef __linux__
+static int proxy_io_worker_open_notify_fd(vemb_v16_proxy_io_worker_t *worker) {
+    worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (worker->notify_fd < 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 FATAL: proxy io notify eventfd create failed: worker_id=%u errno=%d error=%s",
+                  worker->worker_id, errno, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void proxy_io_worker_wake(vemb_v16_proxy_io_worker_t *worker) {
+    (void)eventfd_write(worker->notify_fd, 1);
+}
+
+static void proxy_io_worker_close_notify_fd(vemb_v16_proxy_io_worker_t *worker) {
+    close(worker->notify_fd);
+    worker->notify_fd = -1;
+}
+#endif
+
 static int start_proxy_io_pool(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
@@ -1848,14 +2355,36 @@ static int start_proxy_io_pool(vemb_v16_proxy_t *proxy) {
         proxy->proxy_io_workers[i].proxy = proxy;
 #ifdef __linux__
         proxy->proxy_io_workers[i].notify_fd = -1;
+        if (proxy_io_worker_open_notify_fd(&proxy->proxy_io_workers[i]) != 0) {
+            atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+            for (uint32_t j = 0; j < i; j++)
+                proxy_io_worker_wake(&proxy->proxy_io_workers[j]);
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_join(proxy->proxy_io_workers[j].thread, NULL);
+                proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[j]);
+            }
+            proxy->proxy_io_pool_started = 0;
+            return -1;
+        }
 #endif
         if (pthread_create(&proxy->proxy_io_workers[i].thread,
                            NULL,
                            proxy_io_pool_thread_main,
                            &proxy->proxy_io_workers[i]) != 0) {
             atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+#ifdef __linux__
             for (uint32_t j = 0; j < i; j++)
+                proxy_io_worker_wake(&proxy->proxy_io_workers[j]);
+#endif
+            for (uint32_t j = 0; j < i; j++) {
                 pthread_join(proxy->proxy_io_workers[j].thread, NULL);
+#ifdef __linux__
+                proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[j]);
+#endif
+            }
+#ifdef __linux__
+            proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[i]);
+#endif
             proxy->proxy_io_pool_started = 0;
             return -1;
         }
@@ -1868,8 +2397,16 @@ static void stop_proxy_io_pool(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (!proxy->proxy_io_pool_started)
         return;
+#ifdef __linux__
+    for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
+        proxy_io_worker_wake(&proxy->proxy_io_workers[i]);
+#endif
     for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
         pthread_join(proxy->proxy_io_workers[i].thread, NULL);
+#ifdef __linux__
+    for (uint32_t i = 0; i < proxy->proxy_io_worker_count; i++)
+        proxy_io_worker_close_notify_fd(&proxy->proxy_io_workers[i]);
+#endif
     proxy->proxy_io_pool_started = 0;
 }
 
@@ -1924,10 +2461,7 @@ static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx)
         return;
     }
     int notify_fd = *ctx->completion_notify_fd;
-    if (notify_fd >= 0) {
-        uint64_t one = 1;
-        (void)write(notify_fd, &one, sizeof(one));
-    }
+    (void)eventfd_write(notify_fd, 1);
 #else
     (void)ctx;
 #endif
@@ -1935,17 +2469,14 @@ static void notify_completion_consumer_from_proxy(vemb_v16_supernode_ctx_t *ctx)
 
 static void publish_synthetic_completion(vemb_v16_supernode_ctx_t *ctx,
                                          const vemb_v16_completion_t *completion) {
+    uint32_t spins = 0;
+    int use_backoff = vemb_v16_cross_node_aeron_enabled();
     while (vemb_v16_aeron_publish(ctx->completion_ring, completion) != 0 &&
            atomic_load_explicit(ctx->running, memory_order_relaxed) &&
            atomic_load_explicit(ctx->channel_active, memory_order_acquire)) {
-        atomic_fetch_add_explicit(&ctx->stats->supernode_completion_ring_full, 1,
-                                  memory_order_relaxed);
-        cpu_relax();
+        if (use_backoff) vemb_v16_aeron_backoff(spins++);
+        else             cpu_relax();
     }
-    atomic_fetch_add_explicit(&ctx->stats->supernode_completion_publish, 1,
-                              memory_order_relaxed);
-    atomic_fetch_add_explicit(&ctx->stats->completed_jobs, 1,
-                              memory_order_relaxed);
     notify_completion_consumer_from_proxy(ctx);
 }
 
@@ -1990,15 +2521,18 @@ static void apply_unified_shard_job(vemb_v16_supernode_ctx_t *ctx,
     }
 }
 
-static void publish_job_return(vemb_v16_proxy_t *proxy,
-                               uint32_t proxy_worker_id,
-                               uint32_t sn_work_id,
-                               const vemb_v16_job_return_t *ret) {
+static void publish_job_return_batch(vemb_v16_proxy_t *proxy,
+                                     uint32_t proxy_worker_id,
+                                     uint32_t sn_work_id,
+                                     const vemb_v16_job_return_t *rets,
+                                     uint32_t ret_count) {
     assert(proxy != NULL);
-    assert(ret != NULL);
+    assert(rets != NULL || ret_count == 0);
+    if (ret_count == 0)
+        return;
     uint32_t queue_index = shard_queue_index(proxy, proxy_worker_id, sn_work_id);
     vemb_v16_aeron_ring_t *ring = &proxy->job_return_queues[queue_index].ring;
-    while (vemb_v16_aeron_publish(ring, ret) != 0 &&
+    while (vemb_v16_aeron_publish_batch(ring, rets, ret_count) != 0 &&
            atomic_load_explicit(&proxy->running, memory_order_relaxed)) {
         cpu_relax();
     }
@@ -2019,9 +2553,14 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
 
     int did_work = 0;
     for (uint32_t work_id = 0; work_id < proxy->job_shard_proxy_count; work_id++) {
+        vemb_v16_channel_t *batched_ch = NULL;
+        vemb_v16_supernode_ctx_t batched_ctx;
+        uint32_t batched_completion_count = 0;
         uint32_t queue_index = shard_queue_index(proxy, work_id, sn_work_id);
         vemb_v16_aeron_ring_t *ring = &queues[queue_index].ring;
-        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_refs, VEMB_V16_PROXY_BATCH);
+        uint32_t n = vemb_v16_aeron_poll_batch(ring, job_refs, PROXY_QUEUE_BATCH);
+        vemb_v16_job_return_t job_returns[PROXY_QUEUE_BATCH];
+        uint32_t return_count = 0;
         if (!n) continue;
 
         did_work += (int)n;
@@ -2051,40 +2590,40 @@ static int drain_shard_queues(vemb_v16_proxy_t *proxy,
                 .generation = ref->generation,
             };
             if (job_base->channel_index >= VEMB_V16_MAX_CHANNELS) {
-                publish_job_return(proxy, ref->proxy_worker_id, sn_work_id, &job_return);
+                job_returns[return_count++] = job_return;
                 continue;
             }
             vemb_v16_channel_t *ch = &proxy->channels[job_base->channel_index];
-            if (!supernode_channel_acquire(ch)) {
-                publish_job_return(proxy, ref->proxy_worker_id, sn_work_id, &job_return);
-                continue;
+            if (batched_ch != ch) {
+                if (batched_ch != NULL) {
+                    vemb_v16_supernode_flush_completion_batch(&batched_ctx, 1);
+                    supernode_channel_release(batched_ch);
+                    batched_ch = NULL;
+                }
+                if (!supernode_channel_acquire(ch)) {
+                    job_returns[return_count++] = job_return;
+                    continue;
+                }
+                batched_ch = ch;
+                batched_completion_count = 0;
+                batched_ctx = ch->supernode_ctx;
+                batched_ctx.worker_id = sn_work_id;
+                batched_ctx.completion_batch = scratch->completion_batch;
+                batched_ctx.completion_batch_count = &batched_completion_count;
+                batched_ctx.completion_batch_capacity = PROXY_QUEUE_BATCH;
             }
             if (atomic_load_explicit(
                 &ch->slot_channel_id, memory_order_acquire) == job_base->channel_id &&
                 atomic_load_explicit(&ch->active, memory_order_acquire)) {
-                if (diag_should_log_req(job_base->req_id)) {
-                    serverLog(LL_DEBUG,
-                              "vemb_v16 diag supernode dequeue: worker_id=%u queue=%s proxy_worker=%u queue_index=%u batch_index=%u batch_count=%u channel_index=%u channel_id=%llu req_id=%u op=%u flags=%u key_hash=%llu",
-                              sn_work_id,
-                              "job",
-                              work_id,
-                              queue_index,
-                              i,
-                              n,
-                              job_base->channel_index,
-                              (unsigned long long)job_base->channel_id,
-                              job_base->req_id,
-                              job_base->op,
-                              job_base->flags,
-                              (unsigned long long)job_base->key_hash);
-                }
-                vemb_v16_supernode_ctx_t ctx = ch->supernode_ctx;
-                ctx.worker_id = sn_work_id;
-                apply_unified_shard_job(&ctx, job_base, scratch, ch);
+                apply_unified_shard_job(&batched_ctx, job_base, scratch, ch);
             }
-            supernode_channel_release(ch);
-            publish_job_return(proxy, ref->proxy_worker_id, sn_work_id, &job_return);
+            job_returns[return_count++] = job_return;
         }
+        if (batched_ch != NULL) {
+            vemb_v16_supernode_flush_completion_batch(&batched_ctx, 1);
+            supernode_channel_release(batched_ch);
+        }
+        publish_job_return_batch(proxy, work_id, sn_work_id, job_returns, return_count);
     }
     return did_work;
 }
@@ -2111,14 +2650,14 @@ static int drain_job_return_queues(vemb_v16_proxy_t *proxy,
               0);
 
     int reclaimed = 0;
-    vemb_v16_job_return_t returns[VEMB_V16_PROXY_BATCH];
+    vemb_v16_job_return_t returns[PROXY_QUEUE_BATCH];
     for (uint32_t sn_id = 0; sn_id < proxy->job_shard_supernode_count; sn_id++) {
         uint32_t queue_index = shard_queue_index(proxy, proxy_worker_id, sn_id);
         vemb_v16_aeron_ring_t *ring = &proxy->job_return_queues[queue_index].ring;
         uint32_t n;
         while ((n = vemb_v16_aeron_poll_batch(ring,
                                               returns,
-                                              VEMB_V16_PROXY_BATCH)) != 0) {
+                                              PROXY_QUEUE_BATCH)) != 0) {
             reclaimed += (int)n;
             for (uint32_t i = 0; i < n; i++) {
                 vemb_v16_job_return_t *ret = &returns[i];
@@ -2161,25 +2700,21 @@ static int supernode_worker_has_pending(vemb_v16_proxy_t *proxy,
 }
 
 static void supernode_worker_wait_for_jobs(vemb_v16_supernode_pool_worker_t *worker) {
-    if (worker->notify_fd < 0)
-        return;
-
     atomic_store_explicit(&worker->job_notify_armed, 1, memory_order_release);
     if (supernode_worker_has_pending(worker->proxy, worker->worker_id)) {
         atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
         return;
     }
 
-    struct pollfd pfd = {
-        .fd = worker->notify_fd,
-        .events = POLLIN,
-    };
-    int rc = poll(&pfd, 1, 10);
-    if (rc > 0 && (pfd.revents & POLLIN)) {
-        uint64_t value = 0;
-        (void)read(worker->notify_fd, &value, sizeof(value));
+    eventfd_t value = 0;
+    while (eventfd_read(worker->job_eventfd, &value) != 0 &&
+           errno == EINTR) {
     }
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
+}
+
+static void supernode_worker_wake(vemb_v16_supernode_pool_worker_t *worker) {
+    (void)eventfd_write(worker->job_eventfd, 1);
 }
 #endif
 
@@ -2191,16 +2726,10 @@ static void *supernode_pool_thread_main(void *arg) {
     if (vemb_v16_supernode_scratch_init(&scratch) != 0)
         return NULL;
 #ifdef __linux__
-    worker->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     atomic_store_explicit(&worker->job_notify_armed, 0, memory_order_release);
 #endif
 
-#ifdef __linux__
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET((int)((worker->worker_id * 2 + 2) % 64), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-#endif
+    supernode_worker_set_affinity(proxy, worker->worker_id);
 
     serverLog(LL_VERBOSE, "vemb_v16 pooled supernode worker started: worker_id=%u",
               worker->worker_id);
@@ -2218,15 +2747,27 @@ static void *supernode_pool_thread_main(void *arg) {
     }
     serverLog(LL_VERBOSE, "vemb_v16 pooled supernode worker stopped: worker_id=%u",
               worker->worker_id);
-#ifdef __linux__
-    if (worker->notify_fd >= 0) {
-        close(worker->notify_fd);
-        worker->notify_fd = -1;
-    }
-#endif
     vemb_v16_supernode_scratch_cleanup(&scratch);
     return NULL;
 }
+
+#ifdef __linux__
+static int supernode_worker_open_eventfd(vemb_v16_supernode_pool_worker_t *worker) {
+    worker->job_eventfd = eventfd(0, EFD_CLOEXEC);
+    if (worker->job_eventfd < 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 FATAL: supernode worker eventfd create failed: worker_id=%u errno=%d error=%s",
+                  worker->worker_id, errno, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void supernode_worker_close_eventfd(vemb_v16_supernode_pool_worker_t *worker) {
+    close(worker->job_eventfd);
+    worker->job_eventfd = -1;
+}
+#endif
 
 static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
     if (validate_pooled_worker_config(proxy) != 0)
@@ -2237,16 +2778,40 @@ static int start_supernode_pool(vemb_v16_proxy_t *proxy) {
             .proxy = proxy,
 #ifdef __linux__
             .job_notify_armed = 0,
-            .notify_fd = -1,
+            .job_eventfd = -1,
 #endif
         };
+#ifdef __linux__
+        if (supernode_worker_open_eventfd(&proxy->supernode_workers[i]) != 0) {
+            atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+            for (uint32_t j = 0; j < i; j++)
+                supernode_worker_wake(&proxy->supernode_workers[j]);
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_join(proxy->supernode_workers[j].thread, NULL);
+                supernode_worker_close_eventfd(&proxy->supernode_workers[j]);
+            }
+            proxy->supernode_pool_started = 0;
+            return -1;
+        }
+#endif
         if (pthread_create(&proxy->supernode_workers[i].thread,
                            NULL,
                            supernode_pool_thread_main,
                            &proxy->supernode_workers[i]) != 0) {
             atomic_store_explicit(&proxy->running, 0, memory_order_relaxed);
+#ifdef __linux__
             for (uint32_t j = 0; j < i; j++)
+                supernode_worker_wake(&proxy->supernode_workers[j]);
+#endif
+            for (uint32_t j = 0; j < i; j++) {
                 pthread_join(proxy->supernode_workers[j].thread, NULL);
+#ifdef __linux__
+                supernode_worker_close_eventfd(&proxy->supernode_workers[j]);
+#endif
+            }
+#ifdef __linux__
+            supernode_worker_close_eventfd(&proxy->supernode_workers[i]);
+#endif
             proxy->supernode_pool_started = 0;
             return -1;
         }
@@ -2259,8 +2824,16 @@ static void stop_supernode_pool(vemb_v16_proxy_t *proxy) {
     assert(proxy != NULL);
     if (!proxy->supernode_pool_started)
         return;
+#ifdef __linux__
     for (uint32_t i = 0; i < proxy->supernode_worker_count; i++)
+        supernode_worker_wake(&proxy->supernode_workers[i]);
+#endif
+    for (uint32_t i = 0; i < proxy->supernode_worker_count; i++) {
         pthread_join(proxy->supernode_workers[i].thread, NULL);
+#ifdef __linux__
+        supernode_worker_close_eventfd(&proxy->supernode_workers[i]);
+#endif
+    }
     proxy->supernode_pool_started = 0;
 }
 
@@ -2285,7 +2858,7 @@ static int scaleout_notify_connect_uds(const char *path, uint32_t timeout_ms) {
         close(fd);
         return -1;
     }
-    strcpy(addr.sun_path, path);
+    redis_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
         return -1;
@@ -2479,6 +3052,8 @@ int vemb_v16_proxy_create(vemb_v16_proxy_t **out,
     proxy->response_ring_slot_size = sizeof(vemb_v16_resp_t);
     proxy->max_vectors = max_vectors;
     proxy->listen_fd = -1;
+    proxy->inject_pipe_rd = -1;
+    proxy->inject_pipe_wr = -1;
     proxy->tcp_port = VEMB_V16_TCP_PORT;
     strncpy(proxy->tcp_host, VEMB_V16_TCP_HOST, sizeof(proxy->tcp_host) - 1);
     atomic_init(&proxy->running, 0);
@@ -2533,6 +3108,34 @@ int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy) {
     return 0;
 }
 
+/* Enable the inject pipe so the Redis main thread can hand off VEMB fds that
+ * it sniffed off its own listening ports.  Same-process cross-thread fd-pass:
+ * the integer fd is valid in both threads (redis stole it from the conn by
+ * setting conn->fd=-1, so the kernel descriptor stays open until the proxy's
+ * side closes it). */
+int vemb_v16_proxy_enable_inject(vemb_v16_proxy_t *proxy) {
+    assert(proxy != NULL);
+    if (proxy->inject_pipe_rd >= 0) return 0; /* already enabled */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
+    fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(pipefd[1], F_SETFL, fcntl(pipefd[1], F_GETFL, 0) | O_NONBLOCK);
+    proxy->inject_pipe_rd = pipefd[0];
+    proxy->inject_pipe_wr = pipefd[1];
+    return 0;
+}
+
+int vemb_v16_proxy_inject_fd(vemb_v16_proxy_t *proxy, int fd) {
+    if (!proxy || proxy->inject_pipe_wr < 0 || fd < 0) return -1;
+    /* Make fd blocking for proxy's blocking reads */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    vemb_v16_net_set_tcp_nodelay(fd);
+    vemb_v16_net_set_timeouts(fd, 10000);
+    ssize_t w = write(proxy->inject_pipe_wr, &fd, sizeof(fd));
+    return (w == sizeof(fd)) ? 0 : -1;
+}
+
 static int proxy_set_worker_count(vemb_v16_proxy_t *proxy,
                                   int pool_started,
                                   uint32_t count,
@@ -2584,6 +3187,7 @@ void vemb_v16_proxy_destroy(vemb_v16_proxy_t *proxy) {
 /// Top-level control loop: accept either UDS UB/SHM control or TCP control/data.
 int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
     int rc = -1;
+    apply_default_worker_counts(proxy);
     if (validate_pooled_worker_config(proxy) != 0)
         return -1;
     if (!proxy->uds_enabled && !proxy->tcp_enabled)
@@ -2632,7 +3236,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
         goto cleanup;
     }
 
-    serverLog(LL_NOTICE, "vemb_v16 server ready: uds_enabled=%s uds=%s tcp_enabled=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u dim=%u max_vectors=%u vector_region=%s",
+    serverLog(LL_NOTICE, "vemb_v16 server ready: uds_enabled=%s uds=%s tcp_enabled=%s tcp=%s:%u proxy_io_threads=%u supernode_workers=%u affinity=%s dim=%u max_vectors=%u vector_region=%s",
               proxy->uds_enabled ? "yes" : "no",
               proxy->uds_path,
               proxy->tcp_enabled ? "yes" : "no",
@@ -2640,6 +3244,7 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
               proxy->tcp_port,
               proxy->proxy_io_worker_count,
               proxy->supernode_worker_count,
+              proxy_worker_affinity_mode_name(),
               proxy->vector_dim,
               proxy->max_vectors,
               vemb_v16_storage_vector_region_name(proxy_storage(proxy)));
@@ -2662,6 +3267,18 @@ int vemb_v16_proxy_run(vemb_v16_proxy_t *proxy) {
             did_work = 1;
             listener.handle_fd(proxy, cfd);
         }
+        /* Drain fds injected from Redis main thread (protocol sniffing).  These
+         * are always data-plane HELLO frames — control frames never go through
+         * the pipe (server_integration.c dispatches them directly). */
+        if (proxy->inject_pipe_rd >= 0) {
+            for (;;) {
+                int injected_fd;
+                ssize_t r = read(proxy->inject_pipe_rd, &injected_fd, sizeof(injected_fd));
+                if (r != sizeof(injected_fd)) break;
+                did_work = 1;
+                vemb_v16_tcp_handle_fd(proxy, injected_fd);
+            }
+        }
         if (!did_work) {
             struct timespec ts = {0, 1000000};
             nanosleep(&ts, NULL);
@@ -2681,6 +3298,14 @@ cleanup:
     if (proxy->listen_fd >= 0) {
         close(proxy->listen_fd);
         proxy->listen_fd = -1;
+    }
+    if (proxy->inject_pipe_rd >= 0) {
+        close(proxy->inject_pipe_rd);
+        proxy->inject_pipe_rd = -1;
+    }
+    if (proxy->inject_pipe_wr >= 0) {
+        close(proxy->inject_pipe_wr);
+        proxy->inject_pipe_wr = -1;
     }
     if (proxy->uds_enabled && proxy->uds_path[0])
         unlink(proxy->uds_path);

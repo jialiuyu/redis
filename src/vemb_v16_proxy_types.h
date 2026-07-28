@@ -3,6 +3,7 @@
 
 #include "vemb_v16_proxy_internal.h"
 #include "vemb_v16_aeron_ring.h"
+#include "vemb_v16_client_ring.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_supernode.h"
 
@@ -10,6 +11,9 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* Forward decl: defined in vemb_v16_proxy.c (non-blocking handshake state machine). */
+struct vemb_v16_handshake_ctx;
 
 typedef struct vemb_v16_proxy_io_worker {
     uint32_t worker_id;
@@ -28,7 +32,7 @@ typedef struct vemb_v16_supernode_pool_worker {
     pthread_t thread;
 #ifdef __linux__
     atomic_int job_notify_armed;
-    int notify_fd;
+    int job_eventfd;
 #endif
 } vemb_v16_supernode_pool_worker_t;
 
@@ -55,6 +59,10 @@ struct vemb_v16_channel {
     atomic_uint_fast32_t supernode_state;
     atomic_int completion_notify_armed;
     int tcp_backpressure_enabled;
+    uint8_t *tcp_input_buf;
+    size_t tcp_input_cap;
+    size_t tcp_input_len;
+    size_t tcp_input_pos;
     uint8_t *tcp_response_backlog;
     size_t tcp_response_backlog_cap;
     size_t tcp_response_backlog_len;
@@ -107,6 +115,9 @@ struct vemb_v16_proxy {
     uint64_t read_pool_slot_total;
     pthread_mutex_t stats_lock;
     vemb_v16_stats_t closed_stats;
+    int inject_pipe_rd;   /* read by proxy thread to receive injected fds */
+    int inject_pipe_wr;   /* written by Redis main thread to inject fds  */
+    struct vemb_v16_handshake_ctx *pending_handshakes;  /* non-blocking handshake state list (proxy main only) */
 };
 
 #endif

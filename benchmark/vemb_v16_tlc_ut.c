@@ -991,7 +991,6 @@ static void test_vsim_key2_lookup_local_source(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t key2_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     const char *key1 = "vsim:one";
     const char *key2 = "vsim:two";
@@ -1016,11 +1015,10 @@ static void test_vsim_key2_lookup_local_source(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &key2_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL);
-    assert(timing.local_lookup_count == 1);
-    assert(timing.remote_meta_lookup_count == 0);
+
+
     assert(key2_handle.region_id == 88);
     assert(key2_handle.offset == sizeof(v2));
     assert(key2_handle.bytes == sizeof(v2));
@@ -1032,11 +1030,10 @@ static void test_vsim_key2_lookup_local_source(void) {
                                          (uint32_t)strlen(missing),
                                          missing_hash,
                                          &key2_handle,
-                                         &source,
-                                         &timing) != 0);
+                                         &source) != 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_NONE);
-    assert(timing.local_lookup_count == 1);
-    assert(timing.remote_meta_lookup_count == 0);
+
+
 
     vemb_v16_tlc_destroy(tlc);
 }
@@ -1075,7 +1072,6 @@ static void test_vsim_key2_lookup_remote_source(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     const uint8_t *bytes = NULL;
     uint32_t len = 0;
@@ -1126,11 +1122,10 @@ static void test_vsim_key2_lookup_remote_source(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE);
-    assert(timing.local_lookup_count == 1);
-    assert(timing.remote_meta_lookup_count == 1);
+
+
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);
@@ -1250,7 +1245,6 @@ static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     vemb_v16_remote_meta_handle_t repaired = {0};
     vemb_v16_stats_t stats;
@@ -1303,10 +1297,9 @@ static void test_vsim_key2_lookup_rpc_fallback_and_repair(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
-    assert(timing.remote_meta_lookup_count == 1);
+
     assert(remote_handle.local_slot == handle.local_slot);
     assert(remote_handle.owner_generation == handle.owner_generation);
 
@@ -1363,7 +1356,6 @@ static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     vemb_v16_remote_meta_handle_t repaired = {0};
     vemb_v16_stats_t stats;
@@ -1452,10 +1444,9 @@ static void test_vsim_key2_lookup_ub_ring_rpc_fallback_and_repair(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
-    assert(timing.remote_meta_lookup_count == 1);
+
     assert(remote_handle.local_slot == handle.local_slot);
     assert(remote_handle.owner_generation == handle.owner_generation);
 
@@ -1503,15 +1494,13 @@ static void *ub_ring_rpc_concurrent_worker(void *arg) {
         vemb_v16_vector_handle_t handle = {0};
         vemb_v16_tlc_lookup_source_t source =
             VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-        vemb_v16_tlc_lookup_timing_t timing = {0};
         assert(vemb_v16_tlc_lookup_vsim_key2(
                    ctx->reader,
                    ctx->keys[idx],
                    (uint32_t)strlen(ctx->keys[idx]),
                    ctx->hashes[idx],
                    &handle,
-                   &source,
-                   &timing) == 0);
+                   &source) == 0);
         assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
         assert(handle.key_hash == ctx->hashes[idx]);
         assert(handle.bytes != 0);
@@ -1722,7 +1711,6 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
     vemb_v16_vector_handle_t evict_b_handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     vemb_v16_stats_t stats;
     char req_reader_owner[64];
@@ -1828,8 +1816,7 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
                                          (uint32_t)strlen(stale_key),
                                          stale_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
     assert(remote_handle.owner_generation == stale_new.owner_generation);
     assert(remote_handle.local_slot == stale_new.local_slot);
@@ -1870,14 +1857,12 @@ static void test_vsim_key2_lookup_ub_ring_rpc_stale_and_conflict(void) {
 
     memset(&remote_handle, 0, sizeof(remote_handle));
     source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    memset(&timing, 0, sizeof(timing));
     assert(vemb_v16_tlc_lookup_vsim_key2(reader,
                                          evict_a,
                                          (uint32_t)strlen(evict_a),
                                          evict_a_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_UB_RPC);
     assert(remote_handle.local_slot == evict_a_handle.local_slot);
     assert(remote_handle.owner_generation == evict_a_handle.owner_generation);
@@ -1931,7 +1916,6 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     tlc_core_stats_t stats;
 
@@ -1996,10 +1980,9 @@ static void test_vsim_key2_lookup_remote_meta_stale(void) {
                                          (uint32_t)strlen(key1),
                                          key1_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) != 0);
+                                         &source) != 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_NONE);
-    assert(timing.remote_meta_lookup_count == 1);
+
     tlc_core_get_stats(reader->core, &stats);
     assert(stats.remote_meta_stale >= 1);
     assert(stats.warm_stale_handle_reject >= 1);
@@ -2071,7 +2054,6 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
     vemb_v16_vector_handle_t handle = {0};
     vemb_v16_vector_handle_t remote_handle = {0};
     vemb_v16_tlc_lookup_source_t source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    vemb_v16_tlc_lookup_timing_t timing = {0};
     uint32_t warm_slot = UINT32_MAX;
     const uint8_t *bytes = NULL;
     uint32_t len = 0;
@@ -2132,11 +2114,10 @@ static void test_vsim_key2_lookup_remote_owner_routing(void) {
                                          (uint32_t)strlen(key2),
                                          key2_hash,
                                          &remote_handle,
-                                         &source,
-                                         &timing) == 0);
+                                         &source) == 0);
     assert(source == VEMB_V16_TLC_LOOKUP_SOURCE_REMOTE);
-    assert(timing.local_lookup_count == 1);
-    assert(timing.remote_meta_lookup_count == 1);
+
+
     assert(remote_handle.region_id == handle.region_id);
     assert(remote_handle.offset == handle.offset);
     assert(remote_handle.bytes == handle.bytes);

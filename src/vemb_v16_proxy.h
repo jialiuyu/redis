@@ -1,6 +1,7 @@
 #ifndef __VEMB_V16_PROXY_H
 #define __VEMB_V16_PROXY_H
 
+#include "vemb_v16_aeron_attach.h"
 #include "vemb_v16_protocol.h"
 #include "vemb_v16_storage.h"
 
@@ -16,6 +17,8 @@ int vemb_v16_proxy_enable_uds(vemb_v16_proxy_t *proxy);
 int vemb_v16_proxy_enable_tcp(vemb_v16_proxy_t *proxy,
                               const char *host,
                               uint16_t port);
+int vemb_v16_proxy_enable_inject(vemb_v16_proxy_t *proxy);
+int vemb_v16_proxy_inject_fd(vemb_v16_proxy_t *proxy, int fd);
 int vemb_v16_proxy_set_proxy_io_threads(vemb_v16_proxy_t *proxy,
                                         uint32_t threads);
 int vemb_v16_proxy_set_supernode_workers(vemb_v16_proxy_t *proxy,
@@ -78,5 +81,13 @@ int vemb_v16_proxy_apply_peer_view_map_and_topology_set(
     vemb_v16_proxy_t *proxy,
     const vemb_v16_peer_view_topology_control_req_t *req,
     vemb_v16_peer_view_topology_control_resp_t *resp);
+
+/* Cross-node ATTACH support: if a local warm region has client_path
+ * configured, populate resp's warm_* fields so the remote client can
+ * mmap the region. No-op (warm_region_count stays 0) when no
+ * client_path is configured (loopback / single-host case). */
+void vemb_v16_proxy_fill_attach_warm_region(
+    vemb_v16_proxy_t *proxy,
+    vemb_v16_aeron_attach_resp_t *resp);
 
 #endif

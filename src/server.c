@@ -13,6 +13,7 @@
  */
 
 #include "server.h"
+#include "vemb_v16_server_integration.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -3848,7 +3849,27 @@ void call(client *c, int flags) {
     long long old_master_repl_offset = server.master_repl_offset;
     incrCommandStatsOnError(NULL, 0);
 
-    const long long call_timer = ustime();
+    /* Use monotonic clock if available, and update cached time if needed.
+     * This avoids calling ustime() (gettimeofday via vDSO) on every command;
+     * cached time is synced at most every 25 commands or 10us drift. */
+    const int use_hw_clock = monotonicGetType() == MONOTONIC_CLOCK_HW;
+    monotime monotonic_start = 0;
+    if (use_hw_clock) {
+        monotonic_start = getMonotonicUs();
+        if (server.execution_nesting == 0) {
+            server.accum_call_count_since_ustime++;
+            if (monotonic_start - server.monotonic_us_when_ustime > 10 ||
+                server.accum_call_count_since_ustime > 25)
+            {
+                updateCachedTime(0);
+                monotonic_start = getMonotonicUs();
+                server.monotonic_us_when_ustime = monotonic_start;
+                server.accum_call_count_since_ustime = 0;
+            }
+        }
+    }
+
+    const long long call_timer = use_hw_clock ? server.ustime : ustime();
     enterExecutionUnit(1, call_timer);
 
     /* setting the CLIENT_EXECUTING_COMMAND flag so we will avoid
@@ -3856,10 +3877,6 @@ void call(client *c, int flags) {
      * In case of blocking commands, the flag will be un-set only after successfully
      * re-processing and unblock the client.*/
     c->flags |= CLIENT_EXECUTING_COMMAND;
-
-    monotime monotonic_start = 0;
-    if (monotonicGetType() == MONOTONIC_CLOCK_HW)
-        monotonic_start = getMonotonicUs();
 
     c->cmd->proc(c);
 
@@ -3872,7 +3889,7 @@ void call(client *c, int flags) {
     /* In order to avoid performance implication due to querying the clock using a system call 3 times,
      * we use a monotonic clock, when we are sure its cost is very low, and fall back to non-monotonic call otherwise. */
     ustime_t duration;
-    if (monotonicGetType() == MONOTONIC_CLOCK_HW)
+    if (use_hw_clock)
         duration = getMonotonicUs() - monotonic_start;
     else
         duration = ustime() - call_timer;
@@ -4033,9 +4050,8 @@ void call(client *c, int flags) {
         server.stat_numcommands++;
     }
 
-    /* Record peak memory after each command and before the eviction that runs
-     * before the next command. */
-    updatePeakMemory(zmalloc_used_memory());
+    /* Peak memory is tracked in cronUpdateMemoryStats (every 100ms),
+     * not on every command — avoids per-op zmalloc_used_memory() overhead. */
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);
@@ -5002,6 +5018,11 @@ int finishShutdown(void) {
     /* Best effort flush of slave output buffers, so that we hopefully
      * send them pending writes. */
     flushSlavesOutputBuffers();
+
+    /* Shutdown VEMB V16 dataplane */
+    if (server.vemb_v16_enabled) {
+        vemb_v16_server_integration_shutdown();
+    }
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
@@ -7857,6 +7878,16 @@ int main(int argc, char **argv) {
         clusterInit();
     }
     if (!server.sentinel_mode) {
+        /* Initialize VEMB V16 dataplane before module loading so that
+         * vector engine init (triggered by module load) can connect. */
+        if (server.vemb_v16_enabled) {
+            if (vemb_v16_server_integration_init() != 0) {
+                serverLog(LL_WARNING,
+                          "VEMB V16 integration init failed, disabling dataplane");
+                server.vemb_v16_enabled = 0;
+            }
+        }
+
         moduleInitModulesSystemLast();
         moduleLoadInternalModules();
         moduleLoadFromQueue();

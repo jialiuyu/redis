@@ -2,6 +2,8 @@
 
 #include "cpu_relax.h"
 #include "macro.h"
+#include "util.h"
+#include "vemb_v16_client_ring.h"
 #include "vemb_v16_storage.h"
 #include "vemb_v16_log.h"
 #include "vemb_v16_net.h"
@@ -11,6 +13,8 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -872,6 +876,26 @@ static int storage_attach_ub_rpc_peer_config(
         .inbound_request = src->inbound_request,
         .outbound_response = src->outbound_response,
     };
+    /*
+     * Runtime peer attach happens via peer-view-map AFTER server startup,
+     * so the startup manifest reset path (vemb_v16_storage_reset_manifest_regions)
+     * never saw these ub_rpc_peers and never cleaned the rings. Stale magic +
+     * head/tail from previous test runs survive in the shmdev backing, causing
+     * peer_open's init_on_open check (rpc_ring_ready sees old magic -> skip init)
+     * to reuse a dirty ring. The producer then writes into a ring whose consumer
+     * head pointer is stale, so requests/responses cross past each other and
+     * nothing lands. Force-reset all 4 rings here so both sides start clean.
+     */
+    if (reset_ub_rpc_ring_backing(&peer.request, 0) != 0 ||
+        reset_ub_rpc_ring_backing(&peer.response, 1) != 0 ||
+        reset_ub_rpc_ring_backing(&peer.inbound_request, 0) != 0 ||
+        reset_ub_rpc_ring_backing(&peer.outbound_response, 1) != 0) {
+        serverLog(LL_WARNING,
+                  "vemb_v16 runtime ub rpc peer reset rings failed: local_owner=%u peer_owner=%u",
+                  storage->local_owner_id,
+                  peer.owner_id);
+        return -1;
+    }
     RETURN_IF(vemb_v16_ub_rpc_attach_peer(&storage->ub_rpc,
                                           storage->tlc,
                                           storage->local_owner_id,
@@ -992,7 +1016,7 @@ static int parse_ub_rpc_ring_field(vemb_v16_ub_rpc_ring_config_t *ring,
     snprintf(expected, sizeof(expected), "%s_path", prefix);
     if (!strcmp(key, expected)) {
         RETURN_IF(strlen(value) >= sizeof(ring->path), -1);
-        strcpy(ring->path, value);
+        redis_strlcpy(ring->path, value, sizeof(ring->path));
         return 0;
     }
     snprintf(expected, sizeof(expected), "%s_mmap_offset", prefix);
@@ -1029,7 +1053,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "remote_meta_path")) {
             RETURN_IF(strlen(value) >= sizeof(manifest->remote_meta_path), -1);
-            strcpy(manifest->remote_meta_path, value);
+            redis_strlcpy(manifest->remote_meta_path, value, sizeof(manifest->remote_meta_path));
             return 0;
         }
         if (!strcmp(key, "remote_meta_mmap_offset"))
@@ -1043,7 +1067,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "job_plane_path")) {
             RETURN_IF(strlen(value) >= sizeof(manifest->job_plane_path), -1);
-            strcpy(manifest->job_plane_path, value);
+            redis_strlcpy(manifest->job_plane_path, value, sizeof(manifest->job_plane_path));
             return 0;
         }
         if (!strcmp(key, "job_plane_mmap_offset"))
@@ -1071,7 +1095,12 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
             return parse_backend_value(value, &current->backend_type);
         if (!strcmp(key, "path")) {
             RETURN_IF(strlen(value) >= sizeof(current->path), -1);
-            strcpy(current->path, value);
+            redis_strlcpy(current->path, value, sizeof(current->path));
+            return 0;
+        }
+        if (!strcmp(key, "client_path")) {
+            RETURN_IF(strlen(value) >= sizeof(current->client_path), -1);
+            redis_strlcpy(current->client_path, value, sizeof(current->client_path));
             return 0;
         }
         if (!strcmp(key, "mmap_offset"))
@@ -1108,7 +1137,7 @@ static int parse_manifest_field(vemb_v16_warm_regions_manifest_t *manifest,
         }
         if (!strcmp(key, "path")) {
             RETURN_IF(strlen(value) >= sizeof(current_meta->path), -1);
-            strcpy(current_meta->path, value);
+            redis_strlcpy(current_meta->path, value, sizeof(current_meta->path));
             return 0;
         }
         if (!strcmp(key, "mmap_offset"))
@@ -1616,6 +1645,13 @@ int vemb_v16_storage_ctx_create_from_manifest(vemb_v16_storage_ctx_t **out,
     storage->warm_region_count = manifest->region_count;
     storage->local_region_weight = manifest->local_region_weight ?
         manifest->local_region_weight : 4;
+    /* Cache local manifest regions so cross-node ATTACH resp can read
+     * client_path without re-parsing the yaml. */
+    storage->local_manifest_region_count = manifest->region_count;
+    if (storage->local_manifest_region_count > VEMB_V16_MAX_MANIFEST_REGIONS)
+        storage->local_manifest_region_count = VEMB_V16_MAX_MANIFEST_REGIONS;
+    for (uint32_t i = 0; i < storage->local_manifest_region_count; i++)
+        storage->local_manifest_regions[i] = manifest->regions[i];
     storage->warm_providers =
         zcalloc(sizeof(*storage->warm_providers) * VEMB_V16_MAX_MANIFEST_REGIONS);
     storage->warm_data_mappings =
@@ -4988,4 +5024,158 @@ int vemb_v16_storage_migration_mark_migrating_in_shard(
     if (rc != 0 && !already_active)
         storage_migration_active_dec(storage);
     return rc;
+}
+
+/* =====================================================================
+ *  Cross-node Aeron shmdev allocation
+ * =====================================================================
+ *
+ * Simple bump allocator within /dev/obmm_shmdev1. The first call mmaps
+ * the whole device (or the first 256 MB); subsequent calls carve out
+ * ring pairs from the bump pointer. This is intentionally NOT a general
+ * allocator — it serves the cross-node aeron use case where the server
+ * process owns shmdev1 for the duration and allocates one ring pair
+ * per ATTACH request.
+ *
+ * Concurrency: single mutex. ATTACH requests are rare (per-client, not
+ * per-op), so contention is not a concern.
+ *
+ * Note on shmdev numbering: shmdev1 is *local* physical memory on both
+ * HW01 and HW02 (symmetric topology). The server (HW01) writes rings
+ * into its local shmdev1; the remote client (HW02) sees them via its
+ * shmdev5, which is a UB-mapped view of HW01's shmdev1.
+ *
+ * ABI note: vemb_v16_client_ring_t has a fixed slot count
+ * (VEMB_V16_CLIENT_RING_SIZE = 4096). The ring_slots parameter is
+ * therefore advisory only — actual ring layout is determined by
+ * vemb_v16_client_ring_bytes(slot_size). Callers should still pass
+ * ring_slots = 4096 for documentation.
+ */
+
+#define VEMB_V16_SHMDEV_CROSS_NODE_PATH "/dev/obmm_shmdev1"
+/* Reserve 8 GB for cross-node aeron rings. 4096-slot rings at 1.5 KB
+ * slot size = ~6.5 MB per channel pair, so 8 GB supports ~1200 channels
+ * (covers T*C up to 1024 = MAX_CHANNELS). Use ull suffix: 32-bit overflow
+ * silently produces 0 and mmap fails. */
+#define VEMB_V16_SHMDEV_CROSS_NODE_BYTES (8ull << 30)
+
+static struct {
+    pthread_mutex_t lock;
+    int      inited;
+    int      fd;
+    void    *base;
+    size_t   size;
+    size_t   bump;  /* next free byte offset */
+} g_shmdev_pool = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static int shmdev_pool_init(void) {
+    if (g_shmdev_pool.inited) return 0;
+    /* shmdev1 is *local* physical memory on this node. Local memory
+     * allows plain O_RDWR mmap but rejects O_SYNC: open(O_SYNC) succeeds
+     * (returns a valid fd), but the subsequent mmap fails with EPERM.
+     * The O_SYNC fallback below only catches open() failure, not mmap
+     * failure, so the prior "O_SYNC first" order permanently broke the
+     * pool. Use plain O_RDWR — that is what every other local-mapping
+     * call site in this file already does. */
+    int fd = open(VEMB_V16_SHMDEV_CROSS_NODE_PATH, O_RDWR);
+    if (fd < 0) {
+        serverLog(LL_WARNING, "shmdev_pool_init: open %s failed errno=%d (%s)",
+                  VEMB_V16_SHMDEV_CROSS_NODE_PATH, errno, strerror(errno));
+        return -1;
+    }
+    void *p = mmap(NULL, VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
+                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        serverLog(LL_WARNING,
+                  "shmdev_pool_init: mmap %s size=%llu failed errno=%d (%s)",
+                  VEMB_V16_SHMDEV_CROSS_NODE_PATH,
+                  (unsigned long long)VEMB_V16_SHMDEV_CROSS_NODE_BYTES,
+                  errno, strerror(errno));
+        close(fd);
+        return -2;
+    }
+    g_shmdev_pool.fd   = fd;
+    g_shmdev_pool.base = p;
+    g_shmdev_pool.size = VEMB_V16_SHMDEV_CROSS_NODE_BYTES;
+    g_shmdev_pool.bump = 0;
+    g_shmdev_pool.inited = 1;
+    return 0;
+}
+
+int vemb_v16_storage_alloc_aeron_channel(uint32_t req_slot_size,
+                                         uint32_t resp_slot_size,
+                                         uint32_t ring_slots,
+                                         char out_shmdev_path[256],
+                                         uint64_t *out_req_off,
+                                         uint64_t *out_resp_off,
+                                         void **out_req_mapping,
+                                         void **out_resp_mapping,
+                                         size_t *out_req_bytes,
+                                         size_t *out_resp_bytes) {
+    (void)ring_slots;  /* slot count is fixed at VEMB_V16_CLIENT_RING_SIZE */
+    if (req_slot_size == 0 || resp_slot_size == 0)
+        return -1;
+
+    /* Use the inline helper so the byte count matches what every other
+     * call site (including client-side poll/publish) computes from the
+     * ring header. */
+    size_t req_bytes  = vemb_v16_client_ring_bytes(req_slot_size);
+    size_t resp_bytes = vemb_v16_client_ring_bytes(resp_slot_size);
+
+    pthread_mutex_lock(&g_shmdev_pool.lock);
+    if (shmdev_pool_init() != 0) {
+        pthread_mutex_unlock(&g_shmdev_pool.lock);
+        return -2;
+    }
+    size_t aligned_req  = (req_bytes  + 4095u) & ~4095u;
+    size_t aligned_resp = (resp_bytes + 4095u) & ~4095u;
+    if (g_shmdev_pool.bump + aligned_req + aligned_resp > g_shmdev_pool.size) {
+        pthread_mutex_unlock(&g_shmdev_pool.lock);
+        return -1;  /* pool exhausted */
+    }
+    size_t req_off  = g_shmdev_pool.bump;
+    size_t resp_off = req_off + aligned_req;
+    g_shmdev_pool.bump = resp_off + aligned_resp;
+    pthread_mutex_unlock(&g_shmdev_pool.lock);
+
+    void *req_map  = (uint8_t *)g_shmdev_pool.base + req_off;
+    void *resp_map = (uint8_t *)g_shmdev_pool.base + resp_off;
+    memset(req_map,  0, req_bytes);
+    memset(resp_map, 0, resp_bytes);
+
+    /* init each ring header — slots_off points right after the header */
+    vemb_v16_client_ring_init((vemb_v16_client_ring_t *)req_map,  req_slot_size);
+    vemb_v16_client_ring_init((vemb_v16_client_ring_t *)resp_map, resp_slot_size);
+
+    strncpy(out_shmdev_path, VEMB_V16_SHMDEV_CROSS_NODE_PATH, 255);
+    out_shmdev_path[255] = 0;
+    *out_req_off     = (uint64_t)req_off;
+    *out_resp_off    = (uint64_t)resp_off;
+    *out_req_mapping  = req_map;
+    *out_resp_mapping = resp_map;
+    *out_req_bytes   = req_bytes;
+    *out_resp_bytes  = resp_bytes;
+    return 0;
+}
+
+void vemb_v16_storage_free_aeron_channel(void *req_mapping, size_t req_bytes,
+                                         void *resp_mapping, size_t resp_bytes) {
+    /* No-op: pool is process-lifetime. Memory is released when server
+     * process exits. This matches the existing local-aeron SHM lifecycle
+     * where rings survive until channel close. */
+    (void)req_mapping; (void)req_bytes;
+    (void)resp_mapping; (void)resp_bytes;
+}
+
+const vemb_v16_manifest_region_t *
+vemb_v16_storage_first_local_region_with_client_path(
+    const vemb_v16_storage_ctx_t *storage) {
+    if (!storage) return NULL;
+    for (uint32_t i = 0; i < storage->local_manifest_region_count; i++) {
+        if (storage->local_manifest_regions[i].client_path[0] != '\0')
+            return &storage->local_manifest_regions[i];
+    }
+    return NULL;
 }

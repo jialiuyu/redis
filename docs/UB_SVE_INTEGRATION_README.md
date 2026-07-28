@@ -131,9 +131,6 @@ make CFLAGS="-march=armv8.2-a+sve -O3 -DUSE_UB_SVE"
 在 `redis.conf` 中添加:
 
 ```ini
-# 启用 UB+SVE 引擎
-vector-engine ub
-
 # Proxy 聚合器配置
 proxy-aggregator-enabled yes
 proxy-batch-limit 3000
@@ -184,7 +181,7 @@ supernode-ub-mem-size 4TB
 ### 启动 Redis（Proxy 模式）
 
 ```bash
-redis-server --vector-engine ub \
+redis-server \
              --proxy-aggregator-enabled yes \
              --proxy-num-supernodes 150
 ```

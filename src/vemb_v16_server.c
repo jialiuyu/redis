@@ -23,22 +23,22 @@ static uint32_t clamp_worker_count(long value, uint32_t max_value) {
     return (uint32_t)value;
 }
 
-static uint32_t default_proxy_io_threads(void) {
+static uint32_t default_balanced_worker_count(void) {
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    long target = cpus > 0 ? cpus / 2 : 1;
+    long target = cpus > 0 ? cpus / 4 : 1;
     if (target < 1)
         target = 1;
-    if (target > 16)
-        target = 16;
-    return clamp_worker_count(target, VEMB_V16_MAX_CHANNELS);
-}
-
-static uint32_t default_supernode_workers(void) {
-    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    long target = cpus > 0 ? cpus : 1;
     if (target > 32)
         target = 32;
     return clamp_worker_count(target, VEMB_V16_MAX_CHANNELS);
+}
+
+static uint32_t default_proxy_io_threads(void) {
+    return default_balanced_worker_count();
+}
+
+static uint32_t default_supernode_workers(void) {
+    return default_balanced_worker_count();
 }
 
 static void on_signal(int sig) {
@@ -49,18 +49,18 @@ static void on_signal(int sig) {
 int main(int argc, char **argv) {
     int ret = 1;
     vemb_v16_storage_ctx_t *storage = NULL;
-    const char *uds_path = VEMB_V16_UDS_PATH;
     const char *vector_region_name = VEMB_V16_DEFAULT_VECTOR_REGION;
     const char *warm_regions_manifest = NULL;
     uint32_t dim = VEMB_V16_DEFAULT_DIM;
     uint32_t max_vectors = VEMB_V16_DEFAULT_MAX_VECTORS;
     uint32_t warm_region_id = 0;
-    uint32_t warm_backend_type = VEMB_V16_REGION_LOCAL_SHM;
+    uint32_t warm_backend_type = VEMB_V16_REGION_UB;
     uint64_t warm_mmap_offset = 0;
     int loglevel = LL_NOTICE;
-    const char *transport = "aeron";
     const char *tcp_host = VEMB_V16_TCP_HOST;
     uint16_t tcp_port = VEMB_V16_TCP_PORT;
+    const char *transport = "tcp";
+    const char *uds_path = "/tmp/vemb_v16.sock";
     uint32_t proxy_io_threads = default_proxy_io_threads();
     uint32_t supernode_workers = default_supernode_workers();
     int reset_warm_regions = 0;
@@ -243,10 +243,9 @@ int main(int argc, char **argv) {
            (unsigned long long)stats.published_jobs,
            (unsigned long long)stats.completed_jobs,
            (unsigned long long)stats.active_channels);
-    serverLog(LL_NOTICE, "vemb_v16 stats: bitmap_lock_success=%llu bitmap_lock_failure=%llu sample_vector_load_ns=%llu",
+    serverLog(LL_NOTICE, "vemb_v16 stats: bitmap_lock_success=%llu bitmap_lock_failure=%llu",
            (unsigned long long)stats.bitmap_lock_success,
-           (unsigned long long)stats.bitmap_lock_failure,
-           (unsigned long long)stats.sample_vector_load_ns);
+           (unsigned long long)stats.bitmap_lock_failure);
     serverLog(LL_NOTICE, "vemb_v16 stats: migration moved=%llu stale=%llu ask=%llu forward=%llu duplicate=%llu source_gc=%llu gc_safe_watermark=%llu baseline_sent=%llu baseline_skipped=%llu baseline_error=%llu baseline_retry_queued=%llu baseline_retry_sent=%llu baseline_retry_pending=%llu",
            (unsigned long long)stats.moved_count,
            (unsigned long long)stats.stale_count,
@@ -302,56 +301,6 @@ int main(int argc, char **argv) {
               (unsigned long long)stats.ub_lookup_rpc_error,
               (unsigned long long)stats.ub_lookup_rpc_handle,
               (unsigned long long)stats.ub_lookup_rpc_snapshot);
-    if (stats.timing_job_count) {
-        double total_avg = (double)stats.timing_job_total_ns /
-            (double)stats.timing_job_count;
-        double primary_avg = stats.timing_primary_lookup_count ?
-            (double)stats.timing_primary_lookup_ns /
-            (double)stats.timing_primary_lookup_count : 0.0;
-        double secondary_avg = stats.timing_secondary_lookup_count ?
-            (double)stats.timing_secondary_lookup_ns /
-            (double)stats.timing_secondary_lookup_count : 0.0;
-        double remote_meta_avg = stats.timing_remote_meta_lookup_count ?
-            (double)stats.timing_remote_meta_lookup_ns /
-            (double)stats.timing_remote_meta_lookup_count : 0.0;
-        double payload_local_avg = stats.timing_payload_local_slice_count ?
-            (double)stats.timing_payload_local_slice_ns /
-            (double)stats.timing_payload_local_slice_count : 0.0;
-        double payload_remote_avg = stats.timing_payload_remote_slice_count ?
-            (double)stats.timing_payload_remote_slice_ns /
-            (double)stats.timing_payload_remote_slice_count : 0.0;
-        double compute_avg = stats.timing_compute_count ?
-            (double)stats.timing_compute_ns /
-            (double)stats.timing_compute_count : 0.0;
-        serverLog(LL_NOTICE,
-                  "vemb_v16 stats: timing job_count=%llu job_total_avg_ns=%.1f job_total_max_ns=%llu primary_lookup_count=%llu primary_lookup_avg_ns=%.1f primary_lookup_max_ns=%llu",
-                  (unsigned long long)stats.timing_job_count,
-                  total_avg,
-                  (unsigned long long)stats.timing_job_total_max_ns,
-                  (unsigned long long)stats.timing_primary_lookup_count,
-                  primary_avg,
-                  (unsigned long long)stats.timing_primary_lookup_max_ns);
-        serverLog(LL_NOTICE,
-                  "vemb_v16 stats: timing secondary_lookup_count=%llu secondary_lookup_avg_ns=%.1f secondary_lookup_max_ns=%llu remote_meta_lookup_count=%llu remote_meta_lookup_avg_ns=%.1f remote_meta_lookup_max_ns=%llu",
-                  (unsigned long long)stats.timing_secondary_lookup_count,
-                  secondary_avg,
-                  (unsigned long long)stats.timing_secondary_lookup_max_ns,
-                  (unsigned long long)stats.timing_remote_meta_lookup_count,
-                  remote_meta_avg,
-                  (unsigned long long)stats.timing_remote_meta_lookup_max_ns);
-        serverLog(LL_NOTICE,
-                  "vemb_v16 stats: timing payload_local_slice_count=%llu payload_local_slice_avg_ns=%.1f payload_local_slice_max_ns=%llu payload_remote_slice_count=%llu payload_remote_slice_avg_ns=%.1f payload_remote_slice_max_ns=%llu compute_count=%llu compute_avg_ns=%.1f compute_max_ns=%llu",
-                  (unsigned long long)stats.timing_payload_local_slice_count,
-                  payload_local_avg,
-                  (unsigned long long)stats.timing_payload_local_slice_max_ns,
-                  (unsigned long long)stats.timing_payload_remote_slice_count,
-                  payload_remote_avg,
-                  (unsigned long long)stats.timing_payload_remote_slice_max_ns,
-                  (unsigned long long)stats.timing_compute_count,
-                  compute_avg,
-                  (unsigned long long)stats.timing_compute_max_ns);
-    }
-
 cleanup:
     if (g_proxy) {
         vemb_v16_proxy_destroy(g_proxy);

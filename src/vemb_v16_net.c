@@ -68,9 +68,7 @@ int vemb_v16_net_listen(const char *host, uint16_t port, int backlog) {
 
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#ifdef SO_REUSEPORT
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#endif
 
     struct sockaddr_in addr;
     if (vemb_v16_addr4(host, port, &addr) != 0 ||
@@ -160,6 +158,24 @@ int vemb_v16_net_writev_full(int fd, const struct iovec *iov, int iovcnt) {
     return 0;
 }
 
+ssize_t vemb_v16_net_writev_nonblocking(int fd, const struct iovec *iov, int iovcnt) {
+    struct iovec local[VEMB_V16_NET_MAX_IOV];
+    int nlocal = make_iov(local, iov, iovcnt);
+    if (nlocal < 0) {
+        return -1;
+    }
+
+    struct msghdr msg = {
+        .msg_iov = local,
+        .msg_iovlen = nlocal,
+    };
+    ssize_t r = sendmsg(fd, &msg, MSG_DONTWAIT);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+    return r;
+}
+
 int vemb_v16_net_read_header(int fd, vemb_v16_net_hdr_t *hdr) {
     RETURN_IF(vemb_v16_net_read_full(fd, hdr, sizeof(*hdr)) != 0, -1);
     RETURN_IF(hdr->magic != VEMB_V16_MAGIC || hdr->version != VEMB_V16_VERSION, -1);
@@ -173,47 +189,22 @@ int vemb_v16_net_write_frame(int fd,
                              uint32_t req_id,
                              const void *payload,
                              uint32_t payload_len) {
-    return vemb_v16_net_write_frame2(fd,
-                                     type,
-                                     flags,
-                                     channel_id,
-                                     req_id,
-                                     payload,
-                                     payload_len,
-                                     NULL,
-                                     0);
-}
-
-int vemb_v16_net_write_frame2(int fd,
-                              uint16_t type,
-                              uint32_t flags,
-                              uint64_t channel_id,
-                              uint32_t req_id,
-                              const void *payload1,
-                              uint32_t payload1_len,
-                              const void *payload2,
-                              uint32_t payload2_len) {
     vemb_v16_net_hdr_t hdr = {
         .magic = VEMB_V16_MAGIC,
         .version = VEMB_V16_VERSION,
         .type = type,
         .flags = flags,
-        .payload_len = payload1_len + payload2_len,
+        .payload_len = payload_len,
         .channel_id = channel_id,
         .req_id = req_id,
     };
-    struct iovec iov[3];
+    struct iovec iov[2];
     int iovcnt = 0;
     iov[iovcnt++] = (struct iovec){.iov_base = &hdr, .iov_len = sizeof(hdr)};
-    if (payload1_len)
+    if (payload_len)
         iov[iovcnt++] = (struct iovec){
-            .iov_base = (void *)payload1,
-            .iov_len = payload1_len,
-        };
-    if (payload2_len)
-        iov[iovcnt++] = (struct iovec){
-            .iov_base = (void *)payload2,
-            .iov_len = payload2_len,
+            .iov_base = (void *)payload,
+            .iov_len = payload_len,
         };
     return vemb_v16_net_writev_full(fd, iov, iovcnt);
 }

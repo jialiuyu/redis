@@ -108,27 +108,6 @@ configEnum tls_auth_clients_enum[] = {
     {"no", TLS_CLIENT_AUTH_NO},
 };
 
-configEnum vector_engine_enum[] = {
-    {"redis", 0},
-    {"ub", 1},
-    {NULL, 0}
-};
-
-configEnum ub_element_index_mode_enum[] = {
-    {"numeric", UB_ELEMENT_INDEX_NUMERIC},
-    {"suffix-numeric", UB_ELEMENT_INDEX_SUFFIX_NUMERIC},
-    {"hash", UB_ELEMENT_INDEX_HASH},
-    {NULL, 0}
-};
-
-configEnum proxy_vemb_submit_mode_enum[] = {
-    {"batch", PROXY_VEMB_SUBMIT_MODE_BATCH},
-    {"direct", PROXY_VEMB_SUBMIT_MODE_DIRECT},
-    {"adaptive", PROXY_VEMB_SUBMIT_MODE_ADAPTIVE},
-    {"fc", PROXY_VEMB_SUBMIT_MODE_FC},
-    {NULL, 0}
-};
-
 configEnum tls_client_auth_user_enum[] = {
     {"CN", TLS_CLIENT_FIELD_CN},
     {"off", TLS_CLIENT_FIELD_OFF},
@@ -2386,6 +2365,14 @@ static int isValidDBfilename(char *val, const char **err) {
     return 1;
 }
 
+static int isValidVembV16Transport(char *val, const char **err) {
+    if (strcmp(val, "sniff") && strcmp(val, "aeron")) {
+        *err = "vemb-v16-transport must be 'sniff' or 'aeron'";
+        return 0;
+    }
+    return 1;
+}
+
 static int isValidAOFfilename(char *val, const char **err) {
     if (!strcmp(val, "")) {
         *err = "appendfilename can't be empty";
@@ -2633,17 +2620,6 @@ int updateAppendFsync(const char **err) {
         bioDrainWorker(BIO_AOF_FSYNC);
     }
     return 1;
-}
-
-int updateVectorEngine(const char **err) {
-    /* Switch vector engine at runtime */
-    if (vector_engine_switch(server.vector_engine_type) == C_OK) {
-        server.vector_engine_enabled = 1;
-        return 1;
-    } else {
-        *err = "Failed to switch vector engine";
-        return 0;
-    }
 }
 
 /* applyBind affects both TCP and TLS (if enabled) together */
@@ -3162,8 +3138,6 @@ standardConfig static_configs[] = {
     createBoolConfig("lazyexpire-nested-arbitrary-keys", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.lazyexpire_nested_arbitrary_keys, 1, NULL, NULL),
     createBoolConfig("cluster-slot-stats-enabled", NULL, MODIFIABLE_CONFIG, server.cluster_slot_stats_enabled, 0, NULL, NULL),
     createBoolConfig("lua-enable-deprecated-api", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.lua_enable_deprecated_api, 0, NULL, NULL),
-    createBoolConfig("ub-cacheable", NULL, MODIFIABLE_CONFIG, server.ub.cacheable, 0, NULL, NULL),
-    createBoolConfig("ub-use-ownership", NULL, MODIFIABLE_CONFIG, server.ub.use_ownership, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
@@ -3191,8 +3165,6 @@ standardConfig static_configs[] = {
     createStringConfig("req-res-logfile", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, EMPTY_STRING_IS_NULL, server.req_res_logfile, NULL, NULL, NULL),
 #endif
     createStringConfig("locale-collate", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.locale_collate, "", NULL, updateLocaleCollate),
-    createStringConfig("ub-table-name", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ub.table_name, NULL, NULL, NULL),
-    createStringConfig("ub-shm-path", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ub.shm_path, NULL, NULL, NULL),
 
     /* SDS Configs */
     createSDSConfig("masterauth", NULL, MODIFIABLE_CONFIG | SENSITIVE_CONFIG, EMPTY_STRING_IS_NULL, server.masterauth, NULL, NULL, NULL),
@@ -3214,9 +3186,6 @@ standardConfig static_configs[] = {
     createEnumConfig("cluster-preferred-endpoint-type", NULL, MODIFIABLE_CONFIG, cluster_preferred_endpoint_type_enum, server.cluster_preferred_endpoint_type, CLUSTER_ENDPOINT_TYPE_IP, NULL, NULL),
     createEnumConfig("propagation-error-behavior", NULL, MODIFIABLE_CONFIG, propagation_error_behavior_enum, server.propagation_error_behavior, PROPAGATION_ERR_BEHAVIOR_IGNORE, NULL, NULL),
     createEnumConfig("shutdown-on-sigint", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigint, 0, isValidShutdownOnSigFlags, NULL),
-    createEnumConfig("vector-engine", NULL, MODIFIABLE_CONFIG, vector_engine_enum, server.vector_engine_type, VECTOR_ENGINE_REDIS, NULL, updateVectorEngine),
-    createEnumConfig("ub-element-index-mode", NULL, MODIFIABLE_CONFIG, ub_element_index_mode_enum, server.ub.element_index_mode, UB_ELEMENT_INDEX_SUFFIX_NUMERIC, NULL, NULL),
-    createEnumConfig("proxy-vemb-submit-mode", NULL, MODIFIABLE_CONFIG, proxy_vemb_submit_mode_enum, server.proxy.vemb_submit_mode, PROXY_VEMB_SUBMIT_MODE_ADAPTIVE, NULL, NULL),
     createEnumConfig("shutdown-on-sigterm", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigterm, 0, isValidShutdownOnSigFlags, NULL),
 
     /* Integer configs */
@@ -3224,16 +3193,7 @@ standardConfig static_configs[] = {
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort), /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, 1, 128, server.io_threads_num, 1, INTEGER_CONFIG, NULL, NULL), /* Single threaded by default */
     createIntConfig("supernode-workers", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
-    createSizeTConfig("proxy-batch-limit", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.batch_limit, 0, INTEGER_CONFIG, NULL, NULL),
-    createULongLongConfig("proxy-time-limit-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.time_limit_us, 0, INTEGER_CONFIG, NULL, NULL),
-    createSizeTConfig("proxy-max-supernodes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.max_supernodes, 0, INTEGER_CONFIG, NULL, NULL),
-    createBoolConfig("proxy-vemb-adaptive", NULL, MODIFIABLE_CONFIG, server.proxy.vemb_adaptive, 1, NULL, NULL),
-    createULongLongConfig("proxy-vemb-direct-gap-us", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.proxy.vemb_direct_gap_us, 20, INTEGER_CONFIG, NULL, NULL),
-    createSizeTConfig("proxy-vemb-fc-workers", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_workers, 0, INTEGER_CONFIG, NULL, NULL),
-    createSizeTConfig("proxy-vemb-fc-slots", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_slots, 0, INTEGER_CONFIG, NULL, NULL),
-    createSizeTConfig("proxy-vemb-fc-max-scan", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.proxy.vemb_fc_max_scan, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, PREFETCH_BATCH_MAX_SIZE, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("vector-dimension", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.ub.vector_dimension, 300, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_slave_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* Slave max data age factor. */
     createIntConfig("list-max-listpack-size", "list-max-ziplist-size", MODIFIABLE_CONFIG, INT_MIN, INT_MAX, server.list_max_listpack_size, -2, INTEGER_CONFIG, NULL, NULL),
@@ -3306,7 +3266,6 @@ standardConfig static_configs[] = {
     /* Unsigned Long Long configs */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
     createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_msg_queue_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
-    createULongLongConfig("ub-shm-memid", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.ub.shm_memid, 0, INTEGER_CONFIG, NULL, NULL),
 
     /* Size_t configs */
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
@@ -3321,10 +3280,6 @@ standardConfig static_configs[] = {
     createSizeTConfig("hll-sparse-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hll_sparse_max_bytes, 3000, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("tracking-table-max-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL), /* Default: 1 million keys max. */
     createSizeTConfig("client-query-buffer-limit", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024*1024, LONG_MAX, server.client_max_querybuf_len, 1024*1024*1024, MEMORY_CONFIG, NULL, NULL), /* Default: 1GB max query buffer. */
-    createSizeTConfig("ub-shm-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.ub.shm_size, 0, MEMORY_CONFIG, NULL, NULL),
-    createSizeTConfig("ub-table-offset", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.ub.table_offset, 0, MEMORY_CONFIG, NULL, NULL),
-    createSizeTConfig("ub-table-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.ub.table_size, 0, MEMORY_CONFIG, NULL, NULL),
-    createSizeTConfig("ub-vector-stride-bytes", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.ub.vector_stride_bytes, 0, MEMORY_CONFIG, NULL, NULL),
     createSSizeTConfig("maxmemory-clients", NULL, MODIFIABLE_CONFIG, -100, SSIZE_MAX, server.maxmemory_clients, 0, MEMORY_CONFIG | PERCENT_CONFIG, NULL, applyClientMaxMemoryUsage),
 
     /* Other configs */
@@ -3354,6 +3309,18 @@ standardConfig static_configs[] = {
     createStringConfig("tls-protocols", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.protocols, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, applyTlsCfg),
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, applyTlsCfg),
+
+    /* VEMB V16 configs */
+    createBoolConfig("vemb-v16-enabled", NULL, MODIFIABLE_CONFIG, server.vemb_v16_enabled, 0, NULL, NULL),
+
+    createIntConfig("vemb-v16-dim", NULL, MODIFIABLE_CONFIG, 1, 4096, server.vemb_v16_dim, 300, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-max-vectors", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.vemb_v16_max_vectors, 131072, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("vemb-v16-warm-regions-manifest", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.vemb_v16_warm_regions_manifest, NULL, NULL, NULL),
+    createBoolConfig("vemb-v16-reset-warm-regions", NULL, MODIFIABLE_CONFIG, server.vemb_v16_reset_warm_regions, 0, NULL, NULL),
+    createIntConfig("vemb-v16-supernode-workers", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_supernode_workers, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("vemb-v16-proxy-io-threads", NULL, MODIFIABLE_CONFIG, 0, 256, server.vemb_v16_proxy_io_threads, 0, INTEGER_CONFIG, NULL, NULL),
+    createStringConfig("vemb-v16-transport", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.vemb_v16_transport, "sniff", isValidVembV16Transport, NULL),
+    createBoolConfig("vemb-v16-cross-node-aeron", NULL, IMMUTABLE_CONFIG, server.vemb_v16_cross_node_aeron_enabled, 0, NULL, NULL),
 
     /* Special configs */
     createSpecialConfig("dir", NULL, MODIFIABLE_CONFIG | PROTECTED_CONFIG | DENY_LOADING_CONFIG, setConfigDirOption, getConfigDirOption, rewriteConfigDirOption, NULL),

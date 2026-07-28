@@ -219,7 +219,8 @@ static void make_handle(vemb_v16_tlc_t *tlc,
 }
 
 static void tlc_counter_add(atomic_uint_fast64_t *counter, uint64_t value) {
-    atomic_fetch_add_explicit(counter, value, memory_order_relaxed);
+    (void)counter;
+    (void)value;
 }
 
 static uint64_t tlc_counter_load(atomic_uint_fast64_t *counter) {
@@ -275,15 +276,12 @@ int publish_remote_meta_to_view(vemb_v16_tlc_t *tlc,
         .owner_generation = handle->owner_generation,
     };
     vemb_v16_remote_meta_publish_result_t result = {0};
-    uint64_t start = vemb_v16_monotonic_ns();
     int rc = vemb_v16_remote_meta_publish_with_result(view,
                                                       key,
                                                       key_len,
                                                       key_hash,
                                                       &remote_handle,
                                                       &result);
-    tlc_counter_add(&tlc->remote_meta_publish_ns,
-                    vemb_v16_monotonic_ns() - start);
     if (rc == VEMB_V16_REMOTE_META_OK) {
         tlc_counter_add(&tlc->remote_meta_publish_ok, 1);
         if (is_repair)
@@ -778,6 +776,22 @@ int vemb_v16_tlc_get_handle(vemb_v16_tlc_t *tlc,
     tlc_warm_location_t location = {0};
     if (tlc_core_get_warm_location(tlc->core, key, key_len,
                                    key_hash, &location) != 0) {
+        return -1;
+    }
+    if (warm_slot) *warm_slot = location.local_slot;
+    make_handle(tlc, key_hash, &location, handle);
+    return 0;
+}
+
+int vemb_v16_tlc_get_handle_stable_read(vemb_v16_tlc_t *tlc,
+                                        const char *key,
+                                        uint32_t key_len,
+                                        uint64_t key_hash,
+                                        vemb_v16_vector_handle_t *handle,
+                                        uint32_t *warm_slot) {
+    tlc_warm_location_t location = {0};
+    if (tlc_core_get_warm_location_stable_read(tlc->core, key, key_len,
+                                               key_hash, &location) != 0) {
         return -1;
     }
     if (warm_slot) *warm_slot = location.local_slot;
@@ -1694,11 +1708,8 @@ static int lookup_vsim_key2_via_rpc(vemb_v16_tlc_t *tlc,
     };
     memcpy(req.key, key2, key2_len);
     vemb_v16_ub_lookup_rpc_resp_t resp = {0};
-    uint64_t rpc_start = vemb_v16_monotonic_ns();
     tlc_counter_add(&tlc->ub_lookup_rpc_count, 1);
     int rc = snapshot->lookup_rpc(snapshot->lookup_rpc_arg, &req, &resp);
-    tlc_counter_add(&tlc->ub_lookup_rpc_ns,
-                    vemb_v16_monotonic_ns() - rpc_start);
     if (rc != 0) {
         tlc_counter_add(&tlc->ub_lookup_rpc_error, 1);
         return -1;
@@ -1766,10 +1777,8 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                   uint32_t key2_len,
                                   uint64_t key2_hash,
                                   vemb_v16_vector_handle_t *handle,
-                                  vemb_v16_tlc_lookup_source_t *source,
-                                  vemb_v16_tlc_lookup_timing_t *timing) {
+                                  vemb_v16_tlc_lookup_source_t *source) {
     *source = VEMB_V16_TLC_LOOKUP_SOURCE_NONE;
-    memset(timing, 0, sizeof(*timing));
 
     vemb_v16_tlc_access_snapshot_t *snapshot = access_snapshot_acquire(tlc);
     int try_local = 1;
@@ -1789,7 +1798,6 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
         try_local = owner_id == local_owner_id;
     }
 
-    uint64_t stage_start = vemb_v16_monotonic_ns();
     if (try_local &&
         vemb_v16_tlc_get_handle(tlc,
                                 key2,
@@ -1797,14 +1805,10 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
                                 key2_hash,
                                 handle,
                                 NULL) == 0) {
-        timing->local_lookup_count = 1;
-        timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
         *source = VEMB_V16_TLC_LOOKUP_SOURCE_LOCAL;
         access_snapshot_release(snapshot);
         return 0;
     }
-    timing->local_lookup_count = 1;
-    timing->local_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
 
     if (!remote_meta)
         remote_meta = remote_meta_view_for_key(tlc,
@@ -1815,7 +1819,6 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
     if (remote_meta) {
         vemb_v16_remote_meta_handle_t remote_handle = {0};
         vemb_v16_remote_meta_lookup_result_t lookup_result = {0};
-        stage_start = vemb_v16_monotonic_ns();
         int remote_rc = vemb_v16_remote_meta_lookup_with_result(
             remote_meta,
             key2,
@@ -1824,8 +1827,6 @@ int vemb_v16_tlc_lookup_vsim_key2(vemb_v16_tlc_t *tlc,
             tlc->remote_meta_retry_budget,
             &remote_handle,
             &lookup_result);
-        timing->remote_meta_lookup_count = 1;
-        timing->remote_meta_lookup_ns = vemb_v16_monotonic_ns() - stage_start;
         tlc_counter_add(&tlc->remote_meta_lookup_way_probe, lookup_result.probes);
         if (remote_rc == VEMB_V16_REMOTE_META_OK) {
             tlc_counter_add(&tlc->remote_meta_lookup_hit, 1);

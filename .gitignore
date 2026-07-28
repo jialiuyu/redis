@@ -1,6 +1,9 @@
 # Build output directory
 output/
 
+# Generated perf artifacts
+perf/
+
 # Build metadata
 .make-*
 .nfs*
@@ -249,3 +252,6 @@ benchmark/*_ctl
 /deps/lua/src/luac
 src/vemb_v16_server
 src/release.h
+artifacts/
+xxx引擎架构设计文档-模板.docx
+svg/
